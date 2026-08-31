@@ -32,7 +32,8 @@ _KEYWORDS = (
     "主题歌",
 )
 _TITLE_CARD = re.compile(r"第\s*[一二三四五六七八九十百\d]+\s*[集話话]")
-_NAME_LIST = re.compile(r"^(?:[\u4e00-\u9fff]{2,4})(?:\s+[\u4e00-\u9fff]{2,4})+$")
+_NAME_LIST_EVEN = re.compile(r"^(?:[\u4e00-\u9fff]{2,4})(?:\s+[\u4e00-\u9fff]{2,4})+$")
+_NAME_LIST_RAGGED = re.compile(r"^(?:[\u4e00-\u9fff]{1,5})(?:\s+[\u4e00-\u9fff]{1,5}){2,}$")
 _BRACKET_WRAPPED = re.compile(r"^[《『「(（]\s*(?P<inner>.+?)\s*[》』」)）]$")
 _LATIN = re.compile(r"[A-Za-z]")
 _NON_SPACE = re.compile(r"\S")
@@ -40,7 +41,8 @@ _NON_SPACE = re.compile(r"\S")
 OP_START_WINDOW = (60.0, 300.0)
 OP_SPAN_WINDOW = (40.0, 120.0)
 ED_TAIL_SECONDS = 120.0
-CLUSTER_MAX_GAP = 30.0
+ED_WINDOW_SECONDS = 80.0
+CLUSTER_MAX_GAP = 35.0
 _TITLE_OVERLAP_THRESHOLD = 0.6
 _NAME_LIST_MIN_CJK = 6
 _LATIN_RATIO_THRESHOLD = 0.6
@@ -87,8 +89,10 @@ def is_credits(text: str, *, show_title: str = "", in_credit_window: bool = Fals
     if not in_credit_window:
         return False
 
-    # 4. 纯人名罗列
-    if _NAME_LIST.match(stripped):
+    # 4. 纯人名罗列。EVEN 接「河原正信 有贺史英」这种齐整两段；
+    # RAGGED 接「慧 诹访 豊 和田雄一郎」这种参差不齐但至少三段的 staff 罗列。
+    # RAGGED 要求 3 段以上，否则「早安 早安」这类两段短台词会被误伤。
+    if _NAME_LIST_EVEN.match(stripped) or _NAME_LIST_RAGGED.match(stripped):
         cjk_count = len(re.findall(r"[\u4e00-\u9fff]", stripped))
         if cjk_count >= _NAME_LIST_MIN_CJK:
             return True
@@ -104,8 +108,13 @@ def is_credits(text: str, *, show_title: str = "", in_credit_window: bool = Fals
 
 
 def in_credit_window(start: float, duration: float) -> bool:
-    """片头 0-300s 或片尾最后 150s。给 is_credits 的规则 4-5 开门。"""
-    return start <= OP_START_WINDOW[1] or start >= duration - 150.0
+    """片头 0-300s 或片尾最后 80s。给 is_credits 的规则 4-5 开门。
+
+    片尾窗口刻意比 ED_TAIL_SECONDS 窄：黄金样本最后一句真台词在 1325.5s
+    （片长 1416.6s，距片尾 91s），ED staff 第一行在 1348.2s。80s 的阈值
+    落在两者之间的 19.8s 无字幕间隙里，两侧各留约 11s 余量。
+    """
+    return start <= OP_START_WINDOW[1] or start >= duration - ED_WINDOW_SECONDS
 
 
 def _cluster(lines: list[DialogueLine], max_gap: float) -> list[tuple[float, float]]:

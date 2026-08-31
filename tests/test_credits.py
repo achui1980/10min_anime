@@ -1,6 +1,6 @@
 import pytest
 
-from tenmin.ingest.credits import find_credit_ranges, is_credits
+from tenmin.ingest.credits import find_credit_ranges, in_credit_window, is_credits
 from tenmin.models import DialogueLine
 
 
@@ -88,11 +88,27 @@ def test_find_credit_ranges_picks_longest_op_candidate():
     assert op == pytest.approx((200.0, 290.0))
 
 
+def test_is_credits_name_list_accepts_ragged_segments():
+    # 黄金样本第 52 行，段长 1/2/1/5。齐整的 {2,4} 正则接不到它，OP 区间就算不出来。
+    assert is_credits("慧 诹访 豊 和田雄一郎", in_credit_window=True) is True
+
+
+def test_in_credit_window_excludes_tail_dialogue():
+    duration = 1416.622
+    assert in_credit_window(153.486, duration) is True  # OP staff
+    assert in_credit_window(1348.180, duration) is True  # ED staff 第一行
+    # 黄金样本 398/400 行是真台词。片尾窗若放到 150s，会被纯人名规则误判成 credits，
+    # ED 区间起点就会错成 1314.396。
+    assert in_credit_window(1325.532, duration) is False
+    assert in_credit_window(1314.396, duration) is False
+    assert in_credit_window(700.0, duration) is False
+
+
 def test_golden_sample_credit_lines(golden_track):
     kinds = {}
     for ln in golden_track.lines:
         kinds.setdefault(ln.idx, set()).add(ln.kind)
-    for idx in (51, 52, 53, 54, 401, 403, 404, 405):
+    for idx in (51, 52, 53, 54, 401, 402, 403, 405):
         assert "credits" in kinds[idx], f"第 {idx} 行没被识别成 credits"
 
 
