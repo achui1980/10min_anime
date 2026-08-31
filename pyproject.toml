@@ -1,0 +1,45 @@
+[project]
+name = "tenmin"
+version = "0.1.0"
+description = "10分钟看番剧 - 番剧解说自动化引擎"
+requires-python = ">=3.12"
+dependencies = [
+    "typer>=0.12",
+    "pydantic>=2.7",
+    "pydantic-settings>=2.2",
+    "pyyaml>=6.0",
+    "charset-normalizer>=3.3",
+    "opencc-python-reimplemented>=0.1.7",
+    "google-genai>=1.33",
+]
+
+[project.scripts]
+tenmin = "tenmin.cli:app"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.2",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.5",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/tenmin"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+markers = [
+    "llm: 需要真实 LLM API key 才能跑，无 key 时 skip",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
