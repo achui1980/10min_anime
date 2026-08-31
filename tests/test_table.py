@@ -1,5 +1,3 @@
-import pytest
-
 from tenmin.docgen.table import (
     LEGEND,
     escape_cell,
