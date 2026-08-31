@@ -1,4 +1,13 @@
-from tenmin.ingest.clean import apply_glossary, clean_text, strip_markup, to_simplified
+from tenmin.ingest.clean import (
+    apply_glossary,
+    clean_text,
+    extract_prefix,
+    is_noise,
+    is_suspect,
+    split_dual_track,
+    strip_markup,
+    to_simplified,
+)
 
 
 def test_strip_markup_removes_ass_override_blocks():
@@ -44,3 +53,76 @@ def test_clean_text_can_skip_conversion():
 def test_clean_text_handles_empty():
     assert clean_text("") == ""
     assert clean_text("   \n  ") == ""
+
+
+# --- 结构层清洗 ---
+
+
+def test_extract_prefix_speaker():
+    assert extract_prefix("(伊月) 我知道了") == ("伊月", "我知道了")
+    assert extract_prefix("（天王寺）走了") == ("天王寺", "走了")
+
+
+def test_extract_prefix_long_prefix_is_annotation_not_speaker():
+    speaker, rest = extract_prefix("(第二集当侍从的第一天) 早上好")
+    assert speaker is None
+    assert rest == "早上好"
+
+
+def test_extract_prefix_title_card_short_but_matches_episode_pattern():
+    speaker, rest = extract_prefix("(第二集) 早上好")
+    assert speaker is None
+    assert rest == "早上好"
+
+
+def test_extract_prefix_whole_line_is_parenthesized_returns_unchanged():
+    # 整行都在括号里，交给 credits / screen_text 判定，这里不动它
+    assert extract_prefix("(制作委员会)") == (None, "(制作委员会)")
+
+
+def test_extract_prefix_no_prefix():
+    assert extract_prefix("普通台词") == (None, "普通台词")
+
+
+def test_is_noise():
+    assert is_noise("-") is True
+    assert is_noise("- – —") is True
+    assert is_noise("00") is True
+    assert is_noise("%") is True
+    assert is_noise("正常台词") is False
+    assert is_noise("") is True
+
+
+def test_is_suspect_digit_run():
+    assert is_suspect("80-08 浙谷339") is True
+
+
+def test_is_suspect_short_latin_segment():
+    assert is_suspect("boo") is True
+
+
+def test_is_suspect_unbalanced_quote():
+    assert is_suspect('"杰斯电器\n00') is True
+
+
+def test_is_suspect_odd_symbol():
+    assert is_suspect("じやがいも\n%") is True
+
+
+def test_is_suspect_clean_line():
+    assert is_suspect("我今天要去学院上课") is False
+    assert is_suspect("这药就是会让人硬不起来的药") is False
+
+
+def test_split_dual_track():
+    parts = split_dual_track("刚才的回答相当精彩\n(伊月) 她随时都被旁人包围")
+    assert parts == ["刚才的回答相当精彩", "(伊月) 她随时都被旁人包围"]
+
+
+def test_split_dual_track_no_second_speaker_returns_single():
+    assert split_dual_track("第二句上\n第二句下") == ["第二句上\n第二句下"]
+
+
+def test_split_dual_track_three_segments():
+    parts = split_dual_track("(甲) 一\n(乙) 二\n(丙) 三")
+    assert parts == ["(甲) 一", "(乙) 二", "(丙) 三"]
