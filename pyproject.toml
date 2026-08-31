@@ -34,7 +34,8 @@ packages = ["src/tenmin"]
 testpaths = ["tests"]
 asyncio_mode = "auto"
 markers = [
-    "llm: 需要真实 LLM API key 才能跑，无 key 时 skip",
+    "llm: 需要真实 LLM API key，默认跳过（跑法：TENMIN_GEMINI_API_KEY=xxx uv run pytest -m llm）",
+    "generalize: 需要额外番剧 SRT fixture，默认跳过（把 SRT 放进 tests/fixtures/generalize/ 后自动生效）",
 ]
 
 [tool.ruff]
