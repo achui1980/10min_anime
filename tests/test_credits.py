@@ -8,6 +8,10 @@ def line(idx: int, start: float, end: float, text: str = "x") -> DialogueLine:
     return DialogueLine(idx=idx, start=start, end=end, text=text, raw=text, kind="credits")
 
 
+def speech(idx: int, start: float, end: float, text: str = "台词") -> DialogueLine:
+    return DialogueLine(idx=idx, start=start, end=end, text=text, raw=text, kind="dialogue")
+
+
 def test_is_credits_copyright():
     assert is_credits("©2024 才女的侍从制作委员会") is True
     assert is_credits("(C) SOME STUDIO") is True
@@ -18,7 +22,8 @@ def test_is_credits_keywords_both_scripts():
     assert is_credits("製作委員會") is True
     assert is_credits("作词 作曲 编曲") is True
     assert is_credits("フォント协力") is True
-    assert is_credits("监督 山田太郎") is True
+    assert is_credits("监督 山田太郎", in_credit_window=True) is True
+    assert is_credits("监督 山田太郎", in_credit_window=False) is False
 
 
 def test_is_credits_title_card():
@@ -102,6 +107,31 @@ def test_in_credit_window_excludes_tail_dialogue():
     assert in_credit_window(1325.532, duration) is False
     assert in_credit_window(1314.396, duration) is False
     assert in_credit_window(700.0, duration) is False
+
+
+def test_op_from_silence_prefers_gap_inside_span_window():
+    # 一条 credits 行都没有 → 聚簇路径算不出 OP → 走 _op_from_silence 兜底。
+    # 静区一 40.0-190.0（150s，超出 OP_MAX_SILENT_SPAN，干扰项且比真 OP 更长）
+    # 静区二 200.0-290.0（90s，落在 [60,120] 内，真 OP）
+    # 两个静区起点 40.0 / 200.0 都落在 OP_START_WINDOW=(30,300) 内。
+    lines = [
+        speech(1, 20.0, 40.0, "台词一"),
+        speech(2, 190.0, 200.0, "台词二"),
+        speech(3, 290.0, 300.0, "台词三"),
+    ]
+    op, ed = find_credit_ranges(lines, duration=1400.0)
+    assert op == pytest.approx((200.0, 290.0))
+    assert ed is None
+
+
+def test_op_from_silence_ignores_gap_outside_span_window():
+    # 只留 150s 的干扰静区，兜底必须放弃而不是硬认一个过长静区当 OP。
+    lines = [
+        speech(1, 20.0, 40.0, "台词一"),
+        speech(2, 190.0, 200.0, "台词二"),
+    ]
+    op, _ = find_credit_ranges(lines, duration=1400.0)
+    assert op is None
 
 
 def test_golden_sample_credit_lines(golden_track):
