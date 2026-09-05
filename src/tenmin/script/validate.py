@@ -4,11 +4,14 @@ from __future__ import annotations
 
 from pydantic import BaseModel
 
-from tenmin.models import Clip, DialogueTrack, Script, SignalReport
+from tenmin.models import Beat, Clip, DialogueLine, DialogueTrack, Script, SignalReport
 
 ANCHOR_TOLERANCE_SECONDS = 5.0
 SILENT_OVERLAP_SECONDS = 1.0
 MIN_BEATS = 3
+# 实测真实 LLM 输出里 14/18 个 clip 至少有一条 anchor 落在窗外，多数只差 1-3 秒无害，
+# 所以只在「过半 anchor 都在窗外」时才报——那种情况说明旁白讲的内容整段没有画面。
+ANCHOR_COVERAGE_MIN_RATIO = 0.5
 
 
 class ScriptValidationError(RuntimeError):
@@ -30,15 +33,81 @@ def _overlap(a_start: float, a_end: float, b_start: float, b_end: float) -> floa
     return max(0.0, min(a_end, b_end) - max(a_start, b_start))
 
 
-def _anchor_time(track: DialogueTrack, anchor_lines: list[int]) -> float | None:
-    starts = [
-        ln.start
+def _anchor_matches(track: DialogueTrack, anchor_lines: list[int]) -> list[DialogueLine]:
+    return [
+        ln
         for ln in track.lines
         if ln.idx in anchor_lines or any(m in anchor_lines for m in ln.merged_from)
     ]
+
+
+def _anchor_time(track: DialogueTrack, anchor_lines: list[int]) -> float | None:
+    starts = [ln.start for ln in _anchor_matches(track, anchor_lines)]
     if not starts:
         return None
     return min(starts)
+
+
+def _quote_matches(
+    tracks: dict[int, DialogueTrack], episodes: list[int], quote: str
+) -> list[DialogueLine]:
+    """按整行完全相等反查金句出处。找不到是合法情况（跨 cue 拼接／双轨半句）。"""
+    target = quote.strip()
+    found: list[DialogueLine] = []
+    for episode in episodes:
+        track = tracks.get(episode)
+        if track is None:
+            continue
+        found.extend(ln for ln in track.lines if ln.text.strip() == target)
+    return found
+
+
+def _check_hold_quotes(beat: Beat, tracks: dict[int, DialogueTrack]) -> list[str]:
+    """留白金句的原声必须落在本 beat 某个 clip 的时间窗内，否则剪辑师放不出来。"""
+    if not beat.clips:
+        return []
+    episodes = list(dict.fromkeys(clip.episode for clip in beat.clips))
+    warnings: list[str] = []
+    for hold in beat.audio.holds:
+        matches = _quote_matches(tracks, episodes, hold.quote)
+        if not matches:
+            continue
+        if any(
+            _overlap(ln.start, ln.end, clip.start, clip.end) > 0
+            for ln in matches
+            for clip in beat.clips
+        ):
+            continue
+        warnings.append(
+            f"{beat.label}：留白金句「{hold.quote}」的原声在 "
+            f"{matches[0].start:.1f} 秒，不在本节点任何 clip 的时间窗内，"
+            f"剪辑时放不出这句原声"
+        )
+    return warnings
+
+
+def _check_anchor_coverage(beat: Beat, tracks: dict[int, DialogueTrack]) -> list[str]:
+    """clip 的时间窗必须装得下自己的 anchor_lines，否则旁白讲的内容没有画面。"""
+    warnings: list[str] = []
+    for clip in beat.clips:
+        track = tracks.get(clip.episode)
+        if track is None:
+            continue
+        lines = _anchor_matches(track, clip.anchor_lines)
+        total = len(lines)
+        if total == 0:
+            continue
+        outside = sum(
+            1
+            for ln in lines
+            if _overlap(ln.start, ln.end, clip.start, clip.end) <= 0
+        )
+        if outside / total > ANCHOR_COVERAGE_MIN_RATIO:
+            warnings.append(
+                f"{beat.label}：clip {clip.start:.1f}-{clip.end:.1f} 的 anchor 行有 "
+                f"{outside}/{total} 条落在时间窗外，旁白讲的内容缺画面"
+            )
+    return warnings
 
 
 def validate_script(
@@ -113,5 +182,7 @@ def validate_script(
                 f"{beat.label} 的所有 clip 都未通过校验，剧本不可用，重试"
             )
         beat.clips = kept
+        warnings.extend(_check_hold_quotes(beat, tracks))
+        warnings.extend(_check_anchor_coverage(beat, tracks))
 
     return ValidationResult(script=script, warnings=warnings)

@@ -5,11 +5,13 @@ from tenmin.models import (
     Clip,
     DialogueLine,
     DialogueTrack,
+    Hold,
     Script,
     Signal,
     SignalReport,
 )
 from tenmin.script.validate import (
+    ANCHOR_COVERAGE_MIN_RATIO,
     ANCHOR_TOLERANCE_SECONDS,
     ScriptValidationError,
     validate_script,
@@ -220,3 +222,133 @@ def test_three_beats_is_enough():
         [[clip(10.0, 15.0)], [clip(20.0, 25.0)], [clip(30.0, 35.0)]], pad=False
     )
     assert len(run(s).script.beats) == 3
+
+
+# --- 校验 A：留白金句的原声必须落在本 beat 某个 clip 内 ---
+
+QUOTE = "原来您对我的认知只有这种程度"
+
+
+def hold(quote, at=5.0, duration=2.0):
+    return Hold(at=at, duration=duration, quote=quote, note="留给原声")
+
+
+def with_holds(script, holds, beat_index=0):
+    script.beats[beat_index].audio.holds = list(holds)
+    return script
+
+
+def test_hold_quote_outside_every_clip_warns():
+    """真实缺陷 A：金句在 41.1s，clip 却是 0.6-20.0 与 167.8-209.8。"""
+    track = make_track(lines=[dline(1, 5.0, 8.0, "别的台词"), dline(17, 41.1, 43.0, QUOTE)])
+    s = with_holds(
+        make_script([[clip(0.6, 20.0), clip(167.8, 209.8)]]), [hold(QUOTE)]
+    )
+    result = run(s, track=track)
+    assert len(result.warnings) == 1, result.warnings
+    assert "留白金句" in result.warnings[0]
+    assert "41.1" in result.warnings[0]
+
+
+def test_hold_quote_inside_a_clip_does_not_warn():
+    track = make_track(lines=[dline(17, 41.1, 43.0, QUOTE)])
+    s = with_holds(make_script([[clip(40.0, 60.0)]]), [hold(QUOTE)])
+    result = run(s, track=track)
+    assert result.warnings == []
+
+
+def test_hold_quote_touching_clip_edge_counts_as_inside():
+    """金句尾巴伸进 clip 起点之后，仍算放得出来。"""
+    track = make_track(lines=[dline(17, 38.0, 41.0, QUOTE)])
+    s = with_holds(make_script([[clip(40.0, 60.0)]]), [hold(QUOTE)])
+    assert run(s, track=track).warnings == []
+
+
+def test_hold_quote_not_found_in_track_is_skipped_silently():
+    """跨 cue 拼接／双轨半句在字幕里找不到完全相等的行，这是已知合法情况。"""
+    track = make_track(lines=[dline(17, 41.1, 43.0, "字幕里真正的那行")])
+    s = with_holds(make_script([[clip(0.6, 20.0)]]), [hold("LLM 自己缝出来的半句")])
+    assert run(s, track=track).warnings == []
+
+
+def test_hold_quote_matches_any_of_multiple_occurrences():
+    """同一句台词出现多次，只要有一次落在 clip 里就不报。"""
+    track = make_track(
+        lines=[dline(17, 41.1, 43.0, QUOTE), dline(88, 300.0, 302.0, QUOTE)]
+    )
+    s = with_holds(make_script([[clip(295.0, 310.0)]]), [hold(QUOTE)])
+    assert run(s, track=track).warnings == []
+
+
+def test_hold_quote_is_compared_after_stripping():
+    track = make_track(lines=[dline(17, 41.1, 43.0, QUOTE)])
+    s = with_holds(make_script([[clip(0.6, 20.0)]]), [hold(f"  {QUOTE} ")])
+    result = run(s, track=track)
+    assert len(result.warnings) == 1, result.warnings
+    assert "留白金句" in result.warnings[0]
+
+
+# --- 校验 B：clip 时间窗必须覆盖自己的 anchor_lines ---
+
+
+def test_anchor_coverage_min_ratio_constant():
+    assert ANCHOR_COVERAGE_MIN_RATIO == pytest.approx(0.5)
+
+
+def test_clip_window_missing_most_anchors_warns():
+    """真实缺陷 B：clip 408.9-453.9 只有 45 秒，anchors 却铺到 542.9。"""
+    track = make_track(
+        lines=[
+            dline(1, 410.0, 412.0),
+            dline(2, 500.0, 502.0),
+            dline(3, 520.0, 522.0),
+            dline(4, 540.8, 542.9),
+        ]
+    )
+    s = make_script([[clip(408.9, 453.9, anchors=[1, 2, 3, 4])]])
+    result = run(s, track=track)
+    assert len(result.warnings) == 1, result.warnings
+    assert "anchor 行有" in result.warnings[0]
+    assert "3/4" in result.warnings[0]
+    kept = result.script.beats[0].clips[0]
+    assert kept.start == pytest.approx(408.9)  # 只报警，不改时间戳
+    assert kept.end == pytest.approx(453.9)
+
+
+def test_clip_window_missing_few_anchors_does_not_warn():
+    track = make_track(
+        lines=[dline(1, 410.0, 412.0), dline(2, 420.0, 422.0), dline(3, 455.0, 457.0)]
+    )
+    s = make_script([[clip(408.9, 453.9, anchors=[1, 2, 3])]])
+    assert run(s, track=track).warnings == []
+
+
+def test_clip_window_missing_exactly_half_anchors_does_not_warn():
+    """比例正好等于阈值不报，只有严格超过才报。"""
+    track = make_track(
+        lines=[
+            dline(1, 410.0, 412.0),
+            dline(2, 420.0, 422.0),
+            dline(3, 500.0, 502.0),
+            dline(4, 520.0, 522.0),
+        ]
+    )
+    s = make_script([[clip(408.9, 453.9, anchors=[1, 2, 3, 4])]])
+    assert run(s, track=track).warnings == []
+
+
+def test_anchor_coverage_counts_merged_lines():
+    """合并过的行按 merged_from 反查，与现有 anchor 校验口径一致。"""
+    merged = DialogueLine(
+        idx=90, start=600.0, end=602.0, text="合并行", raw="合并行", merged_from=[7, 8]
+    )
+    track = make_track(lines=[dline(1, 410.0, 412.0), merged, dline(3, 700.0, 702.0)])
+    s = make_script([[clip(408.9, 453.9, anchors=[1, 7, 3])]])
+    result = run(s, track=track)
+    assert len(result.warnings) == 1, result.warnings
+    assert "2/3" in result.warnings[0]
+
+
+def test_anchor_coverage_ignores_clip_without_matching_anchors():
+    s = make_script([[clip(408.9, 453.9, anchors=[9999])]])
+    assert run(s).warnings == []
