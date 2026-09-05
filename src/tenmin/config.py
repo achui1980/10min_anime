@@ -22,8 +22,9 @@ class LocaleConfig(BaseModel):
 
 
 class LLMConfig(BaseModel):
-    provider: Literal["gemini"] = "gemini"
+    provider: Literal["gemini", "minimax"] = "gemini"
     model: str = "gemini-3.6-flash"
+    base_url: str | None = None
 
 
 class ProjectConfig(BaseModel):
@@ -69,3 +70,4 @@ class Settings(BaseSettings):
     )
 
     gemini_api_key: str | None = None
+    minimax_api_key: str | None = None

@@ -11,6 +11,7 @@ dependencies = [
     "charset-normalizer>=3.3",
     "opencc-python-reimplemented>=0.1.7",
     "google-genai>=1.33",
+    "httpx>=0.27",
 ]
 
 [project.scripts]

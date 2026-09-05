@@ -1,12 +1,38 @@
-"""LLM provider。v1 只有 Gemini 一家。"""
+"""LLM provider。目前支持 Gemini 与 MiniMax（OpenAI 兼容接口）。"""
 
 from __future__ import annotations
 
+import json
+import re
 from typing import Any, Protocol, runtime_checkable
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from tenmin.config import LLMConfig, Settings
+
+MINIMAX_BASE_URL = "https://api.minimax.cn/v1"
+MINIMAX_MAX_ATTEMPTS = 3
+
+_THINK_BLOCK = re.compile(r"<think>.*?</think>", re.S)
+_FENCE = re.compile(r"^```(?:json)?[ \t]*\n?|\n?```[ \t]*$", re.M)
+
+
+def _strip_reasoning(text: str) -> str:
+    """MiniMax-M3 每次都在正文前吐一个 <think>…</think> 推理块，必须剥掉。"""
+    return _THINK_BLOCK.sub("", text).strip()
+
+
+def _extract_json(text: str) -> str:
+    """剥掉推理块与 markdown 围栅，再取第一个 { 到最后一个 }。
+
+    模型偶尔会在 JSON 前后加解释文字，所以不能直接 json.loads 整个 content。
+    """
+    cleaned = _FENCE.sub("", _strip_reasoning(text)).strip()
+    start = cleaned.find("{")
+    end = cleaned.rfind("}")
+    if start == -1 or end == -1 or end < start:
+        raise ValueError(f"MiniMax 返回里找不到 JSON 对象：{cleaned[:200]!r}")
+    return cleaned[start : end + 1]
 
 
 @runtime_checkable
@@ -45,6 +71,80 @@ class GeminiProvider:
         return schema.model_validate_json(response.text)
 
 
+class MiniMaxProvider:
+    """MiniMax 的 OpenAI 兼容接口。
+
+    与 GeminiProvider 的关键差别：MiniMax 接受 response_format=json_schema 却完全
+    不执行它（实测传严格嵌套 schema 后，返回的字段名全是模型自己编的），所以 schema
+    只能写进提示词正文，再靠 pydantic 校验 + 带着报错重试来兜住。
+    """
+
+    def __init__(
+        self,
+        api_key: str,
+        model: str = "MiniMax-M3",
+        base_url: str = MINIMAX_BASE_URL,
+    ) -> None:
+        self.model = model
+        self.base_url = base_url.rstrip("/")
+        self._api_key = api_key
+
+    def _schema_prompt(self, user: str, schema: type[BaseModel]) -> str:
+        spec = json.dumps(schema.model_json_schema(), ensure_ascii=False, indent=2)
+        return (
+            f"{user}\n\n"
+            "## 输出 JSON Schema（必须严格遵守）\n\n"
+            f"```json\n{spec}\n```\n\n"
+            "只输出符合上面 schema 的 JSON 对象本身。字段名一个字都不能改，"
+            "不要在外面再套一层包裹对象，不要加解释文字，不要加 markdown 围栅。"
+        )
+
+    async def complete(
+        self, system: str, user: str, schema: type[BaseModel] | None = None
+    ) -> Any:
+        import httpx
+
+        content = self._schema_prompt(user, schema) if schema is not None else user
+        messages: list[dict[str, str]] = [
+            {"role": "system", "content": system},
+            {"role": "user", "content": content},
+        ]
+        payload: dict[str, Any] = {"model": self.model, "messages": messages}
+        if schema is not None:
+            payload["response_format"] = {"type": "json_object"}
+
+        last_error = ""
+        async with httpx.AsyncClient(timeout=600.0) as client:
+            for _ in range(MINIMAX_MAX_ATTEMPTS):
+                response = await client.post(
+                    f"{self.base_url}/chat/completions",
+                    headers={"Authorization": f"Bearer {self._api_key}"},
+                    json=payload,
+                )
+                response.raise_for_status()
+                text = response.json()["choices"][0]["message"]["content"]
+                if schema is None:
+                    return _strip_reasoning(text)
+                try:
+                    return schema.model_validate_json(_extract_json(text))
+                except (ValidationError, ValueError) as exc:
+                    last_error = str(exc)[:1500]
+                    messages.append({"role": "assistant", "content": text})
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                "上面的输出不符合 schema，校验报错如下。"
+                                "请只输出修正后的完整 JSON 对象，不要解释。\n\n"
+                                f"{last_error}"
+                            ),
+                        }
+                    )
+        raise RuntimeError(
+            f"MiniMax 连续 {MINIMAX_MAX_ATTEMPTS} 次输出不符合 {schema.__name__}：{last_error}"
+        )
+
+
 def build_provider(cfg: LLMConfig, settings: Settings) -> LLMProvider:
     if cfg.provider == "gemini":
         if not settings.gemini_api_key:
@@ -52,4 +152,14 @@ def build_provider(cfg: LLMConfig, settings: Settings) -> LLMProvider:
                 "缺少 Gemini API key，请设置环境变量 TENMIN_GEMINI_API_KEY"
             )
         return GeminiProvider(api_key=settings.gemini_api_key, model=cfg.model)
+    if cfg.provider == "minimax":
+        if not settings.minimax_api_key:
+            raise RuntimeError(
+                "缺少 MiniMax API key，请设置环境变量 TENMIN_MINIMAX_API_KEY"
+            )
+        return MiniMaxProvider(
+            api_key=settings.minimax_api_key,
+            model=cfg.model,
+            base_url=cfg.base_url or MINIMAX_BASE_URL,
+        )
     raise ValueError(f"不支持的 LLM provider：{cfg.provider}")

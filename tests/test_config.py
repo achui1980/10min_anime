@@ -1,7 +1,7 @@
 import pytest
 from pydantic import ValidationError
 
-from tenmin.config import ProjectConfig, Settings, load_project
+from tenmin.config import LLMConfig, ProjectConfig, Settings, load_project
 
 SAMPLE = """\
 show: 才女的侍从
@@ -91,3 +91,58 @@ def test_settings_missing_key_is_none(monkeypatch):
 def test_project_config_is_constructible_in_memory():
     cfg = ProjectConfig(show="X", slug="x", episodes=[{"number": 1, "srt": "a.srt"}])
     assert cfg.episodes[0].srt.name == "a.srt"
+
+
+def test_llm_config_base_url_defaults_to_none():
+    cfg = LLMConfig()
+    assert cfg.provider == "gemini"
+    assert cfg.model == "gemini-3.6-flash"
+    assert cfg.base_url is None
+
+
+def test_llm_config_accepts_minimax_provider():
+    cfg = LLMConfig(provider="minimax", model="MiniMax-M3")
+    assert cfg.provider == "minimax"
+    assert cfg.model == "MiniMax-M3"
+    assert cfg.base_url is None
+
+
+def test_llm_config_accepts_base_url_override():
+    cfg = LLMConfig(provider="minimax", base_url="https://proxy.test/v1")
+    assert cfg.base_url == "https://proxy.test/v1"
+
+
+def test_llm_config_rejects_unknown_provider():
+    with pytest.raises(ValidationError):
+        LLMConfig(provider="openai")
+
+
+def test_load_project_with_minimax_llm(tmp_path):
+    path = tmp_path / "project.yaml"
+    path.write_text(
+        MINIMAL + "llm:\n  provider: minimax\n  model: MiniMax-M3\n"
+        "  base_url: https://proxy.test/v1\n",
+        encoding="utf-8",
+    )
+    cfg = load_project(path)
+    assert cfg.llm.provider == "minimax"
+    assert cfg.llm.model == "MiniMax-M3"
+    assert cfg.llm.base_url == "https://proxy.test/v1"
+
+
+def test_settings_reads_minimax_env(monkeypatch):
+    monkeypatch.setenv("TENMIN_MINIMAX_API_KEY", "mm-key")
+    assert Settings().minimax_api_key == "mm-key"
+
+
+def test_settings_missing_minimax_key_is_none(monkeypatch):
+    monkeypatch.delenv("TENMIN_MINIMAX_API_KEY", raising=False)
+    assert Settings(_env_file=None).minimax_api_key is None
+
+
+def test_settings_keys_are_independent(monkeypatch):
+    monkeypatch.setenv("TENMIN_GEMINI_API_KEY", "g-key")
+    monkeypatch.delenv("TENMIN_MINIMAX_API_KEY", raising=False)
+    settings = Settings(_env_file=None)
+    assert settings.gemini_api_key == "g-key"
+    assert settings.minimax_api_key is None
