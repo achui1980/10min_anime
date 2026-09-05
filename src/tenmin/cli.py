@@ -26,7 +26,7 @@ PROJECT_TEMPLATE = {
     "locale": {"convert_traditional": True},
     "episodes": [{"number": 2, "srt": "srt/E02.srt"}],
     "glossary": {},
-    "llm": {"provider": "gemini", "model": "gemini-2.5-pro"},
+    "llm": {"provider": "gemini", "model": "gemini-3.6-flash"},
 }
 
 

@@ -18,7 +18,7 @@ glossary:
   伊月: 伊月
 llm:
   provider: gemini
-  model: gemini-2.5-pro
+  model: gemini-3.6-flash
 """
 
 MINIMAL = """\
@@ -44,7 +44,7 @@ def test_load_project_full(tmp_path):
     assert cfg.episodes[0].op_range == (153.486, 224.681)
     assert cfg.episodes[0].ed_range is None
     assert cfg.glossary == {"伊月": "伊月"}
-    assert cfg.llm.model == "gemini-2.5-pro"
+    assert cfg.llm.model == "gemini-3.6-flash"
 
 
 def test_load_project_minimal_applies_defaults(tmp_path):

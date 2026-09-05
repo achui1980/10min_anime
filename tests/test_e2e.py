@@ -108,7 +108,7 @@ def project(tmp_path: Path, golden_srt_path: Path) -> Path:
         "locale": {"convert_traditional": True},
         "episodes": [{"number": 1, "srt": "srt/E02.srt"}],
         "glossary": {},
-        "llm": {"provider": "gemini", "model": "gemini-2.5-pro"},
+        "llm": {"provider": "gemini", "model": "gemini-3.6-flash"},
     }
     (root / "project.yaml").write_text(
         yaml.safe_dump(config, allow_unicode=True), encoding="utf-8"

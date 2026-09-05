@@ -180,7 +180,7 @@ glossary:                     # 术语表，修正专有名词
   傑斯電器: 杰斯电器
 llm:
   provider: gemini
-  model: gemini-2.5-pro
+  model: gemini-3.6-flash
 ```
 
 ### 5.2 DialogueTrack

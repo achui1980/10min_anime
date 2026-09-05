@@ -19,7 +19,7 @@ class LLMProvider(Protocol):
 
 
 class GeminiProvider:
-    def __init__(self, api_key: str, model: str = "gemini-2.5-pro"):
+    def __init__(self, api_key: str, model: str = "gemini-3.6-flash"):
         from google import genai
 
         self.model = model

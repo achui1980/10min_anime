@@ -41,9 +41,9 @@ async def test_fake_provider_exhausted_raises():
 
 def test_build_provider_returns_gemini():
     settings = Settings(gemini_api_key="fake-key")
-    provider = build_provider(LLMConfig(provider="gemini", model="gemini-2.5-pro"), settings)
+    provider = build_provider(LLMConfig(provider="gemini", model="gemini-3.6-flash"), settings)
     assert isinstance(provider, GeminiProvider)
-    assert provider.model == "gemini-2.5-pro"
+    assert provider.model == "gemini-3.6-flash"
 
 
 def test_build_provider_without_key_raises():
@@ -85,12 +85,12 @@ async def test_gemini_provider_passes_schema_through(monkeypatch):
     class FakeClient:
         aio = FakeAio()
 
-    provider = GeminiProvider(api_key="fake-key", model="gemini-2.5-pro")
+    provider = GeminiProvider(api_key="fake-key", model="gemini-3.6-flash")
     monkeypatch.setattr(provider, "_client", FakeClient())
 
     result = await provider.complete("SYS", "USR", Toy)
     assert result == Toy(value=42)
-    assert captured["model"] == "gemini-2.5-pro"
+    assert captured["model"] == "gemini-3.6-flash"
     assert captured["contents"] == "USR"
     assert captured["config"].system_instruction == "SYS"
     assert captured["config"].response_mime_type == "application/json"
@@ -116,7 +116,7 @@ async def test_gemini_provider_without_schema_returns_text(monkeypatch):
     class FakeClient:
         aio = FakeAio()
 
-    provider = GeminiProvider(api_key="fake-key", model="gemini-2.5-pro")
+    provider = GeminiProvider(api_key="fake-key", model="gemini-3.6-flash")
     monkeypatch.setattr(provider, "_client", FakeClient())
 
     assert await provider.complete("SYS", "USR") == "纯文本回答"

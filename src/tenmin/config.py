@@ -23,7 +23,7 @@ class LocaleConfig(BaseModel):
 
 class LLMConfig(BaseModel):
     provider: Literal["gemini"] = "gemini"
-    model: str = "gemini-2.5-pro"
+    model: str = "gemini-3.6-flash"
 
 
 class ProjectConfig(BaseModel):
