@@ -1,4 +1,4 @@
-import copy
+import json
 
 import pytest
 from pydantic import BaseModel
@@ -8,6 +8,7 @@ from tenmin.models import LLMScript
 from tenmin.script.llm import (
     MINIMAX_BASE_URL,
     MINIMAX_MAX_ATTEMPTS,
+    MINIMAX_TIMEOUT,
     GeminiProvider,
     LLMProvider,
     MiniMaxProvider,
@@ -232,45 +233,65 @@ def test_build_provider_minimax_without_key_raises():
     assert "TENMIN_MINIMAX_API_KEY" in str(exc.value)
 
 
-class _FakeResponse:
-    def __init__(self, content: str) -> None:
-        self._content = content
+def _sse(*payloads: dict, done: bool = True, extra_lines: tuple[str, ...] = ()) -> str:
+    """按 MiniMax 的 SSE 线格式拼一个响应体。payloads 是每个 chunk 的原始 JSON。"""
+    lines = [f"data: {json.dumps(p, ensure_ascii=False)}" for p in payloads]
+    lines.extend(extra_lines)
+    if done:
+        lines.append("data: [DONE]")
+    # SSE 事件之间是空行分隔，httpx 的 aiter_lines 会原样把空行交给我们。
+    return "\n\n".join(lines) + "\n\n"
 
-    def raise_for_status(self) -> None:
-        return None
 
-    def json(self) -> dict:
-        return {"choices": [{"message": {"content": self._content}}]}
+def _delta(content: str) -> dict:
+    return {"choices": [{"delta": {"content": content}}]}
+
+
+def _sse_from_chunks(*chunks: str) -> str:
+    return _sse(*[_delta(c) for c in chunks])
+
+
+def _mock_httpx(monkeypatch, bodies: list) -> list[dict]:
+    """用 httpx.MockTransport 按序回放 SSE 响应体。
+
+    刻意保留真实的 httpx.AsyncClient（只注入 transport），这样 SSE 分行/解码走的是
+    httpx 自己的 aiter_lines 实现，测到的是生产路径而不是手写的假迭代器。
+    """
+    import httpx
+
+    real_client_cls = httpx.AsyncClient
+    requests: list[dict] = []
+    queue = list(bodies)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        # request.content 是当次序列化后的字节，天然是快照；provider 内部的 messages
+        # 会被后续重试就地追加，所以只能从这里取"当次"请求内容。
+        requests.append(
+            {
+                "url": str(request.url),
+                "headers": request.headers,
+                "json": json.loads(request.content),
+            }
+        )
+        assert queue, "假 httpx 的响应队列已用尽"
+        body = queue.pop(0)
+        if isinstance(body, tuple):
+            status, text = body
+        else:
+            status, text = 200, body
+        return httpx.Response(status, content=text.encode("utf-8"))
+
+    def factory(**kwargs):
+        requests.append({"__init__": kwargs})
+        return real_client_cls(transport=httpx.MockTransport(handler), **kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", factory)
+    return requests
 
 
 def _fake_httpx(monkeypatch, contents: list[str]) -> list[dict]:
-    """把 httpx.AsyncClient 换成按序回放 contents 的假客户端；返回请求记录（深拷贝）。"""
-    import httpx
-
-    requests: list[dict] = []
-    queue = list(contents)
-
-    class FakeAsyncClient:
-        def __init__(self, **kwargs) -> None:
-            requests.append({"__init__": kwargs})
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *exc) -> bool:
-            return False
-
-        async def post(self, url, *, headers, json):
-            # payload["messages"] 与 provider 内部的 messages 是同一对象，会被后续
-            # 重试就地追加，所以必须深拷贝才能断言"当次"请求的内容。
-            requests.append(
-                {"url": url, "headers": dict(headers), "json": copy.deepcopy(json)}
-            )
-            assert queue, "假 httpx 的响应队列已用尽"
-            return _FakeResponse(queue.pop(0))
-
-    monkeypatch.setattr(httpx, "AsyncClient", FakeAsyncClient)
-    return requests
+    """老签名的便捷包装：每个 content 作为单 chunk 的流式响应回放。"""
+    return _mock_httpx(monkeypatch, [_sse_from_chunks(c) for c in contents])
 
 
 @pytest.mark.asyncio
@@ -365,3 +386,145 @@ async def test_minimax_complete_without_schema_returns_stripped_text(monkeypatch
     assert "response_format" not in posts[0]["json"]
     # 无 schema 时用户消息原样透传，不注入 schema 段
     assert posts[0]["json"]["messages"][1]["content"] == "USR"
+
+
+# --- MiniMax 流式 ---
+
+
+@pytest.mark.asyncio
+async def test_minimax_stream_accumulates_chunks(monkeypatch):
+    """多个 data: 行按序累加，且请求体里 stream=True。"""
+    log = _mock_httpx(
+        monkeypatch,
+        [_sse_from_chunks('{"val', 'ue": ', "42}")],
+    )
+    provider = MiniMaxProvider(api_key="secret")
+
+    assert await provider.complete("SYS", "USR", Toy) == Toy(value=42)
+
+    posts = [r for r in log if "url" in r]
+    assert len(posts) == 1
+    assert posts[0]["json"]["stream"] is True
+
+
+@pytest.mark.asyncio
+async def test_minimax_stream_think_block_split_across_chunks(monkeypatch):
+    """</think> 落在 chunk 边界中间也必须能正确剥除。"""
+    chunks = ["<thi", "nk>先推理一下\n再推理一下</thi", 'nk>\n{"value"', ": 7}"]
+    log = _mock_httpx(monkeypatch, [_sse_from_chunks(*chunks)])
+    provider = MiniMaxProvider(api_key="secret")
+
+    assert await provider.complete("SYS", "USR", Toy) == Toy(value=7)
+    assert len([r for r in log if "url" in r]) == 1
+
+
+@pytest.mark.asyncio
+async def test_minimax_stream_without_schema_returns_stripped_text(monkeypatch):
+    log = _mock_httpx(
+        monkeypatch,
+        [_sse_from_chunks("<think>推理", "一下</think>\n\n纯文本", "回答")],
+    )
+    provider = MiniMaxProvider(api_key="secret")
+
+    assert await provider.complete("SYS", "USR") == "纯文本回答"
+    posts = [r for r in log if "url" in r]
+    assert posts[0]["json"]["stream"] is True
+    assert "response_format" not in posts[0]["json"]
+
+
+@pytest.mark.asyncio
+async def test_minimax_stream_skips_malformed_lines(monkeypatch):
+    """畸形 data: 行与心跳空行都要跳过，不能崩。"""
+    body = (
+        'data: {"choices": [{"delta": {"content": "{\\"value\\": "}}]}\n\n'
+        "data: not-json\n\n"
+        "\n"
+        ": ping\n\n"
+        'data: {"choices": [{"delta": {"content": "9}"}}]}\n\n'
+        "data: [DONE]\n\n"
+    )
+    log = _mock_httpx(monkeypatch, [body])
+    provider = MiniMaxProvider(api_key="secret")
+
+    assert await provider.complete("SYS", "USR", Toy) == Toy(value=9)
+    assert len([r for r in log if "url" in r]) == 1
+
+
+@pytest.mark.asyncio
+async def test_minimax_stream_tolerates_delta_without_content(monkeypatch):
+    """最后一个 chunk 常带 finish_reason 而 delta 为空；content 也可能是 null。"""
+    log = _mock_httpx(
+        monkeypatch,
+        [
+            _sse(
+                {"choices": [{"delta": {"role": "assistant"}}]},
+                _delta('{"value": 5}'),
+                {"choices": [{"delta": {"content": None}}]},
+                {"choices": [{"delta": {}, "finish_reason": "stop"}]},
+                {"choices": []},
+            )
+        ],
+    )
+    provider = MiniMaxProvider(api_key="secret")
+
+    assert await provider.complete("SYS", "USR", Toy) == Toy(value=5)
+    assert len([r for r in log if "url" in r]) == 1
+
+
+@pytest.mark.asyncio
+async def test_minimax_stream_retries_on_wrong_field_names(monkeypatch):
+    """流式下的重试：第一次真实失败形状，第二次修正；messages 是超集。"""
+    log = _mock_httpx(
+        monkeypatch,
+        [
+            _sse_from_chunks("<think>我来输出</think>\n", '{"script": ', '{"val": 42}}'),
+            _sse_from_chunks("<think>修正一下</think>\n", '```json\n{"value": 42}\n```'),
+        ],
+    )
+    provider = MiniMaxProvider(api_key="secret")
+
+    assert await provider.complete("SYS", "USR", Toy) == Toy(value=42)
+
+    posts = [r for r in log if "url" in r]
+    assert len(posts) == 2
+    first = posts[0]["json"]["messages"]
+    second = posts[1]["json"]["messages"]
+    assert len(first) == 2
+    assert len(second) == 4
+    assert second[:2] == first
+    assert second[2]["role"] == "assistant"
+    assert '{"script": {"val": 42}}' in second[2]["content"]
+    assert second[3]["role"] == "user"
+    assert "不符合 schema" in second[3]["content"]
+    assert posts[1]["json"]["stream"] is True
+
+
+@pytest.mark.asyncio
+async def test_minimax_stream_uses_read_none_timeout(monkeypatch):
+    """read=None 是这次改动的核心：靠流式的 chunk 活性代替一个固定读超时。"""
+    log = _mock_httpx(monkeypatch, [_sse_from_chunks('{"value": 1}')])
+    provider = MiniMaxProvider(api_key="secret")
+
+    await provider.complete("SYS", "USR", Toy)
+
+    timeout = [r for r in log if "__init__" in r][0]["__init__"]["timeout"]
+    assert timeout is MINIMAX_TIMEOUT
+    assert timeout.read is None
+    assert timeout.connect == 30.0
+    assert timeout.write == 120.0
+    assert timeout.pool == 30.0
+
+
+@pytest.mark.asyncio
+async def test_minimax_stream_error_response_body_is_readable(monkeypatch):
+    """流式响应在 raise_for_status 之前必须 aread，否则错误体读不到。"""
+    import httpx
+
+    log = _mock_httpx(monkeypatch, [(429, '{"base_resp": {"status_msg": "rate limited"}}')])
+    provider = MiniMaxProvider(api_key="secret")
+
+    with pytest.raises(httpx.HTTPStatusError) as exc:
+        await provider.complete("SYS", "USR", Toy)
+
+    assert "rate limited" in exc.value.response.text
+    assert len([r for r in log if "url" in r]) == 1

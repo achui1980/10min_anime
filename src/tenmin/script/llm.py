@@ -6,12 +6,17 @@ import json
 import re
 from typing import Any, Protocol, runtime_checkable
 
+import httpx
 from pydantic import BaseModel, ValidationError
 
 from tenmin.config import LLMConfig, Settings
 
 MINIMAX_BASE_URL = "https://api.minimax.cn/v1"
 MINIMAX_MAX_ATTEMPTS = 3
+# read=None：实测 MiniMax-M3 处理 ~35k 字符 prompt 需要 561 秒，非流式模式下服务端在
+# 这 561 秒里零字节返回，正好贴着旧的 600 秒读超时悬崖。流式下每个 SSE chunk 都会刷新
+# 读活性，因此读超时交给 chunk 间隔而不是整体耗时（这里直接关掉固定读超时）。
+MINIMAX_TIMEOUT = httpx.Timeout(connect=30.0, read=None, write=120.0, pool=30.0)
 
 _THINK_BLOCK = re.compile(r"<think>.*?</think>", re.S)
 _FENCE = re.compile(r"^```(?:json)?[ \t]*\n?|\n?```[ \t]*$", re.M)
@@ -33,6 +38,29 @@ def _extract_json(text: str) -> str:
     if start == -1 or end == -1 or end < start:
         raise ValueError(f"MiniMax 返回里找不到 JSON 对象：{cleaned[:200]!r}")
     return cleaned[start : end + 1]
+
+
+def _sse_delta(line: str) -> str:
+    """从一行 SSE 里取增量文本；不是可用的数据行就返回空串。
+
+    容忍这些真实形态：空行/心跳行、`data: [DONE]`、只带 finish_reason 而 delta 为空的
+    收尾 chunk、delta.content 为 null、以及个别实现插进来的非 JSON 行。
+    """
+    line = line.strip()
+    if not line.startswith("data:"):
+        return ""
+    data = line[len("data:") :].strip()
+    if not data or data == "[DONE]":
+        return ""
+    try:
+        event = json.loads(data)
+    except json.JSONDecodeError:
+        return ""
+    choices = event.get("choices") or []
+    if not choices:
+        return ""
+    delta = choices[0].get("delta") or {}
+    return delta.get("content") or ""
 
 
 @runtime_checkable
@@ -99,30 +127,41 @@ class MiniMaxProvider:
             "不要在外面再套一层包裹对象，不要加解释文字，不要加 markdown 围栅。"
         )
 
+    async def _stream_once(self, client: httpx.AsyncClient, payload: dict[str, Any]) -> str:
+        """发一次流式请求，把所有 delta.content 拼成完整文本。"""
+        parts: list[str] = []
+        async with client.stream(
+            "POST",
+            f"{self.base_url}/chat/completions",
+            headers={"Authorization": f"Bearer {self._api_key}"},
+            json=payload,
+        ) as response:
+            if response.is_error:
+                # 流式响应在读取 body 之前 raise_for_status 只能给出空错误体。
+                await response.aread()
+            response.raise_for_status()
+            async for line in response.aiter_lines():
+                chunk = _sse_delta(line)
+                if chunk:
+                    parts.append(chunk)
+        return "".join(parts)
+
     async def complete(
         self, system: str, user: str, schema: type[BaseModel] | None = None
     ) -> Any:
-        import httpx
-
         content = self._schema_prompt(user, schema) if schema is not None else user
         messages: list[dict[str, str]] = [
             {"role": "system", "content": system},
             {"role": "user", "content": content},
         ]
-        payload: dict[str, Any] = {"model": self.model, "messages": messages}
+        payload: dict[str, Any] = {"model": self.model, "messages": messages, "stream": True}
         if schema is not None:
             payload["response_format"] = {"type": "json_object"}
 
         last_error = ""
-        async with httpx.AsyncClient(timeout=600.0) as client:
+        async with httpx.AsyncClient(timeout=MINIMAX_TIMEOUT) as client:
             for _ in range(MINIMAX_MAX_ATTEMPTS):
-                response = await client.post(
-                    f"{self.base_url}/chat/completions",
-                    headers={"Authorization": f"Bearer {self._api_key}"},
-                    json=payload,
-                )
-                response.raise_for_status()
-                text = response.json()["choices"][0]["message"]["content"]
+                text = await self._stream_once(client, payload)
                 if schema is None:
                     return _strip_reasoning(text)
                 try:
