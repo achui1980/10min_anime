@@ -21,6 +21,13 @@ uv sync
 export TENMIN_GEMINI_API_KEY=your-key
 ```
 
+渲染阶段需要编入 libass 的 ffmpeg（否则烧不了字幕）：
+
+```bash
+brew install homebrew-ffmpeg/ffmpeg/ffmpeg --with-libass
+ffmpeg -hide_banner -filters | grep -w subtitles   # 能匹配到才算装对
+```
+
 ## 使用
 
 ```bash
@@ -36,11 +43,25 @@ uv run tenmin run saijo                # 跑全链路
 - `work/saijo/out/narration.txt` — 合并配音纯文本，直接丢给配音
 - `work/saijo/03_script/script.json` — **唯一人工编辑面**，改完重跑 docgen 即可
 
+`03_script/script.json` 管内容，`05_timeline/E{NN}.timeline.json` 管出片节奏。
+
 ```bash
 uv run tenmin run saijo --only docgen --force   # 改完 script.json 重出文档，不调 LLM
 uv run tenmin inspect saijo --episode 1         # 看无字幕间隙与高能点
 uv run tenmin inspect saijo --episode 1 --suspect  # 看被标记为疑似 OCR 噪声的行
 uv run tenmin run saijo --from signals          # 从指定阶段重跑
+```
+
+只跑 v2 渲染部分（前 4 个阶段的产物照旧复用）：
+
+```bash
+uv run tenmin run akujo2 --from voice
+```
+
+手改过 `05_timeline/E02.timeline.json` 后只重新出片：
+
+```bash
+uv run tenmin run akujo2 --from audio --force
 ```
 
 ## 阶段与产物
@@ -51,6 +72,10 @@ uv run tenmin run saijo --from signals          # 从指定阶段重跑
 | signals | `02_signals/E{NN}.signals.json` | 否 |
 | script | `03_script/script.json` | **是** |
 | docgen | `out/解说方案.md`、`out/narration.txt` | 否 |
+| voice | `04_voice/E{NN}/chunk_*.mp3`、`04_voice/E{NN}.voice.json` | Edge-TTS 逐句配音，记录每段真实时长 |
+| timeline | `05_timeline/E{NN}.timeline.json`、`05_timeline/E{NN}.ass` | 按真实配音时长重算画面时间轴，生成硬字幕 |
+| audio | `06_audio/E{NN}.mixed.m4a` | 旁白盖在原声之上，旁白期间原声压低 |
+| render | `07_render/E{NN}.mp4` | 一次编码完成切片、拼接、烧字幕、挂音轨 |
 
 默认按 mtime 跳过已是最新的阶段，`--force` 强制重跑。
 
@@ -60,6 +85,7 @@ uv run tenmin run saijo --from signals          # 从指定阶段重跑
 uv run pytest -q                              # 默认：全部离线，不联网
 uv run pytest -m llm                          # 真调 LLM 出快照（需 API key）
 uv run pytest -m generalize                   # 泛化复验（需自备 SRT）
+uv run pytest -m render     # 真跑渲染链路，需要真视频 + libass 版 ffmpeg
 ```
 
 ## 路线图
