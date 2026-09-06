@@ -1,7 +1,16 @@
+from pathlib import Path
+
 import pytest
 from pydantic import ValidationError
 
-from tenmin.config import LLMConfig, ProjectConfig, Settings, load_project
+from tenmin.config import (
+    EpisodeConfig,
+    LLMConfig,
+    ProjectConfig,
+    RenderConfig,
+    Settings,
+    load_project,
+)
 
 SAMPLE = """\
 show: 才女的侍从
@@ -146,3 +155,68 @@ def test_settings_keys_are_independent(monkeypatch):
     settings = Settings(_env_file=None)
     assert settings.gemini_api_key == "g-key"
     assert settings.minimax_api_key is None
+
+
+def test_render_config_defaults():
+    cfg = RenderConfig()
+    assert cfg.voice == "zh-CN-YunxiNeural"
+    assert cfg.rate == "+0%"
+    assert cfg.video_encoder == "libx264"
+    assert cfg.duck_db == -12.0
+    assert cfg.font_size == 48
+
+
+def test_project_config_has_render_defaults():
+    cfg = ProjectConfig(show="剧名", slug="slug")
+    assert cfg.render.voice == "zh-CN-YunxiNeural"
+
+
+def test_project_config_reads_render_block():
+    cfg = ProjectConfig.model_validate(
+        {
+            "show": "剧名",
+            "slug": "slug",
+            "render": {"voice": "zh-CN-XiaoxiaoNeural", "duck_db": -9.0},
+        }
+    )
+    assert cfg.render.voice == "zh-CN-XiaoxiaoNeural"
+    assert cfg.render.duck_db == -9.0
+    # 没写的字段仍取默认值
+    assert cfg.render.video_encoder == "libx264"
+
+
+def test_video_path_resolves_relative_to_root(tmp_path):
+    cfg = ProjectConfig.model_validate(
+        {
+            "show": "剧名",
+            "slug": "slug",
+            "episodes": [{"number": 2, "srt": "srt/E02.srt", "video": "video/E02.mkv"}],
+        }
+    ).bind_root(tmp_path)
+    assert cfg.video_path(cfg.episodes[0]) == tmp_path.resolve() / "video/E02.mkv"
+
+
+def test_video_path_passes_absolute_through(tmp_path):
+    absolute = tmp_path / "elsewhere" / "E02.mkv"
+    cfg = ProjectConfig.model_validate(
+        {
+            "show": "剧名",
+            "slug": "slug",
+            "episodes": [{"number": 2, "srt": "srt/E02.srt", "video": str(absolute)}],
+        }
+    ).bind_root(tmp_path)
+    assert cfg.video_path(cfg.episodes[0]) == absolute
+
+
+def test_video_path_without_video_raises():
+    cfg = ProjectConfig.model_validate(
+        {"show": "剧名", "slug": "slug", "episodes": [{"number": 2, "srt": "srt/E02.srt"}]}
+    )
+    with pytest.raises(ValueError) as exc:
+        cfg.video_path(cfg.episodes[0])
+    assert "第 2 集没有配置 video" in str(exc.value)
+
+
+def test_episode_config_video_defaults_to_none():
+    episode = EpisodeConfig(number=2, srt=Path("srt/E02.srt"))
+    assert episode.video is None

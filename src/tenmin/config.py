@@ -13,6 +13,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class EpisodeConfig(BaseModel):
     number: int
     srt: Path
+    video: Path | None = None
     op_range: tuple[float, float] | None = None
     ed_range: tuple[float, float] | None = None
 
@@ -27,6 +28,16 @@ class LLMConfig(BaseModel):
     base_url: str | None = None
 
 
+class RenderConfig(BaseModel):
+    """v2 渲染参数。voice 与 rate 直接喂 Edge-TTS。"""
+
+    voice: str = "zh-CN-YunxiNeural"
+    rate: str = "+0%"
+    video_encoder: str = "libx264"
+    duck_db: float = -12.0
+    font_size: int = 48
+
+
 class ProjectConfig(BaseModel):
     show: str
     slug: str
@@ -36,6 +47,7 @@ class ProjectConfig(BaseModel):
     episodes: list[EpisodeConfig] = Field(default_factory=list)
     glossary: dict[str, str] = Field(default_factory=dict)
     llm: LLMConfig = Field(default_factory=LLMConfig)
+    render: RenderConfig = Field(default_factory=RenderConfig)
 
     _root: Path = PrivateAttr(default=Path("."))
 
@@ -54,6 +66,17 @@ class ProjectConfig(BaseModel):
         if episode.srt.is_absolute():
             return episode.srt
         return self._root / episode.srt
+
+    def video_path(self, episode: EpisodeConfig) -> Path:
+        """源视频路径。相对路径按 project.yaml 所在目录解析。"""
+        if episode.video is None:
+            raise ValueError(
+                f"第 {episode.number} 集没有配置 video，"
+                "请在 project.yaml 的 episodes 里补上源视频路径"
+            )
+        if episode.video.is_absolute():
+            return episode.video
+        return self._root / episode.video
 
 
 def load_project(path: Path) -> ProjectConfig:
