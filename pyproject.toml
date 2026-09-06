@@ -12,6 +12,7 @@ dependencies = [
     "opencc-python-reimplemented>=0.1.7",
     "google-genai>=1.33",
     "httpx>=0.27",
+    "edge-tts>=6.1",
 ]
 
 [project.scripts]
@@ -37,6 +38,7 @@ asyncio_mode = "auto"
 markers = [
     "llm: 需要真实 LLM API key，默认跳过（跑法：TENMIN_GEMINI_API_KEY=xxx uv run pytest -m llm）",
     "generalize: 需要额外番剧 SRT fixture，默认跳过（把 SRT 放进 tests/fixtures/generalize/ 后自动生效）",
+    "render: 需要真实视频文件与编入 libass 的 ffmpeg，默认跳过（跑法：uv run pytest -m render）",
 ]
 
 [tool.ruff]
