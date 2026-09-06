@@ -14,6 +14,11 @@ from tenmin.models import (
     SfxCue,
     Signal,
     SignalReport,
+    SubtitleCue,
+    Timeline,
+    TimelineSegment,
+    VoiceChunk,
+    VoiceTrack,
 )
 
 
@@ -101,3 +106,51 @@ def test_llm_script_schema_has_no_computed_fields():
     assert "est_total_seconds" not in dumped
     assert "is_silent_highlight" not in dumped
     assert "beats" in schema["properties"]
+
+
+def test_voice_chunk_defaults():
+    chunk = VoiceChunk(beat_id="b1", index=1, text="第一句。", path="chunk_001.mp3", duration=3.0)
+    assert chunk.hold_after == 0.0
+
+
+def test_voice_track_holds_chunks():
+    chunk = VoiceChunk(
+        beat_id="b1", index=1, text="第一句。", path="chunk_001.mp3", duration=3.0, hold_after=1.5
+    )
+    track = VoiceTrack(episode=2, chunks=[chunk], total_seconds=4.5)
+    assert track.chunks[0].hold_after == 1.5
+    assert track.total_seconds == 4.5
+
+
+def test_timeline_segment_fields():
+    seg = TimelineSegment(
+        beat_id="b1", source_start=100.0, source_end=120.0, timeline_start=0.0, timeline_end=20.0
+    )
+    assert seg.source_end - seg.source_start == 20.0
+
+
+def test_timeline_defaults_are_empty():
+    timeline = Timeline(episode=2, total_seconds=0.0)
+    assert timeline.segments == []
+    assert timeline.subtitles == []
+    assert timeline.narration_offsets == []
+
+
+def test_timeline_roundtrips_json():
+    timeline = Timeline(
+        episode=2,
+        segments=[
+            TimelineSegment(
+                beat_id="b1",
+                source_start=100.0,
+                source_end=120.0,
+                timeline_start=0.0,
+                timeline_end=20.0,
+            )
+        ],
+        subtitles=[SubtitleCue(start=0.0, end=8.0, text="第一句。")],
+        narration_offsets=[0.0],
+        total_seconds=20.0,
+    )
+    restored = Timeline.model_validate_json(timeline.model_dump_json())
+    assert restored == timeline

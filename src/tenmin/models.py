@@ -165,3 +165,57 @@ class LLMBeat(BaseModel):
 
 class LLMScript(BaseModel):
     beats: list[LLMBeat] = Field(default_factory=list)
+
+
+# --- v2 渲染阶段的模型 ---
+
+
+class VoiceChunk(BaseModel):
+    """一段独立合成的旁白。duration 是 TTS 出来后实测的，不是估算。"""
+
+    beat_id: str
+    index: int
+    text: str
+    path: str
+    duration: float
+    hold_after: float = 0.0
+
+
+class VoiceTrack(BaseModel):
+    """一集的全部旁白 chunk。total_seconds 含 hold 静音。"""
+
+    episode: int
+    chunks: list[VoiceChunk] = Field(default_factory=list)
+    total_seconds: float = 0.0
+
+
+class TimelineSegment(BaseModel):
+    """一段画面。source_* 是原片坐标，timeline_* 是成片坐标。"""
+
+    beat_id: str
+    source_start: float
+    source_end: float
+    timeline_start: float
+    timeline_end: float
+
+    @property
+    def duration(self) -> float:
+        return self.source_end - self.source_start
+
+
+class SubtitleCue(BaseModel):
+    """一条烧进画面的旁白字幕。坐标是成片坐标。"""
+
+    start: float
+    end: float
+    text: str
+
+
+class Timeline(BaseModel):
+    """v2 的人工编辑面。改完它跑 --from audio 就能重出片。"""
+
+    episode: int
+    segments: list[TimelineSegment] = Field(default_factory=list)
+    subtitles: list[SubtitleCue] = Field(default_factory=list)
+    narration_offsets: list[float] = Field(default_factory=list)
+    total_seconds: float = 0.0
