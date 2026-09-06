@@ -13,11 +13,22 @@ from tenmin.render.ffmpeg import (
     tail,
 )
 
+# 真实 ffmpeg 9 的 -filters 输出：标志位只有 2 列（早期版本是 3 列）。
+# 这份样本是从 `ffmpeg -hide_banner -filters` 直接抄的，包括开头那段图例，
+# 千万别手写简化版——正是手写的 3 列样本让解析器的 bug 藏了整整一个版本。
 FILTERS_SAMPLE = """Filters:
-  T.. ass               V->V       Render ASS subtitles onto input video.
-  ... concat            N->N       Concatenate audio and video streams.
-  ..C subtitles         V->V       Render text subtitles onto input video.
-  TSC volume            A->A       Change input volume.
+  T.. = Timeline support
+  .S. = Slice threading
+  A = Audio input/output
+  V = Video input/output
+  N = Dynamic number and/or type of input/output
+  | = Source or sink filter
+  ------
+ TS aap               AA->A      Apply Affine Projection algorithm to first audio stream.
+ .. ass               V->V       Render ASS subtitles onto input video using the libass library.
+ .. concat            N->N       Concatenate audio and video streams.
+ .. subtitles         V->V       Render text subtitles onto input video using the libass library.
+ TS volume            A->A       Change input volume.
 """
 
 ENCODERS_SAMPLE = """Encoders:
@@ -30,8 +41,10 @@ ENCODERS_SAMPLE = """Encoders:
 def test_parse_names_from_filters():
     names = parse_names(FILTERS_SAMPLE)
     assert "subtitles" in names
+    assert "ass" in names
     assert "concat" in names
     assert "volume" in names
+    assert "aap" in names
     # 表头那行不该被当成名字
     assert "Filters:" not in names
 

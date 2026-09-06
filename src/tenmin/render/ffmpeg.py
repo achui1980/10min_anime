@@ -11,9 +11,12 @@ FFMPEG = "ffmpeg"
 FFPROBE = "ffprobe"
 STDERR_TAIL_LINES = 30
 
-# ffmpeg -filters / -encoders 每行形如 "  T.. ass  V->V  描述"，
+# ffmpeg -filters / -encoders 每行形如 " .. ass  V->V  描述"，
 # 标志列只由大写字母和点组成，名字是紧跟其后的第一个 token。
-_NAME_LINE = re.compile(r"^\s*[A-Z.]{3,6}\s+(\S+)\s")
+# 宽度必须从 2 起：-encoders 的标志列是 6 列（"V....D"），但 -filters 只有 2 列
+# （ffmpeg 9 实测 " .. subtitles"）。写死 3 起会让 -filters 一个都解析不出来，
+# 于是 has_filter("subtitles") 恒为 False，preflight 谎报「没编 libass」。
+_NAME_LINE = re.compile(r"^\s*[A-Z.]{2,6}\s+(\S+)\s")
 
 
 class FFmpegError(RuntimeError):
