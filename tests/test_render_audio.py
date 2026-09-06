@@ -1,0 +1,202 @@
+import pytest
+
+from tenmin.models import SubtitleCue, Timeline, TimelineSegment, VoiceChunk, VoiceTrack
+from tenmin.render.audio import (
+    build_mix_args,
+    duck_gain,
+    duck_volume_expr,
+    mix_audio,
+)
+
+
+def make_timeline() -> Timeline:
+    """两个 segment、三个旁白 chunk，画面总时长与音频总时长都是 30 秒。"""
+    return Timeline(
+        episode=2,
+        segments=[
+            TimelineSegment(
+                beat_id="b1",
+                source_start=100.0,
+                source_end=120.0,
+                timeline_start=0.0,
+                timeline_end=20.0,
+            ),
+            TimelineSegment(
+                beat_id="b2",
+                source_start=200.0,
+                source_end=210.0,
+                timeline_start=20.0,
+                timeline_end=30.0,
+            ),
+        ],
+        subtitles=[
+            SubtitleCue(start=0.0, end=8.0, text="第一句"),
+            SubtitleCue(start=10.0, end=20.0, text="第二句"),
+            SubtitleCue(start=20.0, end=30.0, text="第三句"),
+        ],
+        narration_offsets=[0.0, 10.0, 20.0],
+        total_seconds=30.0,
+    )
+
+
+def make_track() -> VoiceTrack:
+    return VoiceTrack(
+        episode=2,
+        chunks=[
+            VoiceChunk(
+                beat_id="b1",
+                index=1,
+                text="第一句",
+                path="chunk_001.mp3",
+                duration=8.0,
+                hold_after=2.0,
+            ),
+            VoiceChunk(
+                beat_id="b1",
+                index=2,
+                text="第二句",
+                path="chunk_002.mp3",
+                duration=10.0,
+            ),
+            VoiceChunk(
+                beat_id="b2",
+                index=1,
+                text="第三句",
+                path="chunk_003.mp3",
+                duration=10.0,
+            ),
+        ],
+        total_seconds=30.0,
+    )
+
+
+EXPECTED_GRAPH = (
+    "[0:a]atrim=start=100.000:end=120.000,asetpts=PTS-STARTPTS[o0];"
+    "[0:a]atrim=start=200.000:end=210.000,asetpts=PTS-STARTPTS[o1];"
+    "[o0][o1]concat=n=2:v=0:a=1[orig];"
+    "[orig]volume='if(gt(between(t,0.000,8.000)+between(t,10.000,20.000)"
+    "+between(t,20.000,30.000),0),0.2512,1.0000)':eval=frame[ducked];"
+    "[1:a]adelay=delays=0:all=1[n0];"
+    "[2:a]adelay=delays=10000:all=1[n1];"
+    "[3:a]adelay=delays=20000:all=1[n2];"
+    "[n0][n1][n2]amix=inputs=3:normalize=0[voice];"
+    "[ducked][voice]amix=inputs=2:normalize=0[mix]"
+)
+
+
+def build(tmp_path, **overrides):
+    kwargs = {
+        "video": tmp_path / "source.mkv",
+        "timeline": make_timeline(),
+        "track": make_track(),
+        "voice_dir": tmp_path / "04_voice" / "E02",
+        "out_path": tmp_path / "06_audio" / "E02.mixed.m4a",
+        "duck_db": -12.0,
+    }
+    kwargs.update(overrides)
+    return build_mix_args(**kwargs)
+
+
+def test_duck_gain_zero_db_is_unity():
+    assert duck_gain(0.0) == pytest.approx(1.0)
+
+
+def test_duck_gain_minus_twelve_db():
+    assert duck_gain(-12.0) == pytest.approx(0.2512, abs=1e-4)
+
+
+def test_duck_volume_expr_without_cues_stays_full():
+    assert duck_volume_expr([], 0.2512) == "1.0000"
+
+
+def test_duck_volume_expr_lists_every_cue_window():
+    cues = [SubtitleCue(start=0.0, end=8.0, text="a"), SubtitleCue(start=10.0, end=20.0, text="b")]
+    assert duck_volume_expr(cues, 0.2512) == (
+        "if(gt(between(t,0.000,8.000)+between(t,10.000,20.000),0),0.2512,1.0000)"
+    )
+
+
+def test_build_mix_args_inputs_video_then_every_chunk(tmp_path):
+    args = build(tmp_path)
+    voice_dir = tmp_path / "04_voice" / "E02"
+    assert args[:3] == ["-y", "-i", str(tmp_path / "source.mkv")]
+    assert args[3:5] == ["-i", str(voice_dir / "chunk_001.mp3")]
+    assert args[5:7] == ["-i", str(voice_dir / "chunk_002.mp3")]
+    assert args[7:9] == ["-i", str(voice_dir / "chunk_003.mp3")]
+
+
+def test_build_mix_args_filter_graph_matches_expected(tmp_path):
+    args = build(tmp_path)
+    graph = args[args.index("-filter_complex") + 1]
+    assert graph == EXPECTED_GRAPH
+
+
+def test_build_mix_args_maps_mix_and_encodes_aac(tmp_path):
+    args = build(tmp_path)
+    out = tmp_path / "06_audio" / "E02.mixed.m4a"
+    assert args[-7:] == ["-map", "[mix]", "-c:a", "aac", "-b:a", "192k", str(out)]
+
+
+def test_build_mix_args_single_chunk_skips_voice_amix(tmp_path):
+    timeline = make_timeline()
+    timeline.segments = timeline.segments[:1]
+    timeline.subtitles = timeline.subtitles[:1]
+    timeline.narration_offsets = [0.0]
+    track = make_track()
+    track.chunks = track.chunks[:1]
+    args = build(tmp_path, timeline=timeline, track=track)
+    graph = args[args.index("-filter_complex") + 1]
+    assert "amix=inputs=1" not in graph
+    assert graph.endswith("[ducked][n0]amix=inputs=2:normalize=0[mix]")
+
+
+def test_build_mix_args_rejects_empty_timeline(tmp_path):
+    timeline = make_timeline()
+    timeline.segments = []
+    with pytest.raises(ValueError) as exc:
+        build(tmp_path, timeline=timeline)
+    assert "segment" in str(exc.value)
+
+
+def test_build_mix_args_rejects_empty_track(tmp_path):
+    track = make_track()
+    track.chunks = []
+    with pytest.raises(ValueError) as exc:
+        build(tmp_path, track=track)
+    assert "chunk" in str(exc.value)
+
+
+def test_build_mix_args_rejects_offset_count_mismatch(tmp_path):
+    timeline = make_timeline()
+    timeline.narration_offsets = [0.0]
+    with pytest.raises(ValueError):
+        build(tmp_path, timeline=timeline)
+
+
+def test_mix_audio_runs_ffmpeg_and_returns_path(tmp_path, monkeypatch):
+    from tenmin.render import audio as audio_module
+
+    seen: list[list[str]] = []
+
+    def fake_run(args):
+        seen.append(list(args))
+        return ""
+
+    monkeypatch.setattr(audio_module, "run", fake_run)
+    out_path = tmp_path / "06_audio" / "E02.mixed.m4a"
+    result = audio_module.mix_audio(
+        video=tmp_path / "source.mkv",
+        timeline=make_timeline(),
+        track=make_track(),
+        voice_dir=tmp_path / "04_voice" / "E02",
+        out_path=out_path,
+        duck_db=-12.0,
+    )
+    assert result == out_path
+    assert out_path.parent.is_dir()
+    assert seen[0][0] == "-y"
+    assert seen[0][-1] == str(out_path)
+
+
+def test_mix_audio_is_exported():
+    assert callable(mix_audio)
