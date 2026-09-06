@@ -11,6 +11,8 @@ import yaml
 from tenmin.config import Settings, load_project
 from tenmin.models import DialogueTrack, SignalReport
 from tenmin.pipeline import STAGES, Paths, run_pipeline
+from tenmin.render.ffmpeg import FFmpegError
+from tenmin.render.tts import build_tts_engine
 from tenmin.script.llm import build_provider
 from tenmin.timecode import format_timestamp
 
@@ -24,9 +26,16 @@ PROJECT_TEMPLATE = {
     "mode": "single_episode",
     "target_seconds": 240,
     "locale": {"convert_traditional": True},
-    "episodes": [{"number": 2, "srt": "srt/E02.srt"}],
+    "episodes": [{"number": 2, "srt": "srt/E02.srt", "video": "video/E02.mkv"}],
     "glossary": {},
     "llm": {"provider": "gemini", "model": "gemini-3.6-flash"},
+    "render": {
+        "voice": "zh-CN-YunxiNeural",
+        "rate": "+0%",
+        "video_encoder": "libx264",
+        "duck_db": -12.0,
+        "font_size": 48,
+    },
 }
 
 
@@ -48,6 +57,7 @@ def init(slug: str, work_dir: Path = WORK_DIR_OPTION) -> None:
         raise typer.Exit(code=1)
 
     (root / "srt").mkdir(parents=True, exist_ok=True)
+    (root / "video").mkdir(parents=True, exist_ok=True)
     payload = dict(PROJECT_TEMPLATE)
     payload["slug"] = slug
     payload["show"] = slug
@@ -55,7 +65,8 @@ def init(slug: str, work_dir: Path = WORK_DIR_OPTION) -> None:
         yaml.safe_dump(payload, allow_unicode=True, sort_keys=False), encoding="utf-8"
     )
     typer.echo(f"已创建 {project_file}")
-    typer.echo(f"把字幕放进 {root / 'srt'}，改好 project.yaml 后跑 tenmin run {slug}")
+    typer.echo(f"把字幕放进 {root / 'srt'}、源视频放进 {root / 'video'}，")
+    typer.echo(f"改好 project.yaml 后跑 tenmin run {slug}")
 
 
 @app.command()
@@ -68,7 +79,7 @@ def run(
     only: str | None = typer.Option(None, "--only", help="只跑某一个阶段"),
     force: bool = typer.Option(False, "--force", help="忽略 mtime 强制重跑"),
 ) -> None:
-    """跑流水线：ingest -> signals -> script -> docgen。"""
+    """跑流水线：ingest -> signals -> script -> docgen -> voice -> timeline -> audio -> render。"""
     cfg = load_project(_project_file(work_dir, slug))
 
     stages: list[str] | None
@@ -90,13 +101,22 @@ def run(
             typer.secho(str(error), fg="red", err=True)
             raise typer.Exit(code=1) from error
 
+    tts_engine = None
+    if "voice" in stages:
+        tts_engine = build_tts_engine(cfg.render)
+
     try:
         warnings = asyncio.run(
             run_pipeline(
-                cfg, provider, from_stage=from_stage, only=[only] if only else None, force=force
+                cfg,
+                provider,
+                from_stage=from_stage,
+                only=[only] if only else None,
+                force=force,
+                tts_engine=tts_engine,
             )
         )
-    except (NotImplementedError, FileNotFoundError, ValueError) as error:
+    except (NotImplementedError, FileNotFoundError, ValueError, FFmpegError) as error:
         typer.secho(str(error), fg="red", err=True)
         raise typer.Exit(code=1) from error
 
@@ -107,6 +127,10 @@ def run(
     if paths.table.exists():
         typer.echo(f"对照表：{paths.table}")
         typer.echo(f"配音文本：{paths.narration}")
+    for episode in cfg.episodes:
+        mp4 = paths.video(episode.number)
+        if mp4.exists():
+            typer.echo(f"成品视频：{mp4}")
 
 
 @app.command()

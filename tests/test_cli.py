@@ -3,6 +3,7 @@ import yaml
 from typer.testing import CliRunner
 
 from tenmin.cli import app
+from tenmin.render.ffmpeg import FFmpegError
 
 runner = CliRunner()
 
@@ -128,3 +129,112 @@ def test_inspect_without_ingest_fails(work, golden_srt_path):
         app, ["inspect", "saijo", "--work-dir", str(work), "--episode", "2"]
     )
     assert result.exit_code != 0
+
+
+def _minimal_project(tmp_path):
+    root = tmp_path / "akujo2"
+    (root / "srt").mkdir(parents=True)
+    (root / "project.yaml").write_text(
+        "show: 我是不才恶女\n"
+        "slug: akujo2\n"
+        "episodes:\n"
+        "- number: 2\n"
+        "  srt: srt/E02.srt\n",
+        encoding="utf-8",
+    )
+    return root
+
+
+def test_init_template_has_video_and_render(tmp_path):
+    result = runner.invoke(app, ["init", "akujo2", "--work-dir", str(tmp_path)])
+
+    assert result.exit_code == 0
+    data = yaml.safe_load(
+        (tmp_path / "akujo2" / "project.yaml").read_text(encoding="utf-8")
+    )
+    assert data["episodes"][0]["video"] == "video/E02.mkv"
+    assert data["render"]["voice"] == "zh-CN-YunxiNeural"
+    assert data["render"]["rate"] == "+0%"
+    assert data["render"]["video_encoder"] == "libx264"
+    assert data["render"]["duck_db"] == -12.0
+    assert data["render"]["font_size"] == 48
+    assert (tmp_path / "akujo2" / "video").is_dir()
+
+
+def test_run_passes_tts_engine_when_voice_wanted(tmp_path, monkeypatch):
+    _minimal_project(tmp_path)
+    sentinel = object()
+    monkeypatch.setattr("tenmin.cli.build_tts_engine", lambda cfg: sentinel)
+    captured: dict[str, object] = {}
+
+    async def fake_pipeline(cfg, provider, **kwargs):
+        captured.update(kwargs)
+        return []
+
+    monkeypatch.setattr("tenmin.cli.run_pipeline", fake_pipeline)
+
+    result = runner.invoke(
+        app, ["run", "akujo2", "--work-dir", str(tmp_path), "--only", "voice"]
+    )
+
+    assert result.exit_code == 0
+    assert captured["tts_engine"] is sentinel
+
+
+def test_run_skips_tts_engine_when_voice_not_wanted(tmp_path, monkeypatch):
+    _minimal_project(tmp_path)
+
+    def boom(cfg):
+        raise AssertionError("只跑 docgen 不该造 TTS engine")
+
+    monkeypatch.setattr("tenmin.cli.build_tts_engine", boom)
+    captured: dict[str, object] = {}
+
+    async def fake_pipeline(cfg, provider, **kwargs):
+        captured.update(kwargs)
+        return []
+
+    monkeypatch.setattr("tenmin.cli.run_pipeline", fake_pipeline)
+
+    result = runner.invoke(
+        app, ["run", "akujo2", "--work-dir", str(tmp_path), "--only", "docgen"]
+    )
+
+    assert result.exit_code == 0
+    assert captured["tts_engine"] is None
+
+
+def test_run_reports_ffmpeg_error(tmp_path, monkeypatch):
+    _minimal_project(tmp_path)
+
+    async def boom(cfg, provider, **kwargs):
+        raise FFmpegError("你的 ffmpeg 没编 libass")
+
+    monkeypatch.setattr("tenmin.cli.run_pipeline", boom)
+
+    result = runner.invoke(
+        app, ["run", "akujo2", "--work-dir", str(tmp_path), "--only", "render"]
+    )
+
+    assert result.exit_code == 1
+    assert "没编 libass" in result.output
+
+
+def test_run_prints_mp4_path(tmp_path, monkeypatch):
+    root = _minimal_project(tmp_path)
+    mp4 = root / "07_render" / "E02.mp4"
+    mp4.parent.mkdir(parents=True)
+    mp4.write_bytes(b"")
+
+    async def fake_pipeline(cfg, provider, **kwargs):
+        return []
+
+    monkeypatch.setattr("tenmin.cli.run_pipeline", fake_pipeline)
+
+    result = runner.invoke(
+        app, ["run", "akujo2", "--work-dir", str(tmp_path), "--only", "render"]
+    )
+
+    assert result.exit_code == 0
+    assert "成品视频" in result.output
+    assert str(mp4) in result.output
