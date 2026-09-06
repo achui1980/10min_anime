@@ -1,20 +1,39 @@
+import asyncio
 import json
+from pathlib import Path
 
 import pytest
 
 from tenmin.config import ProjectConfig
-from tenmin.models import LLMBeat, LLMClip, LLMScript, Script
+from tenmin.models import (
+    AudioDirection,
+    Beat,
+    Clip,
+    Hold,
+    LLMBeat,
+    LLMClip,
+    LLMScript,
+    Script,
+)
 from tenmin.pipeline import (
     STAGES,
     Paths,
+    run_audio,
     run_docgen,
     run_ingest,
     run_pipeline,
+    run_render,
     run_signals,
+    run_timeline,
+    run_voice,
     stages_from,
 )
 
-from .fakes import FakeProvider
+from .fakes import FakeProvider, FakeTTSEngine
+
+# STAGES 在 v2 里扩到 8 个，voice 之后的阶段需要 TTS engine 与源视频。
+# 下面这些只关心 v1 链路的用例显式限定阶段范围。
+V1_STAGES = ["ingest", "signals", "script", "docgen"]
 
 
 @pytest.fixture
@@ -60,11 +79,28 @@ def fake_script_response():
 
 
 def test_stage_names():
-    assert STAGES == ["ingest", "signals", "script", "docgen"]
+    assert STAGES == [
+        "ingest",
+        "signals",
+        "script",
+        "docgen",
+        "voice",
+        "timeline",
+        "audio",
+        "render",
+    ]
 
 
 def test_stages_from_middle():
-    assert stages_from("signals") == ["signals", "script", "docgen"]
+    assert stages_from("signals") == [
+        "signals",
+        "script",
+        "docgen",
+        "voice",
+        "timeline",
+        "audio",
+        "render",
+    ]
 
 
 def test_stages_from_unknown_raises():
@@ -122,7 +158,7 @@ def test_run_signals_without_ingest_raises(project):
 @pytest.mark.asyncio
 async def test_run_pipeline_end_to_end(project):
     provider = FakeProvider([fake_script_response()])
-    await run_pipeline(project, provider)
+    await run_pipeline(project, provider, only=V1_STAGES)
     paths = Paths(project.root)
     assert paths.script.exists()
     assert paths.table.exists()
@@ -134,24 +170,24 @@ async def test_run_pipeline_end_to_end(project):
 @pytest.mark.asyncio
 async def test_run_pipeline_skips_when_fresh(project):
     provider = FakeProvider([fake_script_response()])
-    await run_pipeline(project, provider)
+    await run_pipeline(project, provider, only=V1_STAGES)
     # 第二次跑：provider 没有剩余响应，若真的再调 LLM 就会 AssertionError
-    await run_pipeline(project, provider)
+    await run_pipeline(project, provider, only=V1_STAGES)
     assert len(provider.calls) == 1
 
 
 @pytest.mark.asyncio
 async def test_run_pipeline_force_reruns_llm(project):
     provider = FakeProvider([fake_script_response(), fake_script_response()])
-    await run_pipeline(project, provider)
-    await run_pipeline(project, provider, force=True)
+    await run_pipeline(project, provider, only=V1_STAGES)
+    await run_pipeline(project, provider, only=V1_STAGES, force=True)
     assert len(provider.calls) == 2
 
 
 @pytest.mark.asyncio
 async def test_run_pipeline_only_docgen_reuses_edited_script(project):
     provider = FakeProvider([fake_script_response()])
-    await run_pipeline(project, provider)
+    await run_pipeline(project, provider, only=V1_STAGES)
     paths = Paths(project.root)
 
     script = Script.model_validate_json(paths.script.read_text(encoding="utf-8"))
@@ -194,10 +230,10 @@ async def test_run_pipeline_season_mode_raises(project):
 @pytest.mark.asyncio
 async def test_run_pipeline_from_signals_keeps_dialogue(project):
     provider = FakeProvider([fake_script_response(), fake_script_response()])
-    await run_pipeline(project, provider)
+    await run_pipeline(project, provider, only=V1_STAGES)
     dialogue = Paths(project.root).dialogue(2)
     before = dialogue.stat().st_mtime_ns
-    await run_pipeline(project, provider, from_stage="signals", force=True)
+    await run_pipeline(project, provider, only=V1_STAGES[1:], force=True)
     assert dialogue.stat().st_mtime_ns == before
     assert len(provider.calls) == 2
 
@@ -205,3 +241,277 @@ async def test_run_pipeline_from_signals_keeps_dialogue(project):
 def test_run_docgen_without_script_raises(project):
     with pytest.raises(FileNotFoundError):
         run_docgen(project)
+
+
+def _write_script(path: Path, script: Script) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(script.model_dump_json(indent=2), encoding="utf-8")
+
+
+def _touch_output(args: list[str]) -> str:
+    """假的 ffmpeg：不跑编码，只把输出文件创建出来。"""
+    out = Path(args[-1])
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_bytes(b"")
+    return ""
+
+
+def render_script() -> Script:
+    """两个 beat、两个 clip 的最小剧本，配 FakeTTSEngine([8.0, 10.0, 10.0]) 用。"""
+    return Script(
+        show="才女的侍从",
+        episodes=[2],
+        target_seconds=30.0,
+        beats=[
+            Beat(
+                id="b1",
+                label="Hook",
+                role="hook",
+                narration="第一句。第二句。",
+                clips=[Clip(episode=2, start=100.0, end=140.0)],
+                audio=AudioDirection(
+                    holds=[Hold(at=1.0, duration=2.0, quote="第一句")]
+                ),
+            ),
+            Beat(
+                id="b2",
+                label="收尾",
+                role="outro",
+                narration="第三句。",
+                clips=[Clip(episode=2, start=200.0, end=220.0)],
+            ),
+        ],
+    )
+
+
+def _prepare_video(cfg: ProjectConfig) -> Path:
+    """造一个空壳视频文件并写进 config，供需要 video_path 的阶段用。"""
+    video = cfg.root / "E02.mkv"
+    video.write_bytes(b"")
+    cfg.episodes[0].video = Path("E02.mkv")
+    return video
+
+
+def test_paths_render_layout(tmp_path):
+    paths = Paths(tmp_path / "akujo2")
+    assert paths.voice_dir(2).name == "E02"
+    assert paths.voice_dir(2).parent.name == "04_voice"
+    assert paths.voice(2).name == "E02.voice.json"
+    assert paths.voice(2).parent.name == "04_voice"
+    assert paths.timeline(2).name == "E02.timeline.json"
+    assert paths.timeline(2).parent.name == "05_timeline"
+    assert paths.subtitles(2).name == "E02.ass"
+    assert paths.subtitles(2).parent.name == "05_timeline"
+    assert paths.mixed_audio(2).name == "E02.mixed.m4a"
+    assert paths.mixed_audio(2).parent.name == "06_audio"
+    assert paths.video(2).name == "E02.mp4"
+    assert paths.video(2).parent.name == "07_render"
+
+
+@pytest.mark.asyncio
+async def test_run_voice_writes_voice_json(project):
+    paths = Paths(project.root)
+    _write_script(paths.script, render_script())
+    engine = FakeTTSEngine([8.0, 10.0, 10.0])
+
+    track, warnings = await run_voice(project, engine)
+
+    assert warnings == []
+    assert [chunk.path for chunk in track.chunks] == [
+        "chunk_001.mp3",
+        "chunk_002.mp3",
+        "chunk_003.mp3",
+    ]
+    assert track.total_seconds == pytest.approx(30.0)
+    assert paths.voice(2).exists()
+    assert (paths.voice_dir(2) / "chunk_001.mp3").exists()
+
+
+@pytest.mark.asyncio
+async def test_run_voice_without_script_raises(project):
+    with pytest.raises(FileNotFoundError):
+        await run_voice(project, FakeTTSEngine([]))
+
+
+@pytest.mark.asyncio
+async def test_run_voice_without_engine_raises(project):
+    _write_script(Paths(project.root).script, render_script())
+    with pytest.raises(ValueError) as exc:
+        await run_voice(project, None)
+    assert "TTS" in str(exc.value)
+
+
+@pytest.mark.asyncio
+async def test_run_timeline_writes_timeline_and_ass(project):
+    paths = Paths(project.root)
+    _write_script(paths.script, render_script())
+    await run_voice(project, FakeTTSEngine([8.0, 10.0, 10.0]))
+
+    timeline, warnings = run_timeline(project, source_duration=1400.0)
+
+    assert warnings == []
+    assert len(timeline.segments) == 2
+    assert timeline.segments[0].source_end == pytest.approx(120.0)
+    assert timeline.segments[1].source_end == pytest.approx(210.0)
+    assert timeline.segments[1].timeline_end == pytest.approx(30.0)
+    assert timeline.narration_offsets == pytest.approx([0.0, 10.0, 20.0])
+    assert paths.timeline(2).exists()
+    assert paths.subtitles(2).read_text(encoding="utf-8").startswith("[Script Info]")
+
+
+def test_run_timeline_without_voice_raises(project):
+    _write_script(Paths(project.root).script, render_script())
+    with pytest.raises(FileNotFoundError):
+        run_timeline(project, source_duration=1400.0)
+
+
+def test_run_timeline_probes_source_when_duration_missing(project, monkeypatch):
+    _write_script(Paths(project.root).script, render_script())
+    asyncio.run(run_voice(project, FakeTTSEngine([8.0, 10.0, 10.0])))
+    video = _prepare_video(project)
+    calls: list[Path] = []
+
+    def fake_probe(path):
+        calls.append(Path(path))
+        return 1400.0
+
+    monkeypatch.setattr("tenmin.pipeline.probe_duration", fake_probe)
+
+    timeline, warnings = run_timeline(project)
+
+    assert calls == [video]
+    assert warnings == []
+    assert timeline.total_seconds == pytest.approx(30.0)
+
+
+def test_run_timeline_uses_config_font_size(project):
+    _write_script(Paths(project.root).script, render_script())
+    asyncio.run(run_voice(project, FakeTTSEngine([8.0, 10.0, 10.0])))
+    project.render.font_size = 72
+
+    run_timeline(project, source_duration=1400.0)
+
+    ass = Paths(project.root).subtitles(2).read_text(encoding="utf-8")
+    assert "Source Han Sans SC,72," in ass
+
+
+def test_run_audio_invokes_ffmpeg(project, monkeypatch):
+    paths = Paths(project.root)
+    _write_script(paths.script, render_script())
+    asyncio.run(run_voice(project, FakeTTSEngine([8.0, 10.0, 10.0])))
+    run_timeline(project, source_duration=1400.0)
+    _prepare_video(project)
+    captured: list[list[str]] = []
+
+    def fake_run(args):
+        captured.append(list(args))
+        return _touch_output(args)
+
+    monkeypatch.setattr("tenmin.render.audio.run", fake_run)
+
+    out = run_audio(project)
+
+    assert out == paths.mixed_audio(2)
+    assert out.exists()
+    assert captured[0][:2] == ["-y", "-i"]
+    assert captured[0][-1] == str(paths.mixed_audio(2))
+    assert "amix=inputs=2:normalize=0[mix]" in captured[0][captured[0].index("-filter_complex") + 1]
+
+
+def test_run_audio_without_timeline_raises(project):
+    _write_script(Paths(project.root).script, render_script())
+    asyncio.run(run_voice(project, FakeTTSEngine([8.0, 10.0, 10.0])))
+    _prepare_video(project)
+    with pytest.raises(FileNotFoundError):
+        run_audio(project)
+
+
+def test_run_render_invokes_ffmpeg(project, monkeypatch):
+    paths = Paths(project.root)
+    _write_script(paths.script, render_script())
+    asyncio.run(run_voice(project, FakeTTSEngine([8.0, 10.0, 10.0])))
+    run_timeline(project, source_duration=1400.0)
+    _prepare_video(project)
+    paths.mixed_audio(2).parent.mkdir(parents=True, exist_ok=True)
+    paths.mixed_audio(2).write_bytes(b"")
+    captured: list[list[str]] = []
+
+    def fake_run(args):
+        captured.append(list(args))
+        return _touch_output(args)
+
+    monkeypatch.setattr("tenmin.render.video.run", fake_run)
+
+    out = run_render(project)
+
+    assert out == paths.video(2)
+    assert out.exists()
+    assert "-movflags" in captured[0]
+    assert captured[0][-1] == str(paths.video(2))
+
+
+def test_run_render_without_audio_raises(project):
+    _write_script(Paths(project.root).script, render_script())
+    asyncio.run(run_voice(project, FakeTTSEngine([8.0, 10.0, 10.0])))
+    run_timeline(project, source_duration=1400.0)
+    _prepare_video(project)
+    with pytest.raises(FileNotFoundError) as exc:
+        run_render(project)
+    assert "audio 阶段" in str(exc.value)
+
+
+@pytest.mark.asyncio
+async def test_run_pipeline_from_voice_runs_render_stages(project, monkeypatch):
+    paths = Paths(project.root)
+    _write_script(paths.script, render_script())
+    _prepare_video(project)
+    monkeypatch.setattr("tenmin.pipeline.probe_duration", lambda path: 1400.0)
+    monkeypatch.setattr("tenmin.pipeline.preflight", lambda video, encoder: 1400.0)
+    monkeypatch.setattr("tenmin.render.audio.run", _touch_output)
+    monkeypatch.setattr("tenmin.render.video.run", _touch_output)
+
+    warnings = await run_pipeline(
+        project,
+        FakeProvider([]),
+        from_stage="voice",
+        tts_engine=FakeTTSEngine([8.0, 10.0, 10.0]),
+    )
+
+    assert warnings == []
+    assert paths.voice(2).exists()
+    assert paths.timeline(2).exists()
+    assert paths.subtitles(2).exists()
+    assert paths.mixed_audio(2).exists()
+    assert paths.video(2).exists()
+
+
+@pytest.mark.asyncio
+async def test_run_pipeline_skips_voice_when_fresh(project):
+    _write_script(Paths(project.root).script, render_script())
+    engine = FakeTTSEngine([8.0, 10.0, 10.0])
+
+    await run_pipeline(project, FakeProvider([]), only=["voice"], tts_engine=engine)
+    assert len(engine.calls) == 3
+
+    # 预置时长已用尽：真的再合成一次就会 AssertionError
+    await run_pipeline(project, FakeProvider([]), only=["voice"], tts_engine=engine)
+    assert len(engine.calls) == 3
+
+
+@pytest.mark.asyncio
+async def test_run_pipeline_voice_only_skips_preflight(project, monkeypatch):
+    _write_script(Paths(project.root).script, render_script())
+
+    def boom(video, encoder):
+        raise AssertionError("只跑 voice 不该做 ffmpeg 前置检查")
+
+    monkeypatch.setattr("tenmin.pipeline.preflight", boom)
+
+    await run_pipeline(
+        project,
+        FakeProvider([]),
+        only=["voice"],
+        tts_engine=FakeTTSEngine([8.0, 10.0, 10.0]),
+    )
+
+    assert Paths(project.root).voice(2).exists()

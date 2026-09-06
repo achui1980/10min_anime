@@ -5,16 +5,31 @@ from __future__ import annotations
 from collections.abc import Sequence
 from pathlib import Path
 
-from tenmin.config import ProjectConfig
+from tenmin.config import EpisodeConfig, ProjectConfig
 from tenmin.docgen.narration import render_narration
 from tenmin.docgen.table import render_table
 from tenmin.ingest.normalize import build_track
-from tenmin.models import DialogueTrack, Script, SignalReport
+from tenmin.models import DialogueTrack, Script, SignalReport, Timeline, VoiceTrack
+from tenmin.render.audio import mix_audio
+from tenmin.render.ffmpeg import preflight, probe_duration
+from tenmin.render.subtitles import render_ass
+from tenmin.render.timeline import build_timeline
+from tenmin.render.tts import TTSEngine, synthesize_track
+from tenmin.render.video import render_video
 from tenmin.script.llm import LLMProvider
 from tenmin.script.single import generate_script
 from tenmin.signals.aggregate import build_report
 
-STAGES = ["ingest", "signals", "script", "docgen"]
+STAGES = [
+    "ingest",
+    "signals",
+    "script",
+    "docgen",
+    "voice",
+    "timeline",
+    "audio",
+    "render",
+]
 
 
 class Paths:
@@ -38,6 +53,24 @@ class Paths:
     @property
     def narration(self) -> Path:
         return self.root / "out" / "narration.txt"
+
+    def voice_dir(self, episode: int) -> Path:
+        return self.root / "04_voice" / f"E{episode:02d}"
+
+    def voice(self, episode: int) -> Path:
+        return self.root / "04_voice" / f"E{episode:02d}.voice.json"
+
+    def timeline(self, episode: int) -> Path:
+        return self.root / "05_timeline" / f"E{episode:02d}.timeline.json"
+
+    def subtitles(self, episode: int) -> Path:
+        return self.root / "05_timeline" / f"E{episode:02d}.ass"
+
+    def mixed_audio(self, episode: int) -> Path:
+        return self.root / "06_audio" / f"E{episode:02d}.mixed.m4a"
+
+    def video(self, episode: int) -> Path:
+        return self.root / "07_render" / f"E{episode:02d}.mp4"
 
 
 def stages_from(stage: str) -> list[str]:
@@ -135,6 +168,107 @@ def run_docgen(cfg: ProjectConfig) -> Script:
     return script
 
 
+def _only_episode(cfg: ProjectConfig) -> EpisodeConfig:
+    """v2 只做单集。season 模式在 run_pipeline 入口就被拦掉了。"""
+    if not cfg.episodes:
+        raise ValueError("project.yaml 的 episodes 是空的，至少要配一集")
+    return cfg.episodes[0]
+
+
+def _load_script(cfg: ProjectConfig) -> Script:
+    path = Paths(cfg.root).script
+    if not path.exists():
+        raise FileNotFoundError(f"缺少剧本产物 {path}，请先跑 script 阶段")
+    return Script.model_validate_json(path.read_text(encoding="utf-8"))
+
+
+def _load_voice(cfg: ProjectConfig, episode: int) -> VoiceTrack:
+    path = Paths(cfg.root).voice(episode)
+    if not path.exists():
+        raise FileNotFoundError(f"缺少配音产物 {path}，请先跑 voice 阶段")
+    return VoiceTrack.model_validate_json(path.read_text(encoding="utf-8"))
+
+
+def _load_timeline(cfg: ProjectConfig, episode: int) -> Timeline:
+    path = Paths(cfg.root).timeline(episode)
+    if not path.exists():
+        raise FileNotFoundError(f"缺少时间轴产物 {path}，请先跑 timeline 阶段")
+    return Timeline.model_validate_json(path.read_text(encoding="utf-8"))
+
+
+async def run_voice(
+    cfg: ProjectConfig, engine: TTSEngine | None
+) -> tuple[VoiceTrack, list[str]]:
+    if engine is None:
+        raise ValueError(
+            "voice 阶段需要 TTS engine，请检查 project.yaml 的 render.voice 配置"
+        )
+    paths = Paths(cfg.root)
+    episode = _only_episode(cfg).number
+    script = _load_script(cfg)
+    track, warnings = await synthesize_track(
+        script, episode, paths.voice_dir(episode), engine
+    )
+    _write_json(paths.voice(episode), track.model_dump_json(indent=2))
+    return track, warnings
+
+
+def run_timeline(
+    cfg: ProjectConfig, *, source_duration: float | None = None
+) -> tuple[Timeline, list[str]]:
+    paths = Paths(cfg.root)
+    episode_cfg = _only_episode(cfg)
+    episode = episode_cfg.number
+    script = _load_script(cfg)
+    track = _load_voice(cfg, episode)
+    if source_duration is None:
+        source_duration = probe_duration(cfg.video_path(episode_cfg))
+    timeline, warnings = build_timeline(script, track, source_duration)
+    _write_json(paths.timeline(episode), timeline.model_dump_json(indent=2))
+    _write_text(
+        paths.subtitles(episode),
+        render_ass(timeline.subtitles, font_size=cfg.render.font_size),
+    )
+    return timeline, warnings
+
+
+def run_audio(cfg: ProjectConfig) -> Path:
+    paths = Paths(cfg.root)
+    episode_cfg = _only_episode(cfg)
+    episode = episode_cfg.number
+    timeline = _load_timeline(cfg, episode)
+    track = _load_voice(cfg, episode)
+    return mix_audio(
+        video=cfg.video_path(episode_cfg),
+        timeline=timeline,
+        track=track,
+        voice_dir=paths.voice_dir(episode),
+        out_path=paths.mixed_audio(episode),
+        duck_db=cfg.render.duck_db,
+    )
+
+
+def run_render(cfg: ProjectConfig) -> Path:
+    paths = Paths(cfg.root)
+    episode_cfg = _only_episode(cfg)
+    episode = episode_cfg.number
+    timeline = _load_timeline(cfg, episode)
+    audio = paths.mixed_audio(episode)
+    if not audio.exists():
+        raise FileNotFoundError(f"缺少混音产物 {audio}，请先跑 audio 阶段")
+    ass = paths.subtitles(episode)
+    if not ass.exists():
+        raise FileNotFoundError(f"缺少字幕产物 {ass}，请先跑 timeline 阶段")
+    return render_video(
+        video=cfg.video_path(episode_cfg),
+        timeline=timeline,
+        audio=audio,
+        ass=ass,
+        out_path=paths.video(episode),
+        encoder=cfg.render.video_encoder,
+    )
+
+
 async def run_pipeline(
     cfg: ProjectConfig,
     provider: LLMProvider,
@@ -142,6 +276,7 @@ async def run_pipeline(
     from_stage: str = "ingest",
     only: Sequence[str] | None = None,
     force: bool = False,
+    tts_engine: TTSEngine | None = None,
 ) -> list[str]:
     """返回本次运行累积的 warnings。
 
@@ -184,5 +319,42 @@ async def run_pipeline(
     if "docgen" in wanted:
         if force or not _is_fresh([paths.table, paths.narration], [paths.script]):
             run_docgen(cfg)
+
+    # 前置检查放在 voice 之前：绝不能跑完几分钟 TTS，最后一步才发现 ffmpeg 没编 libass。
+    if {"audio", "render"} & set(wanted):
+        preflight(cfg.video_path(_only_episode(cfg)), cfg.render.video_encoder)
+
+    if "voice" in wanted:
+        outputs = [paths.voice(n) for n in numbers]
+        if force or not _is_fresh(outputs, [paths.script]):
+            _, stage_warnings = await run_voice(cfg, tts_engine)
+            warnings.extend(stage_warnings)
+
+    if "timeline" in wanted:
+        outputs = [paths.timeline(n) for n in numbers] + [
+            paths.subtitles(n) for n in numbers
+        ]
+        inputs = [paths.script] + [paths.voice(n) for n in numbers]
+        if force or not _is_fresh(outputs, inputs):
+            _, stage_warnings = run_timeline(cfg)
+            warnings.extend(stage_warnings)
+
+    if "audio" in wanted:
+        outputs = [paths.mixed_audio(n) for n in numbers]
+        inputs = [paths.timeline(n) for n in numbers] + [
+            paths.voice(n) for n in numbers
+        ]
+        if force or not _is_fresh(outputs, inputs):
+            run_audio(cfg)
+
+    if "render" in wanted:
+        outputs = [paths.video(n) for n in numbers]
+        inputs = (
+            [paths.mixed_audio(n) for n in numbers]
+            + [paths.subtitles(n) for n in numbers]
+            + [paths.timeline(n) for n in numbers]
+        )
+        if force or not _is_fresh(outputs, inputs):
+            run_render(cfg)
 
     return warnings

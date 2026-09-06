@@ -17,6 +17,10 @@ from tests.fakes import FakeProvider
 OCR_GARBAGE = "80-08"
 OCR_GARBAGE_CITY = "浙谷"
 
+# STAGES 在 v2 里扩到 8 个，voice 之后的阶段需要 TTS engine 与源视频。
+# 本文件只验证 v1 的「SRT -> 对照表 + 配音文本」链路，显式限定阶段范围。
+V1_STAGES = ["ingest", "signals", "script", "docgen"]
+
 
 def build_llm_payload(highlight_starts: list[float]) -> dict:
     """构造一份合法的 LLMScript JSON，clip 落在真实无字幕高光上。
@@ -130,7 +134,7 @@ async def run_offline(root: Path) -> tuple[list[str], FakeProvider]:
     assert len(starts) >= 3, starts
 
     provider = FakeProvider([build_llm_payload(starts[:3])])
-    warnings = await run_pipeline(cfg, provider, from_stage="script")
+    warnings = await run_pipeline(cfg, provider, only=V1_STAGES[2:])
     return warnings, provider
 
 
@@ -243,7 +247,7 @@ async def test_second_run_skips_completed_stages(project: Path):
     await run_offline(project)
     cfg = load_project(project / "project.yaml")
     provider = FakeProvider([])
-    await run_pipeline(cfg, provider)
+    await run_pipeline(cfg, provider, only=V1_STAGES)
     assert provider.calls == []
 
 
@@ -278,7 +282,7 @@ async def test_real_llm_snapshot(project: Path):
 
     cfg = load_project(project / "project.yaml")
     provider = build_provider(cfg.llm, Settings())
-    await run_pipeline(cfg, provider)
+    await run_pipeline(cfg, provider, only=V1_STAGES)
 
     paths = Paths(project)
     table = paths.table.read_text(encoding="utf-8")
