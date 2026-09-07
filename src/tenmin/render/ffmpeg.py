@@ -37,8 +37,16 @@ def tail(text: str, lines: int = STDERR_TAIL_LINES) -> str:
 
 
 def run(args: list[str]) -> str:
-    """跑 ffmpeg，返回 stderr（ffmpeg 的进度与日志都在 stderr）。"""
-    completed = subprocess.run([FFMPEG, *args], capture_output=True, text=True)
+    """跑 ffmpeg，返回 stderr（ffmpeg 的进度与日志都在 stderr）。
+
+    source 视频的容器元数据（title/album/description 等标签）常年是老字幕组用非
+    UTF-8 编码硬塞进去的脏数据，ffmpeg 会把这些原始字节原样打到 stderr 里。严格
+    UTF-8 解码遇到这种输入必炸——所以这里用 errors="replace"，脏字节换成 U+FFFD，
+    不让一段无关的元数据把整条渲染流水线搞挂。
+    """
+    completed = subprocess.run(
+        [FFMPEG, *args], capture_output=True, text=True, errors="replace"
+    )
     if completed.returncode != 0:
         raise FFmpegError(
             f"ffmpeg 退出码 {completed.returncode}，命令：\n"
@@ -60,7 +68,7 @@ def probe_duration(path: Path) -> float:
         "csv=p=0",
         str(path),
     ]
-    completed = subprocess.run(args, capture_output=True, text=True)
+    completed = subprocess.run(args, capture_output=True, text=True, errors="replace")
     if completed.returncode != 0:
         raise FFmpegError(
             f"ffprobe 读不出 {path} 的时长，退出码 {completed.returncode}：\n"
@@ -76,14 +84,22 @@ def probe_duration(path: Path) -> float:
 
 @lru_cache(maxsize=1)
 def available_filters() -> set[str]:
-    completed = subprocess.run([FFMPEG, "-hide_banner", "-filters"], capture_output=True, text=True)
+    completed = subprocess.run(
+        [FFMPEG, "-hide_banner", "-filters"],
+        capture_output=True,
+        text=True,
+        errors="replace",
+    )
     return parse_names(completed.stdout)
 
 
 @lru_cache(maxsize=1)
 def available_encoders() -> set[str]:
     completed = subprocess.run(
-        [FFMPEG, "-hide_banner", "-encoders"], capture_output=True, text=True
+        [FFMPEG, "-hide_banner", "-encoders"],
+        capture_output=True,
+        text=True,
+        errors="replace",
     )
     return parse_names(completed.stdout)
 

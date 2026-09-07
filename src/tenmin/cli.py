@@ -34,7 +34,10 @@ PROJECT_TEMPLATE = {
         "rate": "+0%",
         "video_encoder": "libx264",
         "duck_db": -12.0,
-        "font_size": 48,
+        "font_size": 52,
+        "fade_out_seconds": 1.5,
+        "outro_card_seconds": 3.0,
+        "outro_message": "解说结束，谢谢观看",
     },
 }
 

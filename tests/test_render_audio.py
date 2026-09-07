@@ -173,6 +173,44 @@ def test_build_mix_args_rejects_offset_count_mismatch(tmp_path):
         build(tmp_path, timeline=timeline)
 
 
+def test_build_mix_args_without_fade_or_outro_keeps_mix_label(tmp_path):
+    """没要求淡出/片尾时，-map 仍然是 [mix]，行为与老版本完全一致。"""
+    args = build(tmp_path)
+    assert args[args.index("-map") + 1] == "[mix]"
+
+
+def test_build_mix_args_applies_fade_out_before_mix_ends(tmp_path):
+    args = build(tmp_path, fade_out_seconds=5.0)
+    graph = args[args.index("-filter_complex") + 1]
+    assert graph.endswith(
+        "[ducked][voice]amix=inputs=2:normalize=0[mix];"
+        "[mix]afade=t=out:st=25.000:d=5.000[mixfaded]"
+    )
+    assert args[args.index("-map") + 1] == "[mixfaded]"
+
+
+def test_build_mix_args_appends_silence_for_outro_card(tmp_path):
+    args = build(tmp_path, fade_out_seconds=5.0, outro_seconds=3.0)
+    graph = args[args.index("-filter_complex") + 1]
+    assert graph.endswith(
+        "[mix]afade=t=out:st=25.000:d=5.000[mixfaded];"
+        "anullsrc=r=48000:cl=stereo:d=3.000[silence];"
+        "[mixfaded][silence]concat=n=2:v=0:a=1[mixfinal]"
+    )
+    assert args[args.index("-map") + 1] == "[mixfinal]"
+
+
+def test_build_mix_args_outro_without_fade_concats_mix_directly(tmp_path):
+    args = build(tmp_path, outro_seconds=3.0)
+    graph = args[args.index("-filter_complex") + 1]
+    assert graph.endswith(
+        "[ducked][voice]amix=inputs=2:normalize=0[mix];"
+        "anullsrc=r=48000:cl=stereo:d=3.000[silence];"
+        "[mix][silence]concat=n=2:v=0:a=1[mixfinal]"
+    )
+    assert args[args.index("-map") + 1] == "[mixfinal]"
+
+
 def test_mix_audio_runs_ffmpeg_and_returns_path(tmp_path, monkeypatch):
     from tenmin.render import audio as audio_module
 

@@ -35,7 +35,10 @@ class RenderConfig(BaseModel):
     rate: str = "+0%"
     video_encoder: str = "libx264"
     duck_db: float = -12.0
-    font_size: int = 48
+    font_size: int = 52
+    fade_out_seconds: float = 1.5
+    outro_card_seconds: float = 3.0
+    outro_message: str = "解说结束，谢谢观看"
 
 
 class ProjectConfig(BaseModel):

@@ -39,6 +39,8 @@ def build_mix_args(
     voice_dir: Path,
     out_path: Path,
     duck_db: float,
+    fade_out_seconds: float = 0.0,
+    outro_seconds: float = 0.0,
 ) -> list[str]:
     """拼出混音用的 ffmpeg 参数列表（不含 ffmpeg 本身）。"""
     if not timeline.segments:
@@ -80,6 +82,19 @@ def build_mix_args(
         voice_label = "[voice]"
     parts.append(f"[ducked]{voice_label}amix=inputs=2:normalize=0[mix]")
 
+    final_label = "[mix]"
+    if fade_out_seconds > 0:
+        fade_start = max(timeline.total_seconds - fade_out_seconds, 0.0)
+        parts.append(
+            f"{final_label}afade=t=out:st={fade_start:.3f}:d={fade_out_seconds:.3f}[mixfaded]"
+        )
+        final_label = "[mixfaded]"
+    if outro_seconds > 0:
+        # 片尾卡片没有声音，垫一段静音跟视频那边的黑卡对齐。
+        parts.append(f"anullsrc=r=48000:cl=stereo:d={outro_seconds:.3f}[silence]")
+        parts.append(f"{final_label}[silence]concat=n=2:v=0:a=1[mixfinal]")
+        final_label = "[mixfinal]"
+
     args = ["-y", "-i", str(video)]
     for path in chunk_paths:
         args.extend(["-i", path])
@@ -88,7 +103,7 @@ def build_mix_args(
             "-filter_complex",
             ";".join(parts),
             "-map",
-            "[mix]",
+            final_label,
             "-c:a",
             AUDIO_CODEC,
             "-b:a",
@@ -107,6 +122,8 @@ def mix_audio(
     voice_dir: Path,
     out_path: Path,
     duck_db: float,
+    fade_out_seconds: float = 0.0,
+    outro_seconds: float = 0.0,
 ) -> Path:
     """真跑 ffmpeg 混音，返回产物路径。"""
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -118,6 +135,8 @@ def mix_audio(
             voice_dir=voice_dir,
             out_path=out_path,
             duck_db=duck_db,
+            fade_out_seconds=fade_out_seconds,
+            outro_seconds=outro_seconds,
         )
     )
     return out_path

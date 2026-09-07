@@ -103,6 +103,31 @@ def test_build_timeline_places_subtitles_and_offsets():
     assert timeline.narration_offsets == pytest.approx([0.0, 10.0])
 
 
+def test_build_timeline_splits_multi_sentence_chunk_into_per_sentence_cues():
+    """一个 chunk 里如果有多句话，字幕要按句切开、按字数比例分配时间，
+    不能整段话一次性挂在屏幕上几十秒。"""
+    script = one_beat_script([Clip(episode=2, start=100.0, end=140.0)])
+    chunks = [
+        VoiceChunk(
+            beat_id="b1", index=1,
+            text="第一句。第二句更长一些。",
+            path="chunk_001.mp3", duration=12.0,
+        )
+    ]
+    track = VoiceTrack(episode=2, chunks=chunks, total_seconds=12.0)
+    timeline, warnings = build_timeline(script, track, source_duration=1400.0)
+    assert warnings == []
+    cues = timeline.subtitles
+    assert [c.text for c in cues] == ["第一句。", "第二句更长一些。"]
+    # 4 字 vs 8 字，12 秒按比例切成 4 秒 / 8 秒
+    assert cues[0].start == pytest.approx(0.0)
+    assert cues[0].end == pytest.approx(4.0)
+    assert cues[1].start == pytest.approx(4.0)
+    assert cues[1].end == pytest.approx(12.0)
+    # 音频游标只按整个 chunk 的时长推进一次，不受切句影响
+    assert timeline.narration_offsets == pytest.approx([0.0])
+
+
 def test_build_timeline_scales_two_clips_proportionally():
     script = one_beat_script(
         [Clip(episode=2, start=100.0, end=140.0), Clip(episode=2, start=200.0, end=220.0)]

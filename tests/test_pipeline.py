@@ -392,7 +392,7 @@ def test_run_timeline_uses_config_font_size(project):
     run_timeline(project, source_duration=1400.0)
 
     ass = Paths(project.root).subtitles(2).read_text(encoding="utf-8")
-    assert "Source Han Sans SC,72," in ass
+    assert "Lantinghei SC,72," in ass
 
 
 def test_run_audio_invokes_ffmpeg(project, monkeypatch):

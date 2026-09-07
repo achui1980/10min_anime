@@ -245,6 +245,8 @@ def run_audio(cfg: ProjectConfig) -> Path:
         voice_dir=paths.voice_dir(episode),
         out_path=paths.mixed_audio(episode),
         duck_db=cfg.render.duck_db,
+        fade_out_seconds=cfg.render.fade_out_seconds,
+        outro_seconds=cfg.render.outro_card_seconds,
     )
 
 
@@ -266,6 +268,10 @@ def run_render(cfg: ProjectConfig) -> Path:
         ass=ass,
         out_path=paths.video(episode),
         encoder=cfg.render.video_encoder,
+        fade_out_seconds=cfg.render.fade_out_seconds,
+        outro_seconds=cfg.render.outro_card_seconds,
+        outro_title=f"{cfg.show} · EP{episode:02d}",
+        outro_message=cfg.render.outro_message,
     )
 
 

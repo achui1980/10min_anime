@@ -115,11 +115,15 @@ def test_golden_picture_matches_audio(golden_script, golden_voice):
 def test_golden_subtitles_cover_every_chunk(golden_script, golden_voice):
     timeline, _ = build_timeline(golden_script, golden_voice, SOURCE_DURATION)
 
-    assert len(timeline.subtitles) == len(golden_voice.chunks)
+    # 多句话的 chunk 现在会拆成多条按比例分配时间的字幕，条数只会 >= chunk 数
+    assert len(timeline.subtitles) >= len(golden_voice.chunks)
     assert len(timeline.narration_offsets) == len(golden_voice.chunks)
     for cue in timeline.subtitles:
         assert cue.end > cue.start
         assert cue.text.strip() == cue.text
+    # 字幕按时间顺序衔接，不重叠、不留缝
+    for previous, current in zip(timeline.subtitles, timeline.subtitles[1:], strict=False):
+        assert current.start >= previous.end - 1e-6
 
 
 def test_golden_ass_renders(golden_script, golden_voice):

@@ -157,7 +157,10 @@ def test_init_template_has_video_and_render(tmp_path):
     assert data["render"]["rate"] == "+0%"
     assert data["render"]["video_encoder"] == "libx264"
     assert data["render"]["duck_db"] == -12.0
-    assert data["render"]["font_size"] == 48
+    assert data["render"]["font_size"] == 52
+    assert data["render"]["fade_out_seconds"] == 1.5
+    assert data["render"]["outro_card_seconds"] == 3.0
+    assert data["render"]["outro_message"] == "解说结束，谢谢观看"
     assert (tmp_path / "akujo2" / "video").is_dir()
 
 

@@ -1,19 +1,26 @@
 from tenmin.models import SubtitleCue
-from tenmin.render.subtitles import escape_text, format_ass_time, render_ass
+from tenmin.render.subtitles import (
+    DEFAULT_FONT_SIZE,
+    escape_text,
+    format_ass_time,
+    max_chars_per_line,
+    render_ass,
+    wrap_text,
+)
 
 EXPECTED = """[Script Info]
 ScriptType: v4.00+
 PlayResX: 1920
 PlayResY: 1080
-WrapStyle: 2
+WrapStyle: 0
 ScaledBorderAndShadow: yes
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, \
 BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, \
 BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Narration,Source Han Sans SC,48,&H00FFFFFF,&H000000FF,&H00000000,\
-&H80000000,0,0,0,0,100,100,0,0,1,3,1,2,60,60,60,1
+Style: Narration,Lantinghei SC,52,&H0000FFFF,&H000000FF,&H00000000,\
+&H80000000,1,0,0,0,100,100,3,0,1,4,1,2,60,60,60,1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
@@ -57,15 +64,72 @@ def test_render_ass_matches_expected_output():
 
 def test_render_ass_honours_font_size():
     out = render_ass([SubtitleCue(start=0.0, end=1.0, text="喂")], font_size=64)
-    assert "Style: Narration,Source Han Sans SC,64," in out
+    assert "Style: Narration,Lantinghei SC,64," in out
 
 
 def test_render_ass_honours_font_name():
     out = render_ass([SubtitleCue(start=0.0, end=1.0, text="喂")], font_name="PingFang SC")
-    assert "Style: Narration,PingFang SC,48," in out
+    assert "Style: Narration,PingFang SC,52," in out
+
+
+def test_render_ass_style_is_bold_with_yellow_fill_black_outline():
+    # 二次元解说风格：黄字、加粗、粗黑色描边（参考 B 站/抖音吐槽解说常见配色）。
+    out = render_ass([SubtitleCue(start=0.0, end=1.0, text="喂")])
+    style_line = next(line for line in out.splitlines() if line.startswith("Style:"))
+    fields = style_line.split(",")
+    assert fields[3] == "&H0000FFFF"  # PrimaryColour（文字填充色，黄）
+    assert fields[5] == "&H00000000"  # OutlineColour（描边色，黑）
+    assert fields[7] == "1"  # Bold
+    assert fields[16] == "4"  # Outline width
 
 
 def test_render_ass_without_cues_still_has_headers():
     out = render_ass([])
     assert "[Events]" in out
     assert "Dialogue:" not in out
+
+
+def test_max_chars_per_line_for_default_font_size():
+    # 1920 - 2*60 margins = 1800px 可用宽度；48号字按 1.05 倍宽度估算。
+    assert max_chars_per_line(48) == 35
+
+
+def test_max_chars_per_line_shrinks_with_bigger_font():
+    assert max_chars_per_line(96) < max_chars_per_line(48)
+
+
+def test_wrap_text_leaves_short_line_untouched():
+    assert wrap_text("第一句。", 35) == "第一句。"
+
+
+def test_wrap_text_breaks_long_line_without_spaces():
+    # libass 只在空格处自动换行，中文没有空格，所以必须手动断行插入 \n。
+    text = "一二三四五六七八九十一二三四五六七八九十一二三四五六七八九十"  # 30 字
+    wrapped = wrap_text(text, 10)
+    lines = wrapped.split("\n")
+    assert len(lines) > 1
+    assert all(len(line) <= 10 for line in lines)
+    assert "".join(lines) == text
+
+
+def test_wrap_text_prefers_breaking_after_punctuation():
+    text = "前半句内容刚好十个字，后面还有一些字"
+    wrapped = wrap_text(text, 12)
+    first_line = wrapped.split("\n")[0]
+    assert first_line.endswith("，")
+
+
+def test_wrap_text_preserves_existing_newlines():
+    assert wrap_text("第一行\n第二行", 35) == "第一行\n第二行"
+
+
+def test_render_ass_wraps_long_cue_into_multiple_lines():
+    long_text = "下午的任务是去女厕取回大小姐落下的钱包，定位来自缝在钱包里的追踪器——这家人对女儿的管理精度已经到这地步了。"
+    cues = [SubtitleCue(start=0.0, end=10.0, text=long_text)]
+    out = render_ass(cues)
+    dialogue_line = next(line for line in out.splitlines() if line.startswith("Dialogue"))
+    assert "\\N" in dialogue_line
+    # 每个物理行都不应超过按字号估算出的单行字符上限。
+    text_part = dialogue_line.split(",", 9)[-1]
+    for segment in text_part.split("\\N"):
+        assert len(segment) <= max_chars_per_line(DEFAULT_FONT_SIZE)

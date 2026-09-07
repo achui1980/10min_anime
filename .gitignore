@@ -9,3 +9,4 @@ build/
 .env
 work/
 tests/fixtures/generalize/
+graphify-out/

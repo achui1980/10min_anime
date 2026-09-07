@@ -5,6 +5,7 @@ import pytest
 from tenmin.models import Timeline, TimelineSegment
 from tenmin.render.video import (
     build_render_args,
+    escape_drawtext,
     escape_filter_path,
     quality_args,
     render_video,
@@ -139,6 +140,44 @@ def test_build_render_args_rejects_empty_timeline(tmp_path):
     with pytest.raises(ValueError) as exc:
         build(tmp_path, timeline=timeline)
     assert "segment" in str(exc.value)
+
+
+def test_escape_drawtext_escapes_backslash_and_quote():
+    raw = "it's\\path"
+    assert escape_drawtext(raw) == "it\\'s\\\\path"
+
+
+def test_build_render_args_without_fade_or_outro_keeps_vout_label(tmp_path):
+    """没要求淡出/片尾卡片时，-map 仍然是 [vout]，行为与老版本完全一致。"""
+    args = build(tmp_path)
+    assert args[args.index("-map") + 1] == "[vout]"
+
+
+def test_build_render_args_applies_fade_out_before_video_ends(tmp_path):
+    args = build(tmp_path, fade_out_seconds=5.0)
+    graph = args[args.index("-filter_complex") + 1]
+    ass = tmp_path / "05_timeline" / "E02.ass"
+    assert graph.endswith(
+        f"[vcat]subtitles=filename='{ass}'[vout];"
+        "[vout]fade=t=out:st=25.000:d=5.000[vfaded]"
+    )
+    assert args[args.index("-map") + 1] == "[vfaded]"
+
+
+def test_build_render_args_appends_outro_card(tmp_path):
+    args = build(
+        tmp_path,
+        fade_out_seconds=5.0,
+        outro_seconds=3.0,
+        outro_title="才女的侍从 · EP02",
+        outro_message="解说结束，谢谢观看",
+    )
+    graph = args[args.index("-filter_complex") + 1]
+    assert "color=c=black:s=1920x1080:d=3.000[cardbg]" in graph
+    assert "drawtext=font='Lantinghei SC':text='才女的侍从 · EP02'" in graph
+    assert "drawtext=font='Lantinghei SC':text='解说结束，谢谢观看'" in graph
+    assert graph.endswith("[vfaded][card]concat=n=2:v=1:a=0[vfinal]")
+    assert args[args.index("-map") + 1] == "[vfinal]"
 
 
 def test_render_video_runs_ffmpeg_and_returns_path(tmp_path, monkeypatch):

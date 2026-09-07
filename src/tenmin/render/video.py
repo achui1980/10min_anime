@@ -28,6 +28,11 @@ def escape_filter_path(path: Path) -> str:
     return f"'{text}'"
 
 
+def escape_drawtext(text: str) -> str:
+    """drawtext 的 text 参数整体用单引号包住，反斜杠与单引号需要转义。"""
+    return text.replace("\\", "\\\\").replace("'", "\\'")
+
+
 def quality_args(encoder: str) -> list[str]:
     """videotoolbox 不认 -crf/-preset，只能给码率。"""
     if encoder.endswith("videotoolbox"):
@@ -45,6 +50,10 @@ def build_render_args(
     encoder: str,
     width: int = WIDTH,
     height: int = HEIGHT,
+    fade_out_seconds: float = 0.0,
+    outro_seconds: float = 0.0,
+    outro_title: str = "",
+    outro_message: str = "",
 ) -> list[str]:
     """拼出渲染用的 ffmpeg 参数列表（不含 ffmpeg 本身）。"""
     if not timeline.segments:
@@ -60,6 +69,31 @@ def build_render_args(
     parts.append(f"{labels}concat=n={len(timeline.segments)}:v=1:a=0[vcat]")
     parts.append(f"[vcat]subtitles=filename={escape_filter_path(ass)}[vout]")
 
+    final_label = "[vout]"
+    if fade_out_seconds > 0:
+        fade_start = max(timeline.total_seconds - fade_out_seconds, 0.0)
+        parts.append(
+            f"{final_label}fade=t=out:st={fade_start:.3f}:d={fade_out_seconds:.3f}[vfaded]"
+        )
+        final_label = "[vfaded]"
+    if outro_seconds > 0:
+        # 结尾黑卡：番剧名+集数在上，感谢语在下，样式跟正片字幕保持一致（黄字黑边）。
+        parts.append(f"color=c=black:s={width}x{height}:d={outro_seconds:.3f}[cardbg]")
+        title = escape_drawtext(outro_title)
+        message = escape_drawtext(outro_message)
+        parts.append(
+            f"[cardbg]drawtext=font='Lantinghei SC':text='{title}':fontcolor=yellow:"
+            "bordercolor=black:borderw=4:fontsize=64:x=(w-text_w)/2:y=(h-text_h)/2-60:"
+            "expansion=none[card1]"
+        )
+        parts.append(
+            f"[card1]drawtext=font='Lantinghei SC':text='{message}':fontcolor=yellow:"
+            "bordercolor=black:borderw=4:fontsize=44:x=(w-text_w)/2:y=(h-text_h)/2+40:"
+            "expansion=none[card]"
+        )
+        parts.append(f"{final_label}[card]concat=n=2:v=1:a=0[vfinal]")
+        final_label = "[vfinal]"
+
     return [
         "-y",
         "-i",
@@ -69,7 +103,7 @@ def build_render_args(
         "-filter_complex",
         ";".join(parts),
         "-map",
-        "[vout]",
+        final_label,
         "-map",
         "1:a",
         "-c:v",
@@ -93,6 +127,10 @@ def render_video(
     ass: Path,
     out_path: Path,
     encoder: str,
+    fade_out_seconds: float = 0.0,
+    outro_seconds: float = 0.0,
+    outro_title: str = "",
+    outro_message: str = "",
 ) -> Path:
     """真跑 ffmpeg 渲染，返回成品路径。"""
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -104,6 +142,10 @@ def render_video(
             ass=ass,
             out_path=out_path,
             encoder=encoder,
+            fade_out_seconds=fade_out_seconds,
+            outro_seconds=outro_seconds,
+            outro_title=outro_title,
+            outro_message=outro_message,
         )
     )
     return out_path

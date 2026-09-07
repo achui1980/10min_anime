@@ -163,7 +163,10 @@ def test_render_config_defaults():
     assert cfg.rate == "+0%"
     assert cfg.video_encoder == "libx264"
     assert cfg.duck_db == -12.0
-    assert cfg.font_size == 48
+    assert cfg.font_size == 52
+    assert cfg.fade_out_seconds == 1.5
+    assert cfg.outro_card_seconds == 3.0
+    assert cfg.outro_message == "解说结束，谢谢观看"
 
 
 def test_project_config_has_render_defaults():

@@ -15,9 +15,41 @@ from tenmin.models import (
     VoiceChunk,
     VoiceTrack,
 )
+from tenmin.render.chunks import split_sentences
+from tenmin.script.budget import narration_chars
 
 # 画面与音频总时长的容忍差。超过就报 warning，不报错。
 DRIFT_TOLERANCE = 0.5
+
+
+def sentence_cues(chunk: VoiceChunk, start: float) -> list[SubtitleCue]:
+    """把一个 chunk 的字幕按句切开，按字数比例分配 chunk.duration。
+
+    一个 chunk 常常是好几句话拼起来一次性合成的（省 TTS 调用次数），
+    但字幕不能整段话挂几十秒不动——观众读完第一句时，画面上该已经是第二句了。
+    没有逐句的真实音频时长，只能按字数比例估算，这是唯一可行的近似。
+    """
+    sentences = split_sentences(chunk.text)
+    if not sentences:
+        return [SubtitleCue(start=start, end=start + chunk.duration, text=chunk.text)]
+    if len(sentences) == 1:
+        return [SubtitleCue(start=start, end=start + chunk.duration, text=sentences[0])]
+
+    weights = [narration_chars(sentence) for sentence in sentences]
+    total_weight = sum(weights)
+    if total_weight <= 0:
+        weights = [1] * len(sentences)
+        total_weight = len(sentences)
+
+    cues: list[SubtitleCue] = []
+    cursor = start
+    for sentence, weight in zip(sentences, weights, strict=True):
+        duration = chunk.duration * weight / total_weight
+        cues.append(SubtitleCue(start=cursor, end=cursor + duration, text=sentence))
+        cursor += duration
+    # 累积浮点误差可能让最后一句结束时刻偏离 chunk 边界，钳死到精确值
+    cues[-1].end = start + chunk.duration
+    return cues
 
 
 def beat_audio_seconds(chunks: list[VoiceChunk]) -> float:
@@ -63,9 +95,7 @@ def build_timeline(
         # 音频游标：字幕与旁白落点都由它驱动
         for chunk in chunks:
             offsets.append(audio_cursor)
-            subtitles.append(
-                SubtitleCue(start=audio_cursor, end=audio_cursor + chunk.duration, text=chunk.text)
-            )
+            subtitles.extend(sentence_cues(chunk, audio_cursor))
             audio_cursor += chunk.duration + chunk.hold_after
 
         audio_seconds = beat_audio_seconds(chunks)
