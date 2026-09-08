@@ -334,10 +334,10 @@ async def test_run_voice_without_script_raises(project):
 @pytest.mark.asyncio
 async def test_run_timeline_writes_timeline_and_ass(project):
     paths = Paths(project.root)
-    _write_script(paths.script, render_script())
+    _write_script(paths.script(2), render_script())
     await run_voice(project, FakeTTSEngine([8.0, 10.0, 10.0]), episode=2)
 
-    timeline, warnings = run_timeline(project, source_duration=1400.0)
+    timeline, warnings = run_timeline(project, episode=2, source_duration=1400.0)
 
     assert warnings == []
     assert len(timeline.segments) == 2
@@ -350,13 +350,13 @@ async def test_run_timeline_writes_timeline_and_ass(project):
 
 
 def test_run_timeline_without_voice_raises(project):
-    _write_script(Paths(project.root).script, render_script())
+    _write_script(Paths(project.root).script(2), render_script())
     with pytest.raises(FileNotFoundError):
-        run_timeline(project, source_duration=1400.0)
+        run_timeline(project, episode=2, source_duration=1400.0)
 
 
 def test_run_timeline_probes_source_when_duration_missing(project, monkeypatch):
-    _write_script(Paths(project.root).script, render_script())
+    _write_script(Paths(project.root).script(2), render_script())
     asyncio.run(run_voice(project, FakeTTSEngine([8.0, 10.0, 10.0]), episode=2))
     video = _prepare_video(project)
     calls: list[Path] = []
@@ -367,7 +367,7 @@ def test_run_timeline_probes_source_when_duration_missing(project, monkeypatch):
 
     monkeypatch.setattr("tenmin.pipeline.probe_duration", fake_probe)
 
-    timeline, warnings = run_timeline(project)
+    timeline, warnings = run_timeline(project, episode=2)
 
     assert calls == [video]
     assert warnings == []
@@ -375,11 +375,11 @@ def test_run_timeline_probes_source_when_duration_missing(project, monkeypatch):
 
 
 def test_run_timeline_uses_config_font_size(project):
-    _write_script(Paths(project.root).script, render_script())
+    _write_script(Paths(project.root).script(2), render_script())
     asyncio.run(run_voice(project, FakeTTSEngine([8.0, 10.0, 10.0]), episode=2))
     project.render.font_size = 72
 
-    run_timeline(project, source_duration=1400.0)
+    run_timeline(project, episode=2, source_duration=1400.0)
 
     ass = Paths(project.root).subtitles(2).read_text(encoding="utf-8")
     assert "Lantinghei SC,72," in ass
@@ -389,7 +389,7 @@ def test_run_audio_invokes_ffmpeg(project, monkeypatch):
     paths = Paths(project.root)
     _write_script(paths.script, render_script())
     asyncio.run(run_voice(project, FakeTTSEngine([8.0, 10.0, 10.0]), episode=2))
-    run_timeline(project, source_duration=1400.0)
+    run_timeline(project, episode=2, source_duration=1400.0)
     _prepare_video(project)
     captured: list[list[str]] = []
 
@@ -420,7 +420,7 @@ def test_run_render_invokes_ffmpeg(project, monkeypatch):
     paths = Paths(project.root)
     _write_script(paths.script, render_script())
     asyncio.run(run_voice(project, FakeTTSEngine([8.0, 10.0, 10.0]), episode=2))
-    run_timeline(project, source_duration=1400.0)
+    run_timeline(project, episode=2, source_duration=1400.0)
     _prepare_video(project)
     paths.mixed_audio(2).parent.mkdir(parents=True, exist_ok=True)
     paths.mixed_audio(2).write_bytes(b"")
@@ -443,7 +443,7 @@ def test_run_render_invokes_ffmpeg(project, monkeypatch):
 def test_run_render_without_audio_raises(project):
     _write_script(Paths(project.root).script, render_script())
     asyncio.run(run_voice(project, FakeTTSEngine([8.0, 10.0, 10.0]), episode=2))
-    run_timeline(project, source_duration=1400.0)
+    run_timeline(project, episode=2, source_duration=1400.0)
     _prepare_video(project)
     with pytest.raises(FileNotFoundError) as exc:
         run_render(project)

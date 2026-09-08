@@ -219,12 +219,11 @@ async def run_voice(
 
 
 def run_timeline(
-    cfg: ProjectConfig, *, source_duration: float | None = None
+    cfg: ProjectConfig, episode: int, *, source_duration: float | None = None
 ) -> tuple[Timeline, list[str]]:
     paths = Paths(cfg.root)
-    episode_cfg = _only_episode(cfg)
-    episode = episode_cfg.number
-    script = _load_script(cfg)
+    episode_cfg = _find_episode(cfg, episode)
+    script = _load_script(cfg, episode)
     track = _load_voice(cfg, episode)
     if source_duration is None:
         source_duration = probe_duration(cfg.video_path(episode_cfg))
