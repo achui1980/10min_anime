@@ -418,7 +418,7 @@ def test_run_audio_without_timeline_raises(project):
 
 def test_run_render_invokes_ffmpeg(project, monkeypatch):
     paths = Paths(project.root)
-    _write_script(paths.script, render_script())
+    _write_script(paths.script(2), render_script())
     asyncio.run(run_voice(project, FakeTTSEngine([8.0, 10.0, 10.0]), episode=2))
     run_timeline(project, episode=2, source_duration=1400.0)
     _prepare_video(project)
@@ -432,7 +432,7 @@ def test_run_render_invokes_ffmpeg(project, monkeypatch):
 
     monkeypatch.setattr("tenmin.render.video.run", fake_run)
 
-    out = run_render(project)
+    out = run_render(project, episode=2)
 
     assert out == paths.video(2)
     assert out.exists()
@@ -441,12 +441,12 @@ def test_run_render_invokes_ffmpeg(project, monkeypatch):
 
 
 def test_run_render_without_audio_raises(project):
-    _write_script(Paths(project.root).script, render_script())
+    _write_script(Paths(project.root).script(2), render_script())
     asyncio.run(run_voice(project, FakeTTSEngine([8.0, 10.0, 10.0]), episode=2))
     run_timeline(project, episode=2, source_duration=1400.0)
     _prepare_video(project)
     with pytest.raises(FileNotFoundError) as exc:
-        run_render(project)
+        run_render(project, episode=2)
     assert "audio 阶段" in str(exc.value)
 
 

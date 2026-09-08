@@ -253,10 +253,9 @@ def run_audio(cfg: ProjectConfig, episode: int) -> Path:
     )
 
 
-def run_render(cfg: ProjectConfig) -> Path:
+def run_render(cfg: ProjectConfig, episode: int) -> Path:
     paths = Paths(cfg.root)
-    episode_cfg = _only_episode(cfg)
-    episode = episode_cfg.number
+    episode_cfg = _find_episode(cfg, episode)
     timeline = _load_timeline(cfg, episode)
     audio = paths.mixed_audio(episode)
     if not audio.exists():
