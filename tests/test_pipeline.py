@@ -238,7 +238,7 @@ async def test_run_pipeline_from_signals_keeps_dialogue(project):
 
 def test_run_docgen_without_script_raises(project):
     with pytest.raises(FileNotFoundError):
-        run_docgen(project)
+        run_docgen(project, episode=2)
 
 
 def _write_script(path: Path, script: Script) -> None:

@@ -159,13 +159,14 @@ async def run_script(
     return script, warnings
 
 
-def run_docgen(cfg: ProjectConfig) -> Script:
+def run_docgen(cfg: ProjectConfig, episode: int) -> Script:
     paths = Paths(cfg.root)
-    if not paths.script.exists():
-        raise FileNotFoundError(f"缺少剧本产物 {paths.script}，请先跑 script 阶段")
-    script = Script.model_validate_json(paths.script.read_text(encoding="utf-8"))
-    _write_text(paths.table, render_table(script))
-    _write_text(paths.narration, render_narration(script))
+    script_path = paths.script(episode)
+    if not script_path.exists():
+        raise FileNotFoundError(f"缺少剧本 {script_path}，请先跑 script 阶段")
+    script = Script.model_validate_json(script_path.read_text())
+    _write_text(paths.table(episode), render_table(script))
+    _write_text(paths.narration(episode), render_narration(script))
     return script
 
 
