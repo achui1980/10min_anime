@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from tenmin.config import ProjectConfig
+from tenmin.config import EpisodeConfig, ProjectConfig
 from tenmin.models import (
     AudioDirection,
     Beat,
@@ -55,7 +55,7 @@ def project(tmp_path, golden_srt_path):
     return cfg
 
 
-def fake_script_response():
+def fake_script_response(episode: int = 2):
     labels = ["Hook 开场", "阶段一：入职即地狱", "收尾：修罗场引爆"]
     roles = ["hook", "act", "outro"]
     return LLMScript(
@@ -67,7 +67,7 @@ def fake_script_response():
                 narration="啊" * 360,
                 clips=[
                     LLMClip(
-                        episode=2,
+                        episode=episode,
                         start=300.0 + i * 100,
                         end=305.0 + i * 100,
                         visual="画面 ➔ 特写",
@@ -158,11 +158,11 @@ async def test_run_pipeline_end_to_end(project):
     provider = FakeProvider([fake_script_response()])
     await run_pipeline(project, provider, only=V1_STAGES)
     paths = Paths(project.root)
-    assert paths.script.exists()
-    assert paths.table.exists()
-    assert paths.narration.exists()
-    assert "解说方案" in paths.table.read_text(encoding="utf-8")
-    assert paths.narration.read_text(encoding="utf-8").startswith("啊")
+    assert paths.script(2).exists()
+    assert paths.table(2).exists()
+    assert paths.narration(2).exists()
+    assert "解说方案" in paths.table(2).read_text(encoding="utf-8")
+    assert paths.narration(2).read_text(encoding="utf-8").startswith("啊")
 
 
 @pytest.mark.asyncio
@@ -188,14 +188,14 @@ async def test_run_pipeline_only_docgen_reuses_edited_script(project):
     await run_pipeline(project, provider, only=V1_STAGES)
     paths = Paths(project.root)
 
-    script = Script.model_validate_json(paths.script.read_text(encoding="utf-8"))
+    script = Script.model_validate_json(paths.script(2).read_text(encoding="utf-8"))
     script.beats[0].narration = "人工改过的开场"
-    paths.script.write_text(
+    paths.script(2).write_text(
         script.model_dump_json(indent=2, exclude_none=False), encoding="utf-8"
     )
 
     await run_pipeline(project, provider, only=["docgen"], force=True)
-    assert "人工改过的开场" in paths.narration.read_text(encoding="utf-8")
+    assert "人工改过的开场" in paths.narration(2).read_text(encoding="utf-8")
     assert len(provider.calls) == 1
 
 
@@ -213,8 +213,41 @@ async def test_run_pipeline_only_accepts_multiple_stages(project):
     paths = Paths(project.root)
     assert paths.dialogue(2).exists()
     assert paths.signals(2).exists()
-    assert not paths.script.exists()
+    assert not paths.script(2).exists()
     assert provider.calls == []
+
+
+@pytest.mark.asyncio
+async def test_run_pipeline_batch_mode_processes_all_episodes(project, golden_srt_path):
+    # register a second episode by copying the same golden SRT under a new number
+    second_srt = project.root / "srt" / "E01.srt"
+    second_srt.write_text(golden_srt_path.read_text(encoding="utf-8"), encoding="utf-8")
+    project.episodes.append(EpisodeConfig(number=1, srt=Path("srt/E01.srt")))
+
+    provider = FakeProvider([fake_script_response(episode=2), fake_script_response(episode=1)])
+    await run_pipeline(project, provider, only=V1_STAGES)
+
+    paths = Paths(project.root)
+    assert paths.script(1).exists()
+    assert paths.script(2).exists()
+    assert paths.table(1).exists()
+    assert paths.table(2).exists()
+
+
+@pytest.mark.asyncio
+async def test_run_pipeline_single_episode_mode_processes_only_that_episode(
+    project, golden_srt_path
+):
+    second_srt = project.root / "srt" / "E01.srt"
+    second_srt.write_text(golden_srt_path.read_text(encoding="utf-8"), encoding="utf-8")
+    project.episodes.append(EpisodeConfig(number=1, srt=Path("srt/E01.srt")))
+
+    provider = FakeProvider([fake_script_response(episode=1)])
+    await run_pipeline(project, provider, only=V1_STAGES, episode=1)
+
+    paths = Paths(project.root)
+    assert paths.script(1).exists()
+    assert not paths.script(2).exists()
 
 
 @pytest.mark.asyncio
@@ -453,7 +486,7 @@ def test_run_render_without_audio_raises(project):
 @pytest.mark.asyncio
 async def test_run_pipeline_from_voice_runs_render_stages(project, monkeypatch):
     paths = Paths(project.root)
-    _write_script(paths.script, render_script())
+    _write_script(paths.script(2), render_script())
     _prepare_video(project)
     monkeypatch.setattr("tenmin.pipeline.probe_duration", lambda path: 1400.0)
     monkeypatch.setattr("tenmin.pipeline.preflight", lambda video, encoder: 1400.0)
@@ -477,7 +510,7 @@ async def test_run_pipeline_from_voice_runs_render_stages(project, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_run_pipeline_skips_voice_when_fresh(project):
-    _write_script(Paths(project.root).script, render_script())
+    _write_script(Paths(project.root).script(2), render_script())
     engine = FakeTTSEngine([8.0, 10.0, 10.0])
 
     await run_pipeline(project, FakeProvider([]), only=["voice"], tts_engine=engine)
@@ -490,7 +523,7 @@ async def test_run_pipeline_skips_voice_when_fresh(project):
 
 @pytest.mark.asyncio
 async def test_run_pipeline_voice_only_skips_preflight(project, monkeypatch):
-    _write_script(Paths(project.root).script, render_script())
+    _write_script(Paths(project.root).script(2), render_script())
 
     def boom(video, encoder):
         raise AssertionError("只跑 voice 不该做 ffmpeg 前置检查")

@@ -285,11 +285,16 @@ async def run_pipeline(
     only: Sequence[str] | None = None,
     force: bool = False,
     tts_engine: TTSEngine | None = None,
+    episode: int | None = None,
 ) -> list[str]:
     """返回本次运行累积的 warnings。
 
     only 传阶段名序列，只跑这些阶段（CLI 的 --only 传单元素列表，
     端到端测试会传 ["ingest", "signals"] 这样的多元素列表）。
+
+    episode 不传（None）时是批量模式：script/docgen/voice/timeline/audio/render
+    都会对 cfg.episodes 里注册的每一集分别跑一遍。传了具体集数时是单集模式：
+    只处理这一集（ingest/signals 仍然是全局阶段，一直处理所有已注册的集）。
     """
     if cfg.mode == "season":
         raise NotImplementedError("整季模式尚未实现，请使用 mode: single_episode")
@@ -303,9 +308,15 @@ async def run_pipeline(
         wanted = stages_from(from_stage)
 
     paths = Paths(cfg.root)
-    numbers = [episode.number for episode in cfg.episodes]
-    srt_inputs = [cfg.srt_path(episode) for episode in cfg.episodes]
+    numbers = [ep.number for ep in cfg.episodes]
+    srt_inputs = [cfg.srt_path(ep) for ep in cfg.episodes]
     warnings: list[str] = []
+
+    if episode is None:
+        target_numbers = numbers
+    else:
+        _find_episode(cfg, episode)  # 找不到会抛 ValueError（"没有注册"）
+        target_numbers = [episode]
 
     if "ingest" in wanted:
         outputs = [paths.dialogue(n) for n in numbers]
@@ -318,51 +329,53 @@ async def run_pipeline(
         if force or not _is_fresh(outputs, inputs):
             run_signals(cfg)
 
-    if "script" in wanted:
-        inputs = [paths.dialogue(n) for n in numbers] + [paths.signals(n) for n in numbers]
-        if force or not _is_fresh([paths.script], inputs):
-            _, stage_warnings = await run_script(cfg, provider)
-            warnings.extend(stage_warnings)
+    for number in target_numbers:
+        if "script" in wanted:
+            inputs = [paths.dialogue(number), paths.signals(number)]
+            if force or not _is_fresh([paths.script(number)], inputs):
+                _, stage_warnings = await run_script(cfg, provider, episode=number)
+                warnings.extend(stage_warnings)
 
-    if "docgen" in wanted:
-        if force or not _is_fresh([paths.table, paths.narration], [paths.script]):
-            run_docgen(cfg)
+        if "docgen" in wanted:
+            outputs = [paths.table(number), paths.narration(number)]
+            if force or not _is_fresh(outputs, [paths.script(number)]):
+                run_docgen(cfg, episode=number)
 
     # 前置检查放在 voice 之前：绝不能跑完几分钟 TTS，最后一步才发现 ffmpeg 没编 libass。
+    # 只在真的要跑 audio/render 时才做（跟原逻辑一致：单独跑 voice 不该触发 ffmpeg 检查）。
     if {"audio", "render"} & set(wanted):
-        preflight(cfg.video_path(_only_episode(cfg)), cfg.render.video_encoder)
+        first_number = target_numbers[0]
+        preflight(cfg.video_path(_find_episode(cfg, first_number)), cfg.render.video_encoder)
 
-    if "voice" in wanted:
-        outputs = [paths.voice(n) for n in numbers]
-        if force or not _is_fresh(outputs, [paths.script]):
-            _, stage_warnings = await run_voice(cfg, tts_engine)
-            warnings.extend(stage_warnings)
+    for number in target_numbers:
+        if "voice" in wanted:
+            outputs = [paths.voice(number)]
+            if force or not _is_fresh(outputs, [paths.script(number)]):
+                assert tts_engine is not None
+                _, stage_warnings = await run_voice(cfg, tts_engine, episode=number)
+                warnings.extend(stage_warnings)
 
-    if "timeline" in wanted:
-        outputs = [paths.timeline(n) for n in numbers] + [
-            paths.subtitles(n) for n in numbers
-        ]
-        inputs = [paths.script] + [paths.voice(n) for n in numbers]
-        if force or not _is_fresh(outputs, inputs):
-            _, stage_warnings = run_timeline(cfg)
-            warnings.extend(stage_warnings)
+        if "timeline" in wanted:
+            outputs = [paths.timeline(number), paths.subtitles(number)]
+            inputs = [paths.script(number), paths.voice(number)]
+            if force or not _is_fresh(outputs, inputs):
+                _, stage_warnings = run_timeline(cfg, episode=number)
+                warnings.extend(stage_warnings)
 
-    if "audio" in wanted:
-        outputs = [paths.mixed_audio(n) for n in numbers]
-        inputs = [paths.timeline(n) for n in numbers] + [
-            paths.voice(n) for n in numbers
-        ]
-        if force or not _is_fresh(outputs, inputs):
-            run_audio(cfg)
+        if "audio" in wanted:
+            outputs = [paths.mixed_audio(number)]
+            inputs = [paths.timeline(number), paths.voice(number)]
+            if force or not _is_fresh(outputs, inputs):
+                run_audio(cfg, episode=number)
 
-    if "render" in wanted:
-        outputs = [paths.video(n) for n in numbers]
-        inputs = (
-            [paths.mixed_audio(n) for n in numbers]
-            + [paths.subtitles(n) for n in numbers]
-            + [paths.timeline(n) for n in numbers]
-        )
-        if force or not _is_fresh(outputs, inputs):
-            run_render(cfg)
+        if "render" in wanted:
+            outputs = [paths.video(number)]
+            inputs = [
+                paths.mixed_audio(number),
+                paths.subtitles(number),
+                paths.timeline(number),
+            ]
+            if force or not _is_fresh(outputs, inputs):
+                run_render(cfg, episode=number)
 
     return warnings
