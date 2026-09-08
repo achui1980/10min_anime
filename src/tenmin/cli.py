@@ -10,7 +10,7 @@ import yaml
 
 from tenmin.config import Settings, load_project
 from tenmin.models import DialogueTrack, SignalReport
-from tenmin.pipeline import STAGES, Paths, run_pipeline
+from tenmin.pipeline import STAGES, Paths, _find_episode, run_pipeline
 from tenmin.render.ffmpeg import FFmpegError
 from tenmin.render.tts import build_tts_engine
 from tenmin.script.llm import build_provider
@@ -40,6 +40,11 @@ PROJECT_TEMPLATE = {
         "outro_message": "解说结束，谢谢观看",
     },
 }
+
+
+def _register_episode_placeholder(cfg, *, episode, srt, video):
+    """临时占位：真正的 register_episode 在 Task 12 实现。"""
+    raise NotImplementedError("register_episode not implemented yet — see Task 12")
 
 
 def _project_file(work_dir: Path, slug: str) -> Path:
@@ -81,9 +86,36 @@ def run(
     ),
     only: str | None = typer.Option(None, "--only", help="只跑某一个阶段"),
     force: bool = typer.Option(False, "--force", help="忽略 mtime 强制重跑"),
+    episode: int | None = typer.Option(
+        None, "--episode", help="要处理的集数；配合 --srt/--video 可注册新的一集"
+    ),
+    srt: Path | None = typer.Option(
+        None, "--srt", help="要注册的字幕文件路径，需配合 --episode 和 --video"
+    ),
+    video: Path | None = typer.Option(
+        None, "--video", help="要注册的视频文件路径，需配合 --episode 和 --srt"
+    ),
 ) -> None:
     """跑流水线：ingest -> signals -> script -> docgen -> voice -> timeline -> audio -> render。"""
     cfg = load_project(_project_file(work_dir, slug))
+
+    if (srt is None) != (video is None):
+        typer.secho("--srt 和 --video 必须一起传", fg=typer.colors.RED)
+        raise typer.Exit(code=1)
+
+    if srt is not None and episode is None:
+        typer.secho("传 --srt/--video 时必须同时传 --episode", fg=typer.colors.RED)
+        raise typer.Exit(code=1)
+
+    if srt is not None and video is not None:
+        cfg = _register_episode_placeholder(cfg, episode=episode, srt=srt, video=video)
+
+    if episode is not None:
+        try:
+            _find_episode(cfg, episode)
+        except ValueError as error:
+            typer.secho(str(error), fg=typer.colors.RED)
+            raise typer.Exit(code=1) from error
 
     stages: list[str] | None
     if only:
@@ -117,6 +149,7 @@ def run(
                 only=[only] if only else None,
                 force=force,
                 tts_engine=tts_engine,
+                episode=episode,
             )
         )
     except (NotImplementedError, FileNotFoundError, ValueError, FFmpegError) as error:

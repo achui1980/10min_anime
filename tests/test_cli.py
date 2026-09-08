@@ -241,3 +241,53 @@ def test_run_prints_mp4_path(tmp_path, monkeypatch):
     assert result.exit_code == 0
     assert "成品视频" in result.output
     assert str(mp4) in result.output
+
+
+def test_run_srt_without_video_fails(work, golden_srt_path):
+    _bootstrap(work, golden_srt_path)
+    result = runner.invoke(
+        app,
+        [
+            "run",
+            "saijo",
+            "--work-dir",
+            str(work),
+            "--episode",
+            "1",
+            "--srt",
+            str(golden_srt_path),
+        ],
+    )
+    assert result.exit_code != 0
+    assert "--srt" in out(result) and "--video" in out(result)
+
+
+def test_run_srt_video_without_episode_fails(work, golden_srt_path, tmp_path):
+    _bootstrap(work, golden_srt_path)
+    fake_video = tmp_path / "E01.mp4"
+    fake_video.write_bytes(b"fake")
+    result = runner.invoke(
+        app,
+        [
+            "run",
+            "saijo",
+            "--work-dir",
+            str(work),
+            "--srt",
+            str(golden_srt_path),
+            "--video",
+            str(fake_video),
+        ],
+    )
+    assert result.exit_code != 0
+    assert "--episode" in out(result)
+
+
+def test_run_episode_not_registered_fails(work, golden_srt_path):
+    _bootstrap(work, golden_srt_path)
+    result = runner.invoke(
+        app,
+        ["run", "saijo", "--work-dir", str(work), "--episode", "99"],
+    )
+    assert result.exit_code != 0
+    assert "没有注册" in out(result)
