@@ -147,11 +147,15 @@ def _load_reports(cfg: ProjectConfig) -> list[SignalReport]:
     return reports
 
 
-async def run_script(cfg: ProjectConfig, provider: LLMProvider) -> tuple[Script, list[str]]:
+async def run_script(
+    cfg: ProjectConfig, provider: LLMProvider, episode: int
+) -> tuple[Script, list[str]]:
     tracks = _load_tracks(cfg)
     reports = _load_reports(cfg)
-    script, warnings = await generate_script(cfg, tracks[0], reports[0], provider)
-    _write_json(Paths(cfg.root).script, script.model_dump_json(indent=2))
+    track = next(t for t in tracks if t.episode == episode)
+    report = next(r for r in reports if r.episode == episode)
+    script, warnings = await generate_script(cfg, track, report, provider)
+    _write_json(Paths(cfg.root).script(episode), script.model_dump_json(indent=2))
     return script, warnings
 
 
