@@ -127,13 +127,16 @@ def run(
         typer.secho(f"[warn] {warning}", fg="yellow")
 
     paths = Paths(cfg.root)
-    if paths.table.exists():
-        typer.echo(f"对照表：{paths.table}")
-        typer.echo(f"配音文本：{paths.narration}")
-    for episode in cfg.episodes:
-        mp4 = paths.video(episode.number)
-        if mp4.exists():
-            typer.echo(f"成品视频：{mp4}")
+    for episode_cfg in cfg.episodes:
+        table_path = paths.table(episode_cfg.number)
+        narration_path = paths.narration(episode_cfg.number)
+        if table_path.exists():
+            typer.echo(f"对照表：{table_path}")
+        if narration_path.exists():
+            typer.echo(f"配音文本：{narration_path}")
+        video_path = paths.video(episode_cfg.number)
+        if video_path.exists():
+            typer.echo(f"成品视频：{video_path}")
 
 
 @app.command()

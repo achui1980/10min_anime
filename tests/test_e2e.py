@@ -141,9 +141,9 @@ async def run_offline(root: Path) -> tuple[list[str], FakeProvider]:
 async def test_offline_pipeline_produces_both_artifacts(project: Path):
     await run_offline(project)
     paths = Paths(project)
-    assert paths.table.exists()
-    assert paths.narration.exists()
-    assert paths.script.exists()
+    assert paths.table(1).exists()
+    assert paths.narration(1).exists()
+    assert paths.script(1).exists()
     assert paths.dialogue(1).exists()
     assert paths.signals(1).exists()
 
@@ -155,7 +155,7 @@ async def test_offline_pipeline_calls_llm_exactly_once(project: Path):
 
 async def test_table_has_five_columns_and_three_beats(project: Path):
     await run_offline(project)
-    text = Paths(project).table.read_text(encoding="utf-8")
+    text = Paths(project).table(1).read_text(encoding="utf-8")
     assert "| 节点 | 原片截取时间戳 | 建议画面特征 | 分段解说文案 | 剪辑与原声处理 |" in text
     body = [ln for ln in text.splitlines() if ln.startswith("| ") and "---" not in ln]
     assert len(body) == 4, body  # 表头 + 3 个节点
@@ -163,14 +163,14 @@ async def test_table_has_five_columns_and_three_beats(project: Path):
 
 async def test_table_marks_silent_highlights(project: Path):
     await run_offline(project)
-    text = Paths(project).table.read_text(encoding="utf-8")
+    text = Paths(project).table(1).read_text(encoding="utf-8")
     assert "★" in text
     assert "★ = 该片段命中无字幕演出高光区间，纯字幕方案取不到" in text
 
 
 async def test_table_records_holds_and_audio_direction(project: Path):
     await run_offline(project)
-    text = Paths(project).table.read_text(encoding="utf-8")
+    text = Paths(project).table(1).read_text(encoding="utf-8")
     assert "原声压低垫底" in text
     assert "留白 3.0s：「两个叛徒」" in text
     assert "音效 impact @1.0s" in text
@@ -178,7 +178,7 @@ async def test_table_records_holds_and_audio_direction(project: Path):
 
 async def test_narration_is_plain_text(project: Path):
     await run_offline(project)
-    text = Paths(project).narration.read_text(encoding="utf-8")
+    text = Paths(project).narration(1).read_text(encoding="utf-8")
     for marker in ("★", "|", "#", "<br>", "节点", "留白", "音效"):
         assert marker not in text, marker
     assert text.count("\n\n") == 2
@@ -187,7 +187,7 @@ async def test_narration_is_plain_text(project: Path):
 async def test_script_json_is_reloadable(project: Path):
     """script.json 是唯一人工编辑面，必须能原样读回。"""
     await run_offline(project)
-    script = Script.model_validate_json(Paths(project).script.read_text(encoding="utf-8"))
+    script = Script.model_validate_json(Paths(project).script(1).read_text(encoding="utf-8"))
     assert len(script.beats) == 3
     assert script.est_total_seconds > 0
     assert all(beat.clips for beat in script.beats)
@@ -206,20 +206,20 @@ async def test_editing_script_json_changes_output(project: Path):
     """人工编辑 script.json 后重跑 docgen，产物随之变化。"""
     await run_offline(project)
     paths = Paths(project)
-    script = Script.model_validate_json(paths.script.read_text(encoding="utf-8"))
+    script = Script.model_validate_json(paths.script(1).read_text(encoding="utf-8"))
     script.beats[0].narration = "人工改写过的开场"
-    paths.script.write_text(script.model_dump_json(indent=2), encoding="utf-8")
+    paths.script(1).write_text(script.model_dump_json(indent=2), encoding="utf-8")
 
     cfg = load_project(project / "project.yaml")
     await run_pipeline(cfg, FakeProvider([]), only=["docgen"], force=True)
-    assert "人工改写过的开场" in paths.narration.read_text(encoding="utf-8")
+    assert "人工改写过的开场" in paths.narration(1).read_text(encoding="utf-8")
 
 
 async def test_ocr_garbage_never_reaches_output(project: Path):
     """回归护栏：第 41 行的车牌 OCR 噪声不得出现在任何交付物里。"""
     await run_offline(project)
     paths = Paths(project)
-    for path in (paths.table, paths.narration):
+    for path in (paths.table(1), paths.narration(1)):
         text = path.read_text(encoding="utf-8")
         assert OCR_GARBAGE not in text, path
         assert OCR_GARBAGE_CITY not in text, path
@@ -228,7 +228,7 @@ async def test_ocr_garbage_never_reaches_output(project: Path):
 async def test_credits_never_reach_output(project: Path):
     """OP/ED staff 名单不得进旁白。"""
     await run_offline(project)
-    text = Paths(project).narration.read_text(encoding="utf-8")
+    text = Paths(project).narration(1).read_text(encoding="utf-8")
     for name in ("J.C.STAFF", "制作委员会", "Synergy"):
         assert name not in text, name
 
@@ -236,7 +236,7 @@ async def test_credits_never_reach_output(project: Path):
 async def test_estimated_duration_within_tolerance(project: Path):
     """build_llm_payload 的字数是照 4.5 字/秒凑到 240s 的，必须落在 ±12% 内。"""
     await run_offline(project)
-    script = Script.model_validate_json(Paths(project).script.read_text(encoding="utf-8"))
+    script = Script.model_validate_json(Paths(project).script(1).read_text(encoding="utf-8"))
     deviation = abs(script.est_total_seconds - script.target_seconds) / script.target_seconds
     assert deviation <= 0.12, script.est_total_seconds
     assert script.est_total_seconds == pytest.approx(239.94, abs=0.1)
@@ -285,9 +285,9 @@ async def test_real_llm_snapshot(project: Path):
     await run_pipeline(cfg, provider, only=V1_STAGES)
 
     paths = Paths(project)
-    table = paths.table.read_text(encoding="utf-8")
-    narration = paths.narration.read_text(encoding="utf-8")
-    script = Script.model_validate_json(paths.script.read_text(encoding="utf-8"))
+    table = paths.table(1).read_text(encoding="utf-8")
+    narration = paths.narration(1).read_text(encoding="utf-8")
+    script = Script.model_validate_json(paths.script(1).read_text(encoding="utf-8"))
 
     SNAPSHOT_DIR.mkdir(exist_ok=True)
     (SNAPSHOT_DIR / "saijo_e02.解说方案.md").write_text(table, encoding="utf-8")
