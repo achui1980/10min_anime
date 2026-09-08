@@ -217,13 +217,10 @@ def register_episode(
 
     yaml_path = cfg.root / "project.yaml"
     data = yaml.safe_load(yaml_path.read_text(encoding="utf-8"))
+    # 用每个 EpisodeConfig 自己的 model_dump 序列化，而不是手挑 number/srt/video，
+    # 这样 op_range/ed_range 等字段（现有的和未来新增的）都不会在改写 yaml 时被静默丢掉。
     data["episodes"] = [
-        {
-            "number": e.number,
-            "srt": str(e.srt),
-            **({"video": str(e.video)} if e.video else {}),
-        }
-        for e in cfg.episodes
+        e.model_dump(exclude_none=True, mode="json") for e in cfg.episodes
     ]
     yaml_path.write_text(
         yaml.safe_dump(data, allow_unicode=True, sort_keys=False), encoding="utf-8"

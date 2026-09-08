@@ -611,3 +611,35 @@ def test_register_episode_updates_existing_entry_in_place(tmp_path, golden_srt_p
 
     assert len(updated_cfg.episodes) == 1
     assert (root / "video" / "E02.mp4").read_bytes() == b"replacement video bytes"
+
+
+def test_register_episode_preserves_other_episodes_op_range(tmp_path, golden_srt_path):
+    """register_episode() 注册一个不相关的新集时，不能把其它已注册集的
+    op_range/ed_range 从 project.yaml 里静默抹掉（Task 12 code review 发现的 bug）。
+    """
+    root = tmp_path / "saijo"
+    (root / "srt").mkdir(parents=True)
+    (root / "video").mkdir(parents=True)
+    yaml_path = root / "project.yaml"
+    yaml_path.write_text(
+        "show: 才女的侍从\nslug: saijo\nmode: single_episode\n"
+        "target_seconds: 240\nepisodes:\n- number: 2\n  srt: srt/E02.srt\n"
+        "  video: video/E02.mp4\n"
+        "  op_range: [153.486, 224.681]\n"
+        "  ed_range: [1300.0, 1350.5]\n",
+        encoding="utf-8",
+    )
+    cfg = load_project(yaml_path)
+
+    source_srt = tmp_path / "incoming_E01.srt"
+    source_srt.write_text(golden_srt_path.read_text(encoding="utf-8"), encoding="utf-8")
+    source_video = tmp_path / "incoming_E01.mp4"
+    source_video.write_bytes(b"fake video bytes")
+
+    register_episode(cfg, episode=1, srt=source_srt, video=source_video)
+
+    # reload from disk: episode 2's op_range/ed_range must survive the rewrite
+    reloaded = load_project(yaml_path)
+    episode_2 = next(e for e in reloaded.episodes if e.number == 2)
+    assert episode_2.op_range == (153.486, 224.681)
+    assert episode_2.ed_range == (1300.0, 1350.5)
