@@ -236,10 +236,9 @@ def run_timeline(
     return timeline, warnings
 
 
-def run_audio(cfg: ProjectConfig) -> Path:
+def run_audio(cfg: ProjectConfig, episode: int) -> Path:
     paths = Paths(cfg.root)
-    episode_cfg = _only_episode(cfg)
-    episode = episode_cfg.number
+    episode_cfg = _find_episode(cfg, episode)
     timeline = _load_timeline(cfg, episode)
     track = _load_voice(cfg, episode)
     return mix_audio(
