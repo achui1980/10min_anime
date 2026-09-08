@@ -155,14 +155,19 @@ def run(
         typer.secho(f"[warn] {warning}", fg="yellow")
 
     paths = Paths(cfg.root)
-    for episode_cfg in cfg.episodes:
-        table_path = paths.table(episode_cfg.number)
-        narration_path = paths.narration(episode_cfg.number)
+    if episode is not None:
+        printed_numbers = [episode]
+    else:
+        printed_numbers = [e.number for e in cfg.episodes]
+
+    for number in printed_numbers:
+        table_path = paths.table(number)
+        narration_path = paths.narration(number)
         if table_path.exists():
             typer.echo(f"对照表：{table_path}")
         if narration_path.exists():
             typer.echo(f"配音文本：{narration_path}")
-        video_path = paths.video(episode_cfg.number)
+        video_path = paths.video(number)
         if video_path.exists():
             typer.echo(f"成品视频：{video_path}")
 
