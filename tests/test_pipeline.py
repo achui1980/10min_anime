@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from tenmin.config import EpisodeConfig, ProjectConfig
+from tenmin.config import EpisodeConfig, ProjectConfig, load_project
 from tenmin.models import (
     AudioDirection,
     Beat,
@@ -19,6 +19,7 @@ from tenmin.pipeline import (
     STAGES,
     Paths,
     _find_episode,
+    register_episode,
     run_audio,
     run_docgen,
     run_ingest,
@@ -548,3 +549,65 @@ def test_find_episode_returns_matching_config(project):
 def test_find_episode_raises_when_not_registered(project):
     with pytest.raises(ValueError, match="没有注册"):
         _find_episode(project, 99)
+
+
+def test_register_episode_copies_files_and_appends_yaml_entry(tmp_path, golden_srt_path):
+    root = tmp_path / "saijo"
+    (root / "srt").mkdir(parents=True)
+    (root / "video").mkdir(parents=True)
+    yaml_path = root / "project.yaml"
+    yaml_path.write_text(
+        "show: 才女的侍从\nslug: saijo\nmode: single_episode\n"
+        "target_seconds: 240\nepisodes:\n- number: 2\n  srt: srt/E02.srt\n"
+        "  video: video/E02.mp4\n",
+        encoding="utf-8",
+    )
+    cfg = load_project(yaml_path)
+
+    source_srt = tmp_path / "incoming_E01.srt"
+    source_srt.write_text(golden_srt_path.read_text(encoding="utf-8"), encoding="utf-8")
+    source_video = tmp_path / "incoming_E01.mp4"
+    source_video.write_bytes(b"fake video bytes")
+
+    updated_cfg = register_episode(
+        cfg, episode=1, srt=source_srt, video=source_video
+    )
+
+    assert (root / "srt" / "E01.srt").exists()
+    assert (root / "video" / "E01.mp4").exists()
+    assert len(updated_cfg.episodes) == 2
+    new_entry = next(e for e in updated_cfg.episodes if e.number == 1)
+    assert new_entry.srt == Path("srt/E01.srt")
+    assert new_entry.video == Path("video/E01.mp4")
+
+    # reload from disk to confirm the yaml file itself was updated
+    reloaded = load_project(yaml_path)
+    assert len(reloaded.episodes) == 2
+    assert any(e.number == 1 for e in reloaded.episodes)
+    assert any(e.number == 2 for e in reloaded.episodes)
+
+
+def test_register_episode_updates_existing_entry_in_place(tmp_path, golden_srt_path):
+    root = tmp_path / "saijo"
+    (root / "srt").mkdir(parents=True)
+    (root / "video").mkdir(parents=True)
+    yaml_path = root / "project.yaml"
+    yaml_path.write_text(
+        "show: 才女的侍从\nslug: saijo\nmode: single_episode\n"
+        "target_seconds: 240\nepisodes:\n- number: 2\n  srt: srt/E02.srt\n"
+        "  video: video/E02.mp4\n",
+        encoding="utf-8",
+    )
+    cfg = load_project(yaml_path)
+
+    source_srt = tmp_path / "replacement_E02.srt"
+    source_srt.write_text(golden_srt_path.read_text(encoding="utf-8"), encoding="utf-8")
+    source_video = tmp_path / "replacement_E02.mp4"
+    source_video.write_bytes(b"replacement video bytes")
+
+    updated_cfg = register_episode(
+        cfg, episode=2, srt=source_srt, video=source_video
+    )
+
+    assert len(updated_cfg.episodes) == 1
+    assert (root / "video" / "E02.mp4").read_bytes() == b"replacement video bytes"

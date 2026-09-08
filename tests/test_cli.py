@@ -291,3 +291,34 @@ def test_run_episode_not_registered_fails(work, golden_srt_path):
     )
     assert result.exit_code != 0
     assert "没有注册" in out(result)
+
+
+def test_run_registers_new_episode_and_updates_yaml(work, golden_srt_path, tmp_path):
+    _bootstrap(work, golden_srt_path)
+    fake_video = tmp_path / "E01_source.mp4"
+    fake_video.write_bytes(b"fake video bytes")
+
+    result = runner.invoke(
+        app,
+        [
+            "run",
+            "saijo",
+            "--work-dir",
+            str(work),
+            "--episode",
+            "1",
+            "--srt",
+            str(golden_srt_path),
+            "--video",
+            str(fake_video),
+            "--only",
+            "ingest",
+        ],
+    )
+
+    assert result.exit_code == 0, out(result)
+    assert (work / "saijo" / "srt" / "E01.srt").exists()
+    assert (work / "saijo" / "video" / "E01.mp4").exists()
+
+    reloaded_yaml = (work / "saijo" / "project.yaml").read_text(encoding="utf-8")
+    assert "number: 1" in reloaded_yaml

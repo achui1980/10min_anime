@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import shutil
 from collections.abc import Sequence
 from pathlib import Path
+
+import yaml
 
 from tenmin.config import EpisodeConfig, ProjectConfig
 from tenmin.docgen.narration import render_narration
@@ -183,6 +186,50 @@ def _find_episode(cfg: ProjectConfig, episode_number: int) -> EpisodeConfig:
         f"请先用 `tenmin run <slug> --episode {episode_number} "
         "--srt <srt路径> --video <视频路径>` 注册这一集。"
     )
+
+
+def register_episode(
+    cfg: ProjectConfig, *, episode: int, srt: Path, video: Path
+) -> ProjectConfig:
+    """把外部传入的 srt/video 拷进项目目录，并把这一集写进 project.yaml。
+
+    如果这一集已经注册过，就覆盖 srt/video 路径（保留其它字段）；
+    否则追加一条新的 episode 记录。返回更新后的 ProjectConfig（root 已绑定）。
+    """
+    srt_dest = cfg.root / "srt" / f"E{episode:02d}.srt"
+    video_dest = cfg.root / "video" / f"E{episode:02d}.mp4"
+    srt_dest.parent.mkdir(parents=True, exist_ok=True)
+    video_dest.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(srt, srt_dest)
+    shutil.copyfile(video, video_dest)
+
+    relative_srt = srt_dest.relative_to(cfg.root)
+    relative_video = video_dest.relative_to(cfg.root)
+
+    existing = next((e for e in cfg.episodes if e.number == episode), None)
+    if existing is not None:
+        existing.srt = relative_srt
+        existing.video = relative_video
+    else:
+        cfg.episodes.append(
+            EpisodeConfig(number=episode, srt=relative_srt, video=relative_video)
+        )
+
+    yaml_path = cfg.root / "project.yaml"
+    data = yaml.safe_load(yaml_path.read_text(encoding="utf-8"))
+    data["episodes"] = [
+        {
+            "number": e.number,
+            "srt": str(e.srt),
+            **({"video": str(e.video)} if e.video else {}),
+        }
+        for e in cfg.episodes
+    ]
+    yaml_path.write_text(
+        yaml.safe_dump(data, allow_unicode=True, sort_keys=False), encoding="utf-8"
+    )
+
+    return cfg
 
 
 def _load_script(cfg: ProjectConfig, episode: int) -> Script:

@@ -10,7 +10,7 @@ import yaml
 
 from tenmin.config import Settings, load_project
 from tenmin.models import DialogueTrack, SignalReport
-from tenmin.pipeline import STAGES, Paths, _find_episode, run_pipeline
+from tenmin.pipeline import STAGES, Paths, _find_episode, register_episode, run_pipeline
 from tenmin.render.ffmpeg import FFmpegError
 from tenmin.render.tts import build_tts_engine
 from tenmin.script.llm import build_provider
@@ -40,11 +40,6 @@ PROJECT_TEMPLATE = {
         "outro_message": "解说结束，谢谢观看",
     },
 }
-
-
-def _register_episode_placeholder(cfg, *, episode, srt, video):
-    """临时占位：真正的 register_episode 在 Task 12 实现。"""
-    raise NotImplementedError("register_episode not implemented yet — see Task 12")
 
 
 def _project_file(work_dir: Path, slug: str) -> Path:
@@ -108,7 +103,7 @@ def run(
         raise typer.Exit(code=1)
 
     if srt is not None and video is not None:
-        cfg = _register_episode_placeholder(cfg, episode=episode, srt=srt, video=video)
+        cfg = register_episode(cfg, episode=episode, srt=srt, video=video)
 
     if episode is not None:
         try:
