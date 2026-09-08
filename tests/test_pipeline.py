@@ -510,6 +510,47 @@ async def test_run_pipeline_from_voice_runs_render_stages(project, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_run_pipeline_batch_mode_runs_full_pipeline_for_all_episodes(
+    project, golden_srt_path, monkeypatch
+):
+    """批量模式（不传 episode，也不限制 only/from_stage）是这个 feature 的核心承诺：
+    对每一集都要跑完整 8 个阶段，一直到渲出成片，不能只覆盖到 docgen。"""
+    second_srt = project.root / "srt" / "E01.srt"
+    second_srt.write_text(golden_srt_path.read_text(encoding="utf-8"), encoding="utf-8")
+    project.episodes.append(EpisodeConfig(number=1, srt=Path("srt/E01.srt")))
+
+    for episode_cfg in project.episodes:
+        video_name = f"E{episode_cfg.number:02d}.mkv"
+        (project.root / video_name).write_bytes(b"")
+        episode_cfg.video = Path(video_name)
+
+    monkeypatch.setattr("tenmin.pipeline.probe_duration", lambda path: 1400.0)
+    monkeypatch.setattr("tenmin.pipeline.preflight", lambda video, encoder: 1400.0)
+    monkeypatch.setattr("tenmin.render.audio.run", _touch_output)
+    monkeypatch.setattr("tenmin.render.video.run", _touch_output)
+
+    # 处理顺序跟 cfg.episodes 一致：project 先注册了第 2 集，再 append 第 1 集。
+    provider = FakeProvider([fake_script_response(episode=2), fake_script_response(episode=1)])
+    tts_engine = FakeTTSEngine([8.0] * 20)
+
+    warnings = await run_pipeline(project, provider, tts_engine=tts_engine)
+
+    assert warnings == []
+    paths = Paths(project.root)
+    for number in (1, 2):
+        assert paths.dialogue(number).exists()
+        assert paths.signals(number).exists()
+        assert paths.script(number).exists()
+        assert paths.table(number).exists()
+        assert paths.narration(number).exists()
+        assert paths.voice(number).exists()
+        assert paths.timeline(number).exists()
+        assert paths.subtitles(number).exists()
+        assert paths.mixed_audio(number).exists()
+        assert paths.video(number).exists()
+
+
+@pytest.mark.asyncio
 async def test_run_pipeline_skips_voice_when_fresh(project):
     _write_script(Paths(project.root).script(2), render_script())
     engine = FakeTTSEngine([8.0, 10.0, 10.0])

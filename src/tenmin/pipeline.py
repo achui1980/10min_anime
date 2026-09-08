@@ -387,9 +387,12 @@ async def run_pipeline(
 
     # 前置检查放在 voice 之前：绝不能跑完几分钟 TTS，最后一步才发现 ffmpeg 没编 libass。
     # 只在真的要跑 audio/render 时才做（跟原逻辑一致：单独跑 voice 不该触发 ffmpeg 检查）。
+    # 批量模式下要给每一集都做前置检查，不能只查第一集——否则第二集视频缺失/坏掉
+    # 要等它自己的 voice 阶段（几分钟 TTS）跑完才会在 audio/render 阶段炸出来，
+    # 失去 preflight 本来该有的「快速失败」意义。
     if {"audio", "render"} & set(wanted):
-        first_number = target_numbers[0]
-        preflight(cfg.video_path(_find_episode(cfg, first_number)), cfg.render.video_encoder)
+        for number in target_numbers:
+            preflight(cfg.video_path(_find_episode(cfg, number)), cfg.render.video_encoder)
 
     for number in target_numbers:
         if "voice" in wanted:
