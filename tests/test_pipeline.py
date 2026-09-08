@@ -109,16 +109,13 @@ def test_stages_from_unknown_raises():
 
 
 def test_paths_layout(tmp_path):
-    paths = Paths(tmp_path / "saijo")
-    assert paths.dialogue(2).name == "E02.dialogue.json"
-    assert paths.dialogue(2).parent.name == "01_dialogue"
-    assert paths.signals(2).name == "E02.signals.json"
-    assert paths.signals(2).parent.name == "02_signals"
-    assert paths.script.name == "script.json"
-    assert paths.script.parent.name == "03_script"
-    assert paths.table.name == "解说方案.md"
-    assert paths.narration.name == "narration.txt"
-    assert paths.table.parent.name == "out"
+    paths = Paths(tmp_path)
+    assert paths.script(2).name == "E02.script.json"
+    assert paths.script(2).parent.name == "03_script"
+    assert paths.table(2).name == "E02.解说方案.md"
+    assert paths.table(2).parent.name == "out"
+    assert paths.narration(2).name == "E02.narration.txt"
+    assert paths.narration(2).parent.name == "out"
 
 
 def test_paths_pads_episode_number(tmp_path):

@@ -42,17 +42,14 @@ class Paths:
     def signals(self, episode: int) -> Path:
         return self.root / "02_signals" / f"E{episode:02d}.signals.json"
 
-    @property
-    def script(self) -> Path:
-        return self.root / "03_script" / "script.json"
+    def script(self, episode: int) -> Path:
+        return self.root / "03_script" / f"E{episode:02d}.script.json"
 
-    @property
-    def table(self) -> Path:
-        return self.root / "out" / "解说方案.md"
+    def table(self, episode: int) -> Path:
+        return self.root / "out" / f"E{episode:02d}.解说方案.md"
 
-    @property
-    def narration(self) -> Path:
-        return self.root / "out" / "narration.txt"
+    def narration(self, episode: int) -> Path:
+        return self.root / "out" / f"E{episode:02d}.narration.txt"
 
     def voice_dir(self, episode: int) -> Path:
         return self.root / "04_voice" / f"E{episode:02d}"
