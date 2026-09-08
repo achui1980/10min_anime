@@ -185,11 +185,11 @@ def _find_episode(cfg: ProjectConfig, episode_number: int) -> EpisodeConfig:
     )
 
 
-def _load_script(cfg: ProjectConfig) -> Script:
-    path = Paths(cfg.root).script
+def _load_script(cfg: ProjectConfig, episode: int) -> Script:
+    path = Paths(cfg.root).script(episode)
     if not path.exists():
-        raise FileNotFoundError(f"缺少剧本产物 {path}，请先跑 script 阶段")
-    return Script.model_validate_json(path.read_text(encoding="utf-8"))
+        raise FileNotFoundError(f"缺少剧本 {path}，请先跑 script 阶段")
+    return Script.model_validate_json(path.read_text())
 
 
 def _load_voice(cfg: ProjectConfig, episode: int) -> VoiceTrack:
@@ -207,15 +207,10 @@ def _load_timeline(cfg: ProjectConfig, episode: int) -> Timeline:
 
 
 async def run_voice(
-    cfg: ProjectConfig, engine: TTSEngine | None
+    cfg: ProjectConfig, engine: TTSEngine, episode: int
 ) -> tuple[VoiceTrack, list[str]]:
-    if engine is None:
-        raise ValueError(
-            "voice 阶段需要 TTS engine，请检查 project.yaml 的 render.voice 配置"
-        )
     paths = Paths(cfg.root)
-    episode = _only_episode(cfg).number
-    script = _load_script(cfg)
+    script = _load_script(cfg, episode)
     track, warnings = await synthesize_track(
         script, episode, paths.voice_dir(episode), engine
     )
