@@ -18,6 +18,7 @@ from tenmin.models import (
 from tenmin.pipeline import (
     STAGES,
     Paths,
+    _find_episode,
     run_audio,
     run_docgen,
     run_ingest,
@@ -512,3 +513,13 @@ async def test_run_pipeline_voice_only_skips_preflight(project, monkeypatch):
     )
 
     assert Paths(project.root).voice(2).exists()
+
+
+def test_find_episode_returns_matching_config(project):
+    episode_cfg = _find_episode(project, 2)
+    assert episode_cfg.number == 2
+
+
+def test_find_episode_raises_when_not_registered(project):
+    with pytest.raises(ValueError, match="没有注册"):
+        _find_episode(project, 99)

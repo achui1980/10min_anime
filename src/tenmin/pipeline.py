@@ -165,11 +165,19 @@ def run_docgen(cfg: ProjectConfig) -> Script:
     return script
 
 
-def _only_episode(cfg: ProjectConfig) -> EpisodeConfig:
-    """v2 只做单集。season 模式在 run_pipeline 入口就被拦掉了。"""
-    if not cfg.episodes:
-        raise ValueError("project.yaml 的 episodes 是空的，至少要配一集")
-    return cfg.episodes[0]
+def _find_episode(cfg: ProjectConfig, episode_number: int) -> EpisodeConfig:
+    """按集数查找已注册的 episode 配置。
+
+    找不到时报错并提示用户先用 --srt/--video/--episode 注册。
+    """
+    for episode in cfg.episodes:
+        if episode.number == episode_number:
+            return episode
+    raise ValueError(
+        f"第 {episode_number} 集还没有注册。"
+        f"请先用 `tenmin run <slug> --episode {episode_number} "
+        "--srt <srt路径> --video <视频路径>` 注册这一集。"
+    )
 
 
 def _load_script(cfg: ProjectConfig) -> Script:
