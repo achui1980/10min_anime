@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 import subprocess
+from collections.abc import Callable
 from functools import lru_cache
 from pathlib import Path
 
@@ -130,3 +131,50 @@ def preflight(video: Path, video_encoder: str) -> float:
     if not Path(video).is_file():
         raise FileNotFoundError(f"找不到源视频 {video}，请检查 project.yaml 的 episodes[].video")
     return probe_duration(Path(video))
+
+
+def run_with_progress(
+    args: list[str],
+    *,
+    total_seconds: float,
+    on_progress: Callable[[float], None] | None = None,
+) -> str:
+    """跟 run() 一样跑 ffmpeg，但额外加 -progress pipe:1，流式解析进度，
+    每读到一条 out_time_ms 就换算成 0.0~1.0 的比例回调 on_progress。
+
+    坑：ffmpeg 的 out_time_ms 字段名字带 "ms"，但实际单位是微秒（众所周知的
+    ffmpeg 老 bug/历史遗留），所以换算要除以 1_000_000 而不是 1_000。
+    """
+    process = subprocess.Popen(
+        [FFMPEG, *args, "-progress", "pipe:1"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        errors="replace",
+    )
+    for line in process.stdout:
+        line = line.strip()
+        if "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        if key == "out_time_ms":
+            try:
+                microseconds = int(value)
+            except ValueError:
+                continue
+            if on_progress is not None and total_seconds > 0:
+                fraction = microseconds / 1_000_000 / total_seconds
+                on_progress(max(0.0, min(1.0, fraction)))
+        elif key == "progress" and value == "end":
+            if on_progress is not None:
+                on_progress(1.0)
+
+    stderr = process.stderr.read()
+    returncode = process.wait()
+    if returncode != 0:
+        command = " ".join([FFMPEG, *args])
+        raise FFmpegError(
+            f"ffmpeg 执行失败（退出码 {returncode}）：{command}\n"
+            f"stderr 末尾 {STDERR_TAIL_LINES} 行：\n{tail(stderr)}"
+        )
+    return stderr
