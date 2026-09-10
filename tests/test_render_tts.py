@@ -11,7 +11,7 @@ from tenmin.render.tts import (
     synthesize_with_retry,
 )
 
-from .fakes import FakeTTSEngine, FlakyTTSEngine
+from .fakes import FakeReporter, FakeTTSEngine, FlakyTTSEngine
 
 
 def sample_script() -> Script:
@@ -123,3 +123,15 @@ async def test_synthesize_track_warns_on_empty_narration(tmp_path):
     assert track.chunks == []
     assert len(warnings) == 1
     assert "b1" in warnings[0]
+
+
+@pytest.mark.asyncio
+async def test_synthesize_track_reports_substep_progress(tmp_path):
+    engine = FakeTTSEngine([3.0, 4.0, 5.0])
+    reporter = FakeReporter()
+    await synthesize_track(sample_script(), 2, tmp_path, engine, reporter=reporter)
+    assert reporter.calls == [
+        ("substep", "voice", 1, 3, "第一句。"),
+        ("substep", "voice", 2, 3, "第二句。"),
+        ("substep", "voice", 3, 3, "第三句。"),
+    ]

@@ -6,7 +6,8 @@ from pathlib import Path
 from typing import Protocol, runtime_checkable
 
 from tenmin.config import RenderConfig
-from tenmin.models import Script, VoiceChunk, VoiceTrack
+from tenmin.models import Beat, Script, VoiceChunk, VoiceTrack
+from tenmin.progress import NullProgressReporter, ProgressReporter
 from tenmin.render.chunks import plan_chunks
 from tenmin.render.ffmpeg import probe_duration
 
@@ -60,20 +61,29 @@ async def synthesize_track(
     engine: TTSEngine,
     *,
     reuse: bool = True,
+    reporter: ProgressReporter | None = None,
 ) -> tuple[VoiceTrack, list[str]]:
     """合成整集旁白。chunk 独立落盘，重跑只补缺的那几个。"""
+    reporter = reporter or NullProgressReporter()
     voice_dir = Path(voice_dir)
     voice_dir.mkdir(parents=True, exist_ok=True)
-    chunks: list[VoiceChunk] = []
     warnings: list[str] = []
-    serial = 0
+    planned_by_beat: list[tuple[Beat, list[tuple[str, float]]]] = []
     for beat in script.beats:
         planned = plan_chunks(beat)
         if not planned:
             warnings.append(f"beat {beat.id} 没有旁白文本，已跳过配音")
             continue
+        planned_by_beat.append((beat, planned))
+
+    total_chunks = sum(len(planned) for _, planned in planned_by_beat)
+
+    chunks: list[VoiceChunk] = []
+    serial = 0
+    for beat, planned in planned_by_beat:
         for index, (text, hold_after) in enumerate(planned, start=1):
             serial += 1
+            reporter.substep("voice", serial, total_chunks, text[:20])
             filename = f"chunk_{serial:03d}.mp3"
             out_path = voice_dir / filename
             label = f"beat {beat.id} 的第 {index} 个 chunk"

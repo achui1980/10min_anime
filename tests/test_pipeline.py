@@ -730,3 +730,14 @@ async def test_run_pipeline_batch_mode_reports_episode_start_for_each_episode(pr
     calls = reporter.calls
     assert ("episode_start", 2, 1, 2) in calls
     assert ("episode_start", 1, 2, 2) in calls
+
+
+@pytest.mark.asyncio
+async def test_run_voice_reports_substep_progress(project):
+    _write_script(Paths(project.root).script(2), render_script())
+    engine = FakeTTSEngine([8.0, 10.0, 10.0])
+    reporter = FakeReporter()
+    await run_voice(project, engine, episode=2, reporter=reporter)
+    substeps = [call for call in reporter.calls if call[0] == "substep"]
+    assert len(substeps) == 3
+    assert substeps[-1] == ("substep", "voice", 3, 3, "第三句。")

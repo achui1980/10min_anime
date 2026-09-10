@@ -252,12 +252,15 @@ def _load_timeline(cfg: ProjectConfig, episode: int) -> Timeline:
 
 
 async def run_voice(
-    cfg: ProjectConfig, engine: TTSEngine, episode: int
+    cfg: ProjectConfig,
+    engine: TTSEngine,
+    episode: int,
+    reporter: ProgressReporter | None = None,
 ) -> tuple[VoiceTrack, list[str]]:
     paths = Paths(cfg.root)
     script = _load_script(cfg, episode)
     track, warnings = await synthesize_track(
-        script, episode, paths.voice_dir(episode), engine
+        script, episode, paths.voice_dir(episode), engine, reporter=reporter
     )
     _write_json(paths.voice(episode), track.model_dump_json(indent=2))
     return track, warnings
@@ -428,7 +431,9 @@ async def run_pipeline(
             if force or not _is_fresh(outputs, [paths.script(number)]):
                 reporter.stage_start("voice")
                 assert tts_engine is not None
-                _, stage_warnings = await run_voice(cfg, tts_engine, episode=number)
+                _, stage_warnings = await run_voice(
+                    cfg, tts_engine, episode=number, reporter=reporter
+                )
                 warnings.extend(stage_warnings)
                 reporter.stage_done("voice")
             else:
