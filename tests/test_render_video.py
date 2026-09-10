@@ -185,11 +185,11 @@ def test_render_video_runs_ffmpeg_and_returns_path(tmp_path, monkeypatch):
 
     seen: list[list[str]] = []
 
-    def fake_run(args):
+    def fake_run_with_progress(args, *, total_seconds, on_progress=None):
         seen.append(list(args))
         return ""
 
-    monkeypatch.setattr(video_module, "run", fake_run)
+    monkeypatch.setattr(video_module, "run_with_progress", fake_run_with_progress)
     out_path = tmp_path / "07_render" / "E02.mp4"
     result = render_video(
         video=tmp_path / "source.mkv",
@@ -202,3 +202,31 @@ def test_render_video_runs_ffmpeg_and_returns_path(tmp_path, monkeypatch):
     assert result == out_path
     assert out_path.parent.is_dir()
     assert seen[0][-1] == str(out_path)
+
+
+def test_render_video_reports_substep_progress(tmp_path, monkeypatch):
+    from tenmin.render import video as video_module
+
+    from .fakes import FakeReporter
+
+    captured: dict[str, float] = {}
+
+    def fake_run_with_progress(args, *, total_seconds, on_progress=None):
+        captured["total_seconds"] = total_seconds
+        if on_progress is not None:
+            on_progress(0.5)
+        return ""
+
+    monkeypatch.setattr(video_module, "run_with_progress", fake_run_with_progress)
+    reporter = FakeReporter()
+    render_video(
+        video=tmp_path / "source.mkv",
+        timeline=make_timeline(),
+        audio=tmp_path / "06_audio" / "E02.mixed.m4a",
+        ass=tmp_path / "05_timeline" / "E02.ass",
+        out_path=tmp_path / "07_render" / "E02.mp4",
+        encoder="libx264",
+        reporter=reporter,
+    )
+    assert captured["total_seconds"] == pytest.approx(30.0)
+    assert reporter.calls == [("substep", "render", 50, 100, "")]

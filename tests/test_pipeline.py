@@ -288,6 +288,15 @@ def _touch_output(args: list[str]) -> str:
     return ""
 
 
+def _touch_output_with_progress(
+    args: list[str], *, total_seconds: float, on_progress=None
+) -> str:
+    """假的 ffmpeg（run_with_progress 版）：不跑编码，只把输出文件创建出来。"""
+    if on_progress is not None:
+        on_progress(1.0)
+    return _touch_output(args)
+
+
 def render_script() -> Script:
     """两个 beat、两个 clip 的最小剧本，配 FakeTTSEngine([8.0, 10.0, 10.0]) 用。"""
     return Script(
@@ -460,11 +469,11 @@ def test_run_render_invokes_ffmpeg(project, monkeypatch):
     paths.mixed_audio(2).write_bytes(b"")
     captured: list[list[str]] = []
 
-    def fake_run(args):
+    def fake_run_with_progress(args, *, total_seconds, on_progress=None):
         captured.append(list(args))
         return _touch_output(args)
 
-    monkeypatch.setattr("tenmin.render.video.run", fake_run)
+    monkeypatch.setattr("tenmin.render.video.run_with_progress", fake_run_with_progress)
 
     out = run_render(project, episode=2)
 
@@ -492,7 +501,7 @@ async def test_run_pipeline_from_voice_runs_render_stages(project, monkeypatch):
     monkeypatch.setattr("tenmin.pipeline.probe_duration", lambda path: 1400.0)
     monkeypatch.setattr("tenmin.pipeline.preflight", lambda video, encoder: 1400.0)
     monkeypatch.setattr("tenmin.render.audio.run", _touch_output)
-    monkeypatch.setattr("tenmin.render.video.run", _touch_output)
+    monkeypatch.setattr("tenmin.render.video.run_with_progress", _touch_output_with_progress)
 
     warnings = await run_pipeline(
         project,
@@ -527,7 +536,7 @@ async def test_run_pipeline_batch_mode_runs_full_pipeline_for_all_episodes(
     monkeypatch.setattr("tenmin.pipeline.probe_duration", lambda path: 1400.0)
     monkeypatch.setattr("tenmin.pipeline.preflight", lambda video, encoder: 1400.0)
     monkeypatch.setattr("tenmin.render.audio.run", _touch_output)
-    monkeypatch.setattr("tenmin.render.video.run", _touch_output)
+    monkeypatch.setattr("tenmin.render.video.run_with_progress", _touch_output_with_progress)
 
     # 处理顺序跟 cfg.episodes 一致：project 先注册了第 2 集，再 append 第 1 集。
     provider = FakeProvider([fake_script_response(episode=2), fake_script_response(episode=1)])
@@ -741,3 +750,27 @@ async def test_run_voice_reports_substep_progress(project):
     substeps = [call for call in reporter.calls if call[0] == "substep"]
     assert len(substeps) == 3
     assert substeps[-1] == ("substep", "voice", 3, 3, "第三句。")
+
+
+def test_run_render_reports_substep_progress(project, monkeypatch):
+    paths = Paths(project.root)
+    _write_script(paths.script(2), render_script())
+    engine = FakeTTSEngine([8.0, 10.0, 10.0])
+    asyncio.run(run_voice(project, engine, episode=2))
+    run_timeline(project, episode=2, source_duration=1400.0)
+    _prepare_video(project)
+    paths.mixed_audio(2).parent.mkdir(parents=True, exist_ok=True)
+    paths.mixed_audio(2).write_bytes(b"")
+
+    def fake_run_with_progress(args, *, total_seconds, on_progress=None):
+        out = Path(args[-1])
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_bytes(b"")
+        if on_progress is not None:
+            on_progress(1.0)
+        return ""
+
+    monkeypatch.setattr("tenmin.render.video.run_with_progress", fake_run_with_progress)
+    reporter = FakeReporter()
+    run_render(project, episode=2, reporter=reporter)
+    assert ("substep", "render", 100, 100, "") in reporter.calls

@@ -301,7 +301,9 @@ def run_audio(cfg: ProjectConfig, episode: int) -> Path:
     )
 
 
-def run_render(cfg: ProjectConfig, episode: int) -> Path:
+def run_render(
+    cfg: ProjectConfig, episode: int, reporter: ProgressReporter | None = None
+) -> Path:
     paths = Paths(cfg.root)
     episode_cfg = _find_episode(cfg, episode)
     timeline = _load_timeline(cfg, episode)
@@ -322,6 +324,7 @@ def run_render(cfg: ProjectConfig, episode: int) -> Path:
         outro_seconds=cfg.render.outro_card_seconds,
         outro_title=f"{cfg.show} · EP{episode:02d}",
         outro_message=cfg.render.outro_message,
+        reporter=reporter,
     )
 
 
@@ -469,7 +472,7 @@ async def run_pipeline(
             ]
             if force or not _is_fresh(outputs, inputs):
                 reporter.stage_start("render")
-                run_render(cfg, episode=number)
+                run_render(cfg, episode=number, reporter=reporter)
                 reporter.stage_done("render")
             else:
                 reporter.stage_skip("render")

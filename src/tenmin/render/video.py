@@ -9,7 +9,8 @@ from __future__ import annotations
 from pathlib import Path
 
 from tenmin.models import Timeline
-from tenmin.render.ffmpeg import run
+from tenmin.progress import NullProgressReporter, ProgressReporter
+from tenmin.render.ffmpeg import run_with_progress
 
 WIDTH = 1920
 HEIGHT = 1080
@@ -131,21 +132,27 @@ def render_video(
     outro_seconds: float = 0.0,
     outro_title: str = "",
     outro_message: str = "",
+    reporter: ProgressReporter | None = None,
 ) -> Path:
     """真跑 ffmpeg 渲染，返回成品路径。"""
+    reporter = reporter or NullProgressReporter()
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    run(
-        build_render_args(
-            video=video,
-            timeline=timeline,
-            audio=audio,
-            ass=ass,
-            out_path=out_path,
-            encoder=encoder,
-            fade_out_seconds=fade_out_seconds,
-            outro_seconds=outro_seconds,
-            outro_title=outro_title,
-            outro_message=outro_message,
-        )
+    args = build_render_args(
+        video=video,
+        timeline=timeline,
+        audio=audio,
+        ass=ass,
+        out_path=out_path,
+        encoder=encoder,
+        fade_out_seconds=fade_out_seconds,
+        outro_seconds=outro_seconds,
+        outro_title=outro_title,
+        outro_message=outro_message,
     )
+    total_seconds = timeline.total_seconds + outro_seconds
+
+    def _on_progress(fraction: float) -> None:
+        reporter.substep("render", int(fraction * 100), 100, "")
+
+    run_with_progress(args, total_seconds=total_seconds, on_progress=_on_progress)
     return out_path
