@@ -31,7 +31,7 @@ from tenmin.pipeline import (
     stages_from,
 )
 
-from .fakes import FakeProvider, FakeTTSEngine
+from .fakes import FakeProvider, FakeReporter, FakeTTSEngine
 
 # STAGES 在 v2 里扩到 8 个，voice 之后的阶段需要 TTS engine 与源视频。
 # 下面这些只关心 v1 链路的用例显式限定阶段范围。
@@ -684,3 +684,49 @@ def test_register_episode_preserves_other_episodes_op_range(tmp_path, golden_srt
     episode_2 = next(e for e in reloaded.episodes if e.number == 2)
     assert episode_2.op_range == (153.486, 224.681)
     assert episode_2.ed_range == (1300.0, 1350.5)
+
+
+@pytest.mark.asyncio
+async def test_run_pipeline_reports_stage_start_and_done(project):
+    reporter = FakeReporter()
+    provider = FakeProvider([fake_script_response()])
+    await run_pipeline(project, provider, only=V1_STAGES, reporter=reporter)
+    calls = reporter.calls
+    assert ("stage_start", "ingest") in calls
+    assert ("stage_done", "ingest") in calls
+    assert ("stage_start", "signals") in calls
+    assert ("stage_done", "signals") in calls
+    assert ("episode_start", 2, 1, 1) in calls
+    assert ("stage_start", "script") in calls
+    assert ("stage_done", "script") in calls
+    assert ("stage_start", "docgen") in calls
+    assert ("stage_done", "docgen") in calls
+    # ingest 必须先于 signals，signals 必须先于 script
+    assert calls.index(("stage_done", "ingest")) < calls.index(("stage_start", "signals"))
+    assert calls.index(("stage_done", "signals")) < calls.index(("stage_start", "script"))
+
+
+@pytest.mark.asyncio
+async def test_run_pipeline_reports_stage_skip_on_second_run(project):
+    provider = FakeProvider([fake_script_response(), fake_script_response()])
+    await run_pipeline(project, provider, only=V1_STAGES)
+    reporter = FakeReporter()
+    await run_pipeline(project, provider, only=V1_STAGES, reporter=reporter)
+    calls = reporter.calls
+    assert ("stage_skip", "ingest") in calls
+    assert ("stage_skip", "signals") in calls
+    assert ("stage_skip", "script") in calls
+    assert ("stage_skip", "docgen") in calls
+    assert ("stage_start", "ingest") not in calls
+    assert ("stage_start", "script") not in calls
+
+
+@pytest.mark.asyncio
+async def test_run_pipeline_batch_mode_reports_episode_start_for_each_episode(project):
+    project.episodes.append(EpisodeConfig(number=1, srt=project.episodes[0].srt))
+    reporter = FakeReporter()
+    provider = FakeProvider([fake_script_response(episode=2), fake_script_response(episode=1)])
+    await run_pipeline(project, provider, only=V1_STAGES, reporter=reporter)
+    calls = reporter.calls
+    assert ("episode_start", 2, 1, 2) in calls
+    assert ("episode_start", 1, 2, 2) in calls
