@@ -26,6 +26,10 @@ class LLMConfig(BaseModel):
     provider: Literal["gemini", "minimax"] = "gemini"
     model: str = "gemini-3.6-flash"
     base_url: str | None = None
+    # MiniMax-M3 默认打开"深度思考"，会先吐一大段 <think>…</think> 推理块再出正文，
+    # 而这段推理内容目前直接被丢弃（见 script/llm.py 的 _strip_reasoning），纯粹是
+    # 浪费掉的耗时（实测 ~35k 字符的 prompt 光推理阶段就能占大头）。默认关掉它。
+    thinking: Literal["adaptive", "disabled"] = "disabled"
 
 
 class RenderConfig(BaseModel):

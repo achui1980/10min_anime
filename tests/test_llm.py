@@ -185,6 +185,12 @@ def test_minimax_provider_defaults():
     provider = MiniMaxProvider(api_key="fake-key")
     assert provider.model == "MiniMax-M3"
     assert provider.base_url == MINIMAX_BASE_URL
+    assert provider.thinking == "disabled"
+
+
+def test_minimax_provider_honours_thinking_override():
+    provider = MiniMaxProvider(api_key="fake-key", thinking="adaptive")
+    assert provider.thinking == "adaptive"
 
 
 def test_minimax_provider_strips_trailing_slash_from_base_url():
@@ -215,6 +221,14 @@ def test_build_provider_returns_minimax():
     assert isinstance(provider, MiniMaxProvider)
     assert provider.model == "MiniMax-M3"
     assert provider.base_url == MINIMAX_BASE_URL
+    assert provider.thinking == "disabled"
+
+
+def test_build_provider_minimax_honours_thinking_override():
+    settings = Settings(minimax_api_key="fake-key")
+    cfg = LLMConfig(provider="minimax", thinking="adaptive")
+    provider = build_provider(cfg, settings)
+    assert provider.thinking == "adaptive"
 
 
 def test_build_provider_minimax_honours_base_url_override():
@@ -309,9 +323,21 @@ async def test_minimax_complete_first_try(monkeypatch):
     body = posts[0]["json"]
     assert body["model"] == "MiniMax-M3"
     assert body["response_format"] == {"type": "json_object"}
+    assert body["thinking"] == {"type": "disabled"}
     assert body["messages"][0] == {"role": "system", "content": "SYS"}
     assert body["messages"][1]["role"] == "user"
     assert body["messages"][1]["content"].startswith("USR")
+
+
+@pytest.mark.asyncio
+async def test_minimax_complete_honours_adaptive_thinking_override(monkeypatch):
+    log = _fake_httpx(monkeypatch, ['<think>算一下</think>\n```json\n{"value": 42}\n```'])
+    provider = MiniMaxProvider(api_key="secret", model="MiniMax-M3", thinking="adaptive")
+
+    await provider.complete("SYS", "USR", Toy)
+
+    posts = [r for r in log if "url" in r]
+    assert posts[0]["json"]["thinking"] == {"type": "adaptive"}
 
 
 @pytest.mark.asyncio

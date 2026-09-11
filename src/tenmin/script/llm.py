@@ -112,10 +112,12 @@ class MiniMaxProvider:
         api_key: str,
         model: str = "MiniMax-M3",
         base_url: str = MINIMAX_BASE_URL,
+        thinking: str = "disabled",
     ) -> None:
         self.model = model
         self.base_url = base_url.rstrip("/")
         self._api_key = api_key
+        self.thinking = thinking
 
     def _schema_prompt(self, user: str, schema: type[BaseModel]) -> str:
         spec = json.dumps(schema.model_json_schema(), ensure_ascii=False, indent=2)
@@ -154,7 +156,12 @@ class MiniMaxProvider:
             {"role": "system", "content": system},
             {"role": "user", "content": content},
         ]
-        payload: dict[str, Any] = {"model": self.model, "messages": messages, "stream": True}
+        payload: dict[str, Any] = {
+            "model": self.model,
+            "messages": messages,
+            "stream": True,
+            "thinking": {"type": self.thinking},
+        }
         if schema is not None:
             payload["response_format"] = {"type": "json_object"}
 
@@ -200,5 +207,6 @@ def build_provider(cfg: LLMConfig, settings: Settings) -> LLMProvider:
             api_key=settings.minimax_api_key,
             model=cfg.model,
             base_url=cfg.base_url or MINIMAX_BASE_URL,
+            thinking=cfg.thinking,
         )
     raise ValueError(f"不支持的 LLM provider：{cfg.provider}")

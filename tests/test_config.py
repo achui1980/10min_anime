@@ -126,6 +126,22 @@ def test_llm_config_rejects_unknown_provider():
         LLMConfig(provider="openai")
 
 
+def test_llm_config_thinking_defaults_to_disabled():
+    """MiniMax-M3 默认关闭深度思考，省掉 <think> 推理块的耗时（结果本来就被丢弃）。"""
+    cfg = LLMConfig()
+    assert cfg.thinking == "disabled"
+
+
+def test_llm_config_accepts_adaptive_thinking():
+    cfg = LLMConfig(provider="minimax", thinking="adaptive")
+    assert cfg.thinking == "adaptive"
+
+
+def test_llm_config_rejects_unknown_thinking():
+    with pytest.raises(ValidationError):
+        LLMConfig(thinking="always")
+
+
 def test_load_project_with_minimax_llm(tmp_path):
     path = tmp_path / "project.yaml"
     path.write_text(
