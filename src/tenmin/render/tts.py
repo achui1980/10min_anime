@@ -115,6 +115,11 @@ def _duration_bounds(text: str, rate: str) -> tuple[float, float]:
 
     换句话说：这条体检只拦「零时长」「只出了几分之一就断流」「挂了几分钟吐出一堆静音」
     这类物理上不可能是正常语音的结果，正常创作与正常网络抖动一律放过。
+
+    已知边界：4.5 字/秒是**中文**的语速，一个 60% 以上是拉丁字母的 chunk（英文读得比
+    中文快得多）会撞下界而被判死。旁白是中文，实测 115 个 chunk 里没有一个接近这种形态，
+    所以接受这个风险 —— 而且它的失败是响亮的（报错直接印出字数、rate 与区间），不是静默
+    地用一个坏文件出片。
     """
     expected = _expected_seconds(text, rate)
     lower = max(0.0, expected * (1.0 - DURATION_TOLERANCE) - DURATION_ABSOLUTE_SLACK)

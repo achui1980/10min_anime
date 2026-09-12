@@ -57,6 +57,13 @@ cat /path/to/zscaler_ca_bundle.pem >> .venv/lib/python3.14/site-packages/certifi
   3. **异常族**：全部继承 `LLMError`（`RuntimeError` 子类，已进 `cli.py` 的 `PIPELINE_ERRORS`）。`LLMHTTPError` 把响应体摘要拼进消息，`LLMBusinessError` 管 HTTP 200 + `base_resp.status_code != 0`，`LLMSchemaError.raw_output` 带着最后一次的原始模型输出（由 `pipeline.run_script` 落到 `03_script/E{NN}.raw.txt`）。
   退避的 `_sleep` / `_rand` 是模块级函数，测试 monkeypatch 掉它们，所以**新增退避路径时不要改成直接 `asyncio.sleep`**，否则测试会真睡。
 - `src/tenmin/render/`：`subtitles.py`（ASS 字幕生成，含手动 CJK 换行，因为 libass 不会按 CJK 字符边界自动换行）、`timeline.py`（时间轴重算 + 按句拆分字幕 cue）、`audio.py`（原声 ducking + 混音 + 淡出 + 结尾静音）、`video.py`（剪辑拼接烧字幕 + 淡出 + 结尾卡片）、`ffmpeg.py`（subprocess 封装，所有调用都用 `text=True, errors="replace"`，因为老番源文件的容器元数据经常不是合法 UTF-8）。
+- `src/tenmin/render/tts.py`：TTS 层，结构上刻意跟 `script/llm.py` 对齐。改它之前先分清自己在动哪一层：
+  1. **缓存身份**：chunk 文件名是 `chunk_{序号:03d}.{hash8}.mp3`，哈希 = sha256(`engine.fingerprint` + `\x00` + text)，`fingerprint` 含 voice 与 rate。**序号只为人工试听时可读，身份全靠哈希** —— 复用先按确切名字找，找不到就在同目录里按哈希 glob（chunk 数量一变序号全平移，但内容没变的不该重合成）。改这里会让 `work/` 下的存量 chunk 全部失效。
+  2. **原子落盘 + 时长体检**（`EdgeTTSEngine.synthesize`）：`edge_tts.Communicate.save()` 是流式写，中断留截断 mp3。所以一律先落 `.part`、`probe_duration` 体检通过才 `os.replace`。体检区间见 `_duration_bounds` 的 docstring（标定自 115 个真实 chunk）。
+  3. **退避重试**（`synthesize_with_retry`）：模块级 `_sleep` / `_rand` 供测试 monkeypatch，参数与命名跟 llm.py 一套。`TypeError` / `ValueError` 判为不可重试（edge-tts 的参数校验）。**新增退避路径不要改成裸 `asyncio.sleep`**，否则测试会真睡。
+  4. **输入健壮性**（`_plan_pronounceable`）：不含任何字母/数字的 chunk（切句留下的孤立 `'`）直接跳过，它带的 hold 折进前一个 chunk。
+  5. `probe_duration` 是阻塞 subprocess，一律走 `asyncio.to_thread`（P2-B 的 TTS 并发要靠它）。
+
 - `src/tenmin/script/single.py`：单集 LLM 调用编排（`generate_script()`），拼 prompt（模板 + few-shot 示例 + schema + 对白/信号数据）。
 
 ## 测试
