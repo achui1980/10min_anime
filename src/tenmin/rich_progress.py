@@ -41,6 +41,16 @@ class RichProgressReporter:
             BarColumn(),
             TextColumn("{task.completed}/{task.total}"),
             TimeElapsedColumn(),
+            # 绝大多数阶段行是 total=None（indeterminate），这一列对它们只显示
+            # -:--:--。刻意保留原样：
+            # - rich 对 indeterminate 任务显示占位符是它的既定行为，不算错；
+            # - 真正需要「还要多久」的两种行都有确定的 total——总进度行（按集）与
+            #   voice/render 的 substep 行（按句/按 ffmpeg 百分比），对它们是准的；
+            # - 想让占位符消失就得把阶段行和总进度行拆成两个 Progress 实例各配一套
+            #   column，而一个 console 同时只能有一个 Live，得再套 Group + Live。
+            #   为了一列占位符做这个重构不值当。
+            # 真嫌它吵的话，删掉这一行（连带上面的 TimeElapsedColumn 一起）比拆两个
+            # Progress 便宜得多。
             TimeRemainingColumn(),
         )
         self._episode_task: TaskID | None = None
