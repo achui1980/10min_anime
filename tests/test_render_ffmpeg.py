@@ -489,6 +489,7 @@ def test_available_filters_cache_is_keyed_by_binary(monkeypatch):
         calls.append(args[0])
         return FakeCompleted(stdout=FILTERS_SAMPLE)
 
+    monkeypatch.setattr("tenmin.render.ffmpeg.shutil.which", lambda name: name)
     monkeypatch.setattr("tenmin.render.ffmpeg.subprocess.run", fake_run)
     ffmpeg_mod.available_filters.cache_clear()
     try:
@@ -801,3 +802,97 @@ def test_run_defaults_to_no_timeout_because_encoding_takes_minutes(monkeypatch):
     monkeypatch.setattr("tenmin.render.ffmpeg.subprocess.run", fake_run)
     run(["-i", "a.mkv"])
     assert seen["timeout"] is None
+
+
+# --- 能力探测的失败必须是响的，而且不许被缓存 ---
+
+
+@pytest.fixture
+def clear_capability_cache():
+    from tenmin.render import ffmpeg as ffmpeg_mod
+
+    ffmpeg_mod.available_filters.cache_clear()
+    ffmpeg_mod.available_encoders.cache_clear()
+    yield ffmpeg_mod
+    ffmpeg_mod.available_filters.cache_clear()
+    ffmpeg_mod.available_encoders.cache_clear()
+
+
+def test_capability_probe_reports_a_missing_binary_by_name(monkeypatch, clear_capability_cache):
+    """ffmpeg 根本不在时，用户原来看到的是裸 FileNotFoundError: 'ffmpeg'。"""
+    monkeypatch.setattr("tenmin.render.ffmpeg.shutil.which", lambda _name: None)
+    with pytest.raises(FFmpegError) as exc:
+        clear_capability_cache.available_filters("/nope/ffmpeg")
+    message = str(exc.value)
+    assert "/nope/ffmpeg" in message
+    # 得告诉用户有 render.ffmpeg_path 这个旋钮可以指路
+    assert "ffmpeg_path" in message
+
+
+def test_capability_probe_raises_on_nonzero_exit_instead_of_returning_empty(
+    monkeypatch, clear_capability_cache
+):
+    """非零退出原来被完全忽略，返回空集合。
+
+    空集合会让 preflight 自信地报「你的 ffmpeg 没编 libass」—— 对「这个 ffmpeg 坏了」
+    来说这是**错误诊断**，用户会去重装 libass，而问题根本不在那儿。
+    """
+    monkeypatch.setattr("tenmin.render.ffmpeg.shutil.which", lambda name: name)
+    monkeypatch.setattr(
+        "tenmin.render.ffmpeg.subprocess.run",
+        lambda args, **kwargs: FakeCompleted(returncode=1, stderr="dyld: Library not loaded"),
+    )
+    with pytest.raises(FFmpegError) as exc:
+        clear_capability_cache.available_filters()
+    assert "dyld: Library not loaded" in str(exc.value)
+
+
+def test_capability_probe_raises_when_nothing_parses(monkeypatch, clear_capability_cache):
+    """退出码 0 但一个名字都没解析出来，同样是「结论不可信」而不是「什么都没有」。
+
+    历史上正是这种情况让 has_filter("subtitles") 恒为 False、preflight 谎报没编
+    libass（解析器的标志列宽度写死成 3 起，见 _NAME_LINE 的注释）。
+    """
+    monkeypatch.setattr("tenmin.render.ffmpeg.shutil.which", lambda name: name)
+    monkeypatch.setattr(
+        "tenmin.render.ffmpeg.subprocess.run",
+        lambda args, **kwargs: FakeCompleted(stdout="totally unparseable\n"),
+    )
+    with pytest.raises(FFmpegError):
+        clear_capability_cache.available_filters()
+
+
+def test_capability_probe_does_not_cache_a_failure(monkeypatch, clear_capability_cache):
+    """一次瞬时失败的空集合原来会被 lru_cache 永久钉在进程里。"""
+    monkeypatch.setattr("tenmin.render.ffmpeg.shutil.which", lambda name: name)
+    attempts = {"n": 0}
+
+    def flaky(args, **kwargs):
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            return FakeCompleted(returncode=1, stderr="transient boom")
+        return FakeCompleted(stdout=FILTERS_SAMPLE)
+
+    monkeypatch.setattr("tenmin.render.ffmpeg.subprocess.run", flaky)
+    with pytest.raises(FFmpegError):
+        clear_capability_cache.available_filters()
+    # 第二次必须真的重探，而不是拿到上一次那个（空的/坏的）结果
+    assert "subtitles" in clear_capability_cache.available_filters()
+    assert attempts["n"] == 2
+    # 成功的结果照常缓存
+    assert "subtitles" in clear_capability_cache.available_filters()
+    assert attempts["n"] == 2
+
+
+def test_preflight_does_not_blame_libass_when_ffmpeg_is_missing(
+    monkeypatch, clear_capability_cache, tmp_path
+):
+    """preflight 的错误诊断必须指向真正的原因。"""
+    video = tmp_path / "E02.mkv"
+    video.write_bytes(b"fake")
+    monkeypatch.setattr("tenmin.render.ffmpeg.shutil.which", lambda _name: None)
+    with pytest.raises(FFmpegError) as exc:
+        preflight(video, "libx264")
+    message = str(exc.value)
+    assert "没编 libass" not in message, "不许把「缺二进制」诊断成「没编 libass」"
+    assert "找不到可执行文件" in message

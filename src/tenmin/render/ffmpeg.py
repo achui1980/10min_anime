@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 import shlex
+import shutil
 import subprocess
 import threading
 from collections.abc import Callable, Mapping
@@ -215,7 +216,30 @@ def available_encoders(ffmpeg: str = FFMPEG) -> frozenset[str]:
     return _probe_capabilities(ffmpeg, "-encoders")
 
 
+def _require_binary(binary: str) -> None:
+    """二进制不存在就给一句专门的人话，而不是让 subprocess 抛裸 FileNotFoundError。
+
+    shutil.which 对裸名字走 PATH 查找、对绝对路径检查存在性与可执行位，两种形态都覆盖。
+    """
+    if shutil.which(binary) is None:
+        raise FFmpegError(
+            f"找不到可执行文件 {binary!r}。\n"
+            "装一个（brew install homebrew-ffmpeg/ffmpeg/ffmpeg --with-libass），"
+            "或用 project.yaml 的 render.ffmpeg_path / render.ffprobe_path 指定完整路径。"
+        )
+
+
 def _probe_capabilities(ffmpeg: str, flag: str) -> frozenset[str]:
+    """问这个 ffmpeg 编了哪些滤镜/编码器。**任何一种读不到都必须抛**，不能返回空集合。
+
+    原来这里完全不看 returncode，失败一律返回空集合。后果是错误诊断：preflight 看到
+    空集合就自信地报「你的 ffmpeg 没编 libass」，而真正的原因可能是这个 ffmpeg 根本
+    跑不起来（dyld 缺库）或者压根不存在 —— 用户于是去重装 libass，方向全错。
+
+    失败走异常而不是返回空值，顺带把 lru_cache 的问题一并解决：lru_cache **不缓存
+    异常**，所以一次瞬时失败不会被永久钉在进程里，只有成功的结果才进缓存。
+    """
+    _require_binary(ffmpeg)
     argv = [ffmpeg, "-nostdin", "-hide_banner", flag]
     try:
         completed = subprocess.run(
@@ -232,7 +256,22 @@ def _probe_capabilities(ffmpeg: str, flag: str) -> frozenset[str]:
             f"\n{shlex.join(argv)}\n\n"
             f"{flag} 只是进程内枚举，正常是毫秒级 —— 这个 ffmpeg 大概率有问题。"
         ) from error
-    return frozenset(parse_names(completed.stdout))
+    if completed.returncode != 0:
+        raise FFmpegError(
+            f"探测 ffmpeg 能力失败（退出码 {completed.returncode}）：\n"
+            f"{shlex.join(argv)}\n\n"
+            f"stderr 末尾 {STDERR_TAIL_LINES} 行：\n{tail(completed.stderr)}"
+        )
+    names = parse_names(completed.stdout)
+    if not names:
+        # 退出码 0 却一个名字都没解析出来 = 结论不可信，绝不能当成「什么都没有」。
+        # 历史事故：_NAME_LINE 的标志列宽度写死成 3 起，-filters 一个都没解析出来，
+        # has_filter("subtitles") 恒为 False，preflight 谎报没编 libass 整整一个版本。
+        raise FFmpegError(
+            f"{shlex.join(argv)} 退出码 0，但一个名字都没解析出来。\n"
+            f"输出末尾 {STDERR_TAIL_LINES} 行：\n{tail(completed.stdout)}"
+        )
+    return frozenset(names)
 
 
 def has_filter(name: str, *, ffmpeg: str = FFMPEG) -> bool:
