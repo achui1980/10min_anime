@@ -23,7 +23,7 @@ class LocaleConfig(BaseModel):
 
 
 class LLMConfig(BaseModel):
-    provider: Literal["gemini", "minimax"] = "gemini"
+    provider: Literal["gemini", "minimax", "openai_compatible"] = "gemini"
     model: str = "gemini-3.6-flash"
     base_url: str | None = None
     # MiniMax-M3 默认打开"深度思考"，会先吐一大段 <think>…</think> 推理块再出正文，
@@ -101,3 +101,4 @@ class Settings(BaseSettings):
 
     gemini_api_key: str | None = None
     minimax_api_key: str | None = None
+    openai_compatible_api_key: str | None = None

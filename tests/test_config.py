@@ -173,6 +173,22 @@ def test_settings_keys_are_independent(monkeypatch):
     assert settings.minimax_api_key is None
 
 
+def test_llm_config_accepts_openai_compatible_provider():
+    cfg = LLMConfig(
+        provider="openai_compatible",
+        model="deepseek-chat",
+        base_url="https://api.deepseek.com/v1",
+    )
+    assert cfg.provider == "openai_compatible"
+    assert cfg.model == "deepseek-chat"
+    assert cfg.base_url == "https://api.deepseek.com/v1"
+
+
+def test_settings_reads_openai_compatible_env(monkeypatch):
+    monkeypatch.setenv("TENMIN_OPENAI_COMPATIBLE_API_KEY", "oc-key")
+    assert Settings().openai_compatible_api_key == "oc-key"
+
+
 def test_render_config_defaults():
     cfg = RenderConfig()
     assert cfg.voice == "zh-CN-YunxiNeural"
