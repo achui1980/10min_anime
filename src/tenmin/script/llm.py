@@ -1,4 +1,5 @@
-"""LLM provider。目前支持 Gemini 与 MiniMax（OpenAI 兼容接口）。"""
+"""LLM provider。目前支持 Gemini、MiniMax，以及任意 OpenAI 兼容接口
+（如 DeepSeek，通过 provider: openai_compatible 配置）。"""
 
 from __future__ import annotations
 
@@ -186,7 +187,8 @@ class OpenAICompatibleProvider:
                         }
                     )
         raise RuntimeError(
-            f"MiniMax 连续 {OPENAI_COMPATIBLE_MAX_ATTEMPTS} 次输出不符合 {schema.__name__}：{last_error}"
+            f"{type(self).__name__} 连续 {OPENAI_COMPATIBLE_MAX_ATTEMPTS} 次"
+            f"输出不符合 {schema.__name__}：{last_error}"
         )
 
 
