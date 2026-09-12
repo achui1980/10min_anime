@@ -13,6 +13,7 @@ from tenmin.script.llm import (
     MINIMAX_BASE_URL,
     POOL_TIMEOUT_SECONDS,
     GeminiProvider,
+    LLMBusinessError,
     LLMError,
     LLMHTTPError,
     LLMProvider,
@@ -719,6 +720,141 @@ async def test_minimax_complete_without_schema_returns_stripped_text(monkeypatch
     assert "response_format" not in posts[0]["json"]
     # 无 schema 时用户消息原样透传，不注入 schema 段
     assert posts[0]["json"]["messages"][1]["content"] == "USR"
+
+
+# --- HTTP 200 + 业务错误 ---
+
+
+@pytest.mark.asyncio
+async def test_business_error_in_a_200_stream_fails_immediately(monkeypatch, sleeps):
+    """MiniMax 的业务错误是 HTTP 200 + base_resp.status_code != 0（1002 限流 /
+    1008 余额不足 / 2013 参数错）。
+
+    原实现里 _sse_delta 对「没有 choices 的数据行」一律返回空串，于是整条流一个
+    delta 都没有 → 累积文本为空 → _extract_json("") 抛「找不到 JSON」→ 白跑 3 次
+    ~35k 字符的 prompt，最后给出一个指向完全错误方向的 schema 报错。
+    """
+    log = _mock_httpx(
+        monkeypatch,
+        [_sse({"base_resp": {"status_code": 1008, "status_msg": "insufficient balance"}})],
+    )
+    provider = MiniMaxProvider(api_key="secret")
+
+    with pytest.raises(LLMBusinessError) as exc:
+        await provider.complete("SYS", "USR", Toy)
+
+    assert exc.value.code == 1008
+    assert "1008" in str(exc.value)
+    assert "insufficient balance" in str(exc.value)
+    # 余额不足重试是纯浪费，也绝不能进 schema 修复循环
+    assert len([r for r in log if "url" in r]) == 1
+    assert sleeps == []
+
+
+@pytest.mark.asyncio
+async def test_business_rate_limit_code_is_retryable(monkeypatch, sleeps):
+    """1002 是 429 的业务码版本，跟 429 一样值得退避重试。"""
+    log = _mock_httpx(
+        monkeypatch,
+        [
+            _sse({"base_resp": {"status_code": 1002, "status_msg": "rate limit"}}),
+            _sse_from_chunks('{"value": 6}'),
+        ],
+    )
+    provider = MiniMaxProvider(api_key="secret")
+
+    assert await provider.complete("SYS", "USR", Toy) == Toy(value=6)
+    assert len([r for r in log if "url" in r]) == 2
+    assert sleeps == [1.0]
+
+
+@pytest.mark.asyncio
+async def test_business_rate_limit_gives_up_after_transport_max_attempts(monkeypatch, sleeps):
+    attempts = LLMConfig().transport_max_attempts
+    body = _sse({"base_resp": {"status_code": 1002, "status_msg": "rate limit"}})
+    log = _mock_httpx(monkeypatch, [body] * attempts)
+    provider = MiniMaxProvider(api_key="secret")
+
+    with pytest.raises(LLMBusinessError) as exc:
+        await provider.complete("SYS", "USR", Toy)
+
+    assert str(attempts) in str(exc.value)
+    assert len([r for r in log if "url" in r]) == attempts
+
+
+@pytest.mark.asyncio
+async def test_base_resp_status_code_zero_is_not_an_error(monkeypatch):
+    """真实的成功 chunk 每一条都带 base_resp.status_code == 0，不能误判成错误。"""
+    log = _mock_httpx(
+        monkeypatch,
+        [
+            _sse(
+                {
+                    "choices": [{"delta": {"content": '{"value": 4}'}}],
+                    "base_resp": {"status_code": 0, "status_msg": ""},
+                }
+            )
+        ],
+    )
+    provider = MiniMaxProvider(api_key="secret")
+
+    assert await provider.complete("SYS", "USR", Toy) == Toy(value=4)
+    assert len([r for r in log if "url" in r]) == 1
+
+
+@pytest.mark.asyncio
+async def test_openai_style_error_field_in_a_200_stream_fails_immediately(monkeypatch, sleeps):
+    """通用 OpenAI 兼容实现把错误塞进 data 行的 error 字段，同样是 HTTP 200。"""
+    log = _mock_httpx(
+        monkeypatch,
+        [_sse({"error": {"code": "context_length_exceeded", "message": "prompt 太长"}})],
+    )
+    provider = OpenAICompatibleProvider(
+        api_key="k", model="m", base_url="https://x.test/v1"
+    )
+
+    with pytest.raises(LLMBusinessError) as exc:
+        await provider.complete("SYS", "USR", Toy)
+
+    assert "context_length_exceeded" in str(exc.value)
+    assert "prompt 太长" in str(exc.value)
+    assert len([r for r in log if "url" in r]) == 1
+    assert sleeps == []
+
+
+@pytest.mark.asyncio
+async def test_malformed_sse_lines_are_reported_in_the_final_error(monkeypatch):
+    """整条流全畸形时原实现静默 return ""，一点痕迹都不留。"""
+    body = "data: not-json\n\ndata: also{not}json\n\ndata: [DONE]\n\n"
+    log = _mock_httpx(monkeypatch, [body] * LLMConfig().max_attempts)
+    provider = MiniMaxProvider(api_key="secret")
+
+    with pytest.raises(LLMSchemaError) as exc:
+        await provider.complete("SYS", "USR", Toy)
+
+    assert "畸形" in str(exc.value)
+    assert "6" in str(exc.value)  # 3 轮 x 2 条
+    assert len([r for r in log if "url" in r]) == LLMConfig().max_attempts
+
+
+@pytest.mark.asyncio
+async def test_transport_retry_count_is_reported_in_the_final_error(monkeypatch, sleeps):
+    log = _mock_httpx(
+        monkeypatch,
+        [(429, "slow down"), _sse_from_chunks('{"val": 1}')]
+        + [_sse_from_chunks('{"val": 1}')] * 2,
+    )
+    provider = MiniMaxProvider(api_key="secret")
+
+    with pytest.raises(LLMSchemaError) as exc:
+        await provider.complete("SYS", "USR", Toy)
+
+    assert "传输层重试 1 次" in str(exc.value)
+    assert len([r for r in log if "url" in r]) == 4
+
+
+def test_llm_business_error_is_an_llm_error():
+    assert issubclass(LLMBusinessError, LLMError)
 
 
 # --- MiniMax 流式 ---

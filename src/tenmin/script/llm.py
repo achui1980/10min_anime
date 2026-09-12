@@ -38,6 +38,9 @@ RETRY_AFTER_MAX_SECONDS = 120.0
 # 429 = 限流，5xx = 服务端/网关侧的瞬时故障。其余 4xx（401/403/400/404）重试是纯
 # 浪费：key 不会在 1 秒后自己变对，请求体也不会自己变合法。
 RETRYABLE_STATUS_CODES = frozenset({429, 500, 502, 503, 504})
+# HTTP 200 + base_resp.status_code 的业务错误码里，只有限流值得重试：它就是 429 的
+# 业务码版本。1008（余额不足）、2013（参数错）重试三遍只是把同一个必错的请求发三遍。
+RETRYABLE_BUSINESS_CODES = frozenset({1002})
 # 连接/读取类的传输异常。刻意不用 httpx.TransportError 这个大父类：
 # UnsupportedProtocol（base_url 写成了 ftp://）与 LocalProtocolError（我们自己拼错了
 # 请求）也在它底下，重试它们只是把同一个必错的请求发四遍。
@@ -169,6 +172,26 @@ class LLMTransportError(LLMError):
     """连不上 / 建连超时 / chunk 间隔超时 / 服务端提前断流 / 撞到总截止。"""
 
 
+class LLMBusinessError(LLMError):
+    """HTTP 200，但流里的数据行带着业务错误码。
+
+    MiniMax 的限流/欠费/参数错全是这个形态（HTTP 200 + `base_resp.status_code != 0`，
+    1002 限流 / 1008 余额不足 / 2013 参数错），通用 OpenAI 兼容实现则塞在 `error`
+    字段里。原实现对「没有 choices 的数据行」一律返回空串，于是整条流一个 delta 都
+    没有 → 累积文本为空 → _extract_json("") 抛「找不到 JSON」→ 白跑 3 次 ~35k 字符
+    的 prompt，最后给出一个指向完全错误方向的 schema 报错。
+    """
+
+    def __init__(self, *, code: Any, message: str, attempts: int = 1) -> None:
+        self.code = code
+        self.message = message
+        self.attempts = attempts
+        tries = f"（已尝试 {attempts} 次）" if attempts > 1 else ""
+        super().__init__(
+            f"LLM 接口返回 HTTP 200 但带着业务错误码 {code}{tries}：{message}"
+        )
+
+
 def _truncate(text: str, limit: int) -> str:
     """超长就截断并注明原长度，免得读报错的人以为模型只输出了这么点。"""
     if len(text) <= limit:
@@ -264,27 +287,84 @@ def _extract_json(text: str) -> str:
     return cleaned[start : end + 1]
 
 
-def _sse_delta(line: str) -> str:
-    """从一行 SSE 里取增量文本；不是可用的数据行就返回空串。
+class _MalformedSSELine(Exception):
+    """内部信号：`data:` 后面不是合法 JSON。调用方计数后继续读下一行。"""
 
-    容忍这些真实形态：空行/心跳行、`data: [DONE]`、只带 finish_reason 而 delta 为空的
-    收尾 chunk、delta.content 为 null、以及个别实现插进来的非 JSON 行。
+
+def _sse_event(line: str) -> dict[str, Any] | None:
+    """把一行 SSE 解析成事件 dict；不是可用的数据行返回 None。
+
+    容忍这些真实形态：空行/心跳行、`data: [DONE]`、以及个别实现插进来的非 JSON 行
+    （后者抛 _MalformedSSELine，由调用方计数——原实现在这里静默 return ""，整条流
+    全畸形时一点痕迹都不留）。
     """
     line = line.strip()
     if not line.startswith("data:"):
-        return ""
+        return None
     data = line[len("data:") :].strip()
     if not data or data == "[DONE]":
-        return ""
+        return None
     try:
         event = json.loads(data)
-    except json.JSONDecodeError:
-        return ""
+    except json.JSONDecodeError as exc:
+        raise _MalformedSSELine(data[:200]) from exc
+    return event if isinstance(event, dict) else None
+
+
+def _event_delta(event: dict[str, Any]) -> str:
+    """取增量文本。
+
+    容忍：只带 finish_reason 而 delta 为空的收尾 chunk、delta.content 为 null、
+    choices 为空列表。
+    """
     choices = event.get("choices") or []
     if not choices:
         return ""
     delta = choices[0].get("delta") or {}
     return delta.get("content") or ""
+
+
+def _business_error(event: dict[str, Any]) -> tuple[Any, str] | None:
+    """从一个事件里找业务错误，返回 (错误码, message)；没有就返回 None。
+
+    注意 **status_code == 0 不是错误**：真实的成功 chunk 每一条都带
+    `base_resp: {"status_code": 0, "status_msg": ""}`。
+    """
+    base = event.get("base_resp")
+    if isinstance(base, dict):
+        code = base.get("status_code")
+        if isinstance(code, int) and code != 0:
+            return code, str(base.get("status_msg") or base.get("msg") or "(无 message)")
+    error = event.get("error")
+    if isinstance(error, dict):
+        return (
+            error.get("code") or error.get("type") or "(无错误码)",
+            str(error.get("message") or "(无 message)"),
+        )
+    if isinstance(error, str) and error:
+        return "(无错误码)", error
+    return None
+
+
+@dataclass
+class _StreamTally:
+    """一次 complete() 期间跨轮累计的「值得报告但不该拿去日志」的现场。
+
+    本项目刻意不引入 logging，所以这些数字只走异常消息（见 _StreamTally.summary
+    被当作 _complete_with_schema_repair 的 diagnostics 传进去）。
+    """
+
+    malformed_lines: int = 0
+    transport_retries: int = 0
+    requests: int = 0
+
+    def summary(self) -> str:
+        notes = []
+        if self.malformed_lines:
+            notes.append(f"流里跳过了 {self.malformed_lines} 条畸形 data: 行")
+        if self.transport_retries:
+            notes.append(f"传输层重试 {self.transport_retries} 次")
+        return "；".join(notes)
 
 
 @runtime_checkable
@@ -493,7 +573,7 @@ class OpenAICompatibleProvider:
     def _endpoint(self) -> str:
         return f"{self.base_url}/chat/completions"
 
-    async def _stream_once(self, payload: dict[str, Any]) -> str:
+    async def _stream_once(self, payload: dict[str, Any], tally: _StreamTally) -> str:
         """发一次流式请求，把所有 delta.content 拼成完整文本。
 
         整次请求外面套一个 asyncio.timeout：read 只管**相邻两个 chunk**的间隔，
@@ -501,6 +581,7 @@ class OpenAICompatibleProvider:
         整体截止。
         """
         parts: list[str] = []
+        tally.requests += 1
         try:
             async with asyncio.timeout(self._total_timeout_seconds):
                 async with self._get_client().stream(
@@ -521,9 +602,18 @@ class OpenAICompatibleProvider:
                             ),
                         )
                     async for line in response.aiter_lines():
-                        chunk = _sse_delta(line)
-                        if chunk:
-                            parts.append(chunk)
+                        try:
+                            event = _sse_event(line)
+                        except _MalformedSSELine:
+                            tally.malformed_lines += 1
+                            continue
+                        if event is None:
+                            continue
+                        business = _business_error(event)
+                        if business is not None:
+                            code, message = business
+                            raise LLMBusinessError(code=code, message=message)
+                        parts.append(_event_delta(event))
         except TimeoutError as exc:
             # asyncio.timeout 到点抛的是内置 TimeoutError（httpx 自己的超时是
             # httpx.TimeoutException，两者没有继承关系，不会互相误吞）。
@@ -533,7 +623,9 @@ class OpenAICompatibleProvider:
             ) from exc
         return "".join(parts)
 
-    async def _stream_with_retries(self, payload: dict[str, Any]) -> str:
+    async def _stream_with_retries(
+        self, payload: dict[str, Any], tally: _StreamTally
+    ) -> str:
         """在 _stream_once 外面套传输层重试。
 
         **跟 schema 修复重试分开计数**：原实现只有一个 3 次的循环、且只覆盖 schema
@@ -545,17 +637,23 @@ class OpenAICompatibleProvider:
         while True:
             attempt += 1
             try:
-                return await self._stream_once(payload)
+                return await self._stream_once(payload, tally)
             except LLMHTTPError as exc:
                 retryable = exc.status_code in RETRYABLE_STATUS_CODES
                 retry_after = exc.retry_after
                 error: Exception = exc
+            except LLMBusinessError as exc:
+                # 限流码值得等一等；余额不足/参数错重试是纯浪费。
+                retryable = exc.code in RETRYABLE_BUSINESS_CODES
+                retry_after = None
+                error = exc
             except _RETRYABLE_TRANSPORT_ERRORS as exc:
                 retryable = True
                 retry_after = None
                 error = exc
             if not retryable or attempt >= self.transport_max_attempts:
                 raise self._exhausted(error, attempt) from error
+            tally.transport_retries += 1
             await _sleep(_backoff_delay(attempt, retry_after))
 
     def _exhausted(self, error: Exception, attempt: int) -> LLMError:
@@ -572,6 +670,10 @@ class OpenAICompatibleProvider:
                 retry_after=error.retry_after,
                 attempts=attempt,
             )
+        if isinstance(error, LLMBusinessError):
+            return LLMBusinessError(
+                code=error.code, message=error.message, attempts=attempt
+            )
         detail = str(error) or type(error).__name__
         return LLMTransportError(
             f"连接 LLM 接口失败，已尝试 {attempt} 次仍不通"
@@ -587,13 +689,14 @@ class OpenAICompatibleProvider:
     async def complete(
         self, system: str, user: str, schema: type[BaseModel] | None = None
     ) -> Any:
+        tally = _StreamTally()
         if schema is None:
             messages = [
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
             ]
             text = await self._stream_with_retries(
-                self._payload(messages, json_mode=False)
+                self._payload(messages, json_mode=False), tally
             )
             return _strip_reasoning(text)
 
@@ -606,10 +709,16 @@ class OpenAICompatibleProvider:
             messages = (
                 first if repair is None else self._repair_messages(system, schema, repair)
             )
-            return await self._stream_with_retries(self._payload(messages, json_mode=True))
+            return await self._stream_with_retries(
+                self._payload(messages, json_mode=True), tally
+            )
 
         return await _complete_with_schema_repair(
-            send, schema, max_attempts=self.max_attempts, label=type(self).__name__
+            send,
+            schema,
+            max_attempts=self.max_attempts,
+            label=type(self).__name__,
+            diagnostics=tally.summary,
         )
 
 
