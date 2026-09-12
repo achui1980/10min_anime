@@ -193,7 +193,7 @@ def run_docgen(cfg: ProjectConfig, episode: int) -> Script:
     script_path = paths.script(episode)
     if not script_path.exists():
         raise FileNotFoundError(f"缺少剧本 {script_path}，请先跑 script 阶段")
-    script = Script.model_validate_json(script_path.read_text())
+    script = Script.model_validate_json(script_path.read_text(encoding="utf-8"))
     _write_text(paths.table(episode), render_table(script))
     _write_text(paths.narration(episode), render_narration(script))
     return script
@@ -259,7 +259,7 @@ def _load_script(cfg: ProjectConfig, episode: int) -> Script:
     path = Paths(cfg.root).script(episode)
     if not path.exists():
         raise FileNotFoundError(f"缺少剧本 {path}，请先跑 script 阶段")
-    return Script.model_validate_json(path.read_text())
+    return Script.model_validate_json(path.read_text(encoding="utf-8"))
 
 
 def _load_voice(cfg: ProjectConfig, episode: int) -> VoiceTrack:
