@@ -23,7 +23,7 @@ from tenmin.pipeline import (
 from tenmin.render.ffmpeg import FFmpegError
 from tenmin.render.tts import build_tts_engine
 from tenmin.rich_progress import RichProgressReporter
-from tenmin.script.llm import build_provider
+from tenmin.script.llm import LLMError, build_provider
 from tenmin.script.validate import ScriptValidationError
 from tenmin.timecode import format_timestamp
 
@@ -41,8 +41,11 @@ app = typer.Typer(add_completion=False, help="把番剧压成解说方案的流�
 # - FFmpegError：ffmpeg 没编 libass / 编码器不存在 / 转码失败。
 # - ScriptValidationError：它是 RuntimeError 子类而不是 ValueError 子类，
 #   历史上漏在表外——LLM 出的剧本过不了 validate 时用户看的是裸 traceback。
-# - httpx.HTTPError：provider 的 raise_for_status()（429/5xx）抛的 HTTPStatusError，
-#   以及连不上/读超时的 TransportError。取它们的公共父类，免得再漏一个子类。
+# - httpx.HTTPError：provider 里没被包成 LLMError 的传输类异常（比如 base_url 写成
+#   了不支持的 scheme）。取它们的公共父类，免得再漏一个子类。
+# - LLMError：provider 自己抛的、已经带好人话的那一族（HTTP 4xx/5xx 带响应体摘要、
+#   HTTP 200 + 业务错误码、传输层重试耗尽、连续 N 次不合 schema、Gemini 的
+#   finish_reason 异常）。它是 RuntimeError 子类，**不在** ValueError 那条网里。
 PIPELINE_ERRORS = (
     NotImplementedError,
     FileNotFoundError,
@@ -50,6 +53,7 @@ PIPELINE_ERRORS = (
     FFmpegError,
     ScriptValidationError,
     httpx.HTTPError,
+    LLMError,
 )
 
 

@@ -517,6 +517,28 @@ def test_run_reports_http_transport_error(tmp_path, monkeypatch):
     assert "Connection refused" in out(result)
 
 
+def test_run_reports_llm_error(tmp_path, monkeypatch):
+    """LLMError 是 RuntimeError 子类（不在 ValueError 那条网里），provider 抛的
+    「HTTP 4xx 带响应体」「业务错误码」「连续 N 次不合 schema」全走它。"""
+    from tenmin.script.llm import LLMError
+
+    _minimal_project(tmp_path)
+
+    async def boom(cfg, provider, **kwargs):
+        raise LLMError("LLM 接口返回 HTTP 401：响应体：invalid api key")
+
+    monkeypatch.setattr("tenmin.cli.run_pipeline", boom)
+    monkeypatch.setattr("tenmin.cli.build_provider", lambda llm, settings: object())
+
+    result = runner.invoke(
+        app, ["run", "akujo2", "--work-dir", str(tmp_path), "--only", "script"]
+    )
+
+    assert result.exit_code == 1
+    assert _graceful(result), repr(result.exception)
+    assert "invalid api key" in out(result)
+
+
 def test_run_reports_error_type_when_message_is_empty(tmp_path, monkeypatch):
     """httpx 的传输类异常经常 str() 为空，光 secho(str(error)) 会印一行空红字。"""
     import httpx

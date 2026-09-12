@@ -19,13 +19,49 @@ OPENAI_COMPATIBLE_MAX_ATTEMPTS = 3
 # 读活性，因此读超时交给 chunk 间隔而不是整体耗时（这里直接关掉固定读超时）。
 OPENAI_COMPATIBLE_TIMEOUT = httpx.Timeout(connect=30.0, read=None, write=120.0, pool=30.0)
 
-_THINK_BLOCK = re.compile(r"<think>.*?</think>", re.S)
+_THINK_BLOCK = re.compile(r"<think\b[^>]*>.*?</think\s*>", re.S)
+_THINK_OPEN = re.compile(r"<think\b[^>]*>")
 _FENCE = re.compile(r"^```(?:json)?[ \t]*\n?|\n?```[ \t]*$", re.M)
 
 
+class LLMError(RuntimeError):
+    """provider 抛出、且已经自带一句人话的异常的基类。
+
+    继承 RuntimeError 而不是 Exception 是为了跟 script.validate.ScriptValidationError
+    保持同一形态。**这个基类必须在 cli.py 的 PIPELINE_ERRORS 里**，否则用户看到的是
+    一整页 traceback 而不是一行红字。
+    """
+
+
+class LLMResponseFormatError(LLMError, ValueError):
+    """模型输出的**形态**不对：找不到 JSON 对象、`<think>` 没闭合、一个字都没返回。
+
+    刻意同时继承 ValueError 两个理由：
+    1. `_extract_json` 抛 ValueError 是既有契约（有测试锁着），而 cli.py 的
+       PIPELINE_ERRORS 里那条 ValueError 也一直兜着它。
+    2. 让「校验失败 → 回灌报错重试」那一层可以写成
+       `except (ValidationError, LLMResponseFormatError)` 这种窄网。原来写的是
+       `except (ValidationError, ValueError)`，`_extract_json` 之外任何偶发的
+       ValueError（比如 provider 自己的 bug）都会被误判成「模型输出不合 schema」，
+       白白触发两轮 ~35k 字符的昂贵重试，最后报一个完全指错方向的错。
+    """
+
+
 def _strip_reasoning(text: str) -> str:
-    """MiniMax-M3 每次都在正文前吐一个 <think>…</think> 推理块，必须剥掉。"""
-    return _THINK_BLOCK.sub("", text).strip()
+    """MiniMax-M3 每次都在正文前吐一个 <think>…</think> 推理块，必须剥掉。
+
+    只有闭合的块会被剥掉；剥完还剩一个裸的 `<think>` 说明这一段是**被截断的**推理，
+    此时整段推理内容都还在文本里，交给 _extract_json 只会让它从推理里抓到第一个
+    `{`，最后给出一个指向完全错误方向的 schema 报错。所以这里单独报错。
+    """
+    stripped = _THINK_BLOCK.sub("", text)
+    if _THINK_OPEN.search(stripped):
+        raise LLMResponseFormatError(
+            "模型输出里有 <think> 却没有闭合的 </think>，推理块很可能被截断了"
+            f"（收到 {len(text)} 字符）。这通常是流提前断掉或撞到输出上限，"
+            f"原始输出开头：{text[:200]!r}"
+        )
+    return stripped.strip()
 
 
 def _extract_json(text: str) -> str:
@@ -37,7 +73,7 @@ def _extract_json(text: str) -> str:
     start = cleaned.find("{")
     end = cleaned.rfind("}")
     if start == -1 or end == -1 or end < start:
-        raise ValueError(f"MiniMax 返回里找不到 JSON 对象：{cleaned[:200]!r}")
+        raise LLMResponseFormatError(f"模型返回里找不到 JSON 对象：{cleaned[:200]!r}")
     return cleaned[start : end + 1]
 
 
@@ -173,7 +209,7 @@ class OpenAICompatibleProvider:
                     return _strip_reasoning(text)
                 try:
                     return schema.model_validate_json(_extract_json(text))
-                except (ValidationError, ValueError) as exc:
+                except (ValidationError, LLMResponseFormatError) as exc:
                     last_error = str(exc)[:1500]
                     messages.append({"role": "assistant", "content": text})
                     messages.append(

@@ -10,7 +10,9 @@ from tenmin.script.llm import (
     OPENAI_COMPATIBLE_MAX_ATTEMPTS,
     OPENAI_COMPATIBLE_TIMEOUT,
     GeminiProvider,
+    LLMError,
     LLMProvider,
+    LLMResponseFormatError,
     MiniMaxProvider,
     OpenAICompatibleProvider,
     _extract_json,
@@ -175,6 +177,41 @@ def test_extract_json_without_brace_raises():
     with pytest.raises(ValueError) as exc:
         _extract_json("<think>只有推理没有 JSON</think>\n抱歉我无法回答")
     assert "找不到 JSON" in str(exc.value)
+
+
+def test_extract_json_without_brace_raises_dedicated_type():
+    """专属异常类型：`except ValueError` 那种大网会把偶发的 ValueError 误判成
+    「模型输出不合 schema」，进而触发一轮 ~35k 字符的昂贵重试。"""
+    with pytest.raises(LLMResponseFormatError):
+        _extract_json("没有大括号")
+
+
+def test_llm_response_format_error_is_both_llm_error_and_value_error():
+    """继承 ValueError 是为了保住 _extract_json 抛 ValueError 子类的既有契约；
+    继承 LLMError 是为了让 cli.py 的 PIPELINE_ERRORS 一网打尽。"""
+    assert issubclass(LLMResponseFormatError, LLMError)
+    assert issubclass(LLMResponseFormatError, ValueError)
+    assert issubclass(LLMError, RuntimeError)
+
+
+def test_strip_reasoning_unclosed_think_raises():
+    """流被截断时没有 </think>，整段推理会留在文本里，_extract_json 很可能从推理
+    内容里抓到 `{`，最后给出一个指向完全错误方向的 schema 报错。"""
+    with pytest.raises(LLMResponseFormatError) as exc:
+        _strip_reasoning('<think>我先想想，大概是 {"value": 1} 这样')
+    assert "</think>" in str(exc.value)
+
+
+def test_extract_json_unclosed_think_raises_instead_of_grabbing_reasoning():
+    with pytest.raises(LLMResponseFormatError) as exc:
+        _extract_json('<think>大概是 {"val": 1} 吧')
+    assert "</think>" in str(exc.value)
+
+
+def test_strip_reasoning_closed_block_after_unclosed_prefix_is_still_an_error():
+    """`</think>` 出现在 `<think>` 之前不算闭合。"""
+    with pytest.raises(LLMResponseFormatError):
+        _strip_reasoning('</think><think>{"value": 1}')
 
 
 def test_minimax_provider_satisfies_protocol():
