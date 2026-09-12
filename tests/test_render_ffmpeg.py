@@ -10,6 +10,7 @@ from tenmin.render.ffmpeg import (
     preflight,
     probe_duration,
     run,
+    run_with_progress,
     tail,
 )
 
@@ -194,3 +195,73 @@ def test_preflight_returns_source_duration(monkeypatch, tmp_path):
     monkeypatch.setattr("tenmin.render.ffmpeg.has_encoder", lambda name: True)
     monkeypatch.setattr("tenmin.render.ffmpeg.probe_duration", lambda path: 1425.5)
     assert preflight(video, "libx264") == pytest.approx(1425.5)
+
+
+class FakePopen:
+    """假的 subprocess.Popen，逐行喂 stdout，不真的起进程。"""
+
+    class _Stderr:
+        def __init__(self, text: str):
+            self._text = text
+
+        def read(self) -> str:
+            return self._text
+
+    def __init__(self, lines: list[str], returncode: int = 0, stderr: str = ""):
+        self.stdout = iter(lines)
+        self.stderr = FakePopen._Stderr(stderr)
+        self._returncode = returncode
+
+    def wait(self) -> int:
+        return self._returncode
+
+
+def test_run_with_progress_reports_fraction_from_out_time_ms(monkeypatch):
+    lines = [
+        "frame=1\n",
+        "out_time_ms=5000000\n",
+        "progress=continue\n",
+        "out_time_ms=10000000\n",
+        "progress=end\n",
+    ]
+    monkeypatch.setattr(
+        "tenmin.render.ffmpeg.subprocess.Popen",
+        lambda args, **kwargs: FakePopen(lines),
+    )
+    seen: list[float] = []
+    run_with_progress(["-i", "in.mp4", "out.mp4"], total_seconds=20.0, on_progress=seen.append)
+    assert seen == [0.25, 0.5, 1.0]
+
+
+def test_run_with_progress_raises_with_stderr_tail(monkeypatch):
+    noise = "\n".join(f"line {i}" for i in range(50))
+    stderr = noise + "\nInvalid argument\n"
+    monkeypatch.setattr(
+        "tenmin.render.ffmpeg.subprocess.Popen",
+        lambda args, **kwargs: FakePopen(["progress=end\n"], returncode=1, stderr=stderr),
+    )
+    with pytest.raises(FFmpegError) as exc:
+        run_with_progress(["-i", "in.mp4", "out.mp4"], total_seconds=10.0)
+    message = str(exc.value)
+    assert "Invalid argument" in message
+    assert "line 0" not in message
+
+
+def test_run_with_progress_clamps_fraction_to_one(monkeypatch):
+    lines = ["out_time_ms=999999999\n"]
+    monkeypatch.setattr(
+        "tenmin.render.ffmpeg.subprocess.Popen",
+        lambda args, **kwargs: FakePopen(lines),
+    )
+    seen: list[float] = []
+    run_with_progress(["-i", "in.mp4", "out.mp4"], total_seconds=5.0, on_progress=seen.append)
+    assert seen == [1.0]
+
+
+def test_run_with_progress_works_without_on_progress_callback(monkeypatch):
+    monkeypatch.setattr(
+        "tenmin.render.ffmpeg.subprocess.Popen",
+        lambda args, **kwargs: FakePopen(["out_time_ms=1000000\n", "progress=end\n"]),
+    )
+    result = run_with_progress(["-i", "in.mp4", "out.mp4"], total_seconds=1.0)
+    assert result == ""

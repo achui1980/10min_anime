@@ -322,3 +322,21 @@ def test_run_registers_new_episode_and_updates_yaml(work, golden_srt_path, tmp_p
 
     reloaded_yaml = (work / "saijo" / "project.yaml").read_text(encoding="utf-8")
     assert "number: 1" in reloaded_yaml
+
+
+def test_run_passes_progress_reporter(tmp_path, monkeypatch):
+    from tenmin.progress import ProgressReporter
+
+    _minimal_project(tmp_path)
+    captured: dict[str, object] = {}
+
+    async def fake_pipeline(cfg, provider, **kwargs):
+        captured.update(kwargs)
+        return []
+
+    monkeypatch.setattr("tenmin.cli.run_pipeline", fake_pipeline)
+    result = runner.invoke(
+        app, ["run", "akujo2", "--work-dir", str(tmp_path), "--only", "docgen"]
+    )
+    assert result.exit_code == 0, out(result)
+    assert isinstance(captured["reporter"], ProgressReporter)

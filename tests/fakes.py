@@ -66,3 +66,25 @@ class FlakyTTSEngine:
         out_path.parent.mkdir(parents=True, exist_ok=True)
         out_path.write_bytes(b"fake mp3")
         return self.duration
+
+
+class FakeReporter:
+    """测试用假 progress reporter。记录每次调用，方便断言顺序和参数。"""
+
+    def __init__(self):
+        self.calls: list[tuple] = []
+
+    def stage_start(self, stage: str) -> None:
+        self.calls.append(("stage_start", stage))
+
+    def stage_skip(self, stage: str) -> None:
+        self.calls.append(("stage_skip", stage))
+
+    def stage_done(self, stage: str) -> None:
+        self.calls.append(("stage_done", stage))
+
+    def substep(self, stage: str, current: int, total: int, label: str) -> None:
+        self.calls.append(("substep", stage, current, total, label))
+
+    def episode_start(self, number: int, index: int, total: int) -> None:
+        self.calls.append(("episode_start", number, index, total))

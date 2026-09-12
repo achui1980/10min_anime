@@ -13,6 +13,7 @@ from tenmin.models import DialogueTrack, SignalReport
 from tenmin.pipeline import STAGES, Paths, _find_episode, register_episode, run_pipeline
 from tenmin.render.ffmpeg import FFmpegError
 from tenmin.render.tts import build_tts_engine
+from tenmin.rich_progress import RichProgressReporter
 from tenmin.script.llm import build_provider
 from tenmin.timecode import format_timestamp
 
@@ -136,17 +137,19 @@ def run(
         tts_engine = build_tts_engine(cfg.render)
 
     try:
-        warnings = asyncio.run(
-            run_pipeline(
-                cfg,
-                provider,
-                from_stage=from_stage,
-                only=[only] if only else None,
-                force=force,
-                tts_engine=tts_engine,
-                episode=episode,
+        with RichProgressReporter() as reporter:
+            warnings = asyncio.run(
+                run_pipeline(
+                    cfg,
+                    provider,
+                    from_stage=from_stage,
+                    only=[only] if only else None,
+                    force=force,
+                    tts_engine=tts_engine,
+                    episode=episode,
+                    reporter=reporter,
+                )
             )
-        )
     except (NotImplementedError, FileNotFoundError, ValueError, FFmpegError) as error:
         typer.secho(str(error), fg="red", err=True)
         raise typer.Exit(code=1) from error

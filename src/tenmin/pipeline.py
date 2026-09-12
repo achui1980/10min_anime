@@ -13,6 +13,7 @@ from tenmin.docgen.narration import render_narration
 from tenmin.docgen.table import render_table
 from tenmin.ingest.normalize import build_track
 from tenmin.models import DialogueTrack, Script, SignalReport, Timeline, VoiceTrack
+from tenmin.progress import NullProgressReporter, ProgressReporter
 from tenmin.render.audio import mix_audio
 from tenmin.render.ffmpeg import preflight, probe_duration
 from tenmin.render.subtitles import render_ass
@@ -251,12 +252,15 @@ def _load_timeline(cfg: ProjectConfig, episode: int) -> Timeline:
 
 
 async def run_voice(
-    cfg: ProjectConfig, engine: TTSEngine, episode: int
+    cfg: ProjectConfig,
+    engine: TTSEngine,
+    episode: int,
+    reporter: ProgressReporter | None = None,
 ) -> tuple[VoiceTrack, list[str]]:
     paths = Paths(cfg.root)
     script = _load_script(cfg, episode)
     track, warnings = await synthesize_track(
-        script, episode, paths.voice_dir(episode), engine
+        script, episode, paths.voice_dir(episode), engine, reporter=reporter
     )
     _write_json(paths.voice(episode), track.model_dump_json(indent=2))
     return track, warnings
@@ -297,7 +301,9 @@ def run_audio(cfg: ProjectConfig, episode: int) -> Path:
     )
 
 
-def run_render(cfg: ProjectConfig, episode: int) -> Path:
+def run_render(
+    cfg: ProjectConfig, episode: int, reporter: ProgressReporter | None = None
+) -> Path:
     paths = Paths(cfg.root)
     episode_cfg = _find_episode(cfg, episode)
     timeline = _load_timeline(cfg, episode)
@@ -318,6 +324,7 @@ def run_render(cfg: ProjectConfig, episode: int) -> Path:
         outro_seconds=cfg.render.outro_card_seconds,
         outro_title=f"{cfg.show} · EP{episode:02d}",
         outro_message=cfg.render.outro_message,
+        reporter=reporter,
     )
 
 
@@ -330,6 +337,7 @@ async def run_pipeline(
     force: bool = False,
     tts_engine: TTSEngine | None = None,
     episode: int | None = None,
+    reporter: ProgressReporter | None = None,
 ) -> list[str]:
     """返回本次运行累积的 warnings。
 
@@ -342,6 +350,8 @@ async def run_pipeline(
     """
     if cfg.mode == "season":
         raise NotImplementedError("整季模式尚未实现，请使用 mode: single_episode")
+
+    reporter = reporter or NullProgressReporter()
 
     if only is not None:
         unknown = [stage for stage in only if stage not in STAGES]
@@ -362,28 +372,49 @@ async def run_pipeline(
         _find_episode(cfg, episode)  # 找不到会抛 ValueError（"没有注册"）
         target_numbers = [episode]
 
+    number_to_index = {number: idx for idx, number in enumerate(target_numbers, start=1)}
+
     if "ingest" in wanted:
         outputs = [paths.dialogue(n) for n in numbers]
         if force or not _is_fresh(outputs, srt_inputs):
+            reporter.stage_start("ingest")
             run_ingest(cfg)
+            reporter.stage_done("ingest")
+        else:
+            reporter.stage_skip("ingest")
 
     if "signals" in wanted:
         outputs = [paths.signals(n) for n in numbers]
         inputs = [paths.dialogue(n) for n in numbers]
         if force or not _is_fresh(outputs, inputs):
+            reporter.stage_start("signals")
             run_signals(cfg)
+            reporter.stage_done("signals")
+        else:
+            reporter.stage_skip("signals")
 
     for number in target_numbers:
+        if episode is None:
+            reporter.episode_start(number, number_to_index[number], len(target_numbers))
+
         if "script" in wanted:
             inputs = [paths.dialogue(number), paths.signals(number)]
             if force or not _is_fresh([paths.script(number)], inputs):
+                reporter.stage_start("script")
                 _, stage_warnings = await run_script(cfg, provider, episode=number)
                 warnings.extend(stage_warnings)
+                reporter.stage_done("script")
+            else:
+                reporter.stage_skip("script")
 
         if "docgen" in wanted:
             outputs = [paths.table(number), paths.narration(number)]
             if force or not _is_fresh(outputs, [paths.script(number)]):
+                reporter.stage_start("docgen")
                 run_docgen(cfg, episode=number)
+                reporter.stage_done("docgen")
+            else:
+                reporter.stage_skip("docgen")
 
     # 前置检查放在 voice 之前：绝不能跑完几分钟 TTS，最后一步才发现 ffmpeg 没编 libass。
     # 只在真的要跑 audio/render 时才做（跟原逻辑一致：单独跑 voice 不该触发 ffmpeg 检查）。
@@ -395,25 +426,42 @@ async def run_pipeline(
             preflight(cfg.video_path(_find_episode(cfg, number)), cfg.render.video_encoder)
 
     for number in target_numbers:
+        if episode is None:
+            reporter.episode_start(number, number_to_index[number], len(target_numbers))
+
         if "voice" in wanted:
             outputs = [paths.voice(number)]
             if force or not _is_fresh(outputs, [paths.script(number)]):
+                reporter.stage_start("voice")
                 assert tts_engine is not None
-                _, stage_warnings = await run_voice(cfg, tts_engine, episode=number)
+                _, stage_warnings = await run_voice(
+                    cfg, tts_engine, episode=number, reporter=reporter
+                )
                 warnings.extend(stage_warnings)
+                reporter.stage_done("voice")
+            else:
+                reporter.stage_skip("voice")
 
         if "timeline" in wanted:
             outputs = [paths.timeline(number), paths.subtitles(number)]
             inputs = [paths.script(number), paths.voice(number)]
             if force or not _is_fresh(outputs, inputs):
+                reporter.stage_start("timeline")
                 _, stage_warnings = run_timeline(cfg, episode=number)
                 warnings.extend(stage_warnings)
+                reporter.stage_done("timeline")
+            else:
+                reporter.stage_skip("timeline")
 
         if "audio" in wanted:
             outputs = [paths.mixed_audio(number)]
             inputs = [paths.timeline(number), paths.voice(number)]
             if force or not _is_fresh(outputs, inputs):
+                reporter.stage_start("audio")
                 run_audio(cfg, episode=number)
+                reporter.stage_done("audio")
+            else:
+                reporter.stage_skip("audio")
 
         if "render" in wanted:
             outputs = [paths.video(number)]
@@ -423,6 +471,10 @@ async def run_pipeline(
                 paths.timeline(number),
             ]
             if force or not _is_fresh(outputs, inputs):
-                run_render(cfg, episode=number)
+                reporter.stage_start("render")
+                run_render(cfg, episode=number, reporter=reporter)
+                reporter.stage_done("render")
+            else:
+                reporter.stage_skip("render")
 
     return warnings
