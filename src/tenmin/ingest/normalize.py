@@ -59,6 +59,10 @@ def _classify(
 def _can_merge(prev: DialogueLine, nxt: DialogueLine, cfg: IngestConfig) -> bool:
     if prev.kind != "dialogue" or nxt.kind != "dialogue":
         return False
+    # 同一条 cue 被 split_dual_track 拆出的两段不能合并回去（它们是叠在同一时间区间的
+    # 台词与内心独白，不是被硬折断的一句）。idx 是 cue 级的键，所以这个判断就是
+    # 「来自同一条 cue 吗」。idx 改用 position 之后这个守卫的语义才真正准确：原先用
+    # 文件序号时，两条不相关的 cue 只要序号撞了也会被误判成同 cue 而拒绝合并。
     if prev.idx == nxt.idx:
         return False
     if prev.speaker != nxt.speaker:
@@ -157,6 +161,8 @@ def build_track(
             lines.append(
                 DialogueLine(
                     idx=cue.idx,
+                    src_idx=cue.src_idx,
+                    segment_index=position,
                     start=cue.start,
                     end=cue.end,
                     text=body,

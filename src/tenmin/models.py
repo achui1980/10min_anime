@@ -106,7 +106,11 @@ class RawCue(_StageModel):
     纯内部模型，不进任何阶段产物 JSON。
     """
 
+    # 「第几个成功解析的 cue」，从 1 开始单调递增，因此天然唯一。
     idx: int
+    # 文件里那一行序号原样保留。坏字幕里它可能重复、乱序、或干脆不存在（None），
+    # 所以它只用来跟原始 SRT 人工对照，不参与任何定位。
+    src_idx: int | None = None
     start: float
     end: float
     text: str
@@ -116,9 +120,28 @@ class RawCue(_StageModel):
 
 
 class DialogueLine(_StageModel):
-    """标准化后的一行对白。不删任何行，只打标，由下游按 kind 过滤。"""
+    """标准化后的一行对白。不删任何行，只打标，由下游按 kind 过滤。
+
+    定位键的分工（这里曾经只有 idx 一个字段，而它并不唯一）：
+
+    - `idx` 是 **cue 级** 的键，等于「第几个 cue」。它是喂给 LLM 的对白清单里那一列
+      （script/single.py 的 build_dialogue_block），LLM 回填的 `anchor_lines` 就是这些
+      数字，所以它的取值是对外契约的一部分，不能随便改。
+    - 一条 cue 被 `split_dual_track` 拆成多段时，各段沿用同一个 idx，靠 `segment_index`
+      区分；`(idx, segment_index)` 才是行级唯一键。刻意**不**给拆出来的段重新编号：
+      同 cue 各段的时间码完全相同，而 idx 的每一个下游消费者（validate 的 _anchor_time
+      / _anchor_matches、aggregate 的 summary 选行）要的都是「这个锚点对应哪段时间」，
+      重复段给出的答案一致。重新编号既会让存量 script.json 的 anchor_lines 全部错位，
+      又会静默破坏 normalize._can_merge 里靠 `prev.idx == nxt.idx` 拦住的
+      「同一 cue 的两段不能合并」守卫。
+    - `src_idx` 是文件里写的那个序号，只用于跟原始 SRT 人工对照。
+    """
 
     idx: int
+    src_idx: int | None = None
+    segment_index: int = Field(
+        default=0, ge=0, description="本行是所属 cue 拆出的第几段，未拆则为 0"
+    )
     start: float
     end: float
     text: str

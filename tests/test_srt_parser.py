@@ -37,6 +37,29 @@ def test_parse_strips_bom_and_crlf():
     assert cues[0].text == "台词"
 
 
+def test_parse_uses_position_as_idx_and_keeps_file_serial_in_src_idx():
+    """idx 是「第几个 cue」，文件里写的序号另存 src_idx。
+
+    原先只要块头是数字就用文件序号覆盖 idx，坏字幕里序号重复/乱序时 idx 就不再唯一，
+    而 idx 是全项目的定位主键（aggregate 的 `ln.idx in anchors`、validate 的 anchor
+    匹配都按它查）。两条时间完全不同的 cue 共享一个 idx 会让 _anchor_time 取到错误的
+    时间点。position 单调递增，天然唯一。
+    """
+    text = (
+        "7\n00:00:01,000 --> 00:00:02,000\nA\n\n"
+        "7\n00:00:03,000 --> 00:00:04,000\nB\n\n"
+        "3\n00:00:05,000 --> 00:00:06,000\nC\n"
+    )
+    cues = parse_srt(text)
+    assert [c.idx for c in cues] == [1, 2, 3]
+    assert [c.src_idx for c in cues] == [7, 7, 3]
+
+
+def test_parse_src_idx_is_none_when_block_has_no_serial():
+    text = "00:00:01,000 --> 00:00:02,000\nA\n"
+    assert parse_srt(text)[0].src_idx is None
+
+
 def test_parse_falls_back_to_positional_index_when_number_missing():
     text = "00:00:01,000 --> 00:00:02,000\nA\n\n00:00:03,000 --> 00:00:04,000\nB\n"
     cues = parse_srt(text)
@@ -50,7 +73,10 @@ def test_parse_skips_blocks_without_timestamp():
         "3\n00:00:05,000 --> 00:00:06,000\nC\n"
     )
     cues = parse_srt(text)
-    assert [c.idx for c in cues] == [1, 3]
+    # idx 数的是「第几个成功解析的 cue」，所以被跳过的块不占号；
+    # 文件里写的 1 / 3 仍然完整保留在 src_idx 里。
+    assert [c.idx for c in cues] == [1, 2]
+    assert [c.src_idx for c in cues] == [1, 3]
     assert [c.text for c in cues] == ["A", "C"]
 
 
@@ -138,6 +164,8 @@ def test_golden_sample_shape(golden_srt_path):
     assert len(cues) == 405
     assert cues[0].idx == 1
     assert cues[-1].idx == 405
+    # 黄金样本的文件序号本来就等于位置，所以 idx 改用 position 之后取值一字未变。
+    assert all(c.idx == c.src_idx for c in cues)
     assert 7.0 <= cues[0].start < 8.0
     assert cues[-1].end == pytest.approx(1416.622, abs=0.001)
     assert all(c.end >= c.start for c in cues)

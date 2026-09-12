@@ -259,6 +259,69 @@ def test_build_track_clean_srt_has_zero_bad_counts(tmp_path):
     assert (track.skipped_blocks, track.clamped_cues) == (0, 0)
 
 
+def test_build_track_idx_plus_segment_index_is_unique(tmp_path):
+    """`(idx, segment_index)` 才是行级唯一键；idx 单独是 cue 级的。
+
+    split_dual_track 把一条 cue 拆成多段时，每段都沿用 cue 的 idx（拆出来的段时间码
+    完全相同，所以按 idx 反查时间窗的下游拿到的结果一致），行级区分靠 segment_index。
+    """
+    srt = tmp_path / "e01.srt"
+    srt.write_text(
+        "1\n00:00:01,000 --> 00:00:03,000\n(天王寺)出身高贵\n(伊月)这个人超在意雏子\n\n"
+        "2\n00:00:04,000 --> 00:00:05,000\n普通台词\n",
+        encoding="utf-8",
+    )
+    track = build_track(srt, episode=1)
+    assert [ln.idx for ln in track.lines] == [1, 1, 2]
+    assert [ln.segment_index for ln in track.lines] == [0, 1, 0]
+    keys = [(ln.idx, ln.segment_index) for ln in track.lines]
+    assert len(set(keys)) == len(keys)
+    # 同 cue 拆出的两段时间码完全相同 —— 这就是「idx 重复无害」的前提。
+    assert track.lines[0].start == track.lines[1].start
+    assert track.lines[0].end == track.lines[1].end
+
+
+def test_build_track_keeps_file_serial_in_src_idx(tmp_path):
+    srt = tmp_path / "e01.srt"
+    srt.write_text(
+        "7\n00:00:01,000 --> 00:00:02,000\nA\n\n7\n00:00:03,000 --> 00:00:04,000\nB\n",
+        encoding="utf-8",
+    )
+    track = build_track(srt, episode=1)
+    assert [ln.idx for ln in track.lines] == [1, 2]
+    assert [ln.src_idx for ln in track.lines] == [7, 7]
+
+
+def test_build_track_does_not_merge_two_segments_of_one_cue(tmp_path):
+    """_can_merge 的 `prev.idx == nxt.idx` 守卫依赖同 cue 段共享 idx。
+
+    idx 改用 position 之后这个守卫的语义反而更准了：原先两条不相关的 cue 只要文件序号
+    撞了就会被误判成「同一个 cue 的两段」而拒绝合并。
+    """
+    srt = tmp_path / "e01.srt"
+    srt.write_text(
+        "1\n00:00:01,000 --> 00:00:03,000\n(天王寺)我觉得这件事\n(伊月)应该再想想\n",
+        encoding="utf-8",
+    )
+    track = build_track(srt, episode=1, merge_lines=True)
+    assert len(track.lines) == 2
+
+
+def test_build_track_golden_idx_unchanged_by_position_switch(golden_track):
+    """黄金样本的文件序号本来就等于位置，所以 idx 取值一字未变、存量 anchor 不受影响。"""
+    assert all(ln.src_idx == ln.idx for ln in golden_track.lines)
+    counts: dict[int, int] = {}
+    for ln in golden_track.lines:
+        counts[ln.idx] = counts.get(ln.idx, 0) + 1
+    # idx 只在「一条 cue 被拆成多段」时重复；重复的段时间码相同，按 idx 反查时间窗无害。
+    for idx, count in counts.items():
+        if count > 1:
+            same = [ln for ln in golden_track.lines if ln.idx == idx]
+            assert len({(ln.start, ln.end) for ln in same}) == 1, idx
+    keys = [(ln.idx, ln.segment_index) for ln in golden_track.lines]
+    assert len(set(keys)) == len(keys)
+
+
 # --- 黄金样本：12 类实测脏数据 ---
 
 

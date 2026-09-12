@@ -78,14 +78,25 @@ def parse_srt_detailed(text: str) -> SrtParseResult:
         if clamped:
             end = start
             clamped_cues += 1
-        idx = position
+        # idx 一律用 position（单调递增，因此唯一）。文件里写的序号另存 src_idx：
+        # 它可能重复、乱序、或干脆不存在，而 idx 是全项目的定位主键（aggregate 的
+        # `ln.idx in anchors`、validate 的 anchor 匹配都按它查），两条时间完全不同的
+        # cue 共享一个 idx 会让 _anchor_time 静默取到错误的时间点。
+        src_idx = None
         if ts_at > 0:
             head = lines[ts_at - 1].strip()
             if head.isdigit():
-                idx = int(head)
+                src_idx = int(head)
         body = "\n".join(lines[ts_at + 1 :]).strip("\n")
         cues.append(
-            RawCue(idx=idx, start=start, end=end, text=body, clamped=clamped)
+            RawCue(
+                idx=position,
+                src_idx=src_idx,
+                start=start,
+                end=end,
+                text=body,
+                clamped=clamped,
+            )
         )
     return SrtParseResult(cues, skipped_blocks, clamped_cues)
 
