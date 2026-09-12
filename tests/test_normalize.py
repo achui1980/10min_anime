@@ -162,7 +162,8 @@ def test_build_track_full_paren_line_is_screen_text(tmp_path):
     srt = tmp_path / "e01.srt"
     srt.write_text(
         "1\n00:00:01,000 --> 00:00:03,000\n(远处传来钟声)\n\n"
-        "2\n00:00:05,000 --> 00:00:07,000\n（这是一段超过四十个字的长注释所以不会被当成说话人前缀剥掉）\n",
+        "2\n00:00:05,000 --> 00:00:07,000\n"
+        "（这是一段超过四十个字的长注释所以不会被当成说话人前缀剥掉）\n",
         encoding="utf-8",
     )
     track = build_track(srt, episode=1)
