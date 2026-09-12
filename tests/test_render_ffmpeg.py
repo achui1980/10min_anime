@@ -73,6 +73,29 @@ def test_tail_strips_trailing_blank_lines():
     assert tail("a\nb\n\n\n", lines=2) == "a\nb"
 
 
+def test_tail_does_not_split_on_carriage_returns():
+    """ffmpeg 的统计行是 `\\r` 结尾的，而 str.splitlines() 也在 `\\r` 上切。
+
+    实测（60 秒编码、真实源片）：stderr 共 6520 字节 / 70 个 `\\n`，但里面有 4 个
+    `\\r`，splitlines() 于是把它数成 75 行。也就是说「末尾 30 行」里有 5 行是进度
+    碎片，真正的错误被顶出去 5 行。行数越少的报错越容易被完全顶掉。
+    """
+    stats = "".join(f"\rframe={i} fps=300 q=16.0 time=00:00:0{i}" for i in range(5))
+    # 真实形态（从实测 stderr 抄的）：最后一条统计之后同样是 `\r`，然后才是真内容
+    text = "real error line 1\nreal error line 2\n" + stats + "\r[out#0/mp4] muxing overhead"
+    result = tail(text, lines=3)
+    assert "real error line 1" in result
+    assert "real error line 2" in result
+    assert "[out#0/mp4] muxing overhead" in result
+    # `\r` 的语义是「回到行首重写」，被覆盖掉的统计不该算进可见内容
+    assert "frame=" not in result
+
+
+def test_tail_drops_physical_lines_that_are_only_overwritten_stats():
+    """一整行只有被覆盖掉的统计时，它没有任何可见内容，不该占掉一行配额。"""
+    assert tail("real error\n\rframe=1 fps=2 q=16.0\r\n", lines=30) == "real error"
+
+
 def test_ffmpeg_error_is_runtime_error():
     assert issubclass(FFmpegError, RuntimeError)
     with pytest.raises(RuntimeError):

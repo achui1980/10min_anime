@@ -31,11 +31,28 @@ def parse_names(text: str) -> set[str]:
 
 
 def tail(text: str, lines: int = STDERR_TAIL_LINES) -> str:
-    """取末尾若干行。ffmpeg 的真实错误永远在 stderr 尾部。"""
+    """取末尾若干行。ffmpeg 的真实错误永远在 stderr 尾部。
+
+    刻意**不**用 str.splitlines()：它除了 `\\n` 还在 `\\r` 上切，而 ffmpeg 的统计行
+    正是 `\\r` 结尾的。实测一次 60 秒编码的 stderr 有 70 个 `\\n` 但 4 个 `\\r`，
+    splitlines() 把它数成 75 行 —— 「末尾 30 行」里凭空混进 5 行进度碎片，真正的
+    错误被顶出去。加了 -nostats 之后正常情况下不再有 `\\r`（实测降到 0 个），
+    但显式按 `\\r` 的真实语义处理才不用依赖「上游一定记得加那个 flag」。
+
+    `\\r` 的语义是「回到行首重写」，所以一个物理行（`\\n` 之间）的可见内容就是
+    最后一个 `\\r` 之后的那段 —— 跟终端上看到的一致。
+    """
     stripped = text.rstrip("\n")
     if not stripped:
         return ""
-    return "\n".join(stripped.splitlines()[-lines:])
+    visible: list[str] = []
+    for line in stripped.split("\n"):
+        collapsed = line.rpartition("\r")[2]
+        if not collapsed and "\r" in line:
+            # 整行都是被后续写覆盖掉的统计，没有任何可见内容，不该占掉一行配额
+            continue
+        visible.append(collapsed)
+    return "\n".join(visible[-lines:])
 
 
 def run(args: list[str]) -> str:
