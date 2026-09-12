@@ -101,12 +101,18 @@ OriginalAudio = Literal["duck", "mute", "full"]
 
 
 class RawCue(_StageModel):
-    """SRT 解析器的直接产物，未做任何清洗。text 保留内部换行。"""
+    """SRT 解析器的直接产物，未经任何清洗。text 保留内部换行。
+
+    纯内部模型，不进任何阶段产物 JSON。
+    """
 
     idx: int
     start: float
     end: float
     text: str
+    # `end < start` 的坏 cue 被夹成零时长（end = start）。normalize 会把它翻译成
+    # DialogueLine.suspect，parse_srt_detailed 会把它计入 clamped_cues。
+    clamped: bool = False
 
 
 class DialogueLine(_StageModel):
@@ -134,6 +140,11 @@ class DialogueTrack(_StageModel):
     op_range: tuple[float, float] | None = None
     ed_range: tuple[float, float] | None = None
     lines: list[DialogueLine] = Field(default_factory=list)
+    # 解析期丢掉/修补过的数据量。默认 0，所以缺这两个键的旧 dialogue.json 照样读得进来
+    # （_StageModel 是 extra="forbid"，但缺字段走默认值不受影响）。
+    # 暴露渠道：dialogue.json -> `tenmin inspect` 的第一行 + run_pipeline 的 warnings。
+    skipped_blocks: int = Field(default=0, ge=0, description="没有时间戳行、被整块跳过的块数")
+    clamped_cues: int = Field(default=0, ge=0, description="end < start 被夹成零时长的 cue 数")
 
 
 class Signal(_StageModel):

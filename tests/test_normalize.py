@@ -225,6 +225,40 @@ def test_build_track_sorting_fixes_wrong_merge_on_unsorted_input(tmp_path):
     assert "完全无关的一句" in texts
 
 
+def test_build_track_records_bad_cue_counts(tmp_path):
+    """坏 cue 的数量必须进产物 JSON，否则「丢了一半对白」这件事没人看得见。"""
+    srt = tmp_path / "e01.srt"
+    srt.write_text(
+        "1\n00:00:09,000 --> 00:00:02,000\n倒挂的一句\n\n"
+        "没有时间戳的垃圾块\n\n"
+        "3\n00:00:10,000 --> 00:00:12,000\n正常的一句\n",
+        encoding="utf-8",
+    )
+    track = build_track(srt, episode=1)
+    assert track.skipped_blocks == 1
+    assert track.clamped_cues == 1
+
+
+def test_build_track_marks_clamped_cue_as_suspect(tmp_path):
+    """被夹成零时长的 cue 要打 suspect —— 这个字段本来就是为可疑行准备的。"""
+    srt = tmp_path / "e01.srt"
+    srt.write_text(
+        "1\n00:00:09,000 --> 00:00:02,000\n倒挂的一句\n\n"
+        "2\n00:00:10,000 --> 00:00:12,000\n正常的一句\n",
+        encoding="utf-8",
+    )
+    track = build_track(srt, episode=1)
+    assert track.lines[0].suspect is True
+    assert track.lines[1].suspect is False
+
+
+def test_build_track_clean_srt_has_zero_bad_counts(tmp_path):
+    srt = tmp_path / "e01.srt"
+    srt.write_text("1\n00:00:01,000 --> 00:00:03,000\n台词\n", encoding="utf-8")
+    track = build_track(srt, episode=1)
+    assert (track.skipped_blocks, track.clamped_cues) == (0, 0)
+
+
 # --- 黄金样本：12 类实测脏数据 ---
 
 

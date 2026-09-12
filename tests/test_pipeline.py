@@ -9,6 +9,7 @@ from tenmin.models import (
     AudioDirection,
     Beat,
     Clip,
+    DialogueTrack,
     Hold,
     LLMBeat,
     LLMClip,
@@ -19,6 +20,7 @@ from tenmin.pipeline import (
     STAGES,
     Paths,
     _find_episode,
+    ingest_warnings,
     register_episode,
     run_audio,
     run_docgen,
@@ -147,6 +149,21 @@ def test_run_signals_writes_signals_json(project):
     # tests/test_aggregate.py 对同一黄金样本断言的也是 26。
     assert len(reports[0].silent_gaps) == 26
     assert Paths(project.root).signals(2).exists()
+
+
+def test_ingest_warnings_reports_bad_cue_counts():
+    tracks = [
+        DialogueTrack(episode=2, duration=100.0, skipped_blocks=3, clamped_cues=1),
+        DialogueTrack(episode=3, duration=100.0),
+    ]
+    messages = ingest_warnings(tracks)
+    assert len(messages) == 2
+    assert "E02" in messages[0] and "3 个块" in messages[0]
+    assert "E02" in messages[1] and "1 条 cue" in messages[1]
+
+
+def test_ingest_warnings_silent_on_clean_tracks():
+    assert ingest_warnings([DialogueTrack(episode=2, duration=100.0)]) == []
 
 
 def test_run_signals_without_ingest_raises(project):

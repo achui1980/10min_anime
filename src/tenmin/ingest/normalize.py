@@ -14,7 +14,7 @@ from tenmin.ingest.clean import (
     split_dual_track,
 )
 from tenmin.ingest.credits import find_credit_ranges, in_credit_window, is_credits
-from tenmin.ingest.srt_parser import load_srt
+from tenmin.ingest.srt_parser import load_srt_detailed
 from tenmin.models import DialogueLine, DialogueTrack
 
 # 整行都被一对圆括号包住 —— 屏幕注释/拟声，不是台词。
@@ -128,12 +128,12 @@ def build_track(
     """
     ingest = ingest or DEFAULT_INGEST
     credits = credits or DEFAULT_CREDITS
-    cues = load_srt(srt_path)
+    parsed = load_srt_detailed(srt_path)
     # merge_continuations 只比较相邻元素、in_credit_window 逐条按 duration 判断，
     # 两者都默认 cue 按时间有序。乱序 SRT（合并多个字幕源时常见）会导致错误合并与
     # 错误的 duration 归因，而且全程不报错。O(n log n) 相对整条流水线可以忽略。
     # 实测 work/ 下 11 集素材本来就有序，排序后产物逐字节不变。
-    cues = sorted(cues, key=lambda cue: (cue.start, cue.end))
+    cues = sorted(parsed.cues, key=lambda cue: (cue.start, cue.end))
     duration = max((cue.end for cue in cues), default=0.0)
     lines: list[DialogueLine] = []
 
@@ -142,7 +142,9 @@ def build_track(
         window = in_credit_window(cue.start, duration, cfg=credits)
         for position, segment in enumerate(split_dual_track(cleaned)):
             speaker, body = extract_prefix(segment)
-            suspect = is_suspect(segment)
+            # 被夹成零时长的坏 cue 一律算可疑行：DialogueLine.suspect 本来就是为这类
+            # 「只打标不删除、交给有全局上下文的 LLM 判断」的行准备的。
+            suspect = is_suspect(segment) or cue.clamped
             body = _fold(body)
             kind = _classify(
                 body,
@@ -175,4 +177,6 @@ def build_track(
         op_range=op_range or inferred_op,
         ed_range=ed_range or inferred_ed,
         lines=lines,
+        skipped_blocks=parsed.skipped_blocks,
+        clamped_cues=parsed.clamped_cues,
     )

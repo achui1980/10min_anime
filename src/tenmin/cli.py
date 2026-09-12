@@ -205,6 +205,12 @@ def inspect(
     typer.echo("  分类：" + "、".join(f"{k}={v}" for k, v in sorted(counts.items())))
     typer.echo(f"  片头曲：{track.op_range}")
     typer.echo(f"  片尾曲：{track.ed_range}")
+    if track.skipped_blocks or track.clamped_cues:
+        typer.secho(
+            f"  解析期坏数据：跳过 {track.skipped_blocks} 个无时间戳块、"
+            f"夹平 {track.clamped_cues} 条终点早于起点的 cue",
+            fg="yellow",
+        )
 
     if suspect:
         typer.echo("疑似噪声行：")

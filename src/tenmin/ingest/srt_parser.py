@@ -5,6 +5,7 @@ from __future__ import annotations
 import codecs
 import re
 from pathlib import Path
+from typing import NamedTuple
 
 from charset_normalizer import from_bytes
 
@@ -31,33 +32,72 @@ def decode_bytes(data: bytes) -> str:
     return str(best)
 
 
-def parse_srt(text: str) -> list[RawCue]:
+class SrtParseResult(NamedTuple):
+    """解析结果 + 两个「悄悄丢数据」的计数器。
+
+    这两个数字必须能一路传到用户眼前（DialogueTrack 的同名字段 -> dialogue.json ->
+    `tenmin inspect` / run_pipeline 的 warnings）：一个格式略歪的字幕文件可能丢掉大量
+    对白，而原先解析器对此完全沉默 —— 无告警、不设 suspect、不计数。
+
+    本项目刻意不引入 logging 体系，所以走的是「计数进产物 + 汇总进 warnings」这条路。
+    """
+
+    cues: list[RawCue]
+    # 找不到时间戳行、被整块跳过的块数。
+    skipped_blocks: int
+    # `end < start` 被夹成零时长的 cue 数。这些 cue 的 `clamped` 为 True。
+    clamped_cues: int
+
+
+def parse_srt_detailed(text: str) -> SrtParseResult:
     text = text.lstrip("\ufeff").replace("\r\n", "\n").replace("\r", "\n")
     cues: list[RawCue] = []
     position = 0
+    skipped_blocks = 0
+    clamped_cues = 0
     for block in _BLOCK_SPLIT.split(text):
         if not block.strip():
             continue
         lines = block.split("\n")
-        ts_at = next((i for i, line in enumerate(lines) if _TS_LINE.search(line)), None)
-        if ts_at is None:
+        # 一次循环同时拿到行号与 match：原先第一遍用生成器找 ts_at、第二遍再对同一行
+        # 重新 search 一次，并用 `assert match is not None` 兜住第二次的结果 ——
+        # `python -O` 下 assert 被剥离后那句会退化成 AttributeError。
+        ts_at = None
+        match = None
+        for index, line in enumerate(lines):
+            if found := _TS_LINE.search(line):
+                ts_at, match = index, found
+                break
+        if match is None or ts_at is None:
+            skipped_blocks += 1
             continue
         position += 1
-        match = _TS_LINE.search(lines[ts_at])
-        assert match is not None
         start = parse_timestamp(match.group(1))
         end = parse_timestamp(match.group(2))
-        if end < start:
+        clamped = end < start
+        if clamped:
             end = start
+            clamped_cues += 1
         idx = position
         if ts_at > 0:
             head = lines[ts_at - 1].strip()
             if head.isdigit():
                 idx = int(head)
         body = "\n".join(lines[ts_at + 1 :]).strip("\n")
-        cues.append(RawCue(idx=idx, start=start, end=end, text=body))
-    return cues
+        cues.append(
+            RawCue(idx=idx, start=start, end=end, text=body, clamped=clamped)
+        )
+    return SrtParseResult(cues, skipped_blocks, clamped_cues)
+
+
+def parse_srt(text: str) -> list[RawCue]:
+    """只要 cue 列表。要坏数据计数请用 parse_srt_detailed。"""
+    return parse_srt_detailed(text).cues
+
+
+def load_srt_detailed(path: Path) -> SrtParseResult:
+    return parse_srt_detailed(decode_bytes(Path(path).read_bytes()))
 
 
 def load_srt(path: Path) -> list[RawCue]:
-    return parse_srt(decode_bytes(Path(path).read_bytes()))
+    return load_srt_detailed(path).cues

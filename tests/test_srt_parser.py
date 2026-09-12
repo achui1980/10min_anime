@@ -1,6 +1,12 @@
 import pytest
 
-from tenmin.ingest.srt_parser import decode_bytes, load_srt, parse_srt
+from tenmin.ingest.srt_parser import (
+    decode_bytes,
+    load_srt,
+    load_srt_detailed,
+    parse_srt,
+    parse_srt_detailed,
+)
 
 SIMPLE = """\
 1
@@ -64,8 +70,60 @@ def test_parse_keeps_empty_text_block():
     assert cues[0].text == ""
 
 
-def test_decode_bytes_utf8_bom():
-    assert decode_bytes("\ufeff你好".encode()) == "你好"
+# --- 坏数据的可见性 ---
+
+
+def test_parse_detailed_counts_skipped_blocks():
+    """无时间戳的块被静默跳过，全程没有任何计数。
+
+    一个格式略歪的字幕文件可能丢掉大量对白而流水线毫无提示。
+    """
+    text = (
+        "1\n00:00:01,000 --> 00:00:02,000\nA\n\n"
+        "垃圾块没有时间戳\n\n"
+        "另一个垃圾块\n\n"
+        "3\n00:00:05,000 --> 00:00:06,000\nC\n"
+    )
+    result = parse_srt_detailed(text)
+    assert [c.text for c in result.cues] == ["A", "C"]
+    assert result.skipped_blocks == 2
+    assert result.clamped_cues == 0
+
+
+def test_parse_detailed_counts_clamped_cues():
+    """`end < start` 的坏 cue 被夹成零时长，原先无告警、不设 suspect、不计数。"""
+    result = parse_srt_detailed(
+        "1\n00:00:09,000 --> 00:00:02,000\nA\n\n2\n00:00:10,000 --> 00:00:11,000\nB\n"
+    )
+    assert result.clamped_cues == 1
+    assert result.skipped_blocks == 0
+    assert result.cues[0].clamped is True
+    assert result.cues[1].clamped is False
+
+
+def test_parse_srt_stays_a_plain_list():
+    """老调用点与老测试继续拿到纯 list，不受详细版影响。"""
+    cues = parse_srt("1\n00:00:01,000 --> 00:00:02,000\nA\n")
+    assert isinstance(cues, list)
+    assert len(cues) == 1
+
+
+def test_load_srt_detailed_reads_from_disk(tmp_path):
+    path = tmp_path / "e01.srt"
+    path.write_text(
+        "1\n00:00:09,000 --> 00:00:02,000\nA\n\n没有时间戳\n", encoding="utf-8"
+    )
+    result = load_srt_detailed(path)
+    assert (result.skipped_blocks, result.clamped_cues) == (1, 1)
+
+
+def test_golden_sample_has_no_skipped_or_clamped(golden_srt_path):
+    """黄金样本是干净的：两个计数都必须是 0，否则这两个计数器自己就有问题。"""
+    result = load_srt_detailed(golden_srt_path)
+    assert (result.skipped_blocks, result.clamped_cues) == (0, 0)
+
+
+def test_decode_bytes_utf8_bom():    assert decode_bytes("\ufeff你好".encode()) == "你好"
 
 
 def test_decode_bytes_gbk():

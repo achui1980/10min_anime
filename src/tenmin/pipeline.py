@@ -121,6 +121,29 @@ def run_ingest(cfg: ProjectConfig) -> list[DialogueTrack]:
     return tracks
 
 
+def ingest_warnings(tracks: Sequence[DialogueTrack]) -> list[str]:
+    """把解析期悄悄丢掉/修补过的数据翻译成 warnings。
+
+    本项目刻意不引入 logging，所以坏数据走的是已有的 warnings 通道（与 script /
+    voice / timeline 三个阶段一致），另外这两个数字也常驻 dialogue.json，
+    `tenmin inspect` 会打出来。run_ingest 的返回类型刻意不改成 tuple ——
+    它有 4 个既有调用点把返回值直接当 list 用。
+    """
+    out: list[str] = []
+    for track in tracks:
+        if track.skipped_blocks:
+            out.append(
+                f"E{track.episode:02d}：SRT 里有 {track.skipped_blocks} 个块找不到时间戳行，"
+                "已整块跳过（对白可能缺失，建议检查字幕源格式）"
+            )
+        if track.clamped_cues:
+            out.append(
+                f"E{track.episode:02d}：SRT 里有 {track.clamped_cues} 条 cue 的终点早于起点，"
+                "已夹成零时长并标记 suspect"
+            )
+    return out
+
+
 def _load_tracks(cfg: ProjectConfig) -> list[DialogueTrack]:
     paths = Paths(cfg.root)
     tracks = []
@@ -388,7 +411,7 @@ async def run_pipeline(
         outputs = [paths.dialogue(n) for n in numbers]
         if force or not _is_fresh(outputs, srt_inputs):
             reporter.stage_start("ingest")
-            run_ingest(cfg)
+            warnings.extend(ingest_warnings(run_ingest(cfg)))
             reporter.stage_done("ingest")
         else:
             reporter.stage_skip("ingest")
