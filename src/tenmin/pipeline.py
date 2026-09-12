@@ -626,12 +626,22 @@ async def run_pipeline(
     # （ffmpeg -filters/-encoders 有 lru_cache，加一次 ffprobe），却能在花掉任何 LLM
     # token 之前就把「ffmpeg 不行」喊出来。
     if {"audio", "render"} & set(wanted):
+        # drawtext 与片尾卡字体都只在卡片开着时才用到，关掉卡片的用户不该被它们挡住。
+        needs_outro = cfg.render.outro_card_seconds > 0
+        font_names = [cfg.render.subtitle_font_name]
+        if needs_outro:
+            font_names.append(cfg.render.outro_font_name)
         for number in target_numbers:
             preflight(
                 cfg.video_path(_find_episode(cfg, number)),
                 cfg.render.video_encoder,
                 ffmpeg=cfg.render.ffmpeg_path,
                 ffprobe=cfg.render.ffprobe_path,
+                needs_drawtext=needs_outro,
+                font_names=font_names,
+                # 字体缺失只是 warning（fontconfig 会静默替换，纯外观问题）。本项目不引入
+                # logging，warnings 是这类诊断唯一的出口，所以必须把列表递进去。
+                warnings=warnings,
             )
 
     for number in target_numbers:

@@ -7,13 +7,16 @@ import shlex
 import shutil
 import subprocess
 import threading
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from functools import lru_cache
 from pathlib import Path
 from typing import IO
 
 FFMPEG = "ffmpeg"
 FFPROBE = "ffprobe"
+# 字体可用性只能靠 fontconfig 的 fc-list 查（ffmpeg 自己测不出来，见 font_available）。
+# 它不一定装，所以那个函数的返回值是三态的。
+FC_LIST = "fc-list"
 STDERR_TAIL_LINES = 30
 # stderr 排空线程的 join 上限。走到这个上限只可能是 ffmpeg 已经退出但线程还没收到 EOF，
 # 属于「不该发生」；给个上限是为了宁可丢掉诊断信息也不把出片卡成永久挂死。
@@ -306,29 +309,148 @@ def has_encoder(name: str, *, ffmpeg: str = FFMPEG) -> bool:
     return name in available_encoders(ffmpeg)
 
 
+def has_audio_stream(path: Path, *, ffprobe: str = FFPROBE) -> bool:
+    """源片里有没有音轨。
+
+    render/audio.py 的 filtergraph 用 `[0:a]`，一个视频-only 的源（remux 出来的、
+    或者只拿了视频轨的下载）会让混音直接失败 —— 而那是在跑完几分钟 TTS **之后**。
+
+    实测：`-select_streams a` 在没有音轨时退出码仍然是 **0**、stdout 是空的。所以判据
+    只能看 stdout 有没有内容，看 returncode 会永远判成「有音轨」。
+    """
+    path = Path(path)
+    args = [
+        ffprobe,
+        "-v",
+        "error",
+        "-select_streams",
+        "a",
+        "-show_entries",
+        "stream=index",
+        "-of",
+        "csv=p=0",
+        str(path),
+    ]
+    completed = subprocess.run(
+        args,
+        capture_output=True,
+        text=True,
+        errors="replace",
+        stdin=subprocess.DEVNULL,
+        timeout=PROBE_TIMEOUT_SECONDS,
+    )
+    return bool(completed.stdout.strip())
+
+
+def font_available(name: str) -> bool | None:
+    """fontconfig 认不认这个字体家族。**None = 查不了**（不是「不可用」）。
+
+    为什么只能靠 fc-list，不能靠 ffmpeg 自己试一遍：实测 ffmpeg 9.0.1 拿一个根本不存在
+    的 font family 跑 drawtext 依然**退出码 0** —— fontconfig 静默替换成 PingFang 并
+    正常渲染完。也就是说 ffmpeg 这条路在原理上就测不出「字体没装」。
+
+    `fc-list "<family>" family` 命中时打出家族名（含本地化别名），没命中时 stdout 是空的，
+    两种情况退出码都是 0，所以同样只能看 stdout。fc-list 不一定装，那时返回 None，让调用方
+    如实说「跳过了这项检查」而不是谎报可用。
+    """
+    if shutil.which(FC_LIST) is None:
+        return None
+    try:
+        completed = subprocess.run(
+            [FC_LIST, name, "family"],
+            capture_output=True,
+            text=True,
+            errors="replace",
+            stdin=subprocess.DEVNULL,
+            timeout=CAPABILITY_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        # 查不了就说查不了。字体只影响外观，绝不值得为它把渲染打死。
+        return None
+    if completed.returncode != 0:
+        return None
+    return bool(completed.stdout.strip())
+
+
+def _warn_once(warnings: list[str] | None, message: str) -> None:
+    """批量模式下 preflight 每集跑一次，而字体是全项目共享的，别刷 10 遍同一句。"""
+    if warnings is None or message in warnings:
+        return
+    warnings.append(message)
+
+
 def preflight(
     video: Path,
     video_encoder: str,
     *,
     ffmpeg: str = FFMPEG,
     ffprobe: str = FFPROBE,
+    needs_drawtext: bool = False,
+    font_names: Sequence[str] = (),
+    warnings: list[str] | None = None,
 ) -> float:
-    """开跑前一次性检查，返回源片时长。任一项不满足立刻抛错。
+    """开跑前一次性检查，返回源片时长。任一**致命**项不满足立刻抛错。
 
-    渲染动辄几分钟，绝不能跑完 TTS 才在最后一步炸掉。
+    渲染动辄几分钟，而 voice 阶段之前还有一轮 LLM，绝不能跑完 TTS 才在最后一步炸掉。
+    所以这里要覆盖真实渲染会用到的**全部**外部依赖，尤其是最后一公里那几样：
+
+    - subtitles 滤镜（libass）：烧字幕，必需。
+    - 视频编码器：必需。
+    - drawtext 滤镜（+libfreetype/fontconfig）：**只在片尾黑卡开着时**才用到
+      （render/video.py 的 outro 分支），所以由 needs_drawtext 控制，关掉卡片的用户
+      不该被它挡住。
+    - 源片有音轨：render/audio.py 用 `[0:a]`，视频-only 的源会在跑完 TTS + 混音之后
+      才炸 —— 正是 preflight 最该拦的那一类。
+    - 字体：只发 warning，见下。
+
+    抛的一律是 FFmpegError 而不是裸 RuntimeError：裸 RuntimeError **不在**
+    cli.PIPELINE_ERRORS 里，于是「你的 ffmpeg 没编 libass」这句本来写得很清楚的人话，
+    用户实际看到的是一整页 traceback。FFmpegError 是 RuntimeError 子类且已在表里。
+
+    字体为什么是 warning 而不是 error：实测 fontconfig 会**静默替换**成别的字体并正常
+    渲染完（ffmpeg 9.0.1 拿不存在的 family 跑 drawtext 退出码 0）。所以字体不对的后果
+    是「字体长得不一样」这种纯外观问题，不是失败；为它拦住整次渲染是本末倒置。而且检测
+    本身依赖 fc-list（不一定装），查不了的时候如实说查不了 —— 不假装检查过。
     """
     if not has_filter("subtitles", ffmpeg=ffmpeg):
-        raise RuntimeError(
+        raise FFmpegError(
             "你的 ffmpeg 没编 libass，subtitles 滤镜不可用，烧不了字幕。\n"
             "请重装：brew install homebrew-ffmpeg/ffmpeg/ffmpeg --with-libass"
         )
     if not has_encoder(video_encoder, ffmpeg=ffmpeg):
-        raise RuntimeError(
+        raise FFmpegError(
             f"你的 ffmpeg 没有编码器 {video_encoder}，请改 project.yaml 的 render.video_encoder，"
             "或重装 ffmpeg"
         )
+    if needs_drawtext and not has_filter("drawtext", ffmpeg=ffmpeg):
+        raise FFmpegError(
+            "你的 ffmpeg 没编 drawtext 滤镜（需要 libfreetype + fontconfig），"
+            "画不了片尾黑卡。\n"
+            "请重装 ffmpeg，或把 project.yaml 的 render.outro_card_seconds 设成 0 关掉卡片。"
+        )
     if not Path(video).is_file():
         raise FileNotFoundError(f"找不到源视频 {video}，请检查 project.yaml 的 episodes[].video")
+    if not has_audio_stream(Path(video), ffprobe=ffprobe):
+        raise FFmpegError(
+            f"源视频 {video} 里没有音轨，混音这一步（原声 ducking）没法做。\n"
+            "这个源大概率是只拿了视频轨的 remux，请换一个带音轨的源片。"
+        )
+    for name in font_names:
+        state = font_available(name)
+        if state is True:
+            continue
+        if state is None:
+            _warn_once(
+                warnings,
+                f"没装 fc-list，跳过了字体可用性检查（配的是 {name!r}）。"
+                "字体真的缺了的话 fontconfig 会静默换一个，成片字体会跟预期不一样。",
+            )
+        else:
+            _warn_once(
+                warnings,
+                f"fontconfig 里找不到字体 {name!r}，fontconfig 会静默替换成别的字体，"
+                "成片的字幕/片尾卡字体会跟预期不一样（不影响出片）。",
+            )
     return probe_duration(Path(video), ffprobe=ffprobe)
 
 

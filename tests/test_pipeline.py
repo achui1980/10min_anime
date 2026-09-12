@@ -1436,3 +1436,86 @@ def test_preflight_receives_configured_binaries(project, monkeypatch):
         )
     )
     assert seen == {"ffmpeg": "/opt/x/ffmpeg", "ffprobe": "/opt/x/ffprobe"}
+
+
+async def _run_audio_only(project, monkeypatch):
+    """跑到 audio 阶段（会触发 preflight），其余都用假的。"""
+    paths = Paths(project.root)
+    _write_script(paths.script(2), render_script())
+    await run_voice(project, FakeTTSEngine([8.0, 10.0, 10.0]), episode=2)
+    run_timeline(project, episode=2, source_duration=1400.0)
+    _prepare_video(project)
+    monkeypatch.setattr("tenmin.render.audio.run", _touch_output)
+    return await run_pipeline(
+        project,
+        FakeProvider(render_script()),
+        only=["audio"],
+        episode=2,
+        tts_engine=FakeTTSEngine([8.0, 10.0, 10.0]),
+    )
+
+
+def test_preflight_gets_drawtext_requirement_from_outro_card_seconds(project, monkeypatch):
+    """drawtext 只在片尾卡开着时才用到，preflight 的要求必须跟着配置走。"""
+    seen: list[bool] = []
+
+    def fake_preflight(video, encoder, *, needs_drawtext=False, **_):
+        seen.append(needs_drawtext)
+        return 1400.0
+
+    monkeypatch.setattr("tenmin.pipeline.preflight", fake_preflight)
+    project.render.outro_card_seconds = 3.0
+    asyncio.run(_run_audio_only(project, monkeypatch))
+    assert seen == [True]
+
+    seen.clear()
+    project.render.outro_card_seconds = 0.0
+    asyncio.run(_run_audio_only(project, monkeypatch))
+    assert seen == [False]
+
+
+def test_preflight_gets_both_configured_font_names(project, monkeypatch):
+    """字幕字体与片尾卡字体是两个独立旋钮，两个都要查。"""
+    seen: dict[str, object] = {}
+
+    def fake_preflight(video, encoder, *, font_names=(), **_):
+        seen["fonts"] = list(font_names)
+        return 1400.0
+
+    monkeypatch.setattr("tenmin.pipeline.preflight", fake_preflight)
+    project.render.subtitle_font_name = "Lantinghei SC"
+    project.render.outro_font_name = "Hiragino Sans"
+    project.render.outro_card_seconds = 3.0
+    asyncio.run(_run_audio_only(project, monkeypatch))
+    assert set(seen["fonts"]) == {"Lantinghei SC", "Hiragino Sans"}
+
+
+def test_preflight_skips_the_outro_font_when_there_is_no_outro_card(project, monkeypatch):
+    seen: dict[str, object] = {}
+
+    def fake_preflight(video, encoder, *, font_names=(), **_):
+        seen["fonts"] = list(font_names)
+        return 1400.0
+
+    monkeypatch.setattr("tenmin.pipeline.preflight", fake_preflight)
+    project.render.subtitle_font_name = "Lantinghei SC"
+    project.render.outro_font_name = "Hiragino Sans"
+    project.render.outro_card_seconds = 0.0
+    asyncio.run(_run_audio_only(project, monkeypatch))
+    assert seen["fonts"] == ["Lantinghei SC"]
+
+
+def test_preflight_warnings_reach_the_user(project, monkeypatch):
+    """字体缺失是 warning，必须真的冒到 run_pipeline 的 warnings 里去。
+
+    本项目刻意不引入 logging，warnings 通道是这类诊断唯一的出口。
+    """
+
+    def fake_preflight(video, encoder, *, warnings=None, **_):
+        if warnings is not None:
+            warnings.append("字体 'Lantinghei SC' 没找到")
+        return 1400.0
+
+    monkeypatch.setattr("tenmin.pipeline.preflight", fake_preflight)
+    result = asyncio.run(_run_audio_only(project, monkeypatch))
+    assert any("Lantinghei SC" in w for w in result)

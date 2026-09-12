@@ -10,6 +10,8 @@ import pytest
 
 from tenmin.render.ffmpeg import (
     FFmpegError,
+    font_available,
+    has_audio_stream,
     has_encoder,
     has_filter,
     parse_names,
@@ -274,6 +276,7 @@ def test_preflight_returns_source_duration(monkeypatch, tmp_path):
     video.write_bytes(b"fake")
     monkeypatch.setattr("tenmin.render.ffmpeg.has_filter", lambda name, **_: True)
     monkeypatch.setattr("tenmin.render.ffmpeg.has_encoder", lambda name, **_: True)
+    monkeypatch.setattr("tenmin.render.ffmpeg.has_audio_stream", lambda path, **_: True)
     monkeypatch.setattr("tenmin.render.ffmpeg.probe_duration", lambda path, **_: 1425.5)
     assert preflight(video, "libx264") == pytest.approx(1425.5)
 
@@ -523,13 +526,19 @@ def test_preflight_threads_configured_binaries_through(monkeypatch, tmp_path):
         seen["probe_ffprobe"] = ffprobe
         return 100.0
 
+    def fake_has_audio(path, *, ffprobe="ffprobe"):
+        seen["audio_ffprobe"] = ffprobe
+        return True
+
     monkeypatch.setattr("tenmin.render.ffmpeg.has_filter", fake_has_filter)
     monkeypatch.setattr("tenmin.render.ffmpeg.has_encoder", fake_has_encoder)
+    monkeypatch.setattr("tenmin.render.ffmpeg.has_audio_stream", fake_has_audio)
     monkeypatch.setattr("tenmin.render.ffmpeg.probe_duration", fake_probe)
     preflight(video, "libx264", ffmpeg="/opt/x/ffmpeg", ffprobe="/opt/x/ffprobe")
     assert seen["filter_ffmpeg"] == "/opt/x/ffmpeg"
     assert seen["encoder_ffmpeg"] == "/opt/x/ffmpeg"
     assert seen["probe_ffprobe"] == "/opt/x/ffprobe"
+    assert seen["audio_ffprobe"] == "/opt/x/ffprobe"
 
 
 # --- stderr 管道死锁 + 子进程生命周期。这两条刻意用**真的** subprocess 与真的管道 ---
@@ -956,3 +965,179 @@ def test_probe_duration_accepts_a_normal_duration(monkeypatch, tmp_path):
         lambda args, **kwargs: FakeCompleted(stdout="1509.994667\n"),
     )
     assert probe_duration(media) == pytest.approx(1509.994667)
+
+
+# --- preflight 的最后一公里 ---
+# preflight 存在的全部意义就是「绝不能跑完几分钟 TTS 才炸」。它原来只查 subtitles
+# 滤镜和视频编码器，漏掉的恰好是真实渲染最后才会用到的三样东西。
+
+
+@pytest.fixture
+def healthy_ffmpeg(monkeypatch):
+    """把 preflight 的依赖都打成「一切正常」，各条测试只按需推翻其中一项。"""
+    monkeypatch.setattr("tenmin.render.ffmpeg.has_filter", lambda name, **_: True)
+    monkeypatch.setattr("tenmin.render.ffmpeg.has_encoder", lambda name, **_: True)
+    monkeypatch.setattr("tenmin.render.ffmpeg.probe_duration", lambda path, **_: 1400.0)
+    monkeypatch.setattr("tenmin.render.ffmpeg.has_audio_stream", lambda path, **_: True)
+    monkeypatch.setattr("tenmin.render.ffmpeg.font_available", lambda name, **_: True)
+    return monkeypatch
+
+
+@pytest.fixture
+def source_video(tmp_path):
+    video = tmp_path / "E02.mkv"
+    video.write_bytes(b"fake")
+    return video
+
+
+def test_preflight_requires_drawtext_when_the_outro_card_is_enabled(
+    healthy_ffmpeg, source_video
+):
+    """片尾黑卡用 drawtext（+libfreetype/fontconfig）。没编它就出不了片。"""
+    healthy_ffmpeg.setattr(
+        "tenmin.render.ffmpeg.has_filter", lambda name, **_: name != "drawtext"
+    )
+    with pytest.raises(FFmpegError) as exc:
+        preflight(source_video, "libx264", needs_drawtext=True)
+    assert "drawtext" in str(exc.value)
+
+
+def test_preflight_ignores_drawtext_when_there_is_no_outro_card(healthy_ffmpeg, source_video):
+    """outro_card_seconds == 0 时根本不会用 drawtext，不该拿它挡住渲染。"""
+    healthy_ffmpeg.setattr(
+        "tenmin.render.ffmpeg.has_filter", lambda name, **_: name != "drawtext"
+    )
+    assert preflight(source_video, "libx264", needs_drawtext=False) == pytest.approx(1400.0)
+
+
+def test_preflight_rejects_a_source_without_an_audio_stream(healthy_ffmpeg, source_video):
+    """render/audio.py 用 [0:a]。视频-only 的源会在跑完 TTS + 混音之后才炸。
+
+    这正是 preflight 最该拦住的那一类：错误发生在最后一公里，代价是几分钟 TTS。
+    """
+    healthy_ffmpeg.setattr("tenmin.render.ffmpeg.has_audio_stream", lambda path, **_: False)
+    with pytest.raises(FFmpegError) as exc:
+        preflight(source_video, "libx264")
+    message = str(exc.value)
+    assert "音轨" in message
+    assert str(source_video) in message
+
+
+def test_preflight_warns_but_does_not_fail_on_a_missing_font(healthy_ffmpeg, source_video):
+    """字体缺失只能是 warning。
+
+    实测（ffmpeg 9.0.1 + fontconfig）：drawtext 拿一个根本不存在的 font family 依然
+    **退出码 0**，fontconfig 静默替换成 PingFang 并正常渲染。也就是说字体不对的后果是
+    「字体长得不一样」这种纯外观问题，不是失败。preflight 的职责是别让用户白跑几分钟
+    TTS，为一个外观问题拦住整次渲染是本末倒置。
+    """
+    healthy_ffmpeg.setattr("tenmin.render.ffmpeg.font_available", lambda name, **_: False)
+    warnings: list[str] = []
+    assert preflight(
+        source_video, "libx264", font_names=["Lantinghei SC"], warnings=warnings
+    ) == pytest.approx(1400.0)
+    assert len(warnings) == 1
+    assert "Lantinghei SC" in warnings[0]
+
+
+def test_preflight_says_so_when_it_cannot_check_fonts_at_all(healthy_ffmpeg, source_video):
+    """fc-list 不一定装。检查不了就说检查不了，不许假装检查过。"""
+    healthy_ffmpeg.setattr("tenmin.render.ffmpeg.font_available", lambda name, **_: None)
+    warnings: list[str] = []
+    preflight(source_video, "libx264", font_names=["Lantinghei SC"], warnings=warnings)
+    assert len(warnings) == 1
+    assert "fc-list" in warnings[0]
+
+
+def test_preflight_does_not_repeat_the_same_warning_for_every_episode(
+    healthy_ffmpeg, source_video
+):
+    """批量模式下 preflight 每集都跑一次，字体是全项目共享的，别刷 10 遍同一句。"""
+    healthy_ffmpeg.setattr("tenmin.render.ffmpeg.font_available", lambda name, **_: False)
+    warnings: list[str] = []
+    for _ in range(10):
+        preflight(source_video, "libx264", font_names=["Lantinghei SC"], warnings=warnings)
+    assert len(warnings) == 1
+
+
+def test_preflight_is_quiet_when_everything_checks_out(healthy_ffmpeg, source_video):
+    warnings: list[str] = []
+    preflight(
+        source_video,
+        "libx264",
+        needs_drawtext=True,
+        font_names=["Lantinghei SC"],
+        warnings=warnings,
+    )
+    assert warnings == []
+
+
+def test_preflight_errors_are_caught_by_the_cli(healthy_ffmpeg, source_video):
+    """preflight 原来抛裸 RuntimeError，而它**不在** cli.PIPELINE_ERRORS 里。
+
+    结果是「你的 ffmpeg 没编 libass」这句本来写得很清楚的人话，用户实际看到的是
+    一整页 traceback。改成 FFmpegError（RuntimeError 子类，已在表里）。
+    """
+    from tenmin.cli import PIPELINE_ERRORS
+
+    healthy_ffmpeg.setattr("tenmin.render.ffmpeg.has_filter", lambda name, **_: False)
+    with pytest.raises(PIPELINE_ERRORS):
+        preflight(source_video, "libx264")
+
+    healthy_ffmpeg.setattr("tenmin.render.ffmpeg.has_filter", lambda name, **_: True)
+    healthy_ffmpeg.setattr("tenmin.render.ffmpeg.has_encoder", lambda name, **_: False)
+    with pytest.raises(PIPELINE_ERRORS):
+        preflight(source_video, "h264_videotoolbox")
+
+
+# --- 两个新探测函数本身 ---
+
+
+def test_has_audio_stream_reads_the_stream_list(monkeypatch, tmp_path):
+    media = tmp_path / "a.mkv"
+    media.write_bytes(b"fake")
+    seen: dict[str, list[str]] = {}
+
+    def fake_run(args, **kwargs):
+        seen["args"] = list(args)
+        return FakeCompleted(stdout="1\n")
+
+    monkeypatch.setattr("tenmin.render.ffmpeg.subprocess.run", fake_run)
+    assert has_audio_stream(media) is True
+    assert "a" in seen["args"][seen["args"].index("-select_streams") + 1]
+
+
+def test_has_audio_stream_is_false_on_empty_output(monkeypatch, tmp_path):
+    """实测：视频-only 的文件退出码是 0，stdout 是空的 —— 必须看 stdout 而不是 rc。"""
+    media = tmp_path / "a.mkv"
+    media.write_bytes(b"fake")
+    monkeypatch.setattr(
+        "tenmin.render.ffmpeg.subprocess.run",
+        lambda args, **kwargs: FakeCompleted(returncode=0, stdout="\n"),
+    )
+    assert has_audio_stream(media) is False
+
+
+def test_font_available_uses_fc_list(monkeypatch):
+    """实测：`fc-list "<family>" family` 命中时打出家族名，没命中时是空的（rc 都是 0）。"""
+    monkeypatch.setattr("tenmin.render.ffmpeg.shutil.which", lambda _n: "/opt/homebrew/bin/fc-list")
+    monkeypatch.setattr(
+        "tenmin.render.ffmpeg.subprocess.run",
+        lambda args, **kwargs: FakeCompleted(stdout="兰亭黑-简,Lantinghei SC,蘭亭黑-簡\n"),
+    )
+    assert font_available("Lantinghei SC") is True
+
+
+def test_font_available_is_false_when_fontconfig_knows_nothing(monkeypatch):
+    monkeypatch.setattr("tenmin.render.ffmpeg.shutil.which", lambda _n: "/opt/homebrew/bin/fc-list")
+    monkeypatch.setattr(
+        "tenmin.render.ffmpeg.subprocess.run",
+        lambda args, **kwargs: FakeCompleted(stdout="\n"),
+    )
+    assert font_available("NoSuchFontFamilyXYZ") is False
+
+
+def test_font_available_is_none_without_fc_list(monkeypatch):
+    """检查不了就返回 None，让调用方明确说「跳过了」而不是谎报可用。"""
+    monkeypatch.setattr("tenmin.render.ffmpeg.shutil.which", lambda _n: None)
+    assert font_available("Lantinghei SC") is None
