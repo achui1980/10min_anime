@@ -71,25 +71,46 @@ project 用一个 base_url），且和 MiniMax 一样，schema 是写进 prompt
 ## 使用
 
 ```bash
-uv run tenmin init saijo               # 创建 work/saijo/project.yaml 与 srt/
-cp 你的字幕.srt work/saijo/srt/E02.srt  # 放字幕
-$EDITOR work/saijo/project.yaml        # 填 show / episodes
-uv run tenmin run saijo                # 跑全链路
+uv run tenmin init saijo               # 创建 work/saijo/project.yaml 与 srt/、video/
 ```
 
-产物：
-
-- `work/saijo/out/解说方案.md` — 五列对照表，★ 标记纯字幕方案取不到的视觉高光
-- `work/saijo/out/narration.txt` — 合并配音纯文本，直接丢给配音
-- `work/saijo/03_script/script.json` — **唯一人工编辑面**，改完重跑 docgen 即可
-
-`03_script/script.json` 管内容，`05_timeline/E{NN}.timeline.json` 管出片节奏。
+**一个 project 对应一部番，可以装多集**。往里加一集，用 `--episode`/`--srt`/`--video`
+一次性注册并跑：
 
 ```bash
-uv run tenmin run saijo --only docgen --force   # 改完 script.json 重出文档，不调 LLM
+uv run tenmin run saijo --episode 2 --srt 你的字幕.srt --video 你的视频.mp4
+```
+
+这会把字幕和视频拷进 `work/saijo/srt/E02.srt`、`work/saijo/video/E02.mp4`，
+在 `project.yaml` 的 `episodes:` 里补一条 `number: 2` 的记录，然后跑这一集的全链路。
+`--srt`/`--video` 必须一起传，且必须同时带 `--episode`。
+
+已经注册过的集，之后只需要带 `--episode` 就能重跑：
+
+```bash
+uv run tenmin run saijo --episode 2            # 重跑第 2 集
+```
+
+不带 `--episode` 时是**批处理模式**：把 `project.yaml` 里已注册的所有集都跑一遍
+（按 mtime 跳过已是最新的阶段，跟单集模式一致）：
+
+```bash
+uv run tenmin run saijo                        # 跑 project.yaml 里的每一集
+```
+
+产物（每集独立一份，文件名带 `E{NN}` 前缀）：
+
+- `work/saijo/out/E{NN}.解说方案.md` — 五列对照表，★ 标记纯字幕方案取不到的视觉高光
+- `work/saijo/out/E{NN}.narration.txt` — 合并配音纯文本，直接丢给配音
+- `work/saijo/03_script/E{NN}.script.json` — **唯一人工编辑面**，改完重跑 docgen 即可
+
+`03_script/E{NN}.script.json` 管内容，`05_timeline/E{NN}.timeline.json` 管出片节奏。
+
+```bash
+uv run tenmin run saijo --episode 2 --only docgen --force   # 改完 script.json 重出文档，不调 LLM
 uv run tenmin inspect saijo --episode 1         # 看无字幕间隙与高能点
 uv run tenmin inspect saijo --episode 1 --suspect  # 看被标记为疑似 OCR 噪声的行
-uv run tenmin run saijo --from signals          # 从指定阶段重跑
+uv run tenmin run saijo --episode 1 --from signals   # 从指定阶段重跑某一集
 ```
 
 只跑 v2 渲染部分（前 4 个阶段的产物照旧复用）：
@@ -110,8 +131,8 @@ uv run tenmin run akujo2 --from audio --force
 |---|---|---|
 | ingest | `01_dialogue/E{NN}.dialogue.json` | 否 |
 | signals | `02_signals/E{NN}.signals.json` | 否 |
-| script | `03_script/script.json` | **是** |
-| docgen | `out/解说方案.md`、`out/narration.txt` | 否 |
+| script | `03_script/E{NN}.script.json` | **是** |
+| docgen | `out/E{NN}.解说方案.md`、`out/E{NN}.narration.txt` | 否 |
 | voice | `04_voice/E{NN}/chunk_*.mp3`、`04_voice/E{NN}.voice.json` | Edge-TTS 逐句配音，记录每段真实时长 |
 | timeline | `05_timeline/E{NN}.timeline.json`、`05_timeline/E{NN}.ass` | 按真实配音时长重算画面时间轴，生成硬字幕 |
 | audio | `06_audio/E{NN}.mixed.m4a` | 旁白盖在原声之上，旁白期间原声压低 |
