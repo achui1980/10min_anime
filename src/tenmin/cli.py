@@ -178,8 +178,11 @@ def init(slug: str, work_dir: Path = WORK_DIR_OPTION) -> None:
         typer.secho(f"{project_file} 已存在，不覆盖", fg="red", err=True)
         raise typer.Exit(code=1)
 
+    # 只建 srt/：register_episode 会把字幕拷进去（它自己也会 mkdir，这里预先建出来
+    # 是为了让「手动放字幕」的人一眼看到位置）。刻意不建 video/——P0-C 之后源片不再
+    # 被拷进 work/，project.yaml 只记它的绝对路径，一个空的 video/ 夹在
+    # 01_dialogue/…07_render/ 中间只会让人以为源片该放那儿。
     (root / "srt").mkdir(parents=True, exist_ok=True)
-    (root / "video").mkdir(parents=True, exist_ok=True)
     payload = build_project_template(slug)
     project_file.write_text(
         PROJECT_TEMPLATE_HEADER.format(slug=slug)
@@ -187,8 +190,9 @@ def init(slug: str, work_dir: Path = WORK_DIR_OPTION) -> None:
         encoding="utf-8",
     )
     typer.echo(f"已创建 {project_file}")
-    typer.echo(f"把字幕放进 {root / 'srt'}、源视频放进 {root / 'video'}，")
-    typer.echo(f"改好 project.yaml 后跑 tenmin run {slug}")
+    typer.echo("登记一集（源片留在原地，只把绝对路径记进 project.yaml）：")
+    typer.echo(f"  tenmin run {slug} --episode 2 --srt <字幕路径> --video <源片路径>")
+    typer.echo(f"字幕会被拷进 {root / 'srt'}，清洗规则调不好时可以就地改它。")
 
 
 @app.command()

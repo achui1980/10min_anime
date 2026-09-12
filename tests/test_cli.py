@@ -223,7 +223,7 @@ def _minimal_project(tmp_path):
     return root
 
 
-def test_init_template_has_video_and_render(tmp_path):
+def test_init_template_carries_render_defaults(tmp_path):
     result = runner.invoke(app, ["init", "akujo2", "--work-dir", str(tmp_path)])
 
     assert result.exit_code == 0
@@ -238,7 +238,28 @@ def test_init_template_has_video_and_render(tmp_path):
     assert data["render"]["fade_out_seconds"] == 1.5
     assert data["render"]["outro_card_seconds"] == 3.0
     assert data["render"]["outro_message"] == "解说结束，谢谢观看"
-    assert (tmp_path / "akujo2" / "video").is_dir()
+
+
+def test_init_does_not_create_a_video_dir(work):
+    """P0-C 之后源片不再被拷进 work/，register_episode 只记它的绝对路径。
+
+    一个空的 work/<slug>/video/ 夹在 01_dialogue/…07_render/ 中间，读起来就是
+    「源片放这里」，而 project.yaml 里明明指向别的盘，纯属自相矛盾的误导。
+    想用相对路径手动放片的人自己 mkdir 就行，没有任何代码依赖这个目录预先存在。
+    """
+    result = runner.invoke(app, ["init", "saijo", "--work-dir", str(work)])
+    assert result.exit_code == 0, out(result)
+    assert (work / "saijo" / "srt").is_dir()
+    assert not (work / "saijo" / "video").exists()
+
+
+def test_init_tells_user_how_to_register_an_episode(work):
+    """原文案是「把字幕放进 …/srt、源视频放进 …/video」，后半句 P0-C 之后就是假的。"""
+    result = runner.invoke(app, ["init", "saijo", "--work-dir", str(work)])
+    text = out(result)
+    assert "tenmin run saijo --episode" in text
+    assert "--srt" in text and "--video" in text
+    assert "源视频放进" not in text
 
 
 def test_init_template_follows_the_model_defaults(work, monkeypatch):
