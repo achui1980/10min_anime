@@ -11,19 +11,9 @@ from rich.progress import (
     SpinnerColumn,
     TaskID,
     TextColumn,
+    TimeElapsedColumn,
     TimeRemainingColumn,
 )
-
-STAGE_LABELS: dict[str, str] = {
-    "ingest": "ingest",
-    "signals": "signals",
-    "script": "script",
-    "docgen": "docgen",
-    "voice": "voice",
-    "timeline": "timeline",
-    "audio": "audio",
-    "render": "render",
-}
 
 
 class RichProgressReporter:
@@ -35,6 +25,7 @@ class RichProgressReporter:
             TextColumn("[progress.description]{task.description}"),
             BarColumn(),
             TextColumn("{task.completed}/{task.total}"),
+            TimeElapsedColumn(),
             TimeRemainingColumn(),
         )
         self._episode_task: TaskID | None = None
@@ -60,22 +51,19 @@ class RichProgressReporter:
             )
 
     def stage_start(self, stage: str) -> None:
-        label = STAGE_LABELS.get(stage, stage)
-        task_id = self._progress.add_task(f"▶ {label}", total=None)
+        task_id = self._progress.add_task(f"▶ {stage}", total=None)
         self._stage_tasks[stage] = task_id
 
     def stage_skip(self, stage: str) -> None:
-        label = STAGE_LABELS.get(stage, stage)
-        self._progress.add_task(f"⏭ {label}（已是最新，跳过）", total=1, completed=1)
+        self._progress.add_task(f"⏭ {stage}（已是最新，跳过）", total=1, completed=1)
 
     def stage_done(self, stage: str) -> None:
-        label = STAGE_LABELS.get(stage, stage)
         task_id = self._stage_tasks.pop(stage, None)
         if task_id is None:
-            task_id = self._progress.add_task(f"✓ {label}", total=1, completed=1)
+            task_id = self._progress.add_task(f"✓ {stage}", total=1, completed=1)
         else:
             self._progress.update(
-                task_id, description=f"✓ {label}", total=1, completed=1
+                task_id, description=f"✓ {stage}", total=1, completed=1
             )
 
     def substep(self, stage: str, current: int, total: int, label: str) -> None:
