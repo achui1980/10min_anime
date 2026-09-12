@@ -110,6 +110,13 @@ class CreditsConfig(BaseModel):
     # 窄：黄金样本最后一句真台词在 1325.5s（片长 1416.6s，距片尾 91s），ED staff 第一行
     # 在 1348.2s。80s 落在两者之间的 19.8s 无字幕间隙里，两侧各留约 11s 余量。
     ed_keyword_window_seconds: float = Field(default=80.0, gt=0)
+    # in_credit_window 的「片头窗 + 片尾窗」总覆盖率上限（占片长的比例）。
+    # 没有这条约束时两个标称窗（300 + 80）在 duration <= 380 的短 track 上会把整条
+    # 时间轴覆盖满，is_credits 的激进规则（通用中文词「演出」「制作」、纯人名罗列、
+    # 拉丁占比）就对每一行生效，真台词被踢出语音轨、静默间隙虚假合并成假高光。
+    # 0.5 = 至少一半时间轴必须留在窗外。duration >= 760 时预算 >= 380 >= 300+80，
+    # 两个窗都按标称值生效，与这条约束加入前逐点等价（实测最短素材 1315.94 秒）。
+    credit_window_max_ratio: float = Field(default=0.5, gt=0, le=1)
     # 相邻 credits 行间隔不超过这么多秒就并进同一个簇。
     cluster_max_gap: float = Field(default=35.0, ge=0)
     # 静区兜底的 OP 时长区间。实测 OP 静默长度 90.7-94.5 秒；

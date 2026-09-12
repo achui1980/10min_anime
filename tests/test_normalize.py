@@ -125,6 +125,38 @@ def test_build_track_can_opt_into_merging(tmp_path):
     assert track.lines[0].merged_from == [2]
 
 
+def test_build_track_short_episode_keeps_ambiguous_dialogue(tmp_path):
+    """短片长不能让 is_credits 的激进规则对全片生效。
+
+    修复前 in_credit_window 等价于 `start <= 300 or start >= duration - 80`，
+    duration=100 时两个条件的并集就是全时间轴，于是「你现在的说话方式也是演出来的吧」
+    被 _KEYWORDS_IN_WINDOW 的「演出」子串命中 → kind="credits" → 被 SPEECH_KINDS
+    过滤掉 → 语音轨里凭空少一句，两侧静默间隙虚假合并成一个假高光。
+    """
+    srt = tmp_path / "e01.srt"
+    srt.write_text(
+        "1\n00:00:01,000 --> 00:00:03,000\n开场\n\n"
+        "2\n00:00:55,000 --> 00:00:58,000\n你现在的说话方式也是演出来的吧\n\n"
+        "3\n00:01:38,000 --> 00:01:40,000\n收场\n",
+        encoding="utf-8",
+    )
+    track = build_track(srt, episode=1)
+    assert track.duration == pytest.approx(100.0)
+    ambiguous = next(ln for ln in track.lines if "演出来" in ln.text)
+    assert ambiguous.kind == "dialogue"
+    assert [ln.kind for ln in track.lines] == ["dialogue", "dialogue", "dialogue"]
+
+
+def test_build_track_empty_srt_opens_no_credit_window(tmp_path):
+    """duration=0 时 in_credit_window 曾对每一行恒真（0 <= 300 且 0 >= 0-80）。"""
+    srt = tmp_path / "e01.srt"
+    srt.write_text("1\n00:00:00,000 --> 00:00:00,000\n监督 山田太郎\n", encoding="utf-8")
+    track = build_track(srt, episode=1)
+    assert track.duration == pytest.approx(0.0)
+    # 「监督」只在 credit 窗内才敢认；片长未知时不开窗，所以它仍是 dialogue。
+    assert track.lines[0].kind == "dialogue"
+
+
 # --- 黄金样本：12 类实测脏数据 ---
 
 

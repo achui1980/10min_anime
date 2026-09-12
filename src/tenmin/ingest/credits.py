@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import re
 
 # 所有阈值的权威定义在 tenmin.config.CreditsConfig；DEFAULT_CREDITS 只是它的
@@ -128,19 +129,45 @@ def is_credits(
     return False
 
 
+def credit_window_bounds(
+    duration: float, *, cfg: CreditsConfig = DEFAULT_CREDITS
+) -> tuple[float, float]:
+    """算出 (片头窗上界, 片尾窗下界)。片尾窗被关掉时下界是 `math.inf`。
+
+    两个标称窗（credit_head_window / ed_keyword_window_seconds）加起来共享一份
+    `duration * credit_window_max_ratio` 的覆盖预算，片头窗优先拿 —— OP staff 一定在
+    片头，ED staff 在短片里未必存在。预算不够时片头窗先缩到预算大小，剩下多少给片尾窗，
+    剩 0 就整体关掉片尾窗。
+
+    这不是一个 on/off 开关而是连续退化：duration 600-760 之间片尾窗按剩余预算逐渐
+    变窄，<=600 才彻底关闭，所以不存在「多一秒少一秒行为跳变」的悬崖。
+    """
+    budget = duration * cfg.credit_window_max_ratio
+    head_end = min(cfg.credit_head_window, budget)
+    tail_length = min(cfg.ed_keyword_window_seconds, budget - head_end)
+    tail_start = duration - tail_length if tail_length > 0 else math.inf
+    return head_end, tail_start
+
+
 def in_credit_window(
     start: float, duration: float, *, cfg: CreditsConfig = DEFAULT_CREDITS
 ) -> bool:
-    """片头 0-300s 或片尾最后 80s。给 is_credits 的规则 4-5 开门。
+    """片头 0-300s 或片尾最后 80s。给 is_credits 的规则 2b/4/5 开门。
 
     这里用的是 credit_head_window / ed_keyword_window_seconds 两个独立旋钮，
     跟聚簇用的 op_search_* / ed_cluster_tail_seconds 不共享数值：片尾窗口刻意比
     ed_cluster_tail_seconds 窄，理由见 CreditsConfig 里的注释。
+
+    两个窗的实际大小由 credit_window_max_ratio 兜底收缩，保证并集永远覆盖不满整条
+    时间轴 —— 否则短 track（以及 duration=0 的空字幕）上每一行都会拿到
+    in_credit_window=True，本文件头部记录的「演出来」被「演出」命中那类事故就会从
+    「只在片头片尾发生」升级成「全片发生」。
     """
-    return (
-        start <= cfg.credit_head_window
-        or start >= duration - cfg.ed_keyword_window_seconds
-    )
+    if duration <= 0:
+        # 片长未知（空字幕 / 解析失败）。宁可漏判 credits，也不能把激进规则对全片放开。
+        return False
+    head_end, tail_start = credit_window_bounds(duration, cfg=cfg)
+    return start <= head_end or start >= tail_start
 
 
 def _silent_gaps_in_window(

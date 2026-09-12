@@ -109,6 +109,50 @@ def test_in_credit_window_excludes_tail_dialogue():
     assert in_credit_window(700.0, duration) is False
 
 
+def test_in_credit_window_leaves_a_free_middle_on_short_tracks():
+    """短片长时两个窗口的并集不能覆盖整条时间轴。
+
+    修复前的判据是 `start <= 300 or start >= duration - 80`，duration <= 380 时
+    这两个条件的并集就是全时间轴 → 每一行都 in_credit_window → is_credits 的
+    激进规则（通用中文词「演出」「制作」、纯人名罗列、拉丁占比）对全片生效 →
+    真台词被踢出语音轨 → 两侧静默间隙虚假合并成假高光。
+    """
+    for duration in (100.0, 380.0):
+        outside = [
+            t
+            for t in (d * duration / 20 for d in range(20))
+            if not in_credit_window(t, duration)
+        ]
+        assert outside, f"duration={duration} 时整条时间轴都落在 credit 窗内"
+
+
+def test_in_credit_window_disables_tail_window_when_it_would_touch_head():
+    """片长不足以容纳「片头窗 + 中段 + 片尾窗」时，片尾窗必须整体关闭。"""
+    # 380 秒：片头窗 300 + 片尾窗 80 刚好首尾相接，没有中段可留。
+    assert in_credit_window(370.0, 380.0) is False
+    # 381 秒同理（预算 190.5 仍远不够 300+80），也不该开尾窗。
+    assert in_credit_window(370.0, 381.0) is False
+    # 800 秒：预算 400 >= 300+80，两个窗都按标称值生效，中段 300-720 自由。
+    assert in_credit_window(250.0, 800.0) is True
+    assert in_credit_window(500.0, 800.0) is False
+    assert in_credit_window(750.0, 800.0) is True
+
+
+def test_in_credit_window_unknown_duration_opens_nothing():
+    """duration=0（空字幕/解析失败）时不能把激进规则对全片放开。"""
+    assert in_credit_window(0.0, 0.0) is False
+    assert in_credit_window(10.0, 0.0) is False
+
+
+def test_in_credit_window_unchanged_for_full_length_episodes():
+    """实测最短的真实素材 1315.94 秒，预算 657.97 >= 300+80，行为与修复前逐点一致。"""
+    duration = 1315.94
+    assert in_credit_window(299.9, duration) is True
+    assert in_credit_window(300.1, duration) is False
+    assert in_credit_window(duration - 80.1, duration) is False
+    assert in_credit_window(duration - 79.9, duration) is True
+
+
 def test_op_from_silence_prefers_gap_inside_span_window():
     # 一条 credits 行都没有 → 聚簇路径算不出 OP → 走 _op_from_silence 兜底。
     # 静区一 40.0-190.0（150s，超出 OP_MAX_SILENT_SPAN，干扰项且比真 OP 更长）
