@@ -1,5 +1,10 @@
+from __future__ import annotations
+
 import shlex
+import subprocess
+import threading
 from pathlib import Path
+from unittest import mock
 
 import pytest
 
@@ -265,7 +270,11 @@ def test_preflight_returns_source_duration(monkeypatch, tmp_path):
 
 
 class FakePopen:
-    """假的 subprocess.Popen，逐行喂 stdout，不真的起进程。"""
+    """假的 subprocess.Popen，逐行喂 stdout，不真的起进程。
+
+    实现了 context manager 与 kill()：被测代码现在把 Popen 放进 with 并在异常路径上
+    显式 kill（不然 on_progress 一抛就留下孤儿 ffmpeg），假对象必须支持同一套协议。
+    """
 
     class _Stderr:
         def __init__(self, text: str):
@@ -278,6 +287,16 @@ class FakePopen:
         self.stdout = iter(lines)
         self.stderr = FakePopen._Stderr(stderr)
         self._returncode = returncode
+        self.killed = False
+
+    def __enter__(self) -> FakePopen:
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        return None
+
+    def kill(self) -> None:
+        self.killed = True
 
     def wait(self) -> int:
         return self._returncode
@@ -501,3 +520,158 @@ def test_preflight_threads_configured_binaries_through(monkeypatch, tmp_path):
     assert seen["filter_ffmpeg"] == "/opt/x/ffmpeg"
     assert seen["encoder_ffmpeg"] == "/opt/x/ffmpeg"
     assert seen["probe_ffprobe"] == "/opt/x/ffprobe"
+
+
+# --- stderr 管道死锁 + 子进程生命周期。这两条刻意用**真的** subprocess 与真的管道 ---
+# mock 出来的 FakePopen 永远不会背压，也就永远测不出这个 bug。
+
+
+def _write_fake_ffmpeg(tmp_path: Path, body: str) -> str:
+    """造一个假 ffmpeg（sh 脚本）。它忽略全部参数，只按 body 的剧本读写管道。
+
+    开头那个自杀看门狗是为了回归时不留垃圾：一旦被测代码真的死锁，这个脚本会卡在
+    「往写满的 stderr 管道里写」上，除了它自己没人能把它弄死。
+    """
+    script = tmp_path / "fake_ffmpeg.sh"
+    script.write_text(
+        "#!/bin/sh\n( sleep 45; kill -9 $$ ) >/dev/null 2>&1 &\n" + body, encoding="utf-8"
+    )
+    script.chmod(0o755)
+    return str(script)
+
+
+def _run_with_deadline(fn, seconds: float = 30.0):
+    """在 daemon 线程里跑，超时就当死锁。
+
+    死锁的表现是永久挂住，绝不能让它挂住整个测试进程 —— 所以刻意不用
+    ThreadPoolExecutor：它的 __exit__ 会 shutdown(wait=True)，在卡死的 worker 上
+    一样永久阻塞（实测：整个 pytest 进程被挂住，30 秒的 deadline 根本轮不到生效）。
+    daemon 线程配 join(timeout) 才真的能放弃。
+    """
+    box: dict[str, object] = {}
+
+    def target() -> None:
+        try:
+            box["value"] = fn()
+        except BaseException as error:  # noqa: BLE001 - 原样搬回主线程
+            box["error"] = error
+
+    thread = threading.Thread(target=target, daemon=True)
+    thread.start()
+    thread.join(seconds)
+    if thread.is_alive():  # pragma: no cover - 只在回归时走到
+        pytest.fail(f"run_with_progress 在 {seconds} 秒内没返回：stderr 管道写满之后死锁了")
+    if "error" in box:
+        raise box["error"]  # type: ignore[misc]
+    return box["value"]
+
+
+def test_run_with_progress_does_not_deadlock_on_a_stderr_flood(tmp_path):
+    """stderr 写爆 64KB 管道时不许死锁。
+
+    实测：一次 60 秒编码就产生 6520 字节 stderr，240 秒成片约 26KB，距 64KB 上限只有
+    2-3 倍余量。一段 per-frame warning（`Past duration ... too large`、HEVC 解码器
+    抱怨）就能突破 —— 然后 ffmpeg 阻塞在写 stderr、Python 阻塞在读 stdout，永久挂死
+    且没有任何输出。这里让假 ffmpeg **先**写 ~230KB stderr 再写 stdout，精确复现那个
+    顺序（已单独验证：不排空 stderr 的话这段真的会永久卡住）。
+    """
+    flood_lines = 5000
+    fake = _write_fake_ffmpeg(
+        tmp_path,
+        f"i=0\n"
+        f'while [ $i -lt {flood_lines} ]; do\n'
+        f'  echo "[hevc @ 0x1] Past duration 0.999992 too large" >&2\n'
+        f"  i=$((i+1))\n"
+        f"done\n"
+        f'echo "Conversion failed somewhere near the end" >&2\n'
+        f"echo out_time_ms=5000000\n"
+        f"echo progress=end\n",
+    )
+    seen: list[float] = []
+    stderr = _run_with_deadline(
+        lambda: run_with_progress(
+            ["-i", "in.mp4", "out.mp4"],
+            total_seconds=10.0,
+            on_progress=seen.append,
+            ffmpeg=fake,
+        )
+    )
+    # 进度照常解析
+    assert seen == [0.5, 1.0]
+    # stderr 一个字节都没丢，尾部的真错误还在
+    assert stderr.count("Past duration") == flood_lines
+    assert "Conversion failed somewhere near the end" in stderr
+
+
+def test_run_with_progress_error_tail_survives_a_stderr_flood(tmp_path):
+    """洪水般的 stderr + 非零退出：报错里必须还是那句真错误，而不是超时/空串。"""
+    fake = _write_fake_ffmpeg(
+        tmp_path,
+        "i=0\n"
+        'while [ $i -lt 5000 ]; do echo "[hevc @ 0x1] Past duration too large" >&2; '
+        "i=$((i+1)); done\n"
+        'echo "Error while filtering: Invalid argument" >&2\n'
+        "echo progress=end\n"
+        "exit 1\n",
+    )
+
+    def go():
+        with pytest.raises(FFmpegError) as exc:
+            run_with_progress(["-i", "in.mp4", "out.mp4"], total_seconds=10.0, ffmpeg=fake)
+        return str(exc.value)
+
+    message = _run_with_deadline(go)
+    assert "Error while filtering: Invalid argument" in message
+
+
+def test_run_with_progress_passes_nostats(monkeypatch):
+    """进度是从 stdout 的 -progress 解析的，stderr 上那份统计是纯噪音。
+
+    实测它同时是两个问题的来源：白占管道配额（60 秒编码里 506 字节），以及带进 4 个
+    `\\r` 把 tail 的「末尾 30 行」搅成进度碎片。
+    """
+    seen: dict[str, list[str]] = {}
+
+    def fake_popen(args, **kwargs):
+        seen["args"] = list(args)
+        return FakePopen(["progress=end\n"])
+
+    monkeypatch.setattr("tenmin.render.ffmpeg.subprocess.Popen", fake_popen)
+    run_with_progress(["-i", "in.mp4", "out.mp4"], total_seconds=1.0)
+    assert "-nostats" in seen["args"]
+
+
+def test_run_with_progress_kills_ffmpeg_when_on_progress_raises(tmp_path):
+    """on_progress 抛异常（reporter/rich 出错）时不许遗弃子进程。
+
+    原来 Popen 既没进 with 也没 try/finally：回调一炸，ffmpeg 就变成孤儿继续烧 CPU，
+    管道也跟着泄漏。用户 Ctrl-C 是同一条路径。
+    """
+    fake = _write_fake_ffmpeg(
+        tmp_path,
+        "echo out_time_ms=1000000\necho progress=continue\nsleep 20 >/dev/null 2>&1\n",
+    )
+    spawned: list[subprocess.Popen] = []
+    real_popen = subprocess.Popen
+
+    def recording_popen(*a, **k):
+        proc = real_popen(*a, **k)
+        spawned.append(proc)
+        return proc
+
+    with mock.patch.object(subprocess, "Popen", recording_popen):
+
+        def boom(_fraction: float) -> None:
+            raise RuntimeError("reporter 炸了")
+
+        with pytest.raises(RuntimeError, match="reporter 炸了"):
+            run_with_progress(
+                ["-i", "in.mp4", "out.mp4"],
+                total_seconds=10.0,
+                on_progress=boom,
+                ffmpeg=fake,
+            )
+
+    assert len(spawned) == 1
+    # 进程必须已经死了（不是还在 sleep）
+    assert spawned[0].poll() is not None

@@ -5,13 +5,18 @@ from __future__ import annotations
 import re
 import shlex
 import subprocess
+import threading
 from collections.abc import Callable, Mapping
 from functools import lru_cache
 from pathlib import Path
+from typing import IO
 
 FFMPEG = "ffmpeg"
 FFPROBE = "ffprobe"
 STDERR_TAIL_LINES = 30
+# stderr 排空线程的 join 上限。走到这个上限只可能是 ffmpeg 已经退出但线程还没收到 EOF，
+# 属于「不该发生」；给个上限是为了宁可丢掉诊断信息也不把出片卡成永久挂死。
+STDERR_DRAIN_TIMEOUT_SECONDS = 10.0
 
 # ffmpeg -filters / -encoders 每行形如 " .. ass  V->V  描述"，
 # 标志列只由大写字母和点组成，名字是紧跟其后的第一个 token。
@@ -202,6 +207,19 @@ def preflight(
     return probe_duration(Path(video), ffprobe=ffprobe)
 
 
+def _drain(stream: IO[str], sink: list[str]) -> None:
+    """把一条管道读到 EOF。给 run_with_progress 的 stderr 排空线程用。
+
+    读到一半管道被关掉（异常路径上 Popen.__exit__ 会关）会抛 ValueError / OSError，
+    那时我们已经不要这份 stderr 了，静默收工就行 —— 让线程里冒异常只会往 stderr 打一段
+    与真正错因无关的 traceback，把用户的注意力引错方向。
+    """
+    try:
+        sink.append(stream.read())
+    except (ValueError, OSError):  # pragma: no cover - 只在异常清理路径上走到
+        pass
+
+
 def run_with_progress(
     args: list[str],
     *,
@@ -214,18 +232,18 @@ def run_with_progress(
 
     时间字段的回退链见 progress_seconds。按「块」而不是按「行」回调，是因为一个块里
     out_time_us / out_time_ms / out_time 三个字段都会发，逐行处理会把回调打三遍。
+
+    stderr 必须**并发**排空，不能等 stdout 读到 EOF 再读（原来就是这么写的）：管道容量
+    只有 64KB，实测一次 60 秒编码就产生 6520 字节 stderr、240 秒成片约 26KB，一段
+    per-frame warning（`Past duration ... too large`、HEVC 解码器抱怨）就能突破上限
+    —— 然后 ffmpeg 阻塞在写 stderr、Python 阻塞在读 stdout，永久挂死且没有任何输出。
+    -nostats 只是把噪音（实测 506 字节 + 4 个搅乱 tail 的 `\\r`）拿掉，**不能**当成
+    修复：真正兜住这件事的是那个排空线程。
     """
     # -progress 是全局选项，放到 -i 之前才是它该在的位置（原来追加在输出文件名之后，
     # 碰巧能用而已）。argv 只拼一次，Popen 与出错消息共用同一个变量：原来出错分支自己
     # 重建了一遍字符串、且漏了 -progress pipe:1，报出来的命令不是真正跑的那条。
-    argv = [ffmpeg, "-progress", "pipe:1", *args]
-    process = subprocess.Popen(
-        argv,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        errors="replace",
-    )
+    argv = [ffmpeg, "-nostats", "-progress", "pipe:1", *args]
 
     def report(fields: dict[str, str]) -> None:
         seconds = progress_seconds(fields)
@@ -233,26 +251,50 @@ def run_with_progress(
             return
         on_progress(max(0.0, min(1.0, seconds / total_seconds)))
 
-    block: dict[str, str] = {}
-    for line in process.stdout:
-        line = line.strip()
-        if "=" not in line:
-            continue
-        key, _, value = line.partition("=")
-        block[key] = value
-        if key != "progress":
-            continue
-        # `progress=continue` / `progress=end` 是块的结束标记
-        report(block)
-        if value == "end" and on_progress is not None:
-            on_progress(1.0)
-        block.clear()
-    # 没有以 progress= 收尾的残块也要报一次：ffmpeg 被 kill / 提前断流时最后那个块
-    # 是不完整的，丢掉它等于把「实际跑到哪」这条信息扔了。
-    report(block)
+    # with + 异常路径上显式 kill：原来 Popen 既没进 with 也没 try/finally，on_progress
+    # 一抛（reporter/rich 出错）或用户 Ctrl-C，ffmpeg 就变成孤儿继续烧 CPU、管道泄漏。
+    # kill 必须在 __exit__ 之前：__exit__ 先关管道再 wait()，对一个还在跑的几分钟编码
+    # 来说那个 wait() 自己就是一次挂死。
+    with subprocess.Popen(
+        argv,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        errors="replace",
+    ) as process:
+        try:
+            drained: list[str] = []
+            drainer = threading.Thread(
+                target=_drain, args=(process.stderr, drained), daemon=True
+            )
+            drainer.start()
 
-    stderr = process.stderr.read()
-    returncode = process.wait()
+            block: dict[str, str] = {}
+            for line in process.stdout:
+                line = line.strip()
+                if "=" not in line:
+                    continue
+                key, _, value = line.partition("=")
+                block[key] = value
+                if key != "progress":
+                    continue
+                # `progress=continue` / `progress=end` 是块的结束标记
+                report(block)
+                if value == "end" and on_progress is not None:
+                    on_progress(1.0)
+                block.clear()
+            # 没有以 progress= 收尾的残块也要报一次：ffmpeg 被 kill / 提前断流时最后
+            # 那个块是不完整的，丢掉它等于把「实际跑到哪」这条信息扔了。
+            report(block)
+
+            returncode = process.wait()
+            # stdout 已经 EOF、进程已经退出，stderr 必然也到 EOF，这个 join 立刻返回。
+            # 仍然给上限：宁可丢掉诊断信息，也不要把「出片」卡成永久挂死。
+            drainer.join(STDERR_DRAIN_TIMEOUT_SECONDS)
+            stderr = "".join(drained)
+        except BaseException:
+            process.kill()
+            raise
     if returncode != 0:
         raise FFmpegError(
             f"ffmpeg 执行失败（退出码 {returncode}）：{shlex.join(argv)}\n"
