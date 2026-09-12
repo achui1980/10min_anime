@@ -1,3 +1,4 @@
+import asyncio
 import json
 from types import SimpleNamespace
 
@@ -6,14 +7,18 @@ from pydantic import BaseModel
 
 from tenmin.config import LLMConfig, Settings
 from tenmin.models import LLMScript
+from tenmin.script import llm
 from tenmin.script.llm import (
+    CONNECT_TIMEOUT_SECONDS,
     MINIMAX_BASE_URL,
-    OPENAI_COMPATIBLE_TIMEOUT,
+    POOL_TIMEOUT_SECONDS,
     GeminiProvider,
     LLMError,
+    LLMHTTPError,
     LLMProvider,
     LLMResponseFormatError,
     LLMSchemaError,
+    LLMTransportError,
     MiniMaxProvider,
     OpenAICompatibleProvider,
     _extract_json,
@@ -448,6 +453,12 @@ def _mock_httpx(monkeypatch, bodies: list) -> list[dict]:
 
     刻意保留真实的 httpx.AsyncClient（只注入 transport），这样 SSE 分行/解码走的是
     httpx 自己的 aiter_lines 实现，测到的是生产路径而不是手写的假迭代器。
+
+    队列里每一项可以是：
+    - str：HTTP 200 + 这段正文
+    - (status, text)：指定状态码
+    - (status, text, headers)：再指定响应头（比如 Retry-After）
+    - Exception 实例：这一次请求直接抛它（模拟连接失败/读超时）
     """
     import httpx
 
@@ -467,11 +478,17 @@ def _mock_httpx(monkeypatch, bodies: list) -> list[dict]:
         )
         assert queue, "假 httpx 的响应队列已用尽"
         body = queue.pop(0)
+        if isinstance(body, BaseException):
+            raise body
+        headers: dict[str, str] = {}
         if isinstance(body, tuple):
-            status, text = body
+            if len(body) == 3:
+                status, text, headers = body
+            else:
+                status, text = body
         else:
             status, text = 200, body
-        return httpx.Response(status, content=text.encode("utf-8"))
+        return httpx.Response(status, content=text.encode("utf-8"), headers=headers)
 
     def factory(**kwargs):
         requests.append({"__init__": kwargs})
@@ -817,31 +834,305 @@ async def test_minimax_stream_retries_on_wrong_field_names(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_minimax_stream_uses_read_none_timeout(monkeypatch):
-    """read=None 是这次改动的核心：靠流式的 chunk 活性代替一个固定读超时。"""
+async def test_openai_compatible_timeout_mapping(monkeypatch):
+    """超时的四元组映射。
+
+    read 从原来的 None 换成有限值是这次改动的核心：read=None 关掉了 chunk 间隔的
+    活性检测，服务端吐了首字节之后 stall 就永久挂着。read 是「**两个 chunk 之间**
+    最多等多久」，不是整段生成时长，所以 120 秒不会误杀长思考。
+    """
     log = _mock_httpx(monkeypatch, [_sse_from_chunks('{"value": 1}')])
     provider = MiniMaxProvider(api_key="secret")
 
     await provider.complete("SYS", "USR", Toy)
 
     timeout = [r for r in log if "__init__" in r][0]["__init__"]["timeout"]
-    assert timeout is OPENAI_COMPATIBLE_TIMEOUT
-    assert timeout.read is None
-    assert timeout.connect == 30.0
-    assert timeout.write == 120.0
-    assert timeout.pool == 30.0
+    assert timeout.read == pytest.approx(LLMConfig().read_timeout_seconds)
+    assert timeout.write == pytest.approx(LLMConfig().timeout_seconds)
+    assert timeout.connect == pytest.approx(CONNECT_TIMEOUT_SECONDS)
+    assert timeout.pool == pytest.approx(POOL_TIMEOUT_SECONDS)
 
 
 @pytest.mark.asyncio
-async def test_minimax_stream_error_response_body_is_readable(monkeypatch):
-    """流式响应在 raise_for_status 之前必须 aread，否则错误体读不到。"""
-    import httpx
+async def test_openai_compatible_timeout_fields_are_configurable(monkeypatch):
+    log = _mock_httpx(monkeypatch, [_sse_from_chunks('{"value": 1}')])
+    provider = OpenAICompatibleProvider(
+        api_key="k",
+        model="m",
+        base_url="https://x.test/v1",
+        timeout_seconds=7.0,
+        read_timeout_seconds=11.0,
+    )
 
-    log = _mock_httpx(monkeypatch, [(429, '{"base_resp": {"status_msg": "rate limited"}}')])
-    provider = MiniMaxProvider(api_key="secret")
+    await provider.complete("SYS", "USR", Toy)
 
-    with pytest.raises(httpx.HTTPStatusError) as exc:
+    timeout = [r for r in log if "__init__" in r][0]["__init__"]["timeout"]
+    assert timeout.write == pytest.approx(7.0)
+    assert timeout.read == pytest.approx(11.0)
+
+
+@pytest.mark.asyncio
+async def test_openai_compatible_total_timeout_aborts_a_stalled_request(monkeypatch):
+    """read 只管 chunk 间隔，所以还要一个整次请求的总截止，否则「每 100 秒吐一个
+    字节」能让一次请求挂到天荒地老。"""
+    import httpx as _httpx
+
+    real_client_cls = _httpx.AsyncClient
+
+    async def handler(request):
+        await asyncio.sleep(1.0)
+        return _httpx.Response(200, content=b"")
+
+    monkeypatch.setattr(
+        _httpx,
+        "AsyncClient",
+        lambda **kw: real_client_cls(transport=_httpx.MockTransport(handler), **kw),
+    )
+    provider = OpenAICompatibleProvider(
+        api_key="k", model="m", base_url="https://x.test/v1", total_timeout_seconds=0.05
+    )
+
+    with pytest.raises(LLMTransportError) as exc:
         await provider.complete("SYS", "USR", Toy)
 
-    assert "rate limited" in exc.value.response.text
+    assert "0.05" in str(exc.value)
+
+
+# --- 传输层重试与退避 ---
+
+
+@pytest.fixture
+def sleeps(monkeypatch) -> list[float]:
+    """把退避的 sleep 换成 no-op 并记录时长，抖动固定成 0 让序列可断言。
+
+    绝不真睡：退避基数 1 秒、上限 30 秒，真睡一遍这组测试要跑几分钟。
+    """
+    recorded: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        recorded.append(seconds)
+
+    monkeypatch.setattr(llm, "_sleep", fake_sleep)
+    monkeypatch.setattr(llm, "_rand", lambda: 0.0)
+    return recorded
+
+
+def test_backoff_is_exponential_and_capped(monkeypatch):
+    monkeypatch.setattr(llm, "_rand", lambda: 0.0)
+    delays = [llm._backoff_delay(n) for n in range(1, 9)]
+    assert delays[:5] == [1.0, 2.0, 4.0, 8.0, 16.0]
+    assert all(d <= llm.BACKOFF_MAX_SECONDS for d in delays)
+    assert delays[-1] == pytest.approx(llm.BACKOFF_MAX_SECONDS)
+
+
+def test_backoff_jitter_is_multiplicative_and_bounded(monkeypatch):
+    """抖动是乘性的 [1, 1+ratio)，永远不缩短退避、也不会突破上限太多。"""
+    monkeypatch.setattr(llm, "_rand", lambda: 1.0)
+    assert llm._backoff_delay(1) == pytest.approx(1.0 * (1 + llm.BACKOFF_JITTER_RATIO))
+    assert llm._backoff_delay(3) == pytest.approx(4.0 * (1 + llm.BACKOFF_JITTER_RATIO))
+
+
+def test_backoff_honours_retry_after_without_jitter(monkeypatch):
+    monkeypatch.setattr(llm, "_rand", lambda: 1.0)
+    assert llm._backoff_delay(1, retry_after=17.0) == pytest.approx(17.0)
+    # 恶意/离谱的 Retry-After 要夹住，不然一次 429 能把整条流水线钉死几小时
+    assert llm._backoff_delay(1, retry_after=99999.0) == pytest.approx(
+        llm.RETRY_AFTER_MAX_SECONDS
+    )
+
+
+def test_parse_retry_after_accepts_seconds_and_ignores_http_date():
+    assert llm._parse_retry_after("12") == pytest.approx(12.0)
+    assert llm._parse_retry_after(" 2.5 ") == pytest.approx(2.5)
+    assert llm._parse_retry_after("Wed, 21 Oct 2015 07:28:00 GMT") is None
+    assert llm._parse_retry_after(None) is None
+    assert llm._parse_retry_after("") is None
+
+
+@pytest.mark.asyncio
+async def test_openai_compatible_retries_429_then_succeeds(monkeypatch, sleeps):
+    """原实现里 429 抛的 HTTPStatusError 在 try 之外，直接冲出重试循环——
+    OPENAI_COMPATIBLE_MAX_ATTEMPTS 只覆盖 schema 校验失败，传输层零重试零退避。"""
+    log = _mock_httpx(
+        monkeypatch,
+        [
+            (429, '{"base_resp": {"status_msg": "rate limited"}}'),
+            (503, "upstream busy"),
+            _sse_from_chunks('{"value": 42}'),
+        ],
+    )
+    provider = MiniMaxProvider(api_key="secret")
+
+    assert await provider.complete("SYS", "USR", Toy) == Toy(value=42)
+    assert len([r for r in log if "url" in r]) == 3
+    assert sleeps == [1.0, 2.0]
+
+
+@pytest.mark.asyncio
+async def test_openai_compatible_honours_retry_after_header(monkeypatch, sleeps):
+    log = _mock_httpx(
+        monkeypatch,
+        [
+            (429, "slow down", {"Retry-After": "9"}),
+            _sse_from_chunks('{"value": 1}'),
+        ],
+    )
+    provider = MiniMaxProvider(api_key="secret")
+
+    assert await provider.complete("SYS", "USR", Toy) == Toy(value=1)
+    assert sleeps == [9.0]
+    assert len([r for r in log if "url" in r]) == 2
+
+
+@pytest.mark.asyncio
+async def test_openai_compatible_gives_up_after_transport_max_attempts(monkeypatch, sleeps):
+    attempts = LLMConfig().transport_max_attempts
+    log = _mock_httpx(monkeypatch, [(429, "rate limited")] * attempts)
+    provider = MiniMaxProvider(api_key="secret")
+
+    with pytest.raises(LLMHTTPError) as exc:
+        await provider.complete("SYS", "USR", Toy)
+
+    assert exc.value.status_code == 429
+    assert len([r for r in log if "url" in r]) == attempts
+    assert sleeps == [1.0, 2.0, 4.0]
+
+
+@pytest.mark.asyncio
+async def test_openai_compatible_does_not_retry_on_401(monkeypatch, sleeps):
+    """401/403/400 重试是纯浪费：key 不会在 1 秒后自己变对。"""
+    log = _mock_httpx(monkeypatch, [(401, '{"error": {"message": "invalid api key"}}')])
+    provider = MiniMaxProvider(api_key="secret")
+
+    with pytest.raises(LLMHTTPError) as exc:
+        await provider.complete("SYS", "USR", Toy)
+
+    assert exc.value.status_code == 401
     assert len([r for r in log if "url" in r]) == 1
+    assert sleeps == []
+
+
+@pytest.mark.asyncio
+async def test_http_error_message_carries_status_and_body(monkeypatch, sleeps):
+    """原实现为了让错误体可读而 aread()，但 httpx 的 HTTPStatusError 消息不含 body，
+    body 只挂在 exc.response 上，而上层没有任何地方读它——用户看到的仍然只是
+    「429 Too Many Requests for url ...」。"""
+    _mock_httpx(monkeypatch, [(402, '{"base_resp":{"status_code":1008,"msg":"余额不足"}}')])
+    provider = MiniMaxProvider(api_key="secret")
+
+    with pytest.raises(LLMHTTPError) as exc:
+        await provider.complete("SYS", "USR", Toy)
+
+    message = str(exc.value)
+    assert "402" in message
+    assert "余额不足" in message
+    assert "chat/completions" in message
+
+
+@pytest.mark.asyncio
+async def test_http_error_message_truncates_a_huge_body(monkeypatch, sleeps):
+    _mock_httpx(monkeypatch, [(400, "x" * 50000)])
+    provider = MiniMaxProvider(api_key="secret")
+
+    with pytest.raises(LLMHTTPError) as exc:
+        await provider.complete("SYS", "USR", Toy)
+
+    assert len(str(exc.value)) < 3000
+
+
+@pytest.mark.asyncio
+async def test_openai_compatible_retries_transport_errors(monkeypatch, sleeps):
+    import httpx as _httpx
+
+    log = _mock_httpx(
+        monkeypatch,
+        [
+            _httpx.ConnectError("[Errno 61] Connection refused"),
+            _httpx.ReadTimeout("chunk 间隔超时"),
+            _httpx.RemoteProtocolError("服务端提前断流"),
+            _sse_from_chunks('{"value": 3}'),
+        ],
+    )
+    provider = MiniMaxProvider(api_key="secret")
+
+    assert await provider.complete("SYS", "USR", Toy) == Toy(value=3)
+    assert len([r for r in log if "url" in r]) == 4
+    assert sleeps == [1.0, 2.0, 4.0]
+
+
+@pytest.mark.asyncio
+async def test_transport_error_message_survives_retry_exhaustion(monkeypatch, sleeps):
+    import httpx as _httpx
+
+    attempts = LLMConfig().transport_max_attempts
+    _mock_httpx(monkeypatch, [_httpx.ConnectError("Connection refused")] * attempts)
+    provider = MiniMaxProvider(api_key="secret")
+
+    with pytest.raises(LLMTransportError) as exc:
+        await provider.complete("SYS", "USR", Toy)
+
+    assert "Connection refused" in str(exc.value)
+    assert str(attempts) in str(exc.value)
+    assert isinstance(exc.value.__cause__, _httpx.ConnectError)
+
+
+@pytest.mark.asyncio
+async def test_transport_max_attempts_is_configurable(monkeypatch, sleeps):
+    import httpx as _httpx
+
+    log = _mock_httpx(monkeypatch, [_httpx.ConnectError("nope")] * 5)
+    provider = OpenAICompatibleProvider(
+        api_key="k", model="m", base_url="https://x.test/v1", transport_max_attempts=1
+    )
+
+    with pytest.raises(LLMTransportError):
+        await provider.complete("SYS", "USR", Toy)
+
+    assert len([r for r in log if "url" in r]) == 1
+    assert sleeps == []
+
+
+@pytest.mark.asyncio
+async def test_openai_compatible_reuses_one_client_across_rounds(monkeypatch, sleeps):
+    """provider 持有 client：原实现每次 complete 新建一个 AsyncClient，
+    重复 TLS 握手、连接池完全不复用。"""
+    log = _mock_httpx(
+        monkeypatch,
+        [
+            (429, "slow down"),
+            _sse_from_chunks('{"val": 1}'),
+            _sse_from_chunks('{"value": 1}'),
+        ],
+    )
+    provider = MiniMaxProvider(api_key="secret")
+
+    assert await provider.complete("SYS", "USR", Toy) == Toy(value=1)
+    assert len([r for r in log if "url" in r]) == 3
+    assert len([r for r in log if "__init__" in r]) == 1
+
+    await provider.aclose()
+
+
+@pytest.mark.asyncio
+async def test_openai_compatible_aclose_is_idempotent(monkeypatch):
+    _mock_httpx(monkeypatch, [_sse_from_chunks('{"value": 1}')])
+    provider = MiniMaxProvider(api_key="secret")
+
+    await provider.aclose()  # 还没建过 client
+    await provider.complete("SYS", "USR", Toy)
+    await provider.aclose()
+    await provider.aclose()
+
+
+@pytest.mark.asyncio
+async def test_openai_compatible_rebuilds_client_after_aclose(monkeypatch):
+    log = _mock_httpx(
+        monkeypatch, [_sse_from_chunks('{"value": 1}'), _sse_from_chunks('{"value": 2}')]
+    )
+    provider = MiniMaxProvider(api_key="secret")
+
+    assert await provider.complete("SYS", "USR", Toy) == Toy(value=1)
+    await provider.aclose()
+    assert await provider.complete("SYS", "USR", Toy) == Toy(value=2)
+    assert len([r for r in log if "__init__" in r]) == 2
+

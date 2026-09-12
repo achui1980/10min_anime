@@ -517,6 +517,56 @@ def test_run_reports_http_transport_error(tmp_path, monkeypatch):
     assert "Connection refused" in out(result)
 
 
+def test_run_closes_the_provider_connection_pool(tmp_path, monkeypatch):
+    """provider 现在持有一个 httpx.AsyncClient，跑完必须有人收尾。"""
+    _minimal_project(tmp_path)
+    closed: list[bool] = []
+
+    class FakeProviderWithPool:
+        async def aclose(self):
+            closed.append(True)
+
+    async def ok(cfg, provider, **kwargs):
+        return []
+
+    monkeypatch.setattr("tenmin.cli.run_pipeline", ok)
+    monkeypatch.setattr(
+        "tenmin.cli.build_provider", lambda llm, settings: FakeProviderWithPool()
+    )
+
+    result = runner.invoke(
+        app, ["run", "akujo2", "--work-dir", str(tmp_path), "--only", "script"]
+    )
+
+    assert result.exit_code == 0, out(result)
+    assert closed == [True]
+
+
+def test_run_closes_the_provider_even_when_the_pipeline_blows_up(tmp_path, monkeypatch):
+    _minimal_project(tmp_path)
+    closed: list[bool] = []
+
+    class FakeProviderWithPool:
+        async def aclose(self):
+            closed.append(True)
+
+    async def boom(cfg, provider, **kwargs):
+        raise FileNotFoundError("缺少对白轨产物")
+
+    monkeypatch.setattr("tenmin.cli.run_pipeline", boom)
+    monkeypatch.setattr(
+        "tenmin.cli.build_provider", lambda llm, settings: FakeProviderWithPool()
+    )
+
+    result = runner.invoke(
+        app, ["run", "akujo2", "--work-dir", str(tmp_path), "--only", "script"]
+    )
+
+    assert result.exit_code == 1
+    assert _graceful(result), repr(result.exception)
+    assert closed == [True]
+
+
 def test_run_reports_llm_error(tmp_path, monkeypatch):
     """LLMError 是 RuntimeError 子类（不在 ValueError 那条网里），provider 抛的
     「HTTP 4xx 带响应体」「业务错误码」「连续 N 次不合 schema」全走它。"""

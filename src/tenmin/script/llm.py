@@ -3,7 +3,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
+import random
 import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -15,10 +17,39 @@ from pydantic import BaseModel, ValidationError
 from tenmin.config import DEFAULT_LLM, LLMConfig, Settings
 
 MINIMAX_BASE_URL = "https://api.minimax.cn/v1"
-# read=None：实测 MiniMax-M3 处理 ~35k 字符 prompt 需要 561 秒，非流式模式下服务端在
-# 这 561 秒里零字节返回，正好贴着旧的 600 秒读超时悬崖。流式下每个 SSE chunk 都会刷新
-# 读活性，因此读超时交给 chunk 间隔而不是整体耗时（这里直接关掉固定读超时）。
-OPENAI_COMPATIBLE_TIMEOUT = httpx.Timeout(connect=30.0, read=None, write=120.0, pool=30.0)
+
+# httpx.Timeout 里不由 LLMConfig 管的两格。它们是「建连」与「等连接池空位」的上限，
+# 跟模型有多慢、prompt 有多长完全无关，没有调它们的场景。
+CONNECT_TIMEOUT_SECONDS = 30.0
+POOL_TIMEOUT_SECONDS = 30.0
+
+# --- 传输层退避 ---
+# 基数 1 秒：429 的正常恢复窗是秒级，第一次重试等太久纯属浪费。
+# 上限 30 秒：单集 script 阶段本来就是分钟级，30 秒的单次等待还在「用户愿意等」的
+# 范围内，而再往上翻只会把一次注定失败的运行拖成十几分钟。
+# 抖动是**乘性**的 [1, 1.25)：只会加不会减（不缩短退避），同时打散批量模式下 10 集
+# 连着撞同一个限流窗时的同相重试。
+BACKOFF_BASE_SECONDS = 1.0
+BACKOFF_MAX_SECONDS = 30.0
+BACKOFF_JITTER_RATIO = 0.25
+# Retry-After 说多久就等多久，但要夹住：服务端（或中间的代理）给一个离谱的值时，
+# 一次 429 能把整条流水线钉死几小时。
+RETRY_AFTER_MAX_SECONDS = 120.0
+# 429 = 限流，5xx = 服务端/网关侧的瞬时故障。其余 4xx（401/403/400/404）重试是纯
+# 浪费：key 不会在 1 秒后自己变对，请求体也不会自己变合法。
+RETRYABLE_STATUS_CODES = frozenset({429, 500, 502, 503, 504})
+# 连接/读取类的传输异常。刻意不用 httpx.TransportError 这个大父类：
+# UnsupportedProtocol（base_url 写成了 ftp://）与 LocalProtocolError（我们自己拼错了
+# 请求）也在它底下，重试它们只是把同一个必错的请求发四遍。
+_RETRYABLE_TRANSPORT_ERRORS = (
+    httpx.TimeoutException,
+    httpx.NetworkError,
+    httpx.RemoteProtocolError,
+)
+
+# 错误响应体拼进异常消息时的上限。1000 字符足够看清 JSON 错误体里的 code/message，
+# 又不会在终端里刷屏（有些网关的 4xx 会返回一整页 HTML）。
+HTTP_ERROR_BODY_MAX_CHARS = 1000
 
 # 回灌给模型的两段文本各自的上限。坏输出可能是一整份坏剧本（几万字符），报错也可能是
 # 一长串 pydantic 逐字段清单，原样回灌等于把纠错轮的 token 成本推回到首轮量级。
@@ -28,6 +59,44 @@ REPAIR_OUTPUT_MAX_CHARS = 4000
 _THINK_BLOCK = re.compile(r"<think\b[^>]*>.*?</think\s*>", re.S)
 _THINK_OPEN = re.compile(r"<think\b[^>]*>")
 _FENCE = re.compile(r"^```(?:json)?[ \t]*\n?|\n?```[ \t]*$", re.M)
+
+
+async def _sleep(seconds: float) -> None:
+    """退避用的 sleep。**刻意做成模块级函数**，测试 monkeypatch 掉它就既不真睡、
+    又能把整条退避序列的时长逐个断言出来。"""
+    await asyncio.sleep(seconds)
+
+
+def _rand() -> float:
+    """[0, 1) 的抖动源。同样是模块级函数，为的是让退避序列在测试里可确定。"""
+    return random.random()
+
+
+def _backoff_delay(attempt: int, retry_after: float | None = None) -> float:
+    """第 attempt 次尝试失败后要等多久（attempt 从 1 开始）。
+
+    Retry-After 优先（服务端最清楚还要等多久），只做上限夹取、不叠抖动；
+    否则指数退避 base * 2^(attempt-1)，夹到上限后再叠一个乘性抖动。
+    """
+    if retry_after is not None:
+        return max(0.0, min(retry_after, RETRY_AFTER_MAX_SECONDS))
+    delay = min(BACKOFF_BASE_SECONDS * 2 ** (attempt - 1), BACKOFF_MAX_SECONDS)
+    return delay * (1.0 + BACKOFF_JITTER_RATIO * _rand())
+
+
+def _parse_retry_after(value: str | None) -> float | None:
+    """只认秒数形式的 Retry-After。
+
+    HTTP-date 形式（`Wed, 21 Oct 2015 07:28:00 GMT`）一律返回 None 退化成指数退避：
+    解析它要处理时区与本机时钟漂移，而实测的 LLM 网关（MiniMax / DeepSeek / OpenAI）
+    给的都是秒数，为一个没人发的形态引入时钟依赖不划算。
+    """
+    if not value:
+        return None
+    try:
+        return float(value.strip())
+    except ValueError:
+        return None
 
 
 class LLMError(RuntimeError):
@@ -64,6 +133,40 @@ class LLMSchemaError(LLMError):
     def __init__(self, message: str, *, raw_output: str = "") -> None:
         super().__init__(message)
         self.raw_output = raw_output
+
+
+class LLMHTTPError(LLMError):
+    """HTTP 4xx/5xx。**响应体摘要直接进异常消息**。
+
+    原实现只是 `await response.aread()` 之后 `raise_for_status()`：httpx 的
+    HTTPStatusError 消息里不含 body（body 只挂在 exc.response 上），而 single.py /
+    pipeline.py / cli.py 没有任何一处去读它，用户实际看到的仍然只是一句
+    「429 Too Many Requests for url ...」——一个字的诊断信息都没有。
+    """
+
+    def __init__(
+        self,
+        *,
+        status_code: int,
+        body: str,
+        url: str = "",
+        retry_after: float | None = None,
+        attempts: int = 1,
+    ) -> None:
+        self.status_code = status_code
+        self.body = body
+        self.url = url
+        self.retry_after = retry_after
+        self.attempts = attempts
+        tries = f"（已尝试 {attempts} 次）" if attempts > 1 else ""
+        super().__init__(
+            f"LLM 接口返回 HTTP {status_code}{tries}：{url}\n"
+            f"响应体：{_truncate(body, HTTP_ERROR_BODY_MAX_CHARS)}"
+        )
+
+
+class LLMTransportError(LLMError):
+    """连不上 / 建连超时 / chunk 间隔超时 / 服务端提前断流 / 撞到总截止。"""
 
 
 def _truncate(text: str, limit: int) -> str:
@@ -292,11 +395,44 @@ class OpenAICompatibleProvider:
         base_url: str,
         *,
         max_attempts: int = DEFAULT_LLM.max_attempts,
+        transport_max_attempts: int = DEFAULT_LLM.transport_max_attempts,
+        timeout_seconds: float = DEFAULT_LLM.timeout_seconds,
+        read_timeout_seconds: float = DEFAULT_LLM.read_timeout_seconds,
+        total_timeout_seconds: float = DEFAULT_LLM.total_timeout_seconds,
     ) -> None:
         self.model = model
         self.base_url = base_url.rstrip("/")
         self.max_attempts = max_attempts
+        self.transport_max_attempts = transport_max_attempts
         self._api_key = api_key
+        self._total_timeout_seconds = total_timeout_seconds
+        # read 是**相邻两个 chunk 之间**最多等多久，不是整段生成时长——流式下每个
+        # SSE chunk 都会刷新读活性，所以给它一个有限上限并不会误杀「思考了 9 分钟
+        # 才吐完」的长请求，只会杀掉「吐了首字节之后 stall」的死流。原来这里是
+        # read=None，等于把 chunk 间隔的活性检测整个关掉，一旦 stall 就永久挂着。
+        self._timeout = httpx.Timeout(
+            connect=CONNECT_TIMEOUT_SECONDS,
+            read=read_timeout_seconds,
+            write=timeout_seconds,
+            pool=POOL_TIMEOUT_SECONDS,
+        )
+        self._client: httpx.AsyncClient | None = None
+
+    def _get_client(self) -> httpx.AsyncClient:
+        """provider 持有 client，生命周期跟 provider 一致。
+
+        原实现每次 complete 都 `async with httpx.AsyncClient(...)`，于是同一次
+        script 阶段的每一轮重试都要重做一遍 TLS 握手，批量模式下 10 集就是 10 份。
+        """
+        if self._client is None or self._client.is_closed:
+            self._client = httpx.AsyncClient(timeout=self._timeout)
+        return self._client
+
+    async def aclose(self) -> None:
+        """关掉持有的连接池。cli.py 在 run_pipeline 之后调它。幂等。"""
+        client, self._client = self._client, None
+        if client is not None and not client.is_closed:
+            await client.aclose()
 
     def _extra_payload_fields(self) -> dict[str, Any]:
         """子类可覆写，往请求体里加自己专属的字段（比如 MiniMax 的 thinking）。"""
@@ -353,24 +489,94 @@ class OpenAICompatibleProvider:
             payload["response_format"] = {"type": "json_object"}
         return payload
 
-    async def _stream_once(self, client: httpx.AsyncClient, payload: dict[str, Any]) -> str:
-        """发一次流式请求，把所有 delta.content 拼成完整文本。"""
+    @property
+    def _endpoint(self) -> str:
+        return f"{self.base_url}/chat/completions"
+
+    async def _stream_once(self, payload: dict[str, Any]) -> str:
+        """发一次流式请求，把所有 delta.content 拼成完整文本。
+
+        整次请求外面套一个 asyncio.timeout：read 只管**相邻两个 chunk**的间隔，
+        「每 100 秒吐一个字节」这种半死不活的流照样能挂到天荒地老，所以还要一个
+        整体截止。
+        """
         parts: list[str] = []
-        async with client.stream(
-            "POST",
-            f"{self.base_url}/chat/completions",
-            headers={"Authorization": f"Bearer {self._api_key}"},
-            json=payload,
-        ) as response:
-            if response.is_error:
-                # 流式响应在读取 body 之前 raise_for_status 只能给出空错误体。
-                await response.aread()
-            response.raise_for_status()
-            async for line in response.aiter_lines():
-                chunk = _sse_delta(line)
-                if chunk:
-                    parts.append(chunk)
+        try:
+            async with asyncio.timeout(self._total_timeout_seconds):
+                async with self._get_client().stream(
+                    "POST",
+                    self._endpoint,
+                    headers={"Authorization": f"Bearer {self._api_key}"},
+                    json=payload,
+                ) as response:
+                    if response.is_error:
+                        # 流式响应在读 body 之前拿不到错误体，必须先 aread。
+                        body = (await response.aread()).decode("utf-8", "replace")
+                        raise LLMHTTPError(
+                            status_code=response.status_code,
+                            body=body,
+                            url=self._endpoint,
+                            retry_after=_parse_retry_after(
+                                response.headers.get("retry-after")
+                            ),
+                        )
+                    async for line in response.aiter_lines():
+                        chunk = _sse_delta(line)
+                        if chunk:
+                            parts.append(chunk)
+        except TimeoutError as exc:
+            # asyncio.timeout 到点抛的是内置 TimeoutError（httpx 自己的超时是
+            # httpx.TimeoutException，两者没有继承关系，不会互相误吞）。
+            raise LLMTransportError(
+                f"一次 LLM 请求超过了总时长上限 {self._total_timeout_seconds} 秒"
+                f"（{self._endpoint}）。确实需要更久的话调高 llm.total_timeout_seconds。"
+            ) from exc
         return "".join(parts)
+
+    async def _stream_with_retries(self, payload: dict[str, Any]) -> str:
+        """在 _stream_once 外面套传输层重试。
+
+        **跟 schema 修复重试分开计数**：原实现只有一个 3 次的循环、且只覆盖 schema
+        校验失败，_stream_once 抛的 HTTPStatusError(429/5xx) / ConnectError /
+        ReadTimeout / RemoteProtocolError 全部在 try 之外，直接冲出循环，传输层等于
+        零重试零退避——一个 429 就把整集的 script 阶段打死。
+        """
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                return await self._stream_once(payload)
+            except LLMHTTPError as exc:
+                retryable = exc.status_code in RETRYABLE_STATUS_CODES
+                retry_after = exc.retry_after
+                error: Exception = exc
+            except _RETRYABLE_TRANSPORT_ERRORS as exc:
+                retryable = True
+                retry_after = None
+                error = exc
+            if not retryable or attempt >= self.transport_max_attempts:
+                raise self._exhausted(error, attempt) from error
+            await _sleep(_backoff_delay(attempt, retry_after))
+
+    def _exhausted(self, error: Exception, attempt: int) -> LLMError:
+        """把最后一次失败翻译成带现场的 LLMError。
+
+        httpx 的传输类异常必须包一层：它们的 str() 经常是空串（ReadTimeout('')），
+        而且不在 cli.py 那张「已经自带一句人话」的表所覆盖的语义里。
+        """
+        if isinstance(error, LLMHTTPError):
+            return LLMHTTPError(
+                status_code=error.status_code,
+                body=error.body,
+                url=error.url,
+                retry_after=error.retry_after,
+                attempts=attempt,
+            )
+        detail = str(error) or type(error).__name__
+        return LLMTransportError(
+            f"连接 LLM 接口失败，已尝试 {attempt} 次仍不通"
+            f"（{self._endpoint}）：{type(error).__name__}: {detail}"
+        )
 
     @overload
     async def complete(self, system: str, user: str, schema: None = None) -> str: ...
@@ -381,35 +587,30 @@ class OpenAICompatibleProvider:
     async def complete(
         self, system: str, user: str, schema: type[BaseModel] | None = None
     ) -> Any:
-        async with httpx.AsyncClient(timeout=OPENAI_COMPATIBLE_TIMEOUT) as client:
-            if schema is None:
-                messages = [
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": user},
-                ]
-                text = await self._stream_once(
-                    client, self._payload(messages, json_mode=False)
-                )
-                return _strip_reasoning(text)
-
-            first = [
+        if schema is None:
+            messages = [
                 {"role": "system", "content": system},
-                {"role": "user", "content": self._schema_prompt(user, schema)},
+                {"role": "user", "content": user},
             ]
-
-            async def send(repair: RepairContext | None) -> str:
-                messages = (
-                    first
-                    if repair is None
-                    else self._repair_messages(system, schema, repair)
-                )
-                return await self._stream_once(
-                    client, self._payload(messages, json_mode=True)
-                )
-
-            return await _complete_with_schema_repair(
-                send, schema, max_attempts=self.max_attempts, label=type(self).__name__
+            text = await self._stream_with_retries(
+                self._payload(messages, json_mode=False)
             )
+            return _strip_reasoning(text)
+
+        first = [
+            {"role": "system", "content": system},
+            {"role": "user", "content": self._schema_prompt(user, schema)},
+        ]
+
+        async def send(repair: RepairContext | None) -> str:
+            messages = (
+                first if repair is None else self._repair_messages(system, schema, repair)
+            )
+            return await self._stream_with_retries(self._payload(messages, json_mode=True))
+
+        return await _complete_with_schema_repair(
+            send, schema, max_attempts=self.max_attempts, label=type(self).__name__
+        )
 
 
 class MiniMaxProvider(OpenAICompatibleProvider):
@@ -426,16 +627,37 @@ class MiniMaxProvider(OpenAICompatibleProvider):
         model: str = "MiniMax-M3",
         base_url: str = MINIMAX_BASE_URL,
         thinking: str = "disabled",
-        *,
-        max_attempts: int = DEFAULT_LLM.max_attempts,
+        **kwargs: Any,
     ) -> None:
-        super().__init__(
-            api_key=api_key, model=model, base_url=base_url, max_attempts=max_attempts
-        )
+        # kwargs 原样转给基类（max_attempts / transport_max_attempts / 三个超时）。
+        # 这里刻意不逐个重列：本类跟基类的唯一差别就是 thinking 这一个字段，重列 5 个
+        # 参数只会多出一处随基类演进而漂移的拷贝。
+        super().__init__(api_key=api_key, model=model, base_url=base_url, **kwargs)
         self.thinking = thinking
 
     def _extra_payload_fields(self) -> dict[str, Any]:
         return {"thinking": {"type": self.thinking}}
+
+
+def _transport_kwargs(cfg: LLMConfig) -> dict[str, Any]:
+    """LLMConfig -> OpenAICompatibleProvider 的传输层参数。
+
+    超时的最终映射（刻意**不**把 timeout_seconds 当成单一整体超时塞进
+    httpx.Timeout(timeout_seconds)——那会让 read 从「无上限」一步跳到 120 秒，
+    是一个没人声明过的行为变更）：
+
+    - timeout_seconds        -> httpx.Timeout(write=...)   逐字对齐它原本的出处
+    - read_timeout_seconds   -> httpx.Timeout(read=...)    chunk 间隔上限
+    - total_timeout_seconds  -> asyncio.timeout(...)       一次请求的总截止
+    - connect / pool 不可配，见 CONNECT_TIMEOUT_SECONDS / POOL_TIMEOUT_SECONDS
+    """
+    return {
+        "max_attempts": cfg.max_attempts,
+        "transport_max_attempts": cfg.transport_max_attempts,
+        "timeout_seconds": cfg.timeout_seconds,
+        "read_timeout_seconds": cfg.read_timeout_seconds,
+        "total_timeout_seconds": cfg.total_timeout_seconds,
+    }
 
 
 def build_provider(cfg: LLMConfig, settings: Settings) -> LLMProvider:
@@ -462,7 +684,7 @@ def build_provider(cfg: LLMConfig, settings: Settings) -> LLMProvider:
             model=cfg.model,
             base_url=cfg.base_url or MINIMAX_BASE_URL,
             thinking=cfg.thinking,
-            max_attempts=cfg.max_attempts,
+            **_transport_kwargs(cfg),
         )
     if cfg.provider == "openai_compatible":
         if not settings.openai_compatible_api_key:
@@ -477,7 +699,7 @@ def build_provider(cfg: LLMConfig, settings: Settings) -> LLMProvider:
             api_key=settings.openai_compatible_api_key.get_secret_value(),
             model=cfg.model,
             base_url=cfg.base_url,
-            max_attempts=cfg.max_attempts,
+            **_transport_kwargs(cfg),
         )
 
     raise ValueError(f"不支持的 LLM provider：{cfg.provider}")

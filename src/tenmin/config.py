@@ -62,17 +62,32 @@ class LLMConfig(BaseModel):
     # 浪费掉的耗时（实测 ~35k 字符的 prompt 光推理阶段就能占大头）。默认关掉它。
     thinking: Literal["adaptive", "disabled"] = "disabled"
 
-    # 以下五个字段目前"只定义不消费"，等 provider 层专项任务接线。
     # None = 不往请求里塞这个字段，用服务端自己的默认值。
     temperature: float | None = Field(default=None, ge=0)
     max_output_tokens: int | None = Field(default=None, gt=0)
-    # 抄 script/llm.py 的 OPENAI_COMPATIBLE_TIMEOUT 的 write=120.0。
-    # 那个 httpx.Timeout 是四元组（connect=30 / read=None / write=120 / pool=30），
-    # read 故意不设上限（长 prompt 的流式生成可以几分钟不吐第一个 token）。
+
+    # --- 超时。三个字段各管一格，别把它们混成「一个整体超时」 ---
+    # httpx.Timeout 的 write：把请求体（~35k 字符 prompt）推上去的上限。
+    # 这个默认值就是它历史上的出处（script/llm.py 那个四元组里的 write=120.0）。
     timeout_seconds: float = Field(default=120.0, gt=0)
-    # 抄 script/llm.py 的 OPENAI_COMPATIBLE_MAX_ATTEMPTS。
+    # httpx.Timeout 的 read：**相邻两个 SSE chunk 之间**最多等多久，不是整段生成时长。
+    # 流式下每个 chunk 都刷新读活性，所以 120 秒不会误杀「思考了 9 分钟才吐完」的长
+    # 请求，只会杀掉「吐了首字节之后 stall」的死流。原来这里是 read=None，等于把
+    # chunk 间隔的活性检测整个关掉，一旦 stall 就永久挂着、且没有任何整体截止。
+    read_timeout_seconds: float = Field(default=120.0, gt=0)
+    # 一次 HTTP 请求的总截止（asyncio.timeout）。实测 MiniMax-M3 处理 ~35k 字符
+    # prompt 需要 561 秒，1200 秒留了两倍余量；再久基本可以断定是流卡死了。
+    total_timeout_seconds: float = Field(default=1200.0, gt=0)
+
+    # --- 重试。两类失败**分开计数** ---
+    # schema 校验失败的自修复轮数（把报错回灌给模型再来一次）。
     max_attempts: int = Field(default=3, ge=1)
-    # 抄 script/budget.py 的 DEFAULT_TOLERANCE。
+    # 传输层（429 / 5xx / 连接失败 / chunk 间隔超时 / 提前断流）的尝试次数，
+    # 含首发。4 = 首发 + 3 次重试，配上 1 秒基数的指数退避总共只多等 ~7 秒，
+    # 却能兜住绝大多数秒级的限流窗与网关抖动。设成 1 等于关掉传输层重试。
+    transport_max_attempts: int = Field(default=4, ge=1)
+
+    # 抄 script/budget.py 的 DEFAULT_TOLERANCE。目前只定义不消费。
     budget_tolerance: float = Field(default=0.12, ge=0)
 
 

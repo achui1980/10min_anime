@@ -199,6 +199,24 @@ def init(slug: str, work_dir: Path = WORK_DIR_OPTION) -> None:
     typer.echo(f"字幕会被拷进 {root / 'srt'}，清洗规则调不好时可以就地改它。")
 
 
+async def _run_pipeline_and_close(
+    cfg: ProjectConfig, provider: Any, **kwargs: Any
+) -> list[str]:
+    """跑流水线，然后关掉 provider 持有的连接池。
+
+    OpenAICompatibleProvider 现在持有一个 httpx.AsyncClient（为的是让同一次运行的
+    多轮重试、批量模式的多集共用连接池），所以它的生命周期必须有人收尾。用 getattr
+    探测而不是写死类型：GeminiProvider 没有 aclose（google-genai 自己管连接），
+    而库调用方/测试传进来的假 provider 更不会有。
+    """
+    try:
+        return await run_pipeline(cfg, provider, **kwargs)
+    finally:
+        aclose = getattr(provider, "aclose", None)
+        if aclose is not None:
+            await aclose()
+
+
 @app.command()
 def run(
     slug: str,
@@ -257,7 +275,7 @@ def run(
     try:
         with RichProgressReporter() as reporter:
             warnings = asyncio.run(
-                run_pipeline(
+                _run_pipeline_and_close(
                     cfg,
                     provider,
                     from_stage=from_stage,

@@ -452,3 +452,30 @@ def test_llm_config_new_defaults():
     assert cfg.timeout_seconds == pytest.approx(120.0)
     assert cfg.max_attempts == 3
     assert cfg.budget_tolerance == pytest.approx(0.12)
+
+
+def test_llm_config_timeout_and_retry_defaults():
+    """三个超时字段各管一格，两类重试分开计数。"""
+    cfg = LLMConfig()
+    assert cfg.read_timeout_seconds == pytest.approx(120.0)
+    assert cfg.total_timeout_seconds == pytest.approx(1200.0)
+    assert cfg.transport_max_attempts == 4
+
+
+def test_llm_config_rejects_non_positive_timeouts():
+    for field in ("read_timeout_seconds", "total_timeout_seconds"):
+        with pytest.raises(ValidationError):
+            LLMConfig(**{field: 0})
+
+
+def test_llm_config_transport_max_attempts_one_disables_retry():
+    assert LLMConfig(transport_max_attempts=1).transport_max_attempts == 1
+    with pytest.raises(ValidationError):
+        LLMConfig(transport_max_attempts=0)
+
+
+def test_default_llm_is_a_plain_llm_config():
+    """llm.py 的各个默认参数取自这个共享实例，跟 DEFAULT_RENDER 那几个同一形态。"""
+    from tenmin.config import DEFAULT_LLM
+
+    assert DEFAULT_LLM == LLMConfig()
