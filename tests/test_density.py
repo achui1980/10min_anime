@@ -1,6 +1,7 @@
 import pytest
 
 from tenmin.models import DialogueLine, DialogueTrack
+from tenmin.signals import density as density_module
 from tenmin.signals.density import (
     LOW_DENSITY_RATIO,
     char_rate,
@@ -110,6 +111,120 @@ def test_find_density_signals_combines_both_rules():
     t = _bucket_track([30, 30, 30, 30, 120, 30, 30, 30])
     sources = {s.source for s in find_density_signals(t)}
     assert "density_shift" in sources
+
+
+# --- 尾部不完整桶 / stdev 数值稳定性 / OP-ED 屏蔽 ---
+
+
+def test_find_density_shifts_ignores_incomplete_tail_bucket():
+    """duration 不是 window 整数倍时，尾部那个残桶必然造出一条固定的假「节奏骤降」。
+
+    修复前 bucket_count = int(duration // window) + 1，window=30 / duration=241 时
+    得到 9 个桶，第 9 个只覆盖 240→241 共 1 秒。而 duration 是「最后一条 cue 的终点」，
+    那条 cue 必然起于 240 之前、落进第 8 桶，所以残桶字数恒为 0；桶内字数又没有按桶的
+    实际时长归一化，于是 diffs 末项是个大负值，稳定触发一条片尾假信号。
+    """
+    t = _bucket_track([30] * 8)  # 0-240 八个满桶，完全平坦
+    t.duration = 241.0
+    assert find_density_shifts(t) == []
+
+
+def test_find_density_shifts_tail_bucket_does_not_shrink_real_signal():
+    """残桶被丢弃，但完整桶里的真信号一条都不能少。"""
+    chars = [30, 30, 30, 30, 120, 30, 30, 30]
+    t = _bucket_track(chars)
+    t.duration = 240.0 + 7.046  # 抄 saijo E02 的 duration % 30
+    starts = sorted(s.start for s in find_density_shifts(t))
+    assert starts == pytest.approx([120.0, 150.0])
+
+
+def test_find_density_shifts_all_signals_stay_inside_full_buckets():
+    t = _bucket_track([30, 30, 30, 30, 120, 30, 30, 30])
+    t.duration = 235.0
+    for signal in find_density_shifts(t):
+        assert signal.end <= 210.0  # 只剩 7 个完整桶，覆盖 0-210
+
+
+def test_find_density_shifts_treats_near_zero_stdev_as_flat(monkeypatch):
+    """`stdev == 0` 的浮点相等判断漏掉 1e-16，z = diff / 1e-16 会爆成天文数字。
+
+    后果是**每一个**桶边界都变成「节奏突变」。当前 buckets 是整数字数累加，
+    pstdev 对全等整数序列给的是精确 0.0，所以这个坑是潜伏的而不是已激活的；
+    这里直接把 pstdev 打桩成 1e-16 来锁住 EPS 判据，避免以后桶统计一改成
+    浮点（比如按桶实际时长归一化成速率）就立刻踩上去。
+    """
+    monkeypatch.setattr(density_module.statistics, "pstdev", lambda _values: 1e-16)
+    t = _bucket_track([30, 30, 30, 31, 30, 30, 30, 30])
+    assert find_density_shifts(t) == []
+
+
+def test_find_density_shifts_masks_op_range():
+    """OP 段落的 credits 行被 spoken_lines 过滤掉，桶字数骤降为 0。
+
+    修复前 OP 进入与离开各产生一条假 density_shift（实测 work/ 下 10 集有 op_range
+    的素材里，片头 60-270 秒区间的 shift 有 19 条，其中 13 条是这类边界伪影），
+    随后在 aggregate 里给相邻真高光加强度、污染排序。
+    """
+    lines = [
+        dline(1, 1.0, 3.0, "啊" * 60),
+        dline(2, 31.0, 33.0, "啊" * 60),
+        dline(3, 61.0, 63.0, "啊" * 60),
+        # 90-180 是 OP：整段只有 credits 行，spoken_lines 一条都不留。
+        dline(4, 95.0, 100.0, "监督 山田太郎", kind="credits"),
+        dline(5, 150.0, 155.0, "制作委员会", kind="credits"),
+        dline(6, 181.0, 183.0, "啊" * 60),
+        dline(7, 211.0, 213.0, "啊" * 60),
+        dline(8, 241.0, 243.0, "啊" * 60),
+        dline(9, 271.0, 273.0, "啊" * 60),
+    ]
+    t = DialogueTrack(
+        episode=1, duration=300.0, op_range=(90.0, 180.0), lines=lines
+    )
+    assert find_density_shifts(t) == []
+
+
+def test_find_density_shifts_no_diff_bridges_a_masked_hole():
+    """跨过 OP 空洞的差分同样是伪影：屏蔽区两侧的桶不能互相做差。"""
+    lines = [
+        dline(1, 1.0, 3.0, "啊" * 20),
+        dline(2, 31.0, 33.0, "啊" * 20),
+        dline(3, 61.0, 63.0, "啊" * 20),
+        dline(4, 181.0, 183.0, "啊" * 200),
+        dline(5, 211.0, 213.0, "啊" * 200),
+        dline(6, 241.0, 243.0, "啊" * 200),
+    ]
+    t = DialogueTrack(
+        episode=1, duration=270.0, op_range=(90.0, 180.0), lines=lines
+    )
+    # 桶 0-2（各 20 字）与桶 6-8（各 200 字）内部都完全平坦；
+    # 唯一的「突变」是跨 OP 空洞的 20 -> 200，它不该被算出来。
+    assert find_density_shifts(t) == []
+
+
+def test_find_density_shifts_masks_ed_range():
+    lines = [
+        dline(1, 1.0, 3.0, "啊" * 60),
+        dline(2, 31.0, 33.0, "啊" * 60),
+        dline(3, 61.0, 63.0, "啊" * 60),
+        dline(4, 91.0, 93.0, "啊" * 60),
+        dline(5, 125.0, 130.0, "制作委员会", kind="credits"),
+    ]
+    t = DialogueTrack(
+        episode=1, duration=150.0, ed_range=(120.0, 150.0), lines=lines
+    )
+    assert find_density_shifts(t) == []
+
+
+def test_find_density_shifts_partially_masked_bucket_is_dropped():
+    """跨屏蔽边界的桶整桶丢弃：半个桶被 OP 覆盖，字数天然减半，本身就是伪影。"""
+    t = DialogueTrack(
+        episode=1,
+        duration=300.0,
+        op_range=(95.0, 175.0),  # 与桶 [90,120) 和 [150,180) 各重叠一部分
+        lines=[dline(i + 1, i * 30.0 + 1.0, i * 30.0 + 3.0, "啊" * 60) for i in range(10)],
+    )
+    for signal in find_density_shifts(t):
+        assert signal.end <= 90.0 or signal.start >= 180.0
 
 
 # --- 黄金样本 ---

@@ -32,7 +32,19 @@ REGIONAL_SOURCE = "density_shift"
 def _adjacent(
     a: tuple[float, float], b: tuple[float, float], min_separation: float
 ) -> bool:
-    """两个区间重叠，或彼此间隔不超过 min_separation。"""
+    """两个区间重叠，或彼此间隔不超过 min_separation。
+
+    刻意**不**复用 intervals.group_adjacent 的邻接判据，两者语义不同、不是重复：
+
+    - `group_adjacent` 是单向的（`start - current_max_end <= max_gap`）。它按起点排序
+      后单调向前扫，只问「下一条离已见右界够近吗」，用来把一串区间**切成组**。
+    - 这里是双向的（`b[0] - a[1] <= sep and a[0] - b[1] <= sep`）。宿主簇的跨度 span
+      与区域性信号的先后顺序不定 —— 一个 30s 统计桶可能整个落在某个精确簇**之前**，
+      单向判据会漏掉这种情况，于是 density_shift 自成一簇，凭空多出一个
+      「只有节奏换挡、没有任何精确证据」的 highlight。
+
+    换成单向判据会静默改变 highlight 的数量与强度，别当成重复给合并掉。
+    """
     return b[0] - a[1] <= min_separation and a[0] - b[1] <= min_separation
 
 
