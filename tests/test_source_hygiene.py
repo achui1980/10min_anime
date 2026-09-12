@@ -49,3 +49,18 @@ def test_src_has_python_files():
 @pytest.mark.parametrize("path", _source_files(), ids=lambda p: p.name)
 def test_text_io_always_declares_encoding(path: Path):
     assert _offenders(path) == []
+
+
+@pytest.mark.parametrize("path", _source_files(), ids=lambda p: p.name)
+def test_no_assert_statements_in_src(path: Path):
+    """src/ 里不许有 assert。
+
+    `python -O` 会把 assert 整句剥掉，于是被它当作控制流/前置条件用的地方在生产
+    模式下静默失效，错误漂到很远的地方才以别的异常炸出来。本仓库已经踩过两次
+    （srt_parser 的 `assert match is not None` 退化成 AttributeError、
+    run_pipeline 的 `assert tts_engine is not None` 退化成 None 漂进 TTS）。
+    前置条件请写成显式的 `if ...: raise`，并选一个 cli.py 会捕获的异常类型。
+    """
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    lines = [node.lineno for node in ast.walk(tree) if isinstance(node, ast.Assert)]
+    assert lines == [], f"{path.name} 第 {lines} 行有 assert"

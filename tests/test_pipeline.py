@@ -777,6 +777,19 @@ async def test_run_pipeline_batch_mode_runs_full_pipeline_for_all_episodes(
 
 
 @pytest.mark.asyncio
+async def test_run_pipeline_voice_without_tts_engine_raises_value_error(project):
+    """原来这里是裸 assert：python -O 下被剥离，接着 None 一路漂进 synthesize_track，
+    炸在 render/tts.py 里的 AttributeError，报错完全指不到「你忘了传 tts_engine」。
+
+    选 ValueError 是因为 cli.py 的异常捕获列表里有它，会变成一行红字 + exit 1，
+    而不是一整页 traceback。
+    """
+    _write_script(Paths(project.root).script(2), render_script())
+    with pytest.raises(ValueError, match="tts_engine"):
+        await run_pipeline(project, FakeProvider([]), only=["voice"], tts_engine=None)
+
+
+@pytest.mark.asyncio
 async def test_run_pipeline_skips_voice_when_fresh(project):
     _write_script(Paths(project.root).script(2), render_script())
     engine = FakeTTSEngine([8.0, 10.0, 10.0])

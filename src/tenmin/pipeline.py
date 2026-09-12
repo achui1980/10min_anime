@@ -550,7 +550,16 @@ async def run_pipeline(
             outputs = [paths.voice(number)]
             if force or not is_fresh(outputs, [paths.script(number)]):
                 reporter.stage_start("voice")
-                assert tts_engine is not None
+                if tts_engine is None:
+                    # 刻意不用 assert：python -O 下 assert 整句被剥离，None 会一路漂
+                    # 进 synthesize_track，最后炸成 render/tts.py 里的 AttributeError，
+                    # 报错指不到真正的原因。ValueError 在 cli.py 的捕获列表里，用户看到
+                    # 的是一行红字而不是一整页 traceback。
+                    raise ValueError(
+                        "要跑 voice 阶段必须传 tts_engine。"
+                        "CLI 会在 --only/--from 覆盖到 voice 时自动构造，"
+                        "库调用方请自己传 render.tts.build_tts_engine(cfg.render)。"
+                    )
                 _, stage_warnings = await run_voice(
                     cfg, tts_engine, episode=number, reporter=reporter
                 )
