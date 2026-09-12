@@ -246,6 +246,19 @@ def test_video_path_passes_absolute_through(tmp_path):
     assert cfg.video_path(cfg.episodes[0]) == absolute
 
 
+def test_config_path_points_at_project_yaml(tmp_path):
+    cfg = ProjectConfig.model_validate(
+        {"show": "剧名", "slug": "slug", "episodes": []}
+    ).bind_root(tmp_path)
+    assert cfg.config_path == tmp_path.resolve() / "project.yaml"
+
+
+def test_config_path_matches_the_file_load_project_read(tmp_path):
+    path = tmp_path / "project.yaml"
+    path.write_text(MINIMAL, encoding="utf-8")
+    assert load_project(path).config_path == path.resolve()
+
+
 def test_video_path_without_video_raises():
     cfg = ProjectConfig.model_validate(
         {"show": "剧名", "slug": "slug", "episodes": [{"number": 2, "srt": "srt/E02.srt"}]}

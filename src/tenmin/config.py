@@ -225,6 +225,19 @@ class ProjectConfig(BaseModel):
         """project.yaml 所在目录，也就是 work/<slug>/。"""
         return self._root
 
+    @property
+    def config_path(self) -> Path:
+        """project.yaml 自身的路径。
+
+        两个用途：register_episode 要改写它；pipeline._is_fresh 把它当**每个阶段的
+        输入**（P1-B 之后全项目的经验阈值、glossary、render 参数都住在这个文件里，
+        改了它却不让任何产物失效，等于旋钮全是哑的）。
+
+        文件名写死 "project.yaml"：CLI 的 _project_file 只会去找这个名字，
+        register_episode 原本也是这么拼的，这里只是把这份假设收敛到一处。
+        """
+        return self._root / "project.yaml"
+
     def bind_root(self, root: Path) -> ProjectConfig:
         """绑定项目目录（work/<slug>/）。load_project 会自动调用，测试也可直接用。"""
         self._root = Path(root).resolve()

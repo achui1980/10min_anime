@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -20,6 +21,7 @@ from tenmin.pipeline import (
     STAGES,
     Paths,
     _find_episode,
+    _is_fresh,
     ingest_warnings,
     register_episode,
     run_audio,
@@ -110,6 +112,68 @@ def test_stages_from_middle():
 def test_stages_from_unknown_raises():
     with pytest.raises(ValueError):
         stages_from("nope")
+
+
+# --- _is_fresh ---
+
+
+def _shift_mtime(path: Path, seconds: float) -> None:
+    stamp = path.stat().st_mtime + seconds
+    os.utime(path, (stamp, stamp))
+
+
+def _file(path: Path, text: str = "x") -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+def test_is_fresh_true_when_output_is_newer(tmp_path):
+    src = _file(tmp_path / "in.txt")
+    out = _file(tmp_path / "out.txt")
+    assert _is_fresh([out], [src]) is True
+
+
+def test_is_fresh_false_when_input_is_newer(tmp_path):
+    src = _file(tmp_path / "in.txt")
+    out = _file(tmp_path / "out.txt")
+    _shift_mtime(src, 10.0)
+    assert _is_fresh([out], [src]) is False
+
+
+def test_is_fresh_false_when_an_output_is_missing(tmp_path):
+    src = _file(tmp_path / "in.txt")
+    out = _file(tmp_path / "out.txt")
+    assert _is_fresh([out, tmp_path / "gone.txt"], [src]) is False
+
+
+def test_is_fresh_false_when_outputs_empty(tmp_path):
+    assert _is_fresh([], [_file(tmp_path / "in.txt")]) is False
+
+
+def test_is_fresh_false_on_zero_byte_output(tmp_path):
+    """Ctrl-C 打断 ffmpeg 留下的空壳 .m4a/.mp4 不能被当成最新产物。
+
+    这是纯 mtime 比较最伤的失效模式：半截产物的 mtime 恰恰是最新的，于是下一次
+    跑直接 stage_skip，坏产物一路进成片。真正的解法是产物原子写（P1-G），这里
+    只做最低成本的兜底。
+    """
+    src = _file(tmp_path / "in.txt")
+    out = tmp_path / "out.m4a"
+    out.write_bytes(b"")
+    _shift_mtime(out, 10.0)
+    assert _is_fresh([out], [src]) is False
+
+
+def test_is_fresh_true_when_no_input_exists(tmp_path):
+    """输入一个都不存在时视为最新（跳过）。
+
+    这是刻意的选择，不是漏判：重跑一个没有任何输入的阶段只可能崩（build_track
+    读不到 SRT）或产出垃圾，而跳过至少保住了磁盘上已有的产物。加了 project.yaml
+    进 inputs 之后，真实项目里这个分支已经走不到（project.yaml 一定存在）。
+    """
+    out = _file(tmp_path / "out.txt")
+    assert _is_fresh([out], [tmp_path / "never.txt"]) is True
 
 
 def test_paths_layout(tmp_path):
@@ -287,6 +351,62 @@ async def test_run_pipeline_from_signals_keeps_dialogue(project):
     assert len(provider.calls) == 2
 
 
+@pytest.mark.asyncio
+async def test_run_pipeline_reruns_every_stage_when_project_yaml_changes(project):
+    """project.yaml 是每个阶段的隐式输入：改了阈值/glossary/render 必须让产物失效。
+
+    P1-B 把大量经验阈值搬进了 project.yaml，而 _is_fresh 的 inputs 里根本没有它，
+    于是「改 credits.op_span_min 再重跑」会被全部 stage_skip，用户看到的产物跟
+    改动前一模一样，且没有任何提示。
+    """
+    provider = FakeProvider([fake_script_response(), fake_script_response()])
+    await run_pipeline(project, provider, only=V1_STAGES)
+
+    _shift_mtime(project.config_path, 10.0)
+
+    reporter = FakeReporter()
+    await run_pipeline(project, provider, only=V1_STAGES, reporter=reporter)
+    for stage in V1_STAGES:
+        assert ("stage_start", stage) in reporter.calls, stage
+        assert ("stage_skip", stage) not in reporter.calls, stage
+
+
+@pytest.mark.asyncio
+async def test_run_pipeline_reruns_render_stages_when_project_yaml_changes(
+    project, monkeypatch
+):
+    """voice 之后的阶段同样吃 project.yaml（render.font_size / duck_db / 编码器…）。"""
+    paths = Paths(project.root)
+    _write_script(paths.script(2), render_script())
+    _prepare_video(project)
+    monkeypatch.setattr("tenmin.pipeline.probe_duration", lambda path: 1400.0)
+    monkeypatch.setattr("tenmin.pipeline.preflight", lambda video, encoder: 1400.0)
+    # voice 重跑时 synthesize_track 会复用上一轮落盘的 chunk 并用真 ffprobe 量时长，
+    # 而 FakeTTSEngine 写的是假 mp3 字节。
+    monkeypatch.setattr("tenmin.render.tts.probe_duration", lambda path: 8.0)
+    monkeypatch.setattr("tenmin.render.audio.run", _touch_output)
+    monkeypatch.setattr("tenmin.render.video.run_with_progress", _touch_output_with_progress)
+
+    stages = ["voice", "timeline", "audio", "render"]
+    await run_pipeline(
+        project, FakeProvider([]), only=stages, tts_engine=FakeTTSEngine([8.0] * 3)
+    )
+
+    _shift_mtime(project.config_path, 10.0)
+
+    reporter = FakeReporter()
+    await run_pipeline(
+        project,
+        FakeProvider([]),
+        only=stages,
+        tts_engine=FakeTTSEngine([8.0] * 3),
+        reporter=reporter,
+    )
+    for stage in stages:
+        assert ("stage_start", stage) in reporter.calls, stage
+        assert ("stage_skip", stage) not in reporter.calls, stage
+
+
 def test_run_docgen_without_script_raises(project):
     with pytest.raises(FileNotFoundError):
         run_docgen(project, episode=2)
@@ -298,10 +418,14 @@ def _write_script(path: Path, script: Script) -> None:
 
 
 def _touch_output(args: list[str]) -> str:
-    """假的 ffmpeg：不跑编码，只把输出文件创建出来。"""
+    """假的 ffmpeg：不跑编码，只把输出文件创建出来。
+
+    刻意写非空字节：_is_fresh 现在把 0 字节产物当「被打断的半截产物」判成不新鲜，
+    写 b"" 会让所有「产物已是最新所以跳过」的断言被这条兜底规则掩盖掉。
+    """
     out = Path(args[-1])
     out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_bytes(b"")
+    out.write_bytes(b"\x00")
     return ""
 
 

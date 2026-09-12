@@ -91,10 +91,36 @@ def _write_text(path: Path, text: str) -> None:
 
 
 def _is_fresh(outputs: list[Path], inputs: list[Path]) -> bool:
-    if not outputs or any(not p.exists() for p in outputs):
+    """产物是否已经比输入新，可以整段跳过。
+
+    语义与已知局限（改这个函数前先读完）：
+
+    1. **前提是「产物要么不存在、要么完整」**。判据只有 mtime，而被 Ctrl-C 打断的
+       ffmpeg / TTS 会留下一个 mtime 恰好最新的半截文件，纯 mtime 比较必然把它当成
+       最新产物直接跳过，坏产物一路进成片。正解是产物原子写（临时文件 + os.replace），
+       那是 P1-G 的范围，不在这里做。这里只加一条最低成本的兜底：**0 字节产物一律
+       视为不新鲜**。本流水线没有任何一个阶段会合法地产出空文件（json/md/txt/m4a/mp4
+       都有内容），所以这条规则不会误伤；它挡得住「刚 open 就被打断」这一类，挡不住
+       「写了一半」——后者只能靠 P1-G。
+    2. **inputs 必须包含 project.yaml**（调用点用 cfg.config_path 传进来）。所有阶段
+       的行为都由它决定，漏了它就等于所有配置旋钮改了都不生效。
+    3. **inputs 一个都不存在时返回 True（跳过）**，见下面的注释。
+    """
+    if not outputs:
         return False
+    for path in outputs:
+        try:
+            stat = path.stat()
+        except FileNotFoundError:
+            return False
+        if stat.st_size == 0:
+            return False
     existing_inputs = [p for p in inputs if p.exists()]
     if not existing_inputs:
+        # 刻意跳过而不是重跑：一个输入都不存在时重跑只可能崩（run_ingest 读不到 SRT）
+        # 或产出垃圾，而跳过至少保住磁盘上已有的产物。加了 project.yaml 进 inputs 之后
+        # 这个分支在真实项目里已经走不到（project.yaml 必然存在，否则 load_project 就
+        # 报错了），留着只为不给库调用方/单测埋 FileNotFoundError。
         return True
     newest_input = max(p.stat().st_mtime_ns for p in existing_inputs)
     oldest_output = min(p.stat().st_mtime_ns for p in outputs)
@@ -399,6 +425,15 @@ async def run_pipeline(
     srt_inputs = [cfg.srt_path(ep) for ep in cfg.episodes]
     warnings: list[str] = []
 
+    def is_fresh(outputs: list[Path], inputs: list[Path]) -> bool:
+        """每个阶段的判据都自动带上 project.yaml。
+
+        它是所有阶段的隐式输入：ingest/credits/signals 的全部阈值、glossary、
+        render 的字号与编码器都住在那里。漏掉它的话「改配置再重跑」会被全部
+        stage_skip，用户拿到的产物跟改动前一模一样且没有任何提示。
+        """
+        return _is_fresh(outputs, [cfg.config_path, *inputs])
+
     if episode is None:
         target_numbers = numbers
     else:
@@ -409,7 +444,7 @@ async def run_pipeline(
 
     if "ingest" in wanted:
         outputs = [paths.dialogue(n) for n in numbers]
-        if force or not _is_fresh(outputs, srt_inputs):
+        if force or not is_fresh(outputs, srt_inputs):
             reporter.stage_start("ingest")
             warnings.extend(ingest_warnings(run_ingest(cfg)))
             reporter.stage_done("ingest")
@@ -419,7 +454,7 @@ async def run_pipeline(
     if "signals" in wanted:
         outputs = [paths.signals(n) for n in numbers]
         inputs = [paths.dialogue(n) for n in numbers]
-        if force or not _is_fresh(outputs, inputs):
+        if force or not is_fresh(outputs, inputs):
             reporter.stage_start("signals")
             run_signals(cfg)
             reporter.stage_done("signals")
@@ -432,7 +467,7 @@ async def run_pipeline(
 
         if "script" in wanted:
             inputs = [paths.dialogue(number), paths.signals(number)]
-            if force or not _is_fresh([paths.script(number)], inputs):
+            if force or not is_fresh([paths.script(number)], inputs):
                 reporter.stage_start("script")
                 _, stage_warnings = await run_script(cfg, provider, episode=number)
                 warnings.extend(stage_warnings)
@@ -442,7 +477,7 @@ async def run_pipeline(
 
         if "docgen" in wanted:
             outputs = [paths.table(number), paths.narration(number)]
-            if force or not _is_fresh(outputs, [paths.script(number)]):
+            if force or not is_fresh(outputs, [paths.script(number)]):
                 reporter.stage_start("docgen")
                 run_docgen(cfg, episode=number)
                 reporter.stage_done("docgen")
@@ -464,7 +499,7 @@ async def run_pipeline(
 
         if "voice" in wanted:
             outputs = [paths.voice(number)]
-            if force or not _is_fresh(outputs, [paths.script(number)]):
+            if force or not is_fresh(outputs, [paths.script(number)]):
                 reporter.stage_start("voice")
                 assert tts_engine is not None
                 _, stage_warnings = await run_voice(
@@ -478,7 +513,7 @@ async def run_pipeline(
         if "timeline" in wanted:
             outputs = [paths.timeline(number), paths.subtitles(number)]
             inputs = [paths.script(number), paths.voice(number)]
-            if force or not _is_fresh(outputs, inputs):
+            if force or not is_fresh(outputs, inputs):
                 reporter.stage_start("timeline")
                 _, stage_warnings = run_timeline(cfg, episode=number)
                 warnings.extend(stage_warnings)
@@ -489,7 +524,7 @@ async def run_pipeline(
         if "audio" in wanted:
             outputs = [paths.mixed_audio(number)]
             inputs = [paths.timeline(number), paths.voice(number)]
-            if force or not _is_fresh(outputs, inputs):
+            if force or not is_fresh(outputs, inputs):
                 reporter.stage_start("audio")
                 run_audio(cfg, episode=number)
                 reporter.stage_done("audio")
@@ -503,7 +538,7 @@ async def run_pipeline(
                 paths.subtitles(number),
                 paths.timeline(number),
             ]
-            if force or not _is_fresh(outputs, inputs):
+            if force or not is_fresh(outputs, inputs):
                 reporter.stage_start("render")
                 run_render(cfg, episode=number, reporter=reporter)
                 reporter.stage_done("render")
