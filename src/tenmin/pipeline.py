@@ -507,6 +507,22 @@ async def run_pipeline(
         else:
             reporter.stage_skip("signals")
 
+    # 前置检查放在**所有**按集阶段之前：绝不能跑完几分钟 TTS（更别说一轮 LLM），最后
+    # 一步才发现 ffmpeg 没编 libass 或某一集的源视频缺失。
+    # 只在真的要跑 audio/render 时才做（跟原逻辑一致：单独跑 voice 不该触发 ffmpeg 检查）。
+    # 批量模式下要给每一集都做前置检查，不能只查第一集——否则第二集视频缺失/坏掉
+    # 要等它自己的 voice 阶段（几分钟 TTS）跑完才会在 audio/render 阶段炸出来，
+    # 失去 preflight 本来该有的「快速失败」意义。
+    #
+    # 位置从「script/docgen 循环之后、voice 循环之前」提到了循环之前：原先那两个循环
+    # 各自调 reporter.episode_start，批量模式下每集被报两次，总进度条先 0→N 再跳回
+    # 0→N。合并成单循环就必须把 preflight 挪出去，而挪到前面严格更好——检查本身很便宜
+    # （ffmpeg -filters/-encoders 有 lru_cache，加一次 ffprobe），却能在花掉任何 LLM
+    # token 之前就把「ffmpeg 不行」喊出来。
+    if {"audio", "render"} & set(wanted):
+        for number in target_numbers:
+            preflight(cfg.video_path(_find_episode(cfg, number)), cfg.render.video_encoder)
+
     for number in target_numbers:
         if episode is None:
             reporter.episode_start(number, number_to_index[number], len(target_numbers))
@@ -529,19 +545,6 @@ async def run_pipeline(
                 reporter.stage_done("docgen")
             else:
                 reporter.stage_skip("docgen")
-
-    # 前置检查放在 voice 之前：绝不能跑完几分钟 TTS，最后一步才发现 ffmpeg 没编 libass。
-    # 只在真的要跑 audio/render 时才做（跟原逻辑一致：单独跑 voice 不该触发 ffmpeg 检查）。
-    # 批量模式下要给每一集都做前置检查，不能只查第一集——否则第二集视频缺失/坏掉
-    # 要等它自己的 voice 阶段（几分钟 TTS）跑完才会在 audio/render 阶段炸出来，
-    # 失去 preflight 本来该有的「快速失败」意义。
-    if {"audio", "render"} & set(wanted):
-        for number in target_numbers:
-            preflight(cfg.video_path(_find_episode(cfg, number)), cfg.render.video_encoder)
-
-    for number in target_numbers:
-        if episode is None:
-            reporter.episode_start(number, number_to_index[number], len(target_numbers))
 
         if "voice" in wanted:
             outputs = [paths.voice(number)]

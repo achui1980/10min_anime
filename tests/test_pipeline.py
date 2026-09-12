@@ -1047,6 +1047,85 @@ async def test_run_pipeline_batch_mode_reports_episode_start_for_each_episode(pr
 
 
 @pytest.mark.asyncio
+async def test_run_pipeline_reports_episode_start_exactly_once_per_episode(
+    project, golden_srt_path, monkeypatch
+):
+    """批量模式下总进度条不许倒退。
+
+    原实现有两个独立的 `for number in target_numbers` 循环（script+docgen 一个、
+    voice..render 一个），各自调 episode_start，于是每集被报两次：总进度先 0→N
+    再跳回 0→N。
+    """
+    second_srt = project.root / "srt" / "E01.srt"
+    second_srt.write_text(golden_srt_path.read_text(encoding="utf-8"), encoding="utf-8")
+    project.episodes.append(EpisodeConfig(number=1, srt=Path("srt/E01.srt")))
+    for episode_cfg in project.episodes:
+        video_name = f"E{episode_cfg.number:02d}.mkv"
+        (project.root / video_name).write_bytes(b"\x00")
+        episode_cfg.video = Path(video_name)
+
+    monkeypatch.setattr("tenmin.pipeline.probe_duration", lambda path: 1400.0)
+    monkeypatch.setattr("tenmin.pipeline.preflight", lambda video, encoder: 1400.0)
+    monkeypatch.setattr("tenmin.render.audio.run", _touch_output)
+    monkeypatch.setattr("tenmin.render.video.run_with_progress", _touch_output_with_progress)
+
+    reporter = FakeReporter()
+    provider = FakeProvider([fake_script_response(episode=2), fake_script_response(episode=1)])
+    await run_pipeline(
+        project,
+        provider,
+        tts_engine=FakeTTSEngine([8.0] * 20),
+        reporter=reporter,
+    )
+
+    assert [c for c in reporter.calls if c[0] == "episode_start"] == [
+        ("episode_start", 2, 1, 2),
+        ("episode_start", 1, 2, 2),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_run_pipeline_preflights_all_episodes_before_any_tts(
+    project, golden_srt_path, monkeypatch
+):
+    """preflight 的全部意义就是「绝不能跑完几分钟 TTS 才发现 ffmpeg 不行」。
+
+    合并那两个循环时最容易顺手把 preflight 挪进循环体，于是第二集的视频缺失要等
+    第一集渲完才炸。这条锁死：所有集的 preflight 都在第一次 TTS 之前。
+    """
+    second_srt = project.root / "srt" / "E01.srt"
+    second_srt.write_text(golden_srt_path.read_text(encoding="utf-8"), encoding="utf-8")
+    project.episodes.append(EpisodeConfig(number=1, srt=Path("srt/E01.srt")))
+    for episode_cfg in project.episodes:
+        video_name = f"E{episode_cfg.number:02d}.mkv"
+        (project.root / video_name).write_bytes(b"\x00")
+        episode_cfg.video = Path(video_name)
+
+    events: list[str] = []
+
+    class RecordingTTS(FakeTTSEngine):
+        async def synthesize(self, text, out_path):
+            events.append("tts")
+            return await super().synthesize(text, out_path)
+
+    monkeypatch.setattr("tenmin.pipeline.probe_duration", lambda path: 1400.0)
+    monkeypatch.setattr(
+        "tenmin.pipeline.preflight",
+        lambda video, encoder: (events.append(f"preflight:{Path(video).name}"), 1400.0)[1],
+    )
+    monkeypatch.setattr("tenmin.render.audio.run", _touch_output)
+    monkeypatch.setattr("tenmin.render.video.run_with_progress", _touch_output_with_progress)
+
+    provider = FakeProvider([fake_script_response(episode=2), fake_script_response(episode=1)])
+    await run_pipeline(project, provider, tts_engine=RecordingTTS([8.0] * 20))
+
+    preflights = [i for i, e in enumerate(events) if e.startswith("preflight:")]
+    first_tts = events.index("tts")
+    assert len(preflights) == 2, events
+    assert max(preflights) < first_tts, events
+
+
+@pytest.mark.asyncio
 async def test_run_voice_reports_substep_progress(project):
     _write_script(Paths(project.root).script(2), render_script())
     engine = FakeTTSEngine([8.0, 10.0, 10.0])
