@@ -1,7 +1,10 @@
+from pathlib import Path
+
 import pytest
 from pydantic import ValidationError
 
 from tenmin.models import (
+    HOLD_MAX_SECONDS,
     AudioDirection,
     Beat,
     Clip,
@@ -9,6 +12,8 @@ from tenmin.models import (
     DialogueTrack,
     Highlight,
     Hold,
+    LLMBeat,
+    LLMClip,
     LLMScript,
     Script,
     SfxCue,
@@ -106,6 +111,161 @@ def test_llm_script_schema_has_no_computed_fields():
     assert "est_total_seconds" not in dumped
     assert "is_silent_highlight" not in dumped
     assert "beats" in schema["properties"]
+
+
+# --- Hold / SfxCue 的时间与时长约束 ---
+
+
+def test_hold_rejects_negative_at():
+    with pytest.raises(ValidationError):
+        Hold(at=-0.1, duration=3.0, quote="金句")
+
+
+def test_hold_accepts_zero_at():
+    assert Hold(at=0.0, duration=3.0, quote="金句").at == 0.0
+
+
+def test_hold_rejects_non_positive_duration():
+    """duration=0 的留白在预算里占 0 秒、在成片里插 0 秒静音，等于这条 hold 不存在。"""
+    with pytest.raises(ValidationError):
+        Hold(at=1.0, duration=0.0, quote="金句")
+    with pytest.raises(ValidationError):
+        Hold(at=1.0, duration=-2.0, quote="金句")
+
+
+def test_hold_rejects_duration_above_hard_ceiling():
+    """LLM 把 3 写成 30 会往成片里插一整段死寂，还让时长预算彻底失真。"""
+    with pytest.raises(ValidationError):
+        Hold(at=1.0, duration=HOLD_MAX_SECONDS + 0.1, quote="金句")
+
+
+def test_hold_accepts_real_world_duration_range():
+    """实测真实产出全部落在 2.0–4.0 秒，上界本身也必须放过。"""
+    for duration in (2.0, 2.5, 3.0, 3.5, 4.0, HOLD_MAX_SECONDS):
+        assert Hold(at=1.0, duration=duration, quote="金句").duration == duration
+
+
+def test_sfx_cue_rejects_negative_at():
+    with pytest.raises(ValidationError):
+        SfxCue(at=-1.0, cue="impact")
+
+
+# --- Beat.id：渲染阶段的连接键 ---
+
+
+def test_beat_rejects_blank_id():
+    for bad in ("", "   ", "\n"):
+        with pytest.raises(ValidationError):
+            Beat(id=bad, label="Hook", role="hook", narration="文案")
+
+
+def test_llm_beat_rejects_blank_id():
+    for bad in ("", "   "):
+        with pytest.raises(ValidationError):
+            LLMBeat(id=bad, label="Hook", role="hook", narration="文案")
+
+
+def test_script_rejects_duplicate_beat_ids():
+    """重复 id 会让 render/timeline.py 按 beat_id 聚合配音时静默串台。"""
+    beats = [
+        Beat(id="b1", label="Hook", role="hook", narration="甲"),
+        Beat(id="b1", label="阶段一", role="act", narration="乙"),
+    ]
+    with pytest.raises(ValidationError):
+        Script(show="剧名", episodes=[2], beats=beats)
+
+
+def test_llm_script_rejects_duplicate_beat_ids():
+    beats = [
+        LLMBeat(id="b1", label="Hook", role="hook", narration="甲"),
+        LLMBeat(id="b1", label="阶段一", role="act", narration="乙"),
+    ]
+    with pytest.raises(ValidationError):
+        LLMScript(beats=beats)
+
+
+def test_script_accepts_distinct_beat_ids():
+    beats = [
+        Beat(id="b1", label="Hook", role="hook", narration="甲"),
+        Beat(id="b2", label="阶段一", role="act", narration="乙"),
+    ]
+    assert len(Script(show="剧名", episodes=[2], beats=beats).beats) == 2
+
+
+# --- narration：严在 LLM 侧，宽在内部侧 ---
+
+
+def test_llm_beat_rejects_blank_narration():
+    """空 narration 会渲染出一个有画面没声音的节点，LLM 侧直接判错触发重试。"""
+    for bad in ("", "   "):
+        with pytest.raises(ValidationError):
+            LLMBeat(id="b1", label="Hook", role="hook", narration=bad)
+
+
+def test_internal_beat_still_allows_blank_narration():
+    """内部 Beat 刻意保持宽松：人手改 script.json 清空某段旁白是合法编辑，
+    由 render/tts.py 给出 warning 降级，不该让整份 script.json 读不进来。"""
+    assert Beat(id="b1", label="Hook", role="hook", narration="  ").narration == "  "
+
+
+# --- extra="forbid"：拼错的键必须报错，不能静默退回默认值 ---
+
+
+def test_llm_models_forbid_extra_fields():
+    with pytest.raises(ValidationError):
+        LLMScript.model_validate({"beats": [], "bogus": 1})
+    with pytest.raises(ValidationError):
+        LLMClip.model_validate(
+            {"episode": 2, "start": 1.0, "end": 2.0, "visual": "画面", "bogus": 1}
+        )
+
+
+def test_hold_forbids_misspelled_duration_key():
+    """`dur` 被静默忽略的话，收到的是 duration 默认值而不是一个报错。"""
+    with pytest.raises(ValidationError):
+        Hold.model_validate({"at": 1.0, "dur": 3.0, "quote": "金句"})
+
+
+def test_internal_script_models_forbid_extra_fields():
+    with pytest.raises(ValidationError):
+        Script.model_validate({"show": "剧名", "episodes": [2], "bogus": 1})
+
+
+# --- 喂给 Gemini 的 schema 只能用 types.Schema 认识的关键字 ---
+
+
+def _walk_schema_keys(node, found):
+    if isinstance(node, dict):
+        found.update(node.keys())
+        for value in node.values():
+            _walk_schema_keys(value, found)
+    elif isinstance(node, list):
+        for value in node:
+            _walk_schema_keys(value, found)
+
+
+def test_llm_schema_avoids_keywords_gemini_rejects():
+    """google.genai 的 types.Schema 没有 exclusiveMinimum/exclusiveMaximum 字段，
+    pydantic 的 gt/lt 会生成它们，于是 t_schema(LLMScript) 在发请求时直接 ValidationError。
+    所以 LLM 侧的「必须大于 0」只能用 ge + AfterValidator 表达，不能用 gt。"""
+    found: set[str] = set()
+    _walk_schema_keys(LLMScript.model_json_schema(), found)
+    assert "exclusiveMinimum" not in found
+    assert "exclusiveMaximum" not in found
+
+
+# --- 新约束不能把真实产物判成非法 ---
+
+
+@pytest.mark.parametrize(
+    "name", ["../tests/fixtures/akujo_e02.script.json", "../tests/snapshots/saijo_e02.script.json"]
+)
+def test_committed_real_scripts_still_validate(name):
+    path = (Path(__file__).parent / name).resolve()
+    if not path.exists():
+        pytest.skip(f"缺少 {path.name}")
+    script = Script.model_validate_json(path.read_text(encoding="utf-8"))
+    assert script.beats
 
 
 def test_voice_chunk_defaults():

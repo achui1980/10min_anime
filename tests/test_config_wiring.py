@@ -330,9 +330,10 @@ def _write_voice_and_script(cfg: ProjectConfig) -> None:
     paths = Paths(cfg.root)
     narration = "一二三四五六七八九十" * 5
     script = Script(
-        episode=1,
+        # 原来这里写的是 episode=1 / title="标题"，Script 上并没有这两个字段，
+        # extra="ignore" 时被静默丢掉（episodes 实际是 []）。改成真实字段名。
         show="剧名",
-        title="标题",
+        episodes=[1],
         beats=[
             Beat(
                 id="b1",
