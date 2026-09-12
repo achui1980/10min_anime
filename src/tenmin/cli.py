@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
+from typing import Any
 
 import httpx
 import typer
 import yaml
 
-from tenmin.config import Settings, load_project
+from tenmin.config import ProjectConfig, Settings, load_project
 from tenmin.models import DialogueTrack, SignalReport
 from tenmin.pipeline import (
     STAGES,
@@ -75,26 +76,75 @@ VIDEO_OPTION = typer.Option(
     None, "--video", help="要注册的视频文件路径，需配合 --episode 和 --srt"
 )
 
-PROJECT_TEMPLATE = {
-    "show": "剧名",
-    "slug": "slug",
-    "mode": "single_episode",
-    "target_seconds": 240,
-    "locale": {"convert_traditional": True},
-    "episodes": [{"number": 2, "srt": "srt/E02.srt", "video": "video/E02.mkv"}],
-    "glossary": {},
-    "llm": {"provider": "gemini", "model": "gemini-3.6-flash"},
+PROJECT_TEMPLATE_FIELDS: dict[str, Any] = {
+    "show": True,
+    "slug": True,
+    "mode": True,
+    "target_seconds": True,
+    "locale": True,
+    "episodes": True,
+    "glossary": True,
+    "llm": {"provider", "model"},
     "render": {
-        "voice": "zh-CN-YunxiNeural",
-        "rate": "+0%",
-        "video_encoder": "libx264",
-        "duck_db": -12.0,
-        "font_size": 52,
-        "fade_out_seconds": 1.5,
-        "outro_card_seconds": 3.0,
-        "outro_message": "解说结束，谢谢观看",
+        "voice",
+        "rate",
+        "video_encoder",
+        "duck_db",
+        "font_size",
+        "fade_out_seconds",
+        "outro_card_seconds",
+        "outro_message",
     },
 }
+"""tenmin init 生成的 project.yaml 里登场哪些字段。
+
+这里只挑**字段名**，值一律由 ProjectConfig 现场算（见 build_project_template），
+所以「改了 config.py 的默认值、忘了改 cli.py 的模板」这类漂移不可能再发生——
+原实现是把 show/mode/target_seconds/llm/render 的默认值全部手抄一遍的字面量 dict。
+
+为什么不整份 model_dump（那样连字段名都不用挑）：ProjectConfig 底下现在有
+ingest(3) / credits(21) / signals(11) / render(24) / llm(9) 近 70 个调参旋钮，
+全吐出来的 project.yaml 没人能读，而这个文件是用户的主要编辑面。
+
+为什么挑漏了不要紧：漏掉的字段照样走模型默认值，行为完全不变，只是「没在模板里
+被推荐」而已，用户想调时补一行就生效。也就是说这张表过期是良性的（少一句广告），
+而原来那份手抄值过期是有害的（磁盘上落一个错的默认值）。全部旋钮见 config.py。
+"""
+
+# 放在 yaml 正文前面的注释块。episodes 刻意是空的（见 build_project_template），
+# 所以「怎么加一集」必须就地说清楚。
+PROJECT_TEMPLATE_HEADER = """\
+# tenmin 项目配置。这里只列了最常改的旋钮，值全部取自 tenmin 的默认配置。
+# ingest / credits / signals / render 底下还有几十个阈值可以在这里覆盖，
+# 完整清单见 src/tenmin/config.py（那是全项目经验阈值的唯一权威来源）。
+#
+# 登记一集（推荐，路径会自动填好；源片不会被拷进 work/，只记它的绝对路径）：
+#   tenmin run {slug} --episode 2 --srt <字幕路径> --video <源片路径>
+#
+# 也可以手写。srt 相对本文件所在目录解析，video 可以是相对路径或绝对路径：
+#   episodes:
+#   - number: 2
+#     srt: srt/E02.srt
+#     video: /abs/path/to/E02.mkv
+"""
+
+
+def build_project_template(slug: str) -> dict[str, Any]:
+    """算出 tenmin init 要写进 project.yaml 的内容。
+
+    每次调用都新建一个 ProjectConfig 再 dump，返回的嵌套结构没有任何一层跟模块级
+    常量共享对象——原实现 `dict(PROJECT_TEMPLATE)` 是浅拷贝，payload["episodes"]、
+    payload["render"] 与那份全局 dict 是同一个对象，当时只改顶层的 slug/show 所以
+    没暴露，但任何对嵌套字段的改写都会污染后续所有 init。
+
+    episodes 刻意留空，不预置示例条目：register_episode 是「读回 cfg.episodes 再整份
+    写回 yaml」的，示例条目会被当成一集真的番留下来，于是登记完第一集之后 episodes
+    变成 [示例, 真的那集]，不带 --episode 的批处理模式就会去跑那个指向不存在的
+    srt/E02.srt 的幽灵条目。手写 episodes 的形状见 PROJECT_TEMPLATE_HEADER。
+    """
+    return ProjectConfig(show=slug, slug=slug).model_dump(
+        mode="json", include=PROJECT_TEMPLATE_FIELDS
+    )
 
 
 def _project_file(work_dir: Path, slug: str) -> Path:
@@ -130,11 +180,11 @@ def init(slug: str, work_dir: Path = WORK_DIR_OPTION) -> None:
 
     (root / "srt").mkdir(parents=True, exist_ok=True)
     (root / "video").mkdir(parents=True, exist_ok=True)
-    payload = dict(PROJECT_TEMPLATE)
-    payload["slug"] = slug
-    payload["show"] = slug
+    payload = build_project_template(slug)
     project_file.write_text(
-        yaml.safe_dump(payload, allow_unicode=True, sort_keys=False), encoding="utf-8"
+        PROJECT_TEMPLATE_HEADER.format(slug=slug)
+        + yaml.safe_dump(payload, allow_unicode=True, sort_keys=False),
+        encoding="utf-8",
     )
     typer.echo(f"已创建 {project_file}")
     typer.echo(f"把字幕放进 {root / 'srt'}、源视频放进 {root / 'video'}，")

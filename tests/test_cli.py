@@ -230,7 +230,6 @@ def test_init_template_has_video_and_render(tmp_path):
     data = yaml.safe_load(
         (tmp_path / "akujo2" / "project.yaml").read_text(encoding="utf-8")
     )
-    assert data["episodes"][0]["video"] == "video/E02.mkv"
     assert data["render"]["voice"] == "zh-CN-YunxiNeural"
     assert data["render"]["rate"] == "+0%"
     assert data["render"]["video_encoder"] == "libx264"
@@ -240,6 +239,127 @@ def test_init_template_has_video_and_render(tmp_path):
     assert data["render"]["outro_card_seconds"] == 3.0
     assert data["render"]["outro_message"] == "解说结束，谢谢观看"
     assert (tmp_path / "akujo2" / "video").is_dir()
+
+
+def test_init_template_follows_the_model_defaults(work, monkeypatch):
+    """模板不许跟 config.py 平行维护：改模型的默认值，init 生成的 yaml 必须跟着变。
+
+    原实现是手抄一份字面量的 PROJECT_TEMPLATE dict，改 RenderConfig 的默认值时
+    这份拷贝不会动，`tenmin init` 生成的 project.yaml 就静默落后于代码。
+    """
+    from pydantic import Field
+
+    from tenmin.config import LLMConfig, ProjectConfig, RenderConfig
+
+    class ShiftedRender(RenderConfig):
+        font_size: int = 77
+        outro_message: str = "改过的片尾语"
+
+    class ShiftedLLM(LLMConfig):
+        model: str = "改过的模型名"
+
+    class ShiftedProject(ProjectConfig):
+        llm: ShiftedLLM = Field(default_factory=ShiftedLLM)
+        render: ShiftedRender = Field(default_factory=ShiftedRender)
+
+    monkeypatch.setattr("tenmin.cli.ProjectConfig", ShiftedProject)
+    result = runner.invoke(app, ["init", "saijo", "--work-dir", str(work)])
+    assert result.exit_code == 0, out(result)
+
+    data = yaml.safe_load((work / "saijo" / "project.yaml").read_text(encoding="utf-8"))
+    assert data["render"]["font_size"] == 77
+    assert data["render"]["outro_message"] == "改过的片尾语"
+    assert data["llm"]["model"] == "改过的模型名"
+
+
+def test_init_output_round_trips_through_load_project(work):
+    """init 生成的 yaml 必须能被 load_project 原样读回来，且逐字段等于模型默认值。"""
+    from tenmin.config import ProjectConfig, load_project
+
+    result = runner.invoke(app, ["init", "saijo", "--work-dir", str(work)])
+    assert result.exit_code == 0, out(result)
+
+    cfg = load_project(work / "saijo" / "project.yaml")
+    expected = ProjectConfig(show="saijo", slug="saijo")
+    assert cfg.model_dump() == expected.model_dump()
+
+
+def test_init_output_has_no_keys_the_models_do_not_know(work):
+    """独立于 pydantic 的 extra 设置，直接查生成的 yaml 里有没有模型不认识的键。
+
+    config.py 的模型目前是 pydantic 默认的 extra="ignore"，写错的键会被静默吞掉，
+    所以「能 load 回来」并不等于「每个键都真的生效」。这条自己查。
+    """
+    from tenmin.config import LLMConfig, LocaleConfig, ProjectConfig, RenderConfig
+
+    runner.invoke(app, ["init", "saijo", "--work-dir", str(work)])
+    data = yaml.safe_load((work / "saijo" / "project.yaml").read_text(encoding="utf-8"))
+
+    assert set(data) <= set(ProjectConfig.model_fields)
+    assert set(data["llm"]) <= set(LLMConfig.model_fields)
+    assert set(data["render"]) <= set(RenderConfig.model_fields)
+    assert set(data["locale"]) <= set(LocaleConfig.model_fields)
+
+
+def test_init_leaves_episodes_empty(work):
+    """模板不许预置示例 episode。
+
+    register_episode 是「读回 cfg.episodes 再整份写回」的，示例条目会被当成一集真的
+    番留在 yaml 里：`tenmin run <slug> --episode 1 --srt X --video Y` 之后 episodes
+    变成 [示例 E02, 真的 E01]，接着批处理模式（不带 --episode）就会去跑那个指向
+    srt/E02.srt 的幽灵条目并崩掉。
+    """
+    runner.invoke(app, ["init", "saijo", "--work-dir", str(work)])
+    data = yaml.safe_load((work / "saijo" / "project.yaml").read_text(encoding="utf-8"))
+    assert data["episodes"] == []
+
+
+def test_init_yaml_explains_how_to_register_episodes(work):
+    """episodes 是空的，那「怎么加一集」必须在文件里说清楚。"""
+    runner.invoke(app, ["init", "saijo", "--work-dir", str(work)])
+    text = (work / "saijo" / "project.yaml").read_text(encoding="utf-8")
+    assert "tenmin run saijo --episode" in text
+    assert "--srt" in text and "--video" in text
+
+
+def test_build_project_template_returns_a_fresh_object_each_call():
+    """原实现是 dict(PROJECT_TEMPLATE) 浅拷贝：嵌套的 episodes/render/llm 与模块级
+    常量共享同一个对象，任何对嵌套字段的改写都会污染全局。"""
+    from tenmin.cli import build_project_template
+    from tenmin.config import RenderConfig
+
+    first = build_project_template("a")
+    second = build_project_template("b")
+
+    first["episodes"].append({"number": 99})
+    first["render"]["font_size"] = 999
+    first["llm"]["model"] = "污染"
+
+    assert second["episodes"] == []
+    assert second["render"]["font_size"] == RenderConfig().font_size
+    assert second["llm"]["model"] != "污染"
+
+    third = build_project_template("c")
+    assert third["episodes"] == []
+    assert third["render"]["font_size"] == RenderConfig().font_size
+
+
+def test_build_project_template_values_all_come_from_the_models():
+    """逐字段比对：模板里出现的每个值都必须等于对应模型的默认值。
+
+    这条挡的是「后来人图省事又塞回一个字面量」。
+    """
+    from tenmin.cli import build_project_template
+    from tenmin.config import LLMConfig, LocaleConfig, RenderConfig
+
+    template = build_project_template("saijo")
+    for section, model in (
+        ("llm", LLMConfig()),
+        ("render", RenderConfig()),
+        ("locale", LocaleConfig()),
+    ):
+        for key, value in template[section].items():
+            assert value == getattr(model, key), f"{section}.{key}"
 
 
 def test_run_passes_tts_engine_when_voice_wanted(tmp_path, monkeypatch):
