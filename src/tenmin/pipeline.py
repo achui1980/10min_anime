@@ -20,7 +20,7 @@ from tenmin.render.subtitles import render_ass
 from tenmin.render.timeline import build_timeline
 from tenmin.render.tts import TTSEngine, synthesize_track
 from tenmin.render.video import render_video
-from tenmin.script.llm import LLMProvider
+from tenmin.script.llm import LLMProvider, LLMSchemaError
 from tenmin.script.single import generate_script
 from tenmin.signals.aggregate import build_report
 
@@ -53,6 +53,10 @@ _ARTIFACTS: dict[str, tuple[str, str]] = {
     "dialogue": ("01_dialogue", ".dialogue.json"),
     "signals": ("02_signals", ".signals.json"),
     "script": ("03_script", ".script.json"),
+    # 只在 LLM 连续 N 轮都没输出合 schema 的 JSON 时才写：存最后一次的**原始**模型
+    # 输出。刻意跟 script.json 同目录：出事时用户看的就是 03_script/，把现场放在别处
+    # 只会让人找不到。它不是任何阶段的输入或输出，不参与 _is_fresh。
+    "script_raw": ("03_script", ".raw.txt"),
     "table": ("out", ".解说方案.md"),
     "narration": ("out", ".narration.txt"),
     "voice_dir": ("04_voice", ""),
@@ -67,7 +71,7 @@ _ARTIFACTS: dict[str, tuple[str, str]] = {
 class Paths:
     """一个 project 的全部阶段产物路径。
 
-    11 个方法都是 _ARTIFACTS 表的一行薄包装。刻意保留显式方法而不是 __getattr__
+    12 个方法都是 _ARTIFACTS 表的一行薄包装。刻意保留显式方法而不是 __getattr__
     动态派发：调用点（pipeline / cli / 一堆测试）到处在用 paths.script(2)，
     动态派发会让拼错的名字变成运行时 AttributeError、IDE 跳转与补全全失效。
     这里要的是「布局知识只有一份」，不是「代码行数最少」。
@@ -88,6 +92,9 @@ class Paths:
 
     def script(self, episode: int) -> Path:
         return self._artifact("script", episode)
+
+    def script_raw(self, episode: int) -> Path:
+        return self._artifact("script_raw", episode)
 
     def table(self, episode: int) -> Path:
         return self._artifact("table", episode)
@@ -293,12 +300,26 @@ def _load_reports(cfg: ProjectConfig) -> list[SignalReport]:
 async def run_script(
     cfg: ProjectConfig, provider: LLMProvider, episode: int
 ) -> tuple[Script, list[str]]:
+    paths = Paths(cfg.root)
     tracks = _load_tracks(cfg)
     reports = _load_reports(cfg)
     track = next(t for t in tracks if t.episode == episode)
     report = next(r for r in reports if r.episode == episode)
-    script, warnings = await generate_script(cfg, track, report, provider)
-    _write_json(Paths(cfg.root).script(episode), script.model_dump_json(indent=2))
+    try:
+        script, warnings = await generate_script(cfg, track, report, provider)
+    except LLMSchemaError as error:
+        # 落盘选在这一层：llm.py 不该知道 Paths（它是纯 provider 层，被单测直接实例化），
+        # 而 single.py 只是拼 prompt 的无状态函数、同样拿不到项目根目录。pipeline 是
+        # 「知道产物往哪写」的唯一一层，所以现场也在这里落。
+        if not error.raw_output:
+            raise
+        raw_path = paths.script_raw(episode)
+        _write_text(raw_path, error.raw_output)
+        raise LLMSchemaError(
+            f"{error}\n最后一次的原始模型输出已存到 {raw_path}",
+            raw_output=error.raw_output,
+        ) from error
+    _write_json(paths.script(episode), script.model_dump_json(indent=2))
     return script, warnings
 
 

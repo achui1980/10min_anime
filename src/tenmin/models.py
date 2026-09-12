@@ -82,7 +82,7 @@ class _StageModel(BaseModel):
     文档里写明的人工编辑面）。pydantic 默认的 extra="ignore" 会把 `dur` / `duraton` 这类
     拼错的键静默丢掉，字段悄悄退回默认值，错误一路漂到成片里才以「人眼才能发现」的形式爆
     出来。forbid 让拼错的键在读入那一刻就报错；对 LLM 输出来说，这个 ValidationError 正好
-    会触发 OpenAICompatibleProvider 已有的 schema 修复重试（script/llm.py:176）。
+    会触发已有的 schema 修复重试（script/llm.py 的 _complete_with_schema_repair）。
 
     实测 work/ 下 42 份真实产物（script/voice/timeline/dialogue/signals）与
     tests/fixtures、tests/snapshots 里的样本，键集与模型字段完全一致，不会误伤旧产物。
@@ -287,7 +287,8 @@ class Script(_StageModel):
 # 严格度分工：能被「丢弃单条、保留其余」优雅降级的错误（clip 时间窗越界／倒挂）留给
 # validate.py，这里保持宽松；无法降级、只能重来的错误（空 id、空 narration、重复 id、
 # 拼错的键）在这里就判死 —— OpenAICompatibleProvider 会 catch 这个 ValidationError 并把
-# 报错文本回灌给模型重试（script/llm.py:174-180），比放过去更省一轮返工。
+# 报错文本回灌给模型重试（script/llm.py 的 _complete_with_schema_repair），
+# 比放过去更省一轮返工。
 
 
 class LLMClip(_StageModel):

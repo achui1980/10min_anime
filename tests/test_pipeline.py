@@ -30,12 +30,14 @@ from tenmin.pipeline import (
     run_ingest,
     run_pipeline,
     run_render,
+    run_script,
     run_signals,
     run_timeline,
     run_voice,
     stages_from,
 )
 from tenmin.render.ffmpeg import FFmpegError
+from tenmin.script.llm import LLMSchemaError
 
 from .fakes import FakeProvider, FakeReporter, FakeTTSEngine
 
@@ -185,6 +187,7 @@ FROZEN_LAYOUT = {
     "dialogue": "01_dialogue/E02.dialogue.json",
     "signals": "02_signals/E02.signals.json",
     "script": "03_script/E02.script.json",
+    "script_raw": "03_script/E02.raw.txt",
     "table": "out/E02.解说方案.md",
     "narration": "out/E02.narration.txt",
     "voice_dir": "04_voice/E02",
@@ -539,6 +542,56 @@ async def test_run_pipeline_reruns_render_stages_when_project_yaml_changes(
 def test_run_docgen_without_script_raises(project):
     with pytest.raises(FileNotFoundError):
         run_docgen(project, episode=2)
+
+
+# --- LLM 连续失败时把最后一次原始输出落盘 ---
+
+
+class _SchemaBlowupProvider:
+    """连续失败的 provider。raw_output 走 LLMSchemaError 送出来。"""
+
+    def __init__(self, raw: str):
+        self.raw = raw
+
+    async def complete(self, system, user, schema=None):
+        raise LLMSchemaError(
+            f"FakeProvider 连续 3 次输出不符合 {schema.__name__}：val 不是 value",
+            raw_output=self.raw,
+        )
+
+
+@pytest.mark.asyncio
+async def test_run_script_dumps_the_raw_model_output_on_schema_failure(project):
+    """这类失败最需要现场，而原实现只带 last_error 的前 1500 字符、原始输出全丢。"""
+    await run_pipeline(project, FakeProvider([]), only=["ingest", "signals"])
+    raw = '<think>我想想</think>\n{"script": {"val": 42}}'
+
+    with pytest.raises(LLMSchemaError) as exc:
+        await run_script(project, _SchemaBlowupProvider(raw), episode=2)
+
+    dumped = Paths(project.root).script_raw(2)
+    assert dumped.exists()
+    assert dumped.read_text(encoding="utf-8") == raw
+    # 报错里得指出文件在哪，否则落了盘也没人知道
+    assert str(dumped) in str(exc.value)
+    assert "val 不是 value" in str(exc.value)
+    assert exc.value.raw_output == raw
+
+
+@pytest.mark.asyncio
+async def test_run_script_without_raw_output_does_not_write_an_empty_file(project):
+    await run_pipeline(project, FakeProvider([]), only=["ingest", "signals"])
+
+    with pytest.raises(LLMSchemaError):
+        await run_script(project, _SchemaBlowupProvider(""), episode=2)
+
+    assert not Paths(project.root).script_raw(2).exists()
+
+
+@pytest.mark.asyncio
+async def test_run_script_success_leaves_no_raw_dump(project):
+    await run_pipeline(project, FakeProvider([fake_script_response()]), only=V1_STAGES)
+    assert not Paths(project.root).script_raw(2).exists()
 
 
 def _write_script(path: Path, script: Script) -> None:
