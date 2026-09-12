@@ -429,6 +429,24 @@ def _load_timeline(cfg: ProjectConfig, episode: int) -> Timeline:
     return Timeline.model_validate_json(path.read_text(encoding="utf-8"))
 
 
+def _load_previous_voice(cfg: ProjectConfig, episode: int) -> tuple[VoiceTrack | None, str | None]:
+    """读上一轮的 voice.json，纯粹为了拿里面记下的 chunk 时长（省 ffprobe 子进程）。
+
+    读不动就返回 None：voice 阶段马上就要整份覆写它，一份坏的旧产物不该挡住重新合成。
+    但也不能吞掉不吭声 —— 它是文档里写明的人工编辑面，所以带一条 warning 出去。
+    """
+    path = Paths(cfg.root).voice(episode)
+    if not path.is_file():
+        return None, None
+    try:
+        return VoiceTrack.model_validate_json(path.read_text(encoding="utf-8")), None
+    except (ValueError, UnicodeDecodeError) as error:
+        return None, (
+            f"读不动上一轮的 {path.name}（{type(error).__name__}），"
+            "本轮复用的 chunk 会重新用 ffprobe 量时长"
+        )
+
+
 async def run_voice(
     cfg: ProjectConfig,
     engine: TTSEngine,
@@ -437,6 +455,7 @@ async def run_voice(
 ) -> tuple[VoiceTrack, list[str]]:
     paths = Paths(cfg.root)
     script = _load_script(cfg, episode)
+    previous, previous_warning = _load_previous_voice(cfg, episode)
     track, warnings = await synthesize_track(
         script,
         episode,
@@ -444,7 +463,10 @@ async def run_voice(
         engine,
         reporter=reporter,
         max_attempts=cfg.render.tts_max_attempts,
+        previous=previous,
     )
+    if previous_warning is not None:
+        warnings.insert(0, previous_warning)
     _write_json(paths.voice(episode), track.model_dump_json(indent=2))
     return track, warnings
 

@@ -1,4 +1,5 @@
 import asyncio
+import re
 import sys
 import threading
 import types
@@ -200,10 +201,11 @@ async def test_synthesize_track_builds_chunks(tmp_path):
     engine = FakeTTSEngine([3.0, 4.0, 5.0])
     track, warnings = await synthesize_track(sample_script(), 2, tmp_path, engine)
     assert warnings == []
-    assert [c.path for c in track.chunks] == [
-        "chunk_001.mp3",
-        "chunk_002.mp3",
-        "chunk_003.mp3",
+    # 序号仍然按顺序递增（人工试听要靠它），身份则由后面那段内容哈希管。
+    assert [c.path.split(".")[0] for c in track.chunks] == [
+        "chunk_001",
+        "chunk_002",
+        "chunk_003",
     ]
     assert [c.beat_id for c in track.chunks] == ["b1", "b1", "b2"]
     assert [c.index for c in track.chunks] == [1, 2, 1]
@@ -217,27 +219,34 @@ async def test_synthesize_track_builds_chunks(tmp_path):
 
 async def test_synthesize_track_writes_files(tmp_path):
     engine = FakeTTSEngine([3.0, 4.0, 5.0])
-    await synthesize_track(sample_script(), 2, tmp_path, engine)
-    assert (tmp_path / "chunk_001.mp3").exists()
-    assert (tmp_path / "chunk_003.mp3").exists()
+    track, _ = await synthesize_track(sample_script(), 2, tmp_path, engine)
+    for chunk in track.chunks:
+        assert (tmp_path / chunk.path).is_file()
 
 
 async def test_synthesize_track_reuses_existing_chunk(tmp_path, monkeypatch):
-    (tmp_path).mkdir(parents=True, exist_ok=True)
-    (tmp_path / "chunk_001.mp3").write_bytes(b"already there")
+    """第一轮落盘的 chunk，第二轮原样复用，engine 一次都不该被调。
+
+    原来这个测试是手写一个 `chunk_001.mp3` 再断言 engine 只被调 2 次 —— 它锁死的正是
+    「chunk 文件按位置序号命名、复用只看文件存在」这个 bug，所以必须改成先真跑一轮。
+    """
+    await synthesize_track(sample_script(), 2, tmp_path, FakeTTSEngine([3.0, 4.0, 5.0]))
     monkeypatch.setattr("tenmin.render.tts.probe_duration", lambda path: 9.0)
-    engine = FakeTTSEngine([4.0, 5.0])
+
+    engine = FakeTTSEngine([])
     track, _ = await synthesize_track(sample_script(), 2, tmp_path, engine)
-    # 第一个 chunk 复用磁盘上的文件，engine 只被调了 2 次
-    assert len(engine.calls) == 2
-    assert track.chunks[0].duration == 9.0
+
+    assert engine.calls == []
+    assert [c.duration for c in track.chunks] == [9.0, 9.0, 9.0]
 
 
 async def test_synthesize_track_reuse_false_resynthesizes(tmp_path, monkeypatch):
-    (tmp_path / "chunk_001.mp3").write_bytes(b"already there")
+    await synthesize_track(sample_script(), 2, tmp_path, FakeTTSEngine([9.0, 9.0, 9.0]))
     monkeypatch.setattr("tenmin.render.tts.probe_duration", lambda path: 9.0)
+
     engine = FakeTTSEngine([3.0, 4.0, 5.0])
     track, _ = await synthesize_track(sample_script(), 2, tmp_path, engine, reuse=False)
+
     assert len(engine.calls) == 3
     assert track.chunks[0].duration == 3.0
 
@@ -456,3 +465,128 @@ async def test_edge_engine_probes_duration_off_the_event_loop(tmp_path, monkeypa
     monkeypatch.setattr(tts_module, "probe_duration", spy)
     await EdgeTTSEngine().synthesize("第一句。", tmp_path / "c.mp3")
     assert threads and threads[0] != threading.get_ident()
+
+
+# --- chunk 缓存必须绑内容，不能只绑位置 ---
+
+
+def _rewritten_script() -> Script:
+    """跟 sample_script() 的 chunk 数量与顺序完全一致，只改了第二个 chunk 的字。"""
+    script = sample_script()
+    script.beats[0].narration = "第一句。改写过的第二句。"
+    return script
+
+
+def test_chunk_filenames_keep_the_serial_and_carry_a_content_hash():
+    assert re.fullmatch(r"chunk_007\.[0-9a-f]{8}\.mp3", tts_module.chunk_filename(7, "abc", "fp"))
+
+
+async def test_rewritten_narration_is_not_silently_reused(tmp_path):
+    """剧本改写后旧音频被原样复用 = 成片旁白跟它自己的字幕不符，且零警告。"""
+    previous, _ = await synthesize_track(
+        sample_script(), 2, tmp_path, FakeTTSEngine([3.0, 4.0, 5.0])
+    )
+
+    engine = FakeTTSEngine([4.5])
+    track, _ = await synthesize_track(
+        _rewritten_script(), 2, tmp_path, engine, previous=previous
+    )
+
+    assert [c["text"] for c in engine.calls] == ["改写过的第二句。"]
+    assert [c.duration for c in track.chunks] == [3.0, 4.5, 5.0]
+
+
+async def test_changing_the_voice_invalidates_the_cache(tmp_path):
+    """voice / rate 必须进哈希，否则改了 RenderConfig.voice 也会复用旧音色。"""
+    await synthesize_track(sample_script(), 2, tmp_path, FakeTTSEngine([3.0, 4.0, 5.0]))
+
+    other = FakeTTSEngine([1.0, 2.0, 3.0], fingerprint="fake|另一个音色|+10%")
+    await synthesize_track(sample_script(), 2, tmp_path, other)
+
+    assert len(other.calls) == 3
+
+
+async def test_reuse_matches_content_even_after_the_serial_shifts(tmp_path):
+    """chunk 数量变了会让后面所有序号平移，但内容没变的那些仍该复用。"""
+    previous, _ = await synthesize_track(
+        sample_script(), 2, tmp_path, FakeTTSEngine([3.0, 4.0, 5.0])
+    )
+
+    shifted = sample_script()
+    shifted.beats.insert(
+        0, Beat(id="b0", label="新开场", role="hook", narration="插进来的新第一句。")
+    )
+    engine = FakeTTSEngine([1.0])
+    track, _ = await synthesize_track(shifted, 2, tmp_path, engine, previous=previous)
+
+    assert [c["text"] for c in engine.calls] == ["插进来的新第一句。"]
+    assert [c.duration for c in track.chunks] == [1.0, 3.0, 4.0, 5.0]
+
+
+async def test_reuse_prefers_the_duration_recorded_in_voice_json(tmp_path, monkeypatch):
+    """复用路径原来每个 chunk 都要 spawn 一次 ffprobe，而时长早就记在 voice.json 里了。"""
+    previous, _ = await synthesize_track(
+        sample_script(), 2, tmp_path, FakeTTSEngine([3.0, 4.0, 5.0])
+    )
+
+    def boom(path):
+        raise AssertionError("时长已经记在 voice.json 里了，不该再 spawn ffprobe")
+
+    monkeypatch.setattr("tenmin.render.tts.probe_duration", boom)
+    track, _ = await synthesize_track(
+        sample_script(), 2, tmp_path, FakeTTSEngine([]), previous=previous
+    )
+    assert [c.duration for c in track.chunks] == [3.0, 4.0, 5.0]
+
+
+async def test_reuse_probes_when_the_duration_is_not_recorded(tmp_path, monkeypatch):
+    await synthesize_track(sample_script(), 2, tmp_path, FakeTTSEngine([3.0, 4.0, 5.0]))
+    probed: list[Path] = []
+
+    def spy(path):
+        probed.append(path)
+        return 9.0
+
+    monkeypatch.setattr("tenmin.render.tts.probe_duration", spy)
+    track, _ = await synthesize_track(sample_script(), 2, tmp_path, FakeTTSEngine([]))
+    assert len(probed) == 3
+    assert [c.duration for c in track.chunks] == [9.0, 9.0, 9.0]
+
+
+async def test_recorded_duration_is_only_trusted_for_the_matching_file(tmp_path, monkeypatch):
+    """voice.json 里记的是「哪个文件多长」；哈希对不上的条目一律不能用。"""
+    previous, _ = await synthesize_track(
+        sample_script(), 2, tmp_path, FakeTTSEngine([3.0, 4.0, 5.0])
+    )
+    monkeypatch.setattr("tenmin.render.tts.probe_duration", lambda path: 9.0)
+    track, _ = await synthesize_track(
+        _rewritten_script(),
+        2,
+        tmp_path,
+        FakeTTSEngine([4.5]),
+        previous=previous,
+    )
+    assert [c.duration for c in track.chunks] == [3.0, 4.5, 5.0]
+
+
+async def test_duplicate_text_in_one_run_reuses_without_probing(tmp_path, monkeypatch):
+    """同一段文字在剧本里出现两次：第二个 chunk 命中第一个的文件，不该再 spawn ffprobe。"""
+    script = Script(
+        show="剧名",
+        episodes=[2],
+        beats=[
+            Beat(id="b1", label="A", role="hook", narration="一模一样的一句。"),
+            Beat(id="b2", label="B", role="outro", narration="一模一样的一句。"),
+        ],
+    )
+
+    def boom(path):
+        raise AssertionError("这一轮刚合成过它，时长在内存里，不该 spawn ffprobe")
+
+    monkeypatch.setattr("tenmin.render.tts.probe_duration", boom)
+    engine = FakeTTSEngine([6.0])
+    track, _ = await synthesize_track(script, 2, tmp_path, engine)
+
+    assert len(engine.calls) == 1
+    assert [c.duration for c in track.chunks] == [6.0, 6.0]
+    assert track.chunks[0].path == track.chunks[1].path

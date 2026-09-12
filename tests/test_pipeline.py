@@ -681,14 +681,46 @@ async def test_run_voice_writes_voice_json(project):
     track, warnings = await run_voice(project, engine, episode=2)
 
     assert warnings == []
-    assert [chunk.path for chunk in track.chunks] == [
-        "chunk_001.mp3",
-        "chunk_002.mp3",
-        "chunk_003.mp3",
+    # `chunk_003.<hash8>.mp3`：序号在前保留可读性，后面那段内容哈希管缓存身份。
+    assert [chunk.path.split(".")[0] for chunk in track.chunks] == [
+        "chunk_001",
+        "chunk_002",
+        "chunk_003",
     ]
     assert track.total_seconds == pytest.approx(30.0)
     assert paths.voice(2).exists()
-    assert (paths.voice_dir(2) / "chunk_001.mp3").exists()
+    for chunk in track.chunks:
+        assert (paths.voice_dir(2) / chunk.path).is_file()
+
+
+@pytest.mark.asyncio
+async def test_run_voice_reuses_recorded_durations_without_probing(project, monkeypatch):
+    """复用路径原来每个 chunk 都要 spawn 一次 ffprobe，而时长早就写进 voice.json 了。"""
+    paths = Paths(project.root)
+    _write_script(paths.script(2), render_script())
+    await run_voice(project, FakeTTSEngine([8.0, 10.0, 10.0]), episode=2)
+
+    def boom(path):
+        raise AssertionError("run_voice 该从 voice.json 里读时长，不该再 spawn ffprobe")
+
+    monkeypatch.setattr("tenmin.render.tts.probe_duration", boom)
+    engine = FakeTTSEngine([])
+    track, _ = await run_voice(project, engine, episode=2)
+
+    assert engine.calls == []
+    assert [chunk.duration for chunk in track.chunks] == [8.0, 10.0, 10.0]
+
+
+@pytest.mark.asyncio
+async def test_run_voice_warns_when_the_old_voice_json_is_unreadable(project):
+    paths = Paths(project.root)
+    _write_script(paths.script(2), render_script())
+    paths.voice(2).parent.mkdir(parents=True, exist_ok=True)
+    paths.voice(2).write_text("{ 这不是 json", encoding="utf-8")
+
+    _, warnings = await run_voice(project, FakeTTSEngine([8.0, 10.0, 10.0]), episode=2)
+
+    assert any("voice.json" in w or "E02.voice.json" in w for w in warnings)
 
 
 @pytest.mark.asyncio

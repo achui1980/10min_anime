@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import random
 import re
 from pathlib import Path
@@ -16,6 +17,10 @@ from tenmin.render.ffmpeg import probe_duration
 from tenmin.script.budget import SPEECH_RATE_CPS, narration_chars
 
 TTS_MAX_ATTEMPTS = 3
+
+# chunk 文件名里那段哈希的长度。8 个 hex = 32 bit：单集一百多个 chunk 的碰撞概率
+# ~1e-5 量级，而更长只会让文件名更难人眼扫。
+CHUNK_HASH_LENGTH = 8
 
 # --- 合成结果的时长体检。依据全写在 _duration_bounds 的 docstring 里 ---
 # 刻意不做成 RenderConfig 旋钮：它不是「这部番想要多长的解说」那类创作参数，而是
@@ -63,6 +68,12 @@ class TTSError(RuntimeError):
 
 @runtime_checkable
 class TTSEngine(Protocol):
+    @property
+    def fingerprint(self) -> str:
+        """「这台引擎会出什么音色」的身份串。进 chunk 文件名的哈希，所以 voice / rate
+        一改，磁盘上的旧 chunk 就自动失效，不会拿旧音色的音频冒充新配置。"""
+        ...
+
     async def synthesize(self, text: str, out_path: Path) -> float:
         """合成一段语音，返回真实时长（秒）。"""
         ...
@@ -129,6 +140,11 @@ class EdgeTTSEngine:
         self.connect_timeout = connect_timeout
         self.receive_timeout = receive_timeout
         self.chunk_timeout_seconds = chunk_timeout_seconds
+
+    @property
+    def fingerprint(self) -> str:
+        """只含真正改变输出音频的参数。proxy / 超时改了不影响音色，不该让缓存失效。"""
+        return f"edge|{self.voice}|{self.rate}"
 
     async def synthesize(self, text: str, out_path: Path) -> float:
         import edge_tts
@@ -222,6 +238,37 @@ def _exhausted(label: str, text: str, error: Exception, attempt: int) -> TTSErro
     )
 
 
+def content_hash(text: str, fingerprint: str) -> str:
+    """chunk 的内容指纹。`\\x00` 当分隔符：它不可能出现在任何一方，所以不会拼串歧义。"""
+    payload = f"{fingerprint}\x00{text}".encode()
+    return hashlib.sha256(payload).hexdigest()[:CHUNK_HASH_LENGTH]
+
+
+def chunk_filename(serial: int, text: str, fingerprint: str) -> str:
+    """`chunk_003.1a2b3c4d.mp3`：序号在前保留人工试听时的可读性，哈希在后管身份。
+
+    原来只有序号（`chunk_003.mp3`），而复用只检查「文件存在 + st_size > 0」。于是改写
+    剧本后只要 chunk 数量和顺序碰巧一致，旧音频就被原样复用 —— 成片旁白跟它自己的字幕
+    不符，零警告。哈希覆盖 (text, engine.fingerprint)，后者含 voice 与 rate。
+    """
+    return f"chunk_{serial:03d}.{content_hash(text, fingerprint)}.mp3"
+
+
+def _find_cached_chunk(voice_dir: Path, desired: str, digest: str) -> Path | None:
+    """找一个内容对得上的既有 chunk 文件。
+
+    先看这一轮想要的那个名字，再退化成「本目录里任何一个同哈希的文件」——chunk 数量一变
+    后面所有序号都会平移，但内容没变的那些没有理由重新花几十秒去合成一遍。
+    """
+    exact = voice_dir / desired
+    if exact.is_file() and exact.stat().st_size > 0:
+        return exact
+    for candidate in sorted(voice_dir.glob(f"chunk_*.{digest}.mp3")):
+        if candidate.is_file() and candidate.stat().st_size > 0:
+            return candidate
+    return None
+
+
 async def synthesize_track(
     script: Script,
     episode: int,
@@ -231,11 +278,20 @@ async def synthesize_track(
     reuse: bool = True,
     reporter: ProgressReporter | None = None,
     max_attempts: int = TTS_MAX_ATTEMPTS,
+    previous: VoiceTrack | None = None,
 ) -> tuple[VoiceTrack, list[str]]:
-    """合成整集旁白。chunk 独立落盘，重跑只补缺的那几个。"""
+    """合成整集旁白。chunk 独立落盘，重跑只补内容变了的那几个。
+
+    `previous` 是上一轮的 voice.json。复用时优先取里面记下的时长，省掉每个 chunk 一次
+    ffprobe 子进程 —— 文件名里的哈希已经保证内容与音色都对得上，那份时长就是同一段音频
+    体检过的真实时长。
+    """
     reporter = reporter or NullProgressReporter()
     voice_dir = Path(voice_dir)
     voice_dir.mkdir(parents=True, exist_ok=True)
+    known_durations = (
+        {chunk.path: chunk.duration for chunk in previous.chunks} if previous else {}
+    )
     warnings: list[str] = []
     planned_by_beat: list[tuple[Beat, list[tuple[str, float]]]] = []
     for beat in script.beats:
@@ -253,15 +309,23 @@ async def synthesize_track(
         for index, (text, hold_after) in enumerate(planned, start=1):
             serial += 1
             reporter.substep("voice", serial, total_chunks, text[:20])
-            filename = f"chunk_{serial:03d}.mp3"
+            digest = content_hash(text, engine.fingerprint)
+            filename = chunk_filename(serial, text, engine.fingerprint)
             out_path = voice_dir / filename
             label = f"beat {beat.id} 的第 {index} 个 chunk"
-            if reuse and out_path.is_file() and out_path.stat().st_size > 0:
-                duration = await asyncio.to_thread(probe_duration, out_path)
+            cached = _find_cached_chunk(voice_dir, filename, digest) if reuse else None
+            if cached is not None:
+                filename = cached.name
+                duration = known_durations.get(filename)
+                if duration is None:
+                    duration = await asyncio.to_thread(probe_duration, cached)
             else:
                 duration = await synthesize_with_retry(
                     engine, text, out_path, label=label, max_attempts=max_attempts
                 )
+            # 同一段文字在剧本里出现两次时，第二个 chunk 会命中第一个的文件；记下来
+            # 就连那一次 ffprobe 也省了。
+            known_durations[filename] = duration
             chunks.append(
                 VoiceChunk(
                     beat_id=beat.id,

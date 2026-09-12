@@ -37,8 +37,9 @@ class FakeProvider:
 class FakeTTSEngine:
     """测试用假 TTS engine。绝不联网，按调用顺序返回预置时长。"""
 
-    def __init__(self, durations: list[float]):
+    def __init__(self, durations: list[float], fingerprint: str = "fake|voice|+0%"):
         self.durations = list(durations)
+        self.fingerprint = fingerprint
         self.calls: list[dict[str, Any]] = []
 
     async def synthesize(self, text: str, out_path: Path) -> float:
@@ -53,6 +54,8 @@ class FakeTTSEngine:
 
 class FlakyTTSEngine:
     """前 fail_times 次抛错，之后返回 duration。测重试用。"""
+
+    fingerprint = "fake|voice|+0%"
 
     def __init__(self, fail_times: int, duration: float = 3.0):
         self.fail_times = fail_times
@@ -70,6 +73,8 @@ class FlakyTTSEngine:
 
 class FailingTTSEngine:
     """每次都抛同一个异常。测「什么错该重试、什么错该立刻放弃」用。"""
+
+    fingerprint = "fake|voice|+0%"
 
     def __init__(self, error: Exception):
         self.error = error
