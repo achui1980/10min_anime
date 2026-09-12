@@ -21,7 +21,7 @@ from tenmin.pipeline import (
     run_pipeline,
 )
 from tenmin.render.ffmpeg import FFmpegError
-from tenmin.render.tts import build_tts_engine
+from tenmin.render.tts import TTSError, build_tts_engine
 from tenmin.rich_progress import RichProgressReporter
 from tenmin.script.llm import LLMError, build_provider
 from tenmin.script.validate import ScriptValidationError
@@ -46,6 +46,8 @@ app = typer.Typer(add_completion=False, help="把番剧压成解说方案的流�
 # - LLMError：provider 自己抛的、已经带好人话的那一族（HTTP 4xx/5xx 带响应体摘要、
 #   HTTP 200 + 业务错误码、传输层重试耗尽、连续 N 次不合 schema、Gemini 的
 #   finish_reason 异常）。它是 RuntimeError 子类，**不在** ValueError 那条网里。
+# - TTSError：voice 阶段某个 chunk 重试耗尽 / 合成出来的音频时长离谱。同样是
+#   RuntimeError 子类，同样不在 ValueError 那条网里。
 PIPELINE_ERRORS = (
     NotImplementedError,
     FileNotFoundError,
@@ -54,6 +56,7 @@ PIPELINE_ERRORS = (
     ScriptValidationError,
     httpx.HTTPError,
     LLMError,
+    TTSError,
 )
 
 

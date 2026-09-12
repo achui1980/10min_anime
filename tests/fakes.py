@@ -68,6 +68,18 @@ class FlakyTTSEngine:
         return self.duration
 
 
+class FailingTTSEngine:
+    """每次都抛同一个异常。测「什么错该重试、什么错该立刻放弃」用。"""
+
+    def __init__(self, error: Exception):
+        self.error = error
+        self.attempts = 0
+
+    async def synthesize(self, text: str, out_path: Path) -> float:
+        self.attempts += 1
+        raise self.error
+
+
 class FakeReporter:
     """测试用假 progress reporter。记录每次调用，方便断言顺序和参数。"""
 

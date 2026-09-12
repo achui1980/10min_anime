@@ -212,6 +212,16 @@ class RenderConfig(BaseModel):
     tts_concurrency: int = Field(default=1, ge=1)
     # 新旋钮。edge-tts 走公司代理时需要；None = 不设代理。
     tts_proxy: str | None = None
+    # edge_tts.Communicate 的 connect_timeout / receive_timeout（默认值就抄它的
+    # communicate.py:338-339）。它们只是 aiohttp.ClientTimeout 的 sock_connect /
+    # sock_read，**都是单次 socket 操作的上限**，不约束整段合成：一个每 50 秒吐一个
+    # 字节的涓涓细流永远不会触发 sock_read=60。必须是 int，edge-tts 自己会 isinstance 检查。
+    tts_connect_timeout: int = Field(default=10, gt=0)
+    tts_receive_timeout: int = Field(default=60, gt=0)
+    # 单个 chunk 的**整体**截止（asyncio.timeout），补上面两个单次超时的漏。
+    # 实测 115 个真实 chunk 最长 25.6 秒音频，合成耗时是同一量级；300 秒留了十倍余量，
+    # 再久基本可以断定是连接卡死了。语义与 llm.total_timeout_seconds 平行。
+    tts_chunk_timeout_seconds: float = Field(default=300.0, gt=0)
     # 抄 render/timeline.py 的 DRIFT_TOLERANCE。
     drift_tolerance: float = Field(default=0.5, ge=0)
     # 抄 render/ffmpeg.py 的 FFMPEG / FFPROBE。

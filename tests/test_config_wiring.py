@@ -7,6 +7,8 @@ render 里的 width / height / subtitle_font_name（"两份真相"修正）。
 
 from __future__ import annotations
 
+import pytest
+
 from tenmin.config import (
     CreditsConfig,
     IngestConfig,
@@ -17,8 +19,9 @@ from tenmin.config import (
 from tenmin.ingest.credits import find_credit_ranges, in_credit_window
 from tenmin.ingest.normalize import build_track
 from tenmin.models import DialogueLine, DialogueTrack, SubtitleCue
-from tenmin.pipeline import Paths, run_ingest, run_signals, run_timeline
+from tenmin.pipeline import Paths, run_ingest, run_signals, run_timeline, run_voice
 from tenmin.render.subtitles import max_chars_per_line, render_ass
+from tenmin.render.tts import build_tts_engine
 from tenmin.render.video import build_render_args
 from tenmin.signals.aggregate import build_report
 from tenmin.signals.density import find_density_shifts, find_low_density
@@ -364,3 +367,43 @@ def _write_voice_and_script(cfg: ProjectConfig) -> None:
     )
     paths.voice(1).parent.mkdir(parents=True, exist_ok=True)
     paths.voice(1).write_text(voice.model_dump_json(), encoding="utf-8")
+
+
+# --- render.tts_* 接线 ---
+
+
+def test_build_tts_engine_wires_proxy_and_timeouts():
+    engine = build_tts_engine(
+        RenderConfig(
+            tts_proxy="http://127.0.0.1:8080",
+            tts_connect_timeout=3,
+            tts_receive_timeout=17,
+            tts_chunk_timeout_seconds=44.0,
+        )
+    )
+    assert engine.proxy == "http://127.0.0.1:8080"
+    assert engine.connect_timeout == 3
+    assert engine.receive_timeout == 17
+    assert engine.chunk_timeout_seconds == 44.0
+
+
+async def test_run_voice_wires_tts_max_attempts(tmp_path, monkeypatch):
+    """render.tts_max_attempts 必须真的到达 synthesize_with_retry 的重试循环。"""
+    from tenmin.render import tts as tts_module
+
+    from .fakes import FlakyTTSEngine
+
+    async def no_sleep(seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr(tts_module, "_sleep", no_sleep)
+
+    cfg = _minimal_project(tmp_path)
+    cfg.render.tts_max_attempts = 2
+    _write_voice_and_script(cfg)
+    Paths(cfg.root).voice(1).unlink()
+
+    engine = FlakyTTSEngine(fail_times=99)
+    with pytest.raises(tts_module.TTSError):
+        await run_voice(cfg, engine, episode=1)
+    assert engine.attempts == 2

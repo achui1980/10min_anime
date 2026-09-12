@@ -438,7 +438,12 @@ async def run_voice(
     paths = Paths(cfg.root)
     script = _load_script(cfg, episode)
     track, warnings = await synthesize_track(
-        script, episode, paths.voice_dir(episode), engine, reporter=reporter
+        script,
+        episode,
+        paths.voice_dir(episode),
+        engine,
+        reporter=reporter,
+        max_attempts=cfg.render.tts_max_attempts,
     )
     _write_json(paths.voice(episode), track.model_dump_json(indent=2))
     return track, warnings
