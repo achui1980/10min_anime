@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import shlex
 import subprocess
 from collections.abc import Callable
 from functools import lru_cache
@@ -45,13 +46,14 @@ def run(args: list[str]) -> str:
     UTF-8 解码遇到这种输入必炸——所以这里用 errors="replace"，脏字节换成 U+FFFD，
     不让一段无关的元数据把整条渲染流水线搞挂。
     """
+    argv = [FFMPEG, *args]
     completed = subprocess.run(
-        [FFMPEG, *args], capture_output=True, text=True, errors="replace"
+        argv, capture_output=True, text=True, errors="replace"
     )
     if completed.returncode != 0:
         raise FFmpegError(
             f"ffmpeg 退出码 {completed.returncode}，命令：\n"
-            f"{FFMPEG} {' '.join(args)}\n\n"
+            f"{shlex.join(argv)}\n\n"
             f"stderr 末尾 {STDERR_TAIL_LINES} 行：\n{tail(completed.stderr)}"
         )
     return completed.stderr
@@ -145,8 +147,11 @@ def run_with_progress(
     坑：ffmpeg 的 out_time_ms 字段名字带 "ms"，但实际单位是微秒（众所周知的
     ffmpeg 老 bug/历史遗留），所以换算要除以 1_000_000 而不是 1_000。
     """
+    # argv 只拼一次，Popen 与出错消息共用同一个变量。原来出错分支自己重建了一遍
+    # 字符串、且漏了 -progress pipe:1，报出来的命令不是真正跑的那条。
+    argv = [FFMPEG, *args, "-progress", "pipe:1"]
     process = subprocess.Popen(
-        [FFMPEG, *args, "-progress", "pipe:1"],
+        argv,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
@@ -172,9 +177,8 @@ def run_with_progress(
     stderr = process.stderr.read()
     returncode = process.wait()
     if returncode != 0:
-        command = " ".join([FFMPEG, *args])
         raise FFmpegError(
-            f"ffmpeg 执行失败（退出码 {returncode}）：{command}\n"
+            f"ffmpeg 执行失败（退出码 {returncode}）：{shlex.join(argv)}\n"
             f"stderr 末尾 {STDERR_TAIL_LINES} 行：\n{tail(stderr)}"
         )
     return stderr

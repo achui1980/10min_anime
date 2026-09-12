@@ -1,3 +1,4 @@
+import shlex
 from pathlib import Path
 
 import pytest
@@ -113,6 +114,48 @@ def test_run_raises_with_stderr_tail(monkeypatch):
     assert "line 49" in message
     # 只留末尾 30 行，开头的噪声不该出现
     assert "line 0" not in message
+
+
+def test_run_error_command_is_paste_safe(monkeypatch):
+    """报出去的命令必须能直接粘回 shell 跑。
+
+    `' '.join(args)` 拼出来的东西对本项目是必坏的：-filter_complex 的值里有 `;`
+    （分隔 filter）和 `'`（包路径），源片名常年长成 `[LoliHouse] xxx.mkv`。粘回
+    shell 里 `;` 会被当命令分隔符、`[...]` 会被当 glob，用户复现不了自己的报错。
+    """
+    args = [
+        "-i",
+        "/v/[LoliHouse] 番 01.mkv",
+        "-filter_complex",
+        "[0:v]trim=start=1;[v0]subtitles=filename='/x/E02.ass'[vout]",
+    ]
+
+    def fake_run(_args, **kwargs):
+        return FakeCompleted(returncode=1, stderr="Invalid argument")
+
+    monkeypatch.setattr("tenmin.render.ffmpeg.subprocess.run", fake_run)
+    with pytest.raises(FFmpegError) as exc:
+        run(args)
+    message = str(exc.value)
+    assert shlex.join(["ffmpeg", *args]) in message
+
+
+def test_run_with_progress_error_reports_the_argv_actually_executed(monkeypatch):
+    """报出去的命令必须是**真正执行**的那条，一个 token 都不许漏。
+
+    原来这里重建命令字符串时漏掉了自己注入的 -progress pipe:1，于是用户照着报错
+    粘回去跑的是另一条命令 —— 最坏的情况是那条能跑通，把真正的锅藏起来。
+    """
+    executed: dict[str, list[str]] = {}
+
+    def fake_popen(args, **kwargs):
+        executed["args"] = list(args)
+        return FakePopen(["progress=end\n"], returncode=1, stderr="Invalid argument")
+
+    monkeypatch.setattr("tenmin.render.ffmpeg.subprocess.Popen", fake_popen)
+    with pytest.raises(FFmpegError) as exc:
+        run_with_progress(["-i", "in.mp4", "out.mp4"], total_seconds=10.0)
+    assert shlex.join(executed["args"]) in str(exc.value)
 
 
 def test_probe_duration_parses_csv(monkeypatch):
