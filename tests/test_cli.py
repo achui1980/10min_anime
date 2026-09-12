@@ -60,6 +60,84 @@ def test_run_unknown_stage_fails(work, golden_srt_path):
     assert result.exit_code != 0
 
 
+def test_run_unknown_from_stage_fails(work, golden_srt_path):
+    _bootstrap(work, golden_srt_path)
+    result = runner.invoke(
+        app, ["run", "saijo", "--work-dir", str(work), "--from", "nope"]
+    )
+    assert result.exit_code != 0
+    assert "未知阶段" in out(result)
+
+
+def test_run_only_accepts_repeated_flags(work, golden_srt_path):
+    """--only 原先只收一个阶段（CLI 传 str），而 run_pipeline 的 only 本来就吃序列。"""
+    root = _bootstrap(work, golden_srt_path)
+    result = runner.invoke(
+        app,
+        [
+            "run", "saijo", "--work-dir", str(work),
+            "--only", "ingest", "--only", "signals",
+        ],
+    )
+    assert result.exit_code == 0, out(result)
+    assert (root / "01_dialogue" / "E02.dialogue.json").exists()
+    assert (root / "02_signals" / "E02.signals.json").exists()
+    assert not (root / "03_script").exists()
+
+
+def test_run_only_accepts_comma_separated_stages(work, golden_srt_path):
+    root = _bootstrap(work, golden_srt_path)
+    result = runner.invoke(
+        app, ["run", "saijo", "--work-dir", str(work), "--only", "ingest,signals"]
+    )
+    assert result.exit_code == 0, out(result)
+    assert (root / "01_dialogue" / "E02.dialogue.json").exists()
+    assert (root / "02_signals" / "E02.signals.json").exists()
+
+
+def test_run_only_rejects_unknown_stage_among_valid_ones(work, golden_srt_path):
+    _bootstrap(work, golden_srt_path)
+    result = runner.invoke(
+        app, ["run", "saijo", "--work-dir", str(work), "--only", "ingest,nope"]
+    )
+    assert result.exit_code != 0
+    assert "nope" in out(result)
+
+
+def test_run_only_passes_every_stage_to_the_pipeline(tmp_path, monkeypatch):
+    """CLI 校验用的阶段列表与真正传给 run_pipeline 的 only 必须是同一份。"""
+    _minimal_project(tmp_path)
+    captured: dict[str, object] = {}
+
+    async def fake_pipeline(cfg, provider, **kwargs):
+        captured.update(kwargs)
+        return []
+
+    monkeypatch.setattr("tenmin.cli.run_pipeline", fake_pipeline)
+    result = runner.invoke(
+        app,
+        ["run", "akujo2", "--work-dir", str(tmp_path), "--only", "docgen,timeline"],
+    )
+    assert result.exit_code == 0, out(result)
+    assert captured["only"] == ["docgen", "timeline"]
+
+
+def test_run_without_only_passes_none(tmp_path, monkeypatch):
+    _minimal_project(tmp_path)
+    captured: dict[str, object] = {}
+
+    async def fake_pipeline(cfg, provider, **kwargs):
+        captured.update(kwargs)
+        return []
+
+    monkeypatch.setattr("tenmin.cli.run_pipeline", fake_pipeline)
+    monkeypatch.setattr("tenmin.cli.build_tts_engine", lambda cfg: object())
+    monkeypatch.setattr("tenmin.cli.build_provider", lambda llm, settings: object())
+    result = runner.invoke(app, ["run", "akujo2", "--work-dir", str(tmp_path)])
+    assert result.exit_code == 0, out(result)
+    assert captured["only"] is None
+
+
 def _bootstrap(work, golden_srt_path):
     root = work / "saijo"
     (root / "srt").mkdir(parents=True)

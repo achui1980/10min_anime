@@ -36,48 +36,108 @@ STAGES = [
 ]
 
 
+def episode_stem(episode: int) -> str:
+    """全项目所有按集产物的统一文件名前缀。至少两位，三位集号不截断。"""
+    return f"E{episode:02d}"
+
+
+# 产物布局的唯一权威表：方法名 -> (子目录, 文件名后缀)。后缀为空串表示产物是目录本身。
+#
+# 这些字符串是**磁盘上的存量契约**：work/ 下有 100 多个已生成的产物，改一个字符就等于
+# 全部存量失效（流水线会认为什么都没跑过，重新调 LLM、重新 TTS、重新渲染几十分钟）。
+# tests/test_pipeline.py 的 FROZEN_LAYOUT 按字面量逐条锁死这张表拼出来的结果。
+#
+# 目录名带序号前缀（01_/02_/…）是刻意的：`ls work/<slug>` 就能按流水线顺序读出来。
+# out/ 不带序号，因为它是给人看的交付物目录，不是中间产物。
+_ARTIFACTS: dict[str, tuple[str, str]] = {
+    "dialogue": ("01_dialogue", ".dialogue.json"),
+    "signals": ("02_signals", ".signals.json"),
+    "script": ("03_script", ".script.json"),
+    "table": ("out", ".解说方案.md"),
+    "narration": ("out", ".narration.txt"),
+    "voice_dir": ("04_voice", ""),
+    "voice": ("04_voice", ".voice.json"),
+    "timeline": ("05_timeline", ".timeline.json"),
+    "subtitles": ("05_timeline", ".ass"),
+    "mixed_audio": ("06_audio", ".mixed.m4a"),
+    "video": ("07_render", ".mp4"),
+}
+
+
 class Paths:
+    """一个 project 的全部阶段产物路径。
+
+    11 个方法都是 _ARTIFACTS 表的一行薄包装。刻意保留显式方法而不是 __getattr__
+    动态派发：调用点（pipeline / cli / 一堆测试）到处在用 paths.script(2)，
+    动态派发会让拼错的名字变成运行时 AttributeError、IDE 跳转与补全全失效。
+    这里要的是「布局知识只有一份」，不是「代码行数最少」。
+    """
+
     def __init__(self, root: Path):
         self.root = Path(root)
 
+    def _artifact(self, kind: str, episode: int) -> Path:
+        subdir, suffix = _ARTIFACTS[kind]
+        return self.root / subdir / f"{episode_stem(episode)}{suffix}"
+
     def dialogue(self, episode: int) -> Path:
-        return self.root / "01_dialogue" / f"E{episode:02d}.dialogue.json"
+        return self._artifact("dialogue", episode)
 
     def signals(self, episode: int) -> Path:
-        return self.root / "02_signals" / f"E{episode:02d}.signals.json"
+        return self._artifact("signals", episode)
 
     def script(self, episode: int) -> Path:
-        return self.root / "03_script" / f"E{episode:02d}.script.json"
+        return self._artifact("script", episode)
 
     def table(self, episode: int) -> Path:
-        return self.root / "out" / f"E{episode:02d}.解说方案.md"
+        return self._artifact("table", episode)
 
     def narration(self, episode: int) -> Path:
-        return self.root / "out" / f"E{episode:02d}.narration.txt"
+        return self._artifact("narration", episode)
 
     def voice_dir(self, episode: int) -> Path:
-        return self.root / "04_voice" / f"E{episode:02d}"
+        return self._artifact("voice_dir", episode)
 
     def voice(self, episode: int) -> Path:
-        return self.root / "04_voice" / f"E{episode:02d}.voice.json"
+        return self._artifact("voice", episode)
 
     def timeline(self, episode: int) -> Path:
-        return self.root / "05_timeline" / f"E{episode:02d}.timeline.json"
+        return self._artifact("timeline", episode)
 
     def subtitles(self, episode: int) -> Path:
-        return self.root / "05_timeline" / f"E{episode:02d}.ass"
+        return self._artifact("subtitles", episode)
 
     def mixed_audio(self, episode: int) -> Path:
-        return self.root / "06_audio" / f"E{episode:02d}.mixed.m4a"
+        return self._artifact("mixed_audio", episode)
 
     def video(self, episode: int) -> Path:
-        return self.root / "07_render" / f"E{episode:02d}.mp4"
+        return self._artifact("video", episode)
 
 
 def stages_from(stage: str) -> list[str]:
     if stage not in STAGES:
         raise ValueError(f"未知阶段 {stage!r}，可选：{', '.join(STAGES)}")
     return STAGES[STAGES.index(stage) :]
+
+
+def resolve_stages(
+    *, from_stage: str = "ingest", only: Sequence[str] | None = None
+) -> list[str]:
+    """把 --from / --only 解析成实际要跑的阶段列表，永远按 STAGES 的顺序返回。
+
+    CLI 与 run_pipeline 共用这一份实现。原先两边各算一遍（cli.py 算出来只为校验，
+    再把 only/from_stage 原样传给 run_pipeline 让它重算），两份逻辑随时会分叉。
+
+    only 给了就忽略 from_stage。只是过滤 STAGES，所以传进来的顺序无所谓、重复也无所谓；
+    含未知阶段则抛 ValueError。only 传空序列（不是 None）表示「什么都不跑」，
+    这个语义是刻意保留的既有行为。
+    """
+    if only is not None:
+        unknown = [stage for stage in only if stage not in STAGES]
+        if unknown:
+            raise ValueError(f"未知阶段 {unknown[0]!r}，可选：{', '.join(STAGES)}")
+        return [stage for stage in STAGES if stage in only]
+    return stages_from(from_stage)
 
 
 def _write_json(path: Path, payload: str) -> None:
@@ -458,13 +518,7 @@ async def run_pipeline(
 
     reporter = reporter or NullProgressReporter()
 
-    if only is not None:
-        unknown = [stage for stage in only if stage not in STAGES]
-        if unknown:
-            raise ValueError(f"未知阶段 {unknown[0]!r}，可选：{', '.join(STAGES)}")
-        wanted = [stage for stage in STAGES if stage in only]
-    else:
-        wanted = stages_from(from_stage)
+    wanted = resolve_stages(from_stage=from_stage, only=only)
 
     paths = Paths(cfg.root)
     numbers = [ep.number for ep in cfg.episodes]

@@ -10,7 +10,14 @@ import yaml
 
 from tenmin.config import Settings, load_project
 from tenmin.models import DialogueTrack, SignalReport
-from tenmin.pipeline import STAGES, Paths, _find_episode, register_episode, run_pipeline
+from tenmin.pipeline import (
+    STAGES,
+    Paths,
+    _find_episode,
+    register_episode,
+    resolve_stages,
+    run_pipeline,
+)
 from tenmin.render.ffmpeg import FFmpegError
 from tenmin.render.tts import build_tts_engine
 from tenmin.rich_progress import RichProgressReporter
@@ -20,6 +27,17 @@ from tenmin.timecode import format_timestamp
 app = typer.Typer(add_completion=False, help="把番剧压成解说方案的流水线。")
 
 WORK_DIR_OPTION = typer.Option(Path("work"), "--work-dir", help="项目根目录")
+
+# 提到模块级是 B008 的标准解法（typer.Option 是函数调用，写在参数默认值里会被
+# flake8-bugbear 判 B008）。WORK_DIR_OPTION 已经是这个形状，这里跟它保持一致。
+ONLY_OPTION = typer.Option(
+    None,
+    "--only",
+    help=(
+        "只跑这些阶段，可重复传或用逗号分隔"
+        "（--only ingest --only signals / --only ingest,signals）"
+    ),
+)
 
 PROJECT_TEMPLATE = {
     "show": "剧名",
@@ -51,6 +69,20 @@ def _project_file(work_dir: Path, slug: str) -> Path:
     return path
 
 
+def _parse_only(values: list[str] | None) -> list[str] | None:
+    """把 --only 的原始取值摊平成阶段名列表；一个都没传则返回 None。
+
+    两种写法都收：重复传（--only ingest --only signals）与逗号分隔
+    （--only ingest,signals）。阶段名是否合法交给 pipeline.resolve_stages 判。
+    返回 None 而不是空列表：run_pipeline 把 only=[] 当作「什么都不跑」，
+    把「没传 --only」误传成空列表会让整条流水线静默空转。
+    """
+    if not values:
+        return None
+    stages = [part.strip() for value in values for part in value.split(",")]
+    return [stage for stage in stages if stage]
+
+
 @app.command()
 def init(slug: str, work_dir: Path = WORK_DIR_OPTION) -> None:
     """创建 work/<slug>/project.yaml 与 srt/ 目录。"""
@@ -80,7 +112,7 @@ def run(
     from_stage: str = typer.Option(
         "ingest", "--from", help=f"从哪个阶段开始，可选：{', '.join(STAGES)}"
     ),
-    only: str | None = typer.Option(None, "--only", help="只跑某一个阶段"),
+    only: list[str] | None = ONLY_OPTION,
     force: bool = typer.Option(False, "--force", help="忽略 mtime 强制重跑"),
     episode: int | None = typer.Option(
         None, "--episode", help="要处理的集数；配合 --srt/--video 可注册新的一集"
@@ -113,16 +145,12 @@ def run(
             typer.secho(str(error), fg=typer.colors.RED)
             raise typer.Exit(code=1) from error
 
-    stages: list[str] | None
-    if only:
-        stages = [only]
-    elif from_stage in STAGES:
-        stages = STAGES[STAGES.index(from_stage) :]
-    else:
-        stages = None
-    if stages is None or any(stage not in STAGES for stage in stages):
-        typer.secho(f"未知阶段，可选：{', '.join(STAGES)}", fg="red", err=True)
-        raise typer.Exit(code=2)
+    only_stages = _parse_only(only)
+    try:
+        stages = resolve_stages(from_stage=from_stage, only=only_stages)
+    except ValueError as error:
+        typer.secho(str(error), fg="red", err=True)
+        raise typer.Exit(code=2) from error
 
     provider = None
     if "script" in stages:
@@ -143,7 +171,7 @@ def run(
                     cfg,
                     provider,
                     from_stage=from_stage,
-                    only=[only] if only else None,
+                    only=only_stages,
                     force=force,
                     tts_engine=tts_engine,
                     episode=episode,

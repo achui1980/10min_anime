@@ -178,6 +178,59 @@ def test_is_fresh_true_when_no_input_exists(tmp_path):
     assert _is_fresh([out], [tmp_path / "never.txt"]) is True
 
 
+# work/ 下有 11 集的存量产物，产物路径改一个字符就等于全部存量产物失效（流水线会
+# 认为什么都没跑过，重新调 LLM、重新 TTS、重新渲染）。所以这里把每一条路径按字面量
+# 锁死：Paths 的实现怎么重构都行，拼出来的字符串必须逐字节不变。
+FROZEN_LAYOUT = {
+    "dialogue": "01_dialogue/E02.dialogue.json",
+    "signals": "02_signals/E02.signals.json",
+    "script": "03_script/E02.script.json",
+    "table": "out/E02.解说方案.md",
+    "narration": "out/E02.narration.txt",
+    "voice_dir": "04_voice/E02",
+    "voice": "04_voice/E02.voice.json",
+    "timeline": "05_timeline/E02.timeline.json",
+    "subtitles": "05_timeline/E02.ass",
+    "mixed_audio": "06_audio/E02.mixed.m4a",
+    "video": "07_render/E02.mp4",
+}
+
+
+def _artifact_methods() -> set[str]:
+    return {
+        name
+        for name, obj in vars(Paths).items()
+        if callable(obj) and not name.startswith("_")
+    }
+
+
+@pytest.mark.parametrize("kind", sorted(FROZEN_LAYOUT))
+def test_paths_layout_is_frozen(tmp_path, kind):
+    expected = tmp_path.joinpath(*FROZEN_LAYOUT[kind].split("/"))
+    assert getattr(Paths(tmp_path), kind)(2) == expected
+
+
+def test_paths_exposes_exactly_the_frozen_artifacts(tmp_path):
+    """新增一种产物就必须同时进 FROZEN_LAYOUT，否则它的路径没人锁。"""
+    assert _artifact_methods() == set(FROZEN_LAYOUT)
+
+
+@pytest.mark.parametrize("episode,stem", [(1, "E01"), (12, "E12"), (123, "E123")])
+def test_paths_pad_episode_number_consistently(tmp_path, episode, stem):
+    """集号前缀是 E + 至少两位。三位集号不截断（f"E{123:02d}" == "E123"）。"""
+    paths = Paths(tmp_path)
+    for kind in FROZEN_LAYOUT:
+        assert getattr(paths, kind)(episode).name.startswith(f"{stem}.") or getattr(
+            paths, kind
+        )(episode).name == stem, kind
+
+
+def test_paths_are_rooted_at_the_given_root(tmp_path):
+    paths = Paths(tmp_path / "work" / "saijo")
+    for kind in FROZEN_LAYOUT:
+        assert getattr(paths, kind)(2).is_relative_to(tmp_path / "work" / "saijo"), kind
+
+
 def test_paths_layout(tmp_path):
     paths = Paths(tmp_path)
     assert paths.script(2).name == "E02.script.json"
