@@ -28,6 +28,46 @@ brew install homebrew-ffmpeg/ffmpeg/ffmpeg --with-libass
 ffmpeg -hide_banner -filters | grep -w subtitles   # 能匹配到才算装对
 ```
 
+## LLM 配置
+
+默认用 Gemini（`TENMIN_GEMINI_API_KEY`）。也支持切到 MiniMax，在
+`project.yaml` 里把 `llm.provider` 设成 `minimax`：
+
+```yaml
+llm:
+  provider: minimax
+  model: MiniMax-M3
+```
+
+对应的 key 放进 `.env`：
+
+```
+TENMIN_MINIMAX_API_KEY=your-key-here
+```
+
+### 使用其他 OpenAI 兼容模型（如 DeepSeek）
+
+如果你有其他兼容 OpenAI chat/completions 接口的模型服务（比如 DeepSeek、
+自建的开源模型服务），可以把 `llm.provider` 设成 `openai_compatible`，
+并显式填写 `base_url`：
+
+```yaml
+llm:
+  provider: openai_compatible
+  model: deepseek-chat
+  base_url: https://api.deepseek.com/v1
+```
+
+API key 放进 `.env`：
+
+```
+TENMIN_OPENAI_COMPATIBLE_API_KEY=your-key-here
+```
+
+注意：`openai_compatible` 目前只支持同时配置一个服务（一份 key，一个
+project 用一个 base_url），且和 MiniMax 一样，schema 是写进 prompt
+文本里再用 pydantic 校验的，不依赖服务端严格执行 `response_format`。
+
 ## 使用
 
 ```bash
