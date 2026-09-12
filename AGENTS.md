@@ -49,7 +49,13 @@ cat /path/to/zscaler_ca_bundle.pem >> .venv/lib/python3.14/site-packages/certifi
   - `--episode N --srt <path> --video <path>`：注册新集并跑。
   - `--episode N`（不带 srt/video）：重跑已注册的某一集。
   - 不带任何 flag：批处理模式，跑 project.yaml 里注册的所有集。
-- `src/tenmin/script/llm.py`：LLM provider 抽象。`LLMProvider`（Protocol）、`GeminiProvider`（原生 google.genai SDK）、`OpenAICompatibleProvider`（通用 OpenAI 兼容 chat/completions 流式接口，schema 写进 prompt + pydantic 校验 + 报错重试，不依赖 `response_format=json_schema`）、`MiniMaxProvider(OpenAICompatibleProvider)`（MiniMax 专属子类，多了 `thinking` 深度思考开关，走 `_extra_payload_fields()` hook 注入）。`build_provider(cfg, settings)` 工厂函数按 `cfg.provider`（`"gemini"` / `"minimax"` / `"openai_compatible"`）分支构造对应 provider。
+- `src/tenmin/script/llm.py`：LLM provider 抽象。`LLMProvider`（Protocol，`complete` 有两条 PEP 695 重载：传 schema 返回该 schema 实例）、`GeminiProvider`（原生 google.genai SDK）、`OpenAICompatibleProvider`（通用 OpenAI 兼容 chat/completions 流式接口，schema 写进 prompt + pydantic 校验 + 报错重试，不依赖 `response_format=json_schema`）、`MiniMaxProvider(OpenAICompatibleProvider)`（MiniMax 专属子类，多了 `thinking` 深度思考开关，走 `_extra_payload_fields()` hook 注入）。`build_provider(cfg, settings)` 工厂函数按 `cfg.provider`（`"gemini"` / `"minimax"` / `"openai_compatible"`）分支构造对应 provider。
+
+  健壮性分成三层，改这个文件前先分清自己在动哪一层：
+  1. **传输层**（`_stream_with_retries`）：429/5xx 与连接类异常走指数退避 + 抖动 + `Retry-After`，次数由 `transport_max_attempts` 管。其余 4xx 与非限流的业务错误码立即失败。
+  2. **schema 修复层**（`_complete_with_schema_repair`，provider 无关，两个 provider 共用）：校验失败就把「schema + 报错 + 截断后的坏输出」回灌重试，次数由 `max_attempts` 管。**纠错轮刻意不重发首轮那份 ~35k 字符的正文。**
+  3. **异常族**：全部继承 `LLMError`（`RuntimeError` 子类，已进 `cli.py` 的 `PIPELINE_ERRORS`）。`LLMHTTPError` 把响应体摘要拼进消息，`LLMBusinessError` 管 HTTP 200 + `base_resp.status_code != 0`，`LLMSchemaError.raw_output` 带着最后一次的原始模型输出（由 `pipeline.run_script` 落到 `03_script/E{NN}.raw.txt`）。
+  退避的 `_sleep` / `_rand` 是模块级函数，测试 monkeypatch 掉它们，所以**新增退避路径时不要改成直接 `asyncio.sleep`**，否则测试会真睡。
 - `src/tenmin/render/`：`subtitles.py`（ASS 字幕生成，含手动 CJK 换行，因为 libass 不会按 CJK 字符边界自动换行）、`timeline.py`（时间轴重算 + 按句拆分字幕 cue）、`audio.py`（原声 ducking + 混音 + 淡出 + 结尾静音）、`video.py`（剪辑拼接烧字幕 + 淡出 + 结尾卡片）、`ffmpeg.py`（subprocess 封装，所有调用都用 `text=True, errors="replace"`，因为老番源文件的容器元数据经常不是合法 UTF-8）。
 - `src/tenmin/script/single.py`：单集 LLM 调用编排（`generate_script()`），拼 prompt（模板 + few-shot 示例 + schema + 对白/信号数据）。
 
