@@ -28,6 +28,17 @@ class ProgressReporter(Protocol):
         """批量模式下，开始处理第几集（共几集）。单集模式不会调用这个方法。"""
         ...
 
+    def episode_done(self, number: int, index: int, total: int) -> None:
+        """批量模式下，第 index 集（共 total 集）的所有阶段都跑完了。
+
+        参数与 episode_start 逐个对应，刻意做成成对的钩子：只有 start 时实现方
+        只知道「第 index 集开始了」，只能把总进度停在 index-1，最后一集跑完永远差
+        最后一格（原 RichProgressReporter 就是这样封顶在 N-1/N 的）。
+
+        跟 episode_start 一样只在批量模式调用（单集模式没有「第几集/共几集」可言）。
+        """
+        ...
+
 
 class NullProgressReporter:
     """默认的空实现。所有方法都不做事，保证不传 reporter 时行为完全不变。"""
@@ -45,4 +56,7 @@ class NullProgressReporter:
         pass
 
     def episode_start(self, number: int, index: int, total: int) -> None:
+        pass
+
+    def episode_done(self, number: int, index: int, total: int) -> None:
         pass

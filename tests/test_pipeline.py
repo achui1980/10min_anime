@@ -1151,6 +1151,48 @@ async def test_run_pipeline_reports_episode_start_exactly_once_per_episode(
 
 
 @pytest.mark.asyncio
+async def test_run_pipeline_batch_mode_reports_episode_done_for_each_episode(project):
+    """episode_start 有始无终：没有 episode_done，总进度条永远差最后一格。"""
+    project.episodes.append(EpisodeConfig(number=1, srt=project.episodes[0].srt))
+    reporter = FakeReporter()
+    provider = FakeProvider([fake_script_response(episode=2), fake_script_response(episode=1)])
+    await run_pipeline(project, provider, only=V1_STAGES, reporter=reporter)
+    calls = reporter.calls
+    assert ("episode_done", 2, 1, 2) in calls
+    assert ("episode_done", 1, 2, 2) in calls
+    # 每集的 start/done 必须严格配对、按集包住这一集的阶段
+    assert [c for c in calls if c[0] in ("episode_start", "episode_done")] == [
+        ("episode_start", 2, 1, 2),
+        ("episode_done", 2, 1, 2),
+        ("episode_start", 1, 2, 2),
+        ("episode_done", 1, 2, 2),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_run_pipeline_reports_episode_done_after_that_episodes_stages(project):
+    project.episodes.append(EpisodeConfig(number=1, srt=project.episodes[0].srt))
+    reporter = FakeReporter()
+    provider = FakeProvider([fake_script_response(episode=2), fake_script_response(episode=1)])
+    await run_pipeline(project, provider, only=V1_STAGES, reporter=reporter)
+    calls = reporter.calls
+    first_done = calls.index(("episode_done", 2, 1, 2))
+    # 第一集的 docgen 必须在它自己的 episode_done 之前
+    assert calls.index(("stage_done", "docgen")) < first_done
+    # 而第二集的 episode_start 必须在第一集的 episode_done 之后
+    assert first_done < calls.index(("episode_start", 1, 2, 2))
+
+
+@pytest.mark.asyncio
+async def test_run_pipeline_single_episode_mode_reports_neither_episode_hook(project):
+    """单集模式没有「第几集/共几集」可言，episode_start 本来就不报，done 也不该报。"""
+    reporter = FakeReporter()
+    provider = FakeProvider([fake_script_response(episode=2)])
+    await run_pipeline(project, provider, only=V1_STAGES, episode=2, reporter=reporter)
+    assert [c for c in reporter.calls if c[0].startswith("episode_")] == []
+
+
+@pytest.mark.asyncio
 async def test_run_pipeline_preflights_all_episodes_before_any_tts(
     project, golden_srt_path, monkeypatch
 ):

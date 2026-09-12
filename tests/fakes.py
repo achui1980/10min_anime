@@ -88,3 +88,6 @@ class FakeReporter:
 
     def episode_start(self, number: int, index: int, total: int) -> None:
         self.calls.append(("episode_start", number, index, total))
+
+    def episode_done(self, number: int, index: int, total: int) -> None:
+        self.calls.append(("episode_done", number, index, total))

@@ -40,14 +40,28 @@ class RichProgressReporter:
         self._progress.__exit__(exc_type, exc, tb)
 
     def episode_start(self, number: int, index: int, total: int) -> None:
+        self._update_episode_task(number, index, total, completed=index - 1)
+
+    def episode_done(self, number: int, index: int, total: int) -> None:
+        """把总进度推到 index。
+
+        原实现只有 episode_start（永远 completed=index-1），最后一集跑完总进度条就
+        封顶在 N-1/N，从来到不了 100%。下一集的 episode_start 会再把它设回
+        index-1，跟这里推上去的值相同，所以进度不会倒退。
+        """
+        self._update_episode_task(number, index, total, completed=index)
+
+    def _update_episode_task(
+        self, number: int, index: int, total: int, *, completed: int
+    ) -> None:
         label = f"总进度：第 {index}/{total} 集 (E{number:02d})"
         if self._episode_task is None:
             self._episode_task = self._progress.add_task(
-                label, total=total, completed=index - 1
+                label, total=total, completed=completed
             )
         else:
             self._progress.update(
-                self._episode_task, description=label, completed=index - 1
+                self._episode_task, description=label, completed=completed
             )
 
     def stage_start(self, stage: str) -> None:

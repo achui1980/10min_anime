@@ -657,4 +657,7 @@ async def run_pipeline(
             else:
                 reporter.stage_skip("render")
 
+        if episode is None:
+            reporter.episode_done(number, number_to_index[number], len(target_numbers))
+
     return warnings

@@ -74,3 +74,38 @@ def test_time_elapsed_column_is_present():
     """已跑时长是唯一对 total=None 的阶段行有意义的时间列，别再被顺手删掉。"""
     columns = RichProgressReporter()._progress.columns
     assert any(isinstance(column, TimeElapsedColumn) for column in columns)
+
+
+def test_total_progress_bar_reaches_full_after_the_last_episode():
+    """原实现只有 episode_start（永远 completed=index-1）、没有 episode_done，
+    于是最后一集跑完总进度条封顶在 N-1/N，从来到不了 100%。"""
+    with RichProgressReporter() as reporter:
+        for index in (1, 2, 3):
+            reporter.episode_start(index, index, 3)
+            reporter.stage_start("script")
+            reporter.stage_done("script")
+            reporter.episode_done(index, index, 3)
+
+        total = reporter._progress.tasks[0]
+        assert (total.completed, total.total) == (3, 3)
+        assert total.finished
+
+
+def test_episode_done_advances_the_bar_step_by_step():
+    with RichProgressReporter() as reporter:
+        reporter.episode_start(2, 1, 2)
+        assert reporter._progress.tasks[0].completed == 0
+        reporter.episode_done(2, 1, 2)
+        assert reporter._progress.tasks[0].completed == 1
+        reporter.episode_start(1, 2, 2)
+        assert reporter._progress.tasks[0].completed == 1
+        reporter.episode_done(1, 2, 2)
+        assert reporter._progress.tasks[0].completed == 2
+
+
+def test_episode_done_without_episode_start_still_shows_a_total_bar():
+    """库调用方/未来的阶段顺序变化不该让这里炸成 None 上调 update。"""
+    with RichProgressReporter() as reporter:
+        reporter.episode_done(5, 2, 4)
+        total = reporter._progress.tasks[0]
+        assert (total.completed, total.total) == (2, 4)
