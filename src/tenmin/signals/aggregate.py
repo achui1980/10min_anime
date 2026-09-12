@@ -2,8 +2,15 @@
 
 from __future__ import annotations
 
+from tenmin.config import DEFAULT_SIGNALS, SignalsConfig
 from tenmin.intervals import group_adjacent
-from tenmin.models import DialogueTrack, Highlight, Signal, SignalReport
+from tenmin.models import (
+    STRENGTH_MAX,
+    DialogueTrack,
+    Highlight,
+    Signal,
+    SignalReport,
+)
 from tenmin.signals.density import (
     char_rate,
     find_density_signals,
@@ -11,9 +18,10 @@ from tenmin.signals.density import (
 )
 from tenmin.signals.gaps import find_silent_gaps
 
-MIN_SEPARATION = 2.0
-MAX_STRENGTH = 5
-SUMMARY_MAX_CHARS = 30
+# 强度上限不是本模块自己的旋钮：它就是 models.Highlight.strength 的 Field(le=...) 上界。
+# 两处必须一致，否则 min(base + extra, ...) 一超界就直接 ValidationError，
+# 所以这里直接复用 models.STRENGTH_MAX，不再写第二份字面量。
+MAX_STRENGTH = STRENGTH_MAX
 
 # density_shift 是区域性证据：它的区间是 density.py 里死板的 30s 统计桶，
 # 表达「这一片区域的叙事节奏换挡了」，不是一个精确的演出区间。
@@ -73,7 +81,9 @@ def _boundary_signals(cluster: list[Signal]) -> list[Signal]:
     return precise or cluster
 
 
-def _summary(cluster: list[Signal], track: DialogueTrack | None) -> str:
+def _summary(
+    cluster: list[Signal], track: DialogueTrack | None, cfg: SignalsConfig
+) -> str:
     start = min(s.start for s in cluster)
     end = max(s.end for s in cluster)
     duration = end - start
@@ -92,16 +102,17 @@ def _summary(cluster: list[Signal], track: DialogueTrack | None) -> str:
     if not candidates:
         return f"低语速片段 {duration:.1f}s"
     slowest = min(candidates, key=char_rate)
-    return slowest.text[:SUMMARY_MAX_CHARS]
+    return slowest.text[: cfg.summary_max_chars]
 
 
 def aggregate(
     signals: list[Signal],
     track: DialogueTrack | None,
-    min_separation: float = MIN_SEPARATION,
+    *,
+    cfg: SignalsConfig = DEFAULT_SIGNALS,
 ) -> list[Highlight]:
     highlights: list[Highlight] = []
-    for cluster in _cluster(signals, min_separation):
+    for cluster in _cluster(signals, cfg.min_separation):
         bounds = _boundary_signals(cluster)
         # 强度、trigger、anchor 都算整簇（density_shift 照样贡献）；只有边界只看 bounds。
         base = max(s.strength for s in cluster)
@@ -115,19 +126,21 @@ def aggregate(
                 end=max(s.end for s in bounds),
                 strength=strength,
                 triggers=triggers,
-                summary=_summary(bounds, track),
+                summary=_summary(bounds, track, cfg),
                 anchor_lines=anchor_lines,
             )
         )
     return sorted(highlights, key=lambda h: h.start)
 
 
-def build_report(track: DialogueTrack) -> SignalReport:
-    gaps = find_silent_gaps(track)
-    signals = [*gaps, *find_density_signals(track)]
+def build_report(
+    track: DialogueTrack, *, cfg: SignalsConfig = DEFAULT_SIGNALS
+) -> SignalReport:
+    gaps = find_silent_gaps(track, cfg=cfg)
+    signals = [*gaps, *find_density_signals(track, cfg=cfg)]
     return SignalReport(
         episode=track.episode,
         silent_gaps=gaps,
         median_char_rate=median_char_rate(track),
-        highlights=aggregate(signals, track),
+        highlights=aggregate(signals, track, cfg=cfg),
     )

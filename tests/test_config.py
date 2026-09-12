@@ -4,11 +4,14 @@ import pytest
 from pydantic import ValidationError
 
 from tenmin.config import (
+    CreditsConfig,
     EpisodeConfig,
+    IngestConfig,
     LLMConfig,
     ProjectConfig,
     RenderConfig,
     Settings,
+    SignalsConfig,
     load_project,
 )
 
@@ -89,7 +92,7 @@ def test_episode_srt_path_resolves_against_project_dir(tmp_path):
 
 def test_settings_reads_env(monkeypatch):
     monkeypatch.setenv("TENMIN_GEMINI_API_KEY", "fake-key")
-    assert Settings().gemini_api_key == "fake-key"
+    assert Settings().gemini_api_key.get_secret_value() == "fake-key"
 
 
 def test_settings_missing_key_is_none(monkeypatch):
@@ -157,7 +160,7 @@ def test_load_project_with_minimax_llm(tmp_path):
 
 def test_settings_reads_minimax_env(monkeypatch):
     monkeypatch.setenv("TENMIN_MINIMAX_API_KEY", "mm-key")
-    assert Settings().minimax_api_key == "mm-key"
+    assert Settings().minimax_api_key.get_secret_value() == "mm-key"
 
 
 def test_settings_missing_minimax_key_is_none(monkeypatch):
@@ -169,7 +172,7 @@ def test_settings_keys_are_independent(monkeypatch):
     monkeypatch.setenv("TENMIN_GEMINI_API_KEY", "g-key")
     monkeypatch.delenv("TENMIN_MINIMAX_API_KEY", raising=False)
     settings = Settings(_env_file=None)
-    assert settings.gemini_api_key == "g-key"
+    assert settings.gemini_api_key.get_secret_value() == "g-key"
     assert settings.minimax_api_key is None
 
 
@@ -186,7 +189,7 @@ def test_llm_config_accepts_openai_compatible_provider():
 
 def test_settings_reads_openai_compatible_env(monkeypatch):
     monkeypatch.setenv("TENMIN_OPENAI_COMPATIBLE_API_KEY", "oc-key")
-    assert Settings().openai_compatible_api_key == "oc-key"
+    assert Settings().openai_compatible_api_key.get_secret_value() == "oc-key"
 
 
 def test_render_config_defaults():
@@ -255,3 +258,184 @@ def test_video_path_without_video_raises():
 def test_episode_config_video_defaults_to_none():
     episode = EpisodeConfig(number=2, srt=Path("srt/E02.srt"))
     assert episode.video is None
+
+
+# --- 约束与 validator ---
+
+
+@pytest.mark.parametrize("bad", [0, 0.0, -1, -240.0])
+def test_target_seconds_must_be_positive(bad):
+    """target_seconds <= 0 会让 script 阶段的时长预算直接失去意义，必须挡在配置层。"""
+    with pytest.raises(ValidationError):
+        ProjectConfig(show="X", slug="x", target_seconds=bad)
+
+
+def test_target_seconds_accepts_positive():
+    assert ProjectConfig(show="X", slug="x", target_seconds=1.0).target_seconds == 1.0
+
+
+@pytest.mark.parametrize("field", ["op_range", "ed_range"])
+def test_credit_range_rejects_reversed_bounds(field):
+    with pytest.raises(ValidationError) as exc:
+        EpisodeConfig(number=1, srt=Path("a.srt"), **{field: (200.0, 100.0)})
+    assert "起点" in str(exc.value)
+
+
+@pytest.mark.parametrize("field", ["op_range", "ed_range"])
+def test_credit_range_rejects_equal_bounds(field):
+    with pytest.raises(ValidationError):
+        EpisodeConfig(number=1, srt=Path("a.srt"), **{field: (100.0, 100.0)})
+
+
+@pytest.mark.parametrize("field", ["op_range", "ed_range"])
+def test_credit_range_rejects_negative_bounds(field):
+    with pytest.raises(ValidationError) as exc:
+        EpisodeConfig(number=1, srt=Path("a.srt"), **{field: (-1.0, 100.0)})
+    assert "负数" in str(exc.value)
+
+
+@pytest.mark.parametrize("field", ["op_range", "ed_range"])
+def test_credit_range_accepts_valid(field):
+    episode = EpisodeConfig(number=1, srt=Path("a.srt"), **{field: (0.0, 90.0)})
+    assert getattr(episode, field) == (0.0, 90.0)
+
+
+# --- Settings 的 API key 是 SecretStr ---
+
+
+def test_api_keys_are_secret_str(monkeypatch):
+    monkeypatch.delenv("TENMIN_GEMINI_API_KEY", raising=False)
+    settings = Settings(
+        _env_file=None,
+        gemini_api_key="g-secret",
+        minimax_api_key="m-secret",
+        openai_compatible_api_key="o-secret",
+    )
+    assert settings.gemini_api_key.get_secret_value() == "g-secret"
+    assert settings.minimax_api_key.get_secret_value() == "m-secret"
+    assert settings.openai_compatible_api_key.get_secret_value() == "o-secret"
+
+
+def test_api_keys_do_not_leak_into_repr():
+    """误把 Settings 打进日志/异常时不能泄露 key。"""
+    settings = Settings(_env_file=None, gemini_api_key="g-secret")
+    assert "g-secret" not in repr(settings)
+    assert "g-secret" not in str(settings.gemini_api_key)
+
+
+# --- IngestConfig ---
+
+
+def test_ingest_config_defaults():
+    cfg = IngestConfig()
+    assert cfg.merge_max_gap == pytest.approx(0.3)
+    assert cfg.merge_max_chars == 40
+    assert cfg.merge_max_line_seconds == pytest.approx(4.0)
+
+
+def test_project_config_has_ingest_block():
+    cfg = ProjectConfig.model_validate(
+        {"show": "剧名", "slug": "slug", "ingest": {"merge_max_chars": 60}}
+    )
+    assert cfg.ingest.merge_max_chars == 60
+    assert cfg.ingest.merge_max_gap == pytest.approx(0.3)
+
+
+# --- CreditsConfig ---
+
+
+def test_credits_config_defaults():
+    cfg = CreditsConfig()
+    assert cfg.op_search_start == pytest.approx(30.0)
+    assert cfg.op_search_end == pytest.approx(300.0)
+    assert cfg.credit_head_window == pytest.approx(300.0)
+    assert cfg.op_span_min == pytest.approx(40.0)
+    assert cfg.op_span_max == pytest.approx(120.0)
+    assert cfg.ed_cluster_tail_seconds == pytest.approx(120.0)
+    assert cfg.ed_keyword_window_seconds == pytest.approx(80.0)
+    assert cfg.cluster_max_gap == pytest.approx(35.0)
+    assert cfg.op_min_silent_span == pytest.approx(60.0)
+    assert cfg.op_max_silent_span == pytest.approx(120.0)
+    assert cfg.title_overlap_threshold == pytest.approx(0.6)
+    assert cfg.title_card_max_len == 24
+    assert cfg.name_list_min_cjk == 6
+    assert cfg.name_list_many_segments == 4
+    assert cfg.name_list_many_min_cjk == 4
+    assert cfg.latin_ratio_threshold == pytest.approx(0.6)
+    assert cfg.latin_min_len == 6
+
+
+def test_project_config_has_credits_block():
+    cfg = ProjectConfig.model_validate(
+        {"show": "剧名", "slug": "slug", "credits": {"op_span_max": 200.0}}
+    )
+    assert cfg.credits.op_span_max == pytest.approx(200.0)
+    assert cfg.credits.op_span_min == pytest.approx(40.0)
+
+
+# --- SignalsConfig ---
+
+
+def test_signals_config_defaults():
+    cfg = SignalsConfig()
+    assert cfg.min_gap_seconds == pytest.approx(3.0)
+    assert cfg.gap_strong_seconds == pytest.approx(15.0)
+    assert cfg.gap_medium_seconds == pytest.approx(8.0)
+    assert cfg.low_density_ratio == pytest.approx(0.4)
+    assert cfg.low_density_min_seconds == pytest.approx(2.0)
+    assert cfg.low_density_strength == 3
+    assert cfg.shift_window_seconds == pytest.approx(30.0)
+    assert cfg.shift_z_threshold == pytest.approx(1.5)
+    assert cfg.shift_strength == 2
+    assert cfg.min_separation == pytest.approx(2.0)
+    assert cfg.summary_max_chars == 30
+
+
+def test_signals_strength_fields_respect_model_bounds():
+    """强度字段的取值范围必须跟 models.Signal/Highlight 的 Field(ge=1, le=5) 一致。"""
+    with pytest.raises(ValidationError):
+        SignalsConfig(low_density_strength=6)
+    with pytest.raises(ValidationError):
+        SignalsConfig(shift_strength=0)
+
+
+def test_project_config_has_signals_block():
+    cfg = ProjectConfig.model_validate(
+        {"show": "剧名", "slug": "slug", "signals": {"min_gap_seconds": 10.0}}
+    )
+    assert cfg.signals.min_gap_seconds == pytest.approx(10.0)
+    assert cfg.signals.summary_max_chars == 30
+
+
+# --- RenderConfig 新增字段 ---
+
+
+def test_render_config_new_defaults():
+    cfg = RenderConfig()
+    assert cfg.crf == "20"
+    assert cfg.preset == "medium"
+    assert cfg.width == 1920
+    assert cfg.height == 1080
+    assert cfg.videotoolbox_bitrate == "6000k"
+    assert cfg.audio_codec == "aac"
+    assert cfg.audio_bitrate == "192k"
+    assert cfg.subtitle_font_name == "Lantinghei SC"
+    assert cfg.outro_font_name == "Lantinghei SC"
+    assert cfg.tts_max_attempts == 3
+    assert cfg.tts_concurrency == 1
+    assert cfg.tts_proxy is None
+    assert cfg.drift_tolerance == pytest.approx(0.5)
+    assert cfg.ffmpeg_path == "ffmpeg"
+    assert cfg.ffprobe_path == "ffprobe"
+
+
+# --- LLMConfig 新增字段 ---
+
+
+def test_llm_config_new_defaults():
+    cfg = LLMConfig()
+    assert cfg.temperature is None
+    assert cfg.max_output_tokens is None
+    assert cfg.timeout_seconds == pytest.approx(120.0)
+    assert cfg.max_attempts == 3
+    assert cfg.budget_tolerance == pytest.approx(0.12)

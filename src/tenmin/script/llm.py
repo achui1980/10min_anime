@@ -215,19 +215,24 @@ class MiniMaxProvider(OpenAICompatibleProvider):
 
 
 def build_provider(cfg: LLMConfig, settings: Settings) -> LLMProvider:
+    """Settings 里的 API key 是 SecretStr（防止误打进日志），
+    交给各 provider 前在这里统一 get_secret_value() 取明文。
+    """
     if cfg.provider == "gemini":
         if not settings.gemini_api_key:
             raise RuntimeError(
                 "缺少 Gemini API key，请设置环境变量 TENMIN_GEMINI_API_KEY"
             )
-        return GeminiProvider(api_key=settings.gemini_api_key, model=cfg.model)
+        return GeminiProvider(
+            api_key=settings.gemini_api_key.get_secret_value(), model=cfg.model
+        )
     if cfg.provider == "minimax":
         if not settings.minimax_api_key:
             raise RuntimeError(
                 "缺少 MiniMax API key，请设置环境变量 TENMIN_MINIMAX_API_KEY"
             )
         return MiniMaxProvider(
-            api_key=settings.minimax_api_key,
+            api_key=settings.minimax_api_key.get_secret_value(),
             model=cfg.model,
             base_url=cfg.base_url or MINIMAX_BASE_URL,
             thinking=cfg.thinking,
@@ -242,7 +247,7 @@ def build_provider(cfg: LLMConfig, settings: Settings) -> LLMProvider:
                 "openai_compatible provider 必须在 project.yaml 里配置 llm.base_url"
             )
         return OpenAICompatibleProvider(
-            api_key=settings.openai_compatible_api_key,
+            api_key=settings.openai_compatible_api_key.get_secret_value(),
             model=cfg.model,
             base_url=cfg.base_url,
         )

@@ -6,12 +6,16 @@ ASS 的时间是 H:MM:SS.cc（厘秒、小时不补零），跟 timecode.format_
 
 from __future__ import annotations
 
+from tenmin.config import DEFAULT_RENDER
 from tenmin.models import SubtitleCue
 
-DEFAULT_FONT_NAME = "Lantinghei SC"
-DEFAULT_FONT_SIZE = 52
-PLAY_RES_X = 1920
-PLAY_RES_Y = 1080
+# 全部从 config 的默认值派生，不再写第二份字面量：PlayRes 必须跟 render/video.py 的
+# scale=WxH 完全一致，否则 libass 会按 PlayRes 与实际画面的比例静默缩放字号，
+# 「改了分辨率字幕突然变小」这种问题极难查。
+DEFAULT_FONT_NAME = DEFAULT_RENDER.subtitle_font_name
+DEFAULT_FONT_SIZE = DEFAULT_RENDER.font_size
+PLAY_RES_X = DEFAULT_RENDER.width
+PLAY_RES_Y = DEFAULT_RENDER.height
 MARGIN_LR = 60
 # 全角字符的实际显示宽度近似等于字号本身；用 1.05 留一点余量，
 # 免得断行算准了但描边（Outline）一挤又超出画面。
@@ -51,14 +55,14 @@ def escape_text(text: str) -> str:
     return cleaned.replace("\r\n", "\n").replace("\n", "\\N").strip()
 
 
-def max_chars_per_line(font_size: int) -> int:
-    """给定字号，估算一行能塞下多少个全角字符。
+def max_chars_per_line(font_size: int, width: int = PLAY_RES_X) -> int:
+    """给定字号与画布宽度，估算一行能塞下多少个全角字符。
 
     libass 的自动换行（WrapStyle）只在空格处断行，中文没有空格，
     长句会被当成一个不可断的“单词”直接冲出画面。所以断行必须自己算好、
     手动插 \\N，不能指望 libass 帮忙。
     """
-    usable_width = PLAY_RES_X - 2 * MARGIN_LR
+    usable_width = width - 2 * MARGIN_LR
     if font_size <= 0:
         return usable_width
     chars = int(usable_width // (font_size * CJK_CHAR_WIDTH_RATIO))
@@ -99,12 +103,15 @@ def render_ass(
     *,
     font_size: int = DEFAULT_FONT_SIZE,
     font_name: str = DEFAULT_FONT_NAME,
+    width: int = PLAY_RES_X,
+    height: int = PLAY_RES_Y,
 ) -> str:
+    """width/height 必须跟 render/video.py 的 scale 用同一对值（见 RenderConfig）。"""
     lines = [
         "[Script Info]",
         "ScriptType: v4.00+",
-        f"PlayResX: {PLAY_RES_X}",
-        f"PlayResY: {PLAY_RES_Y}",
+        f"PlayResX: {width}",
+        f"PlayResY: {height}",
         "WrapStyle: 0",
         "ScaledBorderAndShadow: yes",
         "",
@@ -115,7 +122,7 @@ def render_ass(
         "[Events]",
         _EVENT_FORMAT,
     ]
-    max_chars = max_chars_per_line(font_size)
+    max_chars = max_chars_per_line(font_size, width)
     for cue in cues:
         wrapped = wrap_text(cue.text, max_chars)
         lines.append(

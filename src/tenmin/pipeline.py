@@ -113,6 +113,8 @@ def run_ingest(cfg: ProjectConfig) -> list[DialogueTrack]:
             show_title=cfg.show,
             op_range=episode.op_range,
             ed_range=episode.ed_range,
+            ingest=cfg.ingest,
+            credits=cfg.credits,
         )
         _write_json(paths.dialogue(episode.number), track.model_dump_json(indent=2))
         tracks.append(track)
@@ -134,7 +136,7 @@ def run_signals(cfg: ProjectConfig) -> list[SignalReport]:
     paths = Paths(cfg.root)
     reports = []
     for track in _load_tracks(cfg):
-        report = build_report(track)
+        report = build_report(track, cfg=cfg.signals)
         _write_json(paths.signals(track.episode), report.model_dump_json(indent=2))
         reports.append(report)
     return reports
@@ -279,7 +281,13 @@ def run_timeline(
     _write_json(paths.timeline(episode), timeline.model_dump_json(indent=2))
     _write_text(
         paths.subtitles(episode),
-        render_ass(timeline.subtitles, font_size=cfg.render.font_size),
+        render_ass(
+            timeline.subtitles,
+            font_size=cfg.render.font_size,
+            font_name=cfg.render.subtitle_font_name,
+            width=cfg.render.width,
+            height=cfg.render.height,
+        ),
     )
     return timeline, warnings
 
@@ -320,6 +328,8 @@ def run_render(
         ass=ass,
         out_path=paths.video(episode),
         encoder=cfg.render.video_encoder,
+        width=cfg.render.width,
+        height=cfg.render.height,
         fade_out_seconds=cfg.render.fade_out_seconds,
         outro_seconds=cfg.render.outro_card_seconds,
         outro_title=f"{cfg.show} · EP{episode:02d}",

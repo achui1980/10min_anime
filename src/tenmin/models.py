@@ -13,6 +13,12 @@ LineKind = Literal["dialogue", "monologue", "screen_text", "credits", "noise"]
 # 平行定义，导致过滤规则悄悄分叉；判定逻辑本身见 tenmin.intervals.is_spoken。
 SPEECH_KINDS: frozenset[LineKind] = frozenset({"dialogue", "monologue"})
 
+# 信号/高光强度的取值范围。signals/aggregate.py 的强度上限与 config.SignalsConfig
+# 的强度字段约束都从这里取，三处不会再各写一份字面量（曾经 aggregate.MAX_STRENGTH=5
+# 与下面两个 Field(le=...) 是隐式耦合，改一处不改另一处就直接 ValidationError）。
+STRENGTH_MIN = 1
+STRENGTH_MAX = 5
+
 SignalSource = Literal["gap", "low_density", "density_shift"]
 SfxKind = Literal["impact", "whoosh", "comedy", "suspense", "uplift"]
 BeatRole = Literal["hook", "act", "climax", "outro"]
@@ -61,7 +67,7 @@ class Signal(BaseModel):
     start: float
     end: float
     source: SignalSource
-    strength: int = Field(ge=1, le=5)
+    strength: int = Field(ge=STRENGTH_MIN, le=STRENGTH_MAX)
     detail: str
     anchor_lines: list[int] = Field(default_factory=list)
 
@@ -75,7 +81,7 @@ class Highlight(BaseModel):
 
     start: float
     end: float
-    strength: int = Field(ge=1, le=5)
+    strength: int = Field(ge=STRENGTH_MIN, le=STRENGTH_MAX)
     triggers: list[str] = Field(default_factory=list)
     summary: str = ""
     anchor_lines: list[int] = Field(default_factory=list)

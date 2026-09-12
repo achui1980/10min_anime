@@ -2,22 +2,22 @@
 
 from __future__ import annotations
 
+from tenmin.config import DEFAULT_SIGNALS, SignalsConfig
 from tenmin.intervals import silent_gaps, subtract
 from tenmin.models import DialogueTrack, Signal
 
-MIN_GAP_SECONDS = 3.0
-_STRENGTH_TABLE = ((15.0, 4), (8.0, 3), (0.0, 2))
 
-
-def _strength(duration: float) -> int:
-    for threshold, strength in _STRENGTH_TABLE:
-        if duration >= threshold:
-            return strength
+def _strength(duration: float, cfg: SignalsConfig) -> int:
+    """间隙时长分档。强度取值范围由 models.STRENGTH_MIN/MAX 约束。"""
+    if duration >= cfg.gap_strong_seconds:
+        return 4
+    if duration >= cfg.gap_medium_seconds:
+        return 3
     return 2
 
 
 def find_silent_gaps(
-    track: DialogueTrack, min_seconds: float = MIN_GAP_SECONDS
+    track: DialogueTrack, *, cfg: SignalsConfig = DEFAULT_SIGNALS
 ) -> list[Signal]:
     blocks = [b for b in (track.op_range, track.ed_range) if b is not None]
 
@@ -27,14 +27,14 @@ def find_silent_gaps(
         anchors = [gap.before.idx] if gap.after is None else [gap.before.idx, gap.after.idx]
         for piece_start, piece_end in subtract((gap.start, gap.end), blocks):
             duration = piece_end - piece_start
-            if duration < min_seconds:
+            if duration < cfg.min_gap_seconds:
                 continue
             signals.append(
                 Signal(
                     start=piece_start,
                     end=piece_end,
                     source="gap",
-                    strength=_strength(duration),
+                    strength=_strength(duration, cfg),
                     detail=f"gap:{duration:.1f}s",
                     anchor_lines=anchors,
                 )

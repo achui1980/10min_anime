@@ -8,16 +8,20 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from tenmin.config import DEFAULT_RENDER
 from tenmin.models import Timeline
 from tenmin.progress import NullProgressReporter, ProgressReporter
 from tenmin.render.ffmpeg import run_with_progress
 
-WIDTH = 1920
-HEIGHT = 1080
+# 全部从 config 的默认值派生。WIDTH/HEIGHT 尤其重要：它必须跟
+# render/subtitles.py 的 PlayResX/Y 同源，否则烧上去的字幕会被静默缩放。
+WIDTH = DEFAULT_RENDER.width
+HEIGHT = DEFAULT_RENDER.height
+CRF = DEFAULT_RENDER.crf
+PRESET = DEFAULT_RENDER.preset
+VIDEOTOOLBOX_BITRATE = DEFAULT_RENDER.videotoolbox_bitrate
+OUTRO_FONT_NAME = DEFAULT_RENDER.outro_font_name
 PIX_FMT = "yuv420p"
-CRF = "20"
-PRESET = "medium"
-VIDEOTOOLBOX_BITRATE = "6000k"
 
 
 def escape_filter_path(path: Path) -> str:
@@ -83,12 +87,12 @@ def build_render_args(
         title = escape_drawtext(outro_title)
         message = escape_drawtext(outro_message)
         parts.append(
-            f"[cardbg]drawtext=font='Lantinghei SC':text='{title}':fontcolor=yellow:"
+            f"[cardbg]drawtext=font='{OUTRO_FONT_NAME}':text='{title}':fontcolor=yellow:"
             "bordercolor=black:borderw=4:fontsize=64:x=(w-text_w)/2:y=(h-text_h)/2-60:"
             "expansion=none[card1]"
         )
         parts.append(
-            f"[card1]drawtext=font='Lantinghei SC':text='{message}':fontcolor=yellow:"
+            f"[card1]drawtext=font='{OUTRO_FONT_NAME}':text='{message}':fontcolor=yellow:"
             "bordercolor=black:borderw=4:fontsize=44:x=(w-text_w)/2:y=(h-text_h)/2+40:"
             "expansion=none[card]"
         )
@@ -128,6 +132,8 @@ def render_video(
     ass: Path,
     out_path: Path,
     encoder: str,
+    width: int = WIDTH,
+    height: int = HEIGHT,
     fade_out_seconds: float = 0.0,
     outro_seconds: float = 0.0,
     outro_title: str = "",
@@ -144,6 +150,8 @@ def render_video(
         ass=ass,
         out_path=out_path,
         encoder=encoder,
+        width=width,
+        height=height,
         fade_out_seconds=fade_out_seconds,
         outro_seconds=outro_seconds,
         outro_title=outro_title,

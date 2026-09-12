@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import re
 
+# 所有阈值的权威定义在 tenmin.config.CreditsConfig；DEFAULT_CREDITS 只是它的
+# 默认实例，让不关心配置的调用点（单测、一次性脚本）可以继续零参数调用。
+from tenmin.config import DEFAULT_CREDITS, CreditsConfig
 from tenmin.intervals import merge_intervals, silent_gaps
 from tenmin.models import DialogueLine
 
@@ -46,29 +49,6 @@ _BRACKET_WRAPPED = re.compile(r"^[《『「(（]\s*(?P<inner>.+?)\s*[》』」)�
 _LATIN = re.compile(r"[A-Za-z]")
 _NON_SPACE = re.compile(r"\S")
 
-# 下界 30 秒：实测最早的 OP 起点是《恶女》第 2 集的 53.554 秒，取 30 留足余量。
-# 原来的 60 秒会把它挡在窗外，OP 就退化成「最长的演出高光」。
-OP_START_WINDOW = (30.0, 300.0)
-OP_SPAN_WINDOW = (40.0, 120.0)
-ED_TAIL_SECONDS = 120.0
-ED_WINDOW_SECONDS = 80.0
-CLUSTER_MAX_GAP = 35.0
-
-# 静区兜底的 OP 时长区间。实测 OP 静默长度 90.7-94.5 秒；
-# 下界 60 是为了不把 20 秒级的演出静场误判成 OP，
-# 上界 120 是为了不把整段无对白的过场误判成 OP。
-OP_MIN_SILENT_SPAN = 60.0
-OP_MAX_SILENT_SPAN = 120.0
-
-_TITLE_OVERLAP_THRESHOLD = 0.6
-_NAME_LIST_MIN_CJK = 6
-# 段数够多时放宽字数门槛：「慧 诹 访 郎」只有 4 个 CJK 字符，
-# 但切成 4 段本身就是 staff 罗列的形态，不可能是台词。
-_NAME_LIST_MANY_SEGMENTS = 4
-_NAME_LIST_MANY_MIN_CJK = 4
-_LATIN_RATIO_THRESHOLD = 0.6
-_LATIN_MIN_LEN = 6
-
 
 def _title_overlap(text: str, show_title: str) -> float:
     title_chars = set(show_title) - set(" 　")
@@ -77,7 +57,13 @@ def _title_overlap(text: str, show_title: str) -> float:
     return len(title_chars & set(text)) / len(title_chars)
 
 
-def is_credits(text: str, *, show_title: str = "", in_credit_window: bool = False) -> bool:
+def is_credits(
+    text: str,
+    *,
+    show_title: str = "",
+    in_credit_window: bool = False,
+    cfg: CreditsConfig = DEFAULT_CREDITS,
+) -> bool:
     """判断一行清洗后的文本是不是 staff / 版权 / 标题卡。
 
     规则 1、2a、3、6 无条件生效；规则 2b、4、5 只在片头片尾时间窗内生效，
@@ -99,13 +85,14 @@ def is_credits(text: str, *, show_title: str = "", in_credit_window: bool = Fals
             return True
 
     # 6. 标题卡
-    if _TITLE_CARD.search(stripped) and len(stripped) <= 24:
+    if _TITLE_CARD.search(stripped) and len(stripped) <= cfg.title_card_max_len:
         return True
 
     # 3. 被书名号/引号包裹且与剧名字符高度重合
     wrapped = _BRACKET_WRAPPED.match(stripped)
     if wrapped and show_title:
-        if _title_overlap(wrapped.group("inner"), show_title) >= _TITLE_OVERLAP_THRESHOLD:
+        overlap = _title_overlap(wrapped.group("inner"), show_title)
+        if overlap >= cfg.title_overlap_threshold:
             return True
 
     if not in_credit_window:
@@ -124,31 +111,36 @@ def is_credits(text: str, *, show_title: str = "", in_credit_window: bool = Fals
         cjk_count = len(re.findall(r"[\u4e00-\u9fff]", stripped))
         segment_count = len(stripped.split())
         min_cjk = (
-            _NAME_LIST_MANY_MIN_CJK
-            if segment_count >= _NAME_LIST_MANY_SEGMENTS
-            else _NAME_LIST_MIN_CJK
+            cfg.name_list_many_min_cjk
+            if segment_count >= cfg.name_list_many_segments
+            else cfg.name_list_min_cjk
         )
         if cjk_count >= min_cjk:
             return True
 
     # 5. 拉丁字母为主
     non_space = _NON_SPACE.findall(stripped)
-    if len(non_space) >= _LATIN_MIN_LEN:
+    if len(non_space) >= cfg.latin_min_len:
         latin_ratio = len(_LATIN.findall(stripped)) / len(non_space)
-        if latin_ratio > _LATIN_RATIO_THRESHOLD:
+        if latin_ratio > cfg.latin_ratio_threshold:
             return True
 
     return False
 
 
-def in_credit_window(start: float, duration: float) -> bool:
+def in_credit_window(
+    start: float, duration: float, *, cfg: CreditsConfig = DEFAULT_CREDITS
+) -> bool:
     """片头 0-300s 或片尾最后 80s。给 is_credits 的规则 4-5 开门。
 
-    片尾窗口刻意比 ED_TAIL_SECONDS 窄：黄金样本最后一句真台词在 1325.5s
-    （片长 1416.6s，距片尾 91s），ED staff 第一行在 1348.2s。80s 的阈值
-    落在两者之间的 19.8s 无字幕间隙里，两侧各留约 11s 余量。
+    这里用的是 credit_head_window / ed_keyword_window_seconds 两个独立旋钮，
+    跟聚簇用的 op_search_* / ed_cluster_tail_seconds 不共享数值：片尾窗口刻意比
+    ed_cluster_tail_seconds 窄，理由见 CreditsConfig 里的注释。
     """
-    return start <= OP_START_WINDOW[1] or start >= duration - ED_WINDOW_SECONDS
+    return (
+        start <= cfg.credit_head_window
+        or start >= duration - cfg.ed_keyword_window_seconds
+    )
 
 
 def _silent_gaps_in_window(
@@ -167,21 +159,24 @@ def _silent_gaps_in_window(
     ]
 
 
-def _op_from_silence(lines: list[DialogueLine]) -> tuple[float, float] | None:
+def _op_from_silence(
+    lines: list[DialogueLine], cfg: CreditsConfig
+) -> tuple[float, float] | None:
     """credits 聚簇算不出 OP 时的兜底。
 
     「没字幕的 OP」（字幕组一条 staff 行都没打）在聚簇法下必然漏判，
     但它整段就是一个 90 秒级的静默区，反过来比有字幕的 OP 更好认。
 
     必须「先按时长过滤、再取最长」，顺序不能反。若先取窗内最长再验时长，
-    某集片头附近只要存在一个 >OP_MAX_SILENT_SPAN 的非-OP 静区
+    某集片头附近只要存在一个 >op_max_silent_span 的非-OP 静区
     （例如整段无对白的长过场），它就会挤掉真正的 90 秒 OP 候选，
     使兜底直接返回 None——本该救回来的 OP 反而丢了。
     """
+    window = (cfg.op_search_start, cfg.op_search_end)
     candidates = [
         gap
-        for gap in _silent_gaps_in_window(lines, OP_START_WINDOW)
-        if OP_MIN_SILENT_SPAN <= gap[1] - gap[0] <= OP_MAX_SILENT_SPAN
+        for gap in _silent_gaps_in_window(lines, window)
+        if cfg.op_min_silent_span <= gap[1] - gap[0] <= cfg.op_max_silent_span
     ]
     if not candidates:
         return None
@@ -189,7 +184,10 @@ def _op_from_silence(lines: list[DialogueLine]) -> tuple[float, float] | None:
 
 
 def find_credit_ranges(
-    lines: list[DialogueLine], duration: float, max_gap: float = CLUSTER_MAX_GAP
+    lines: list[DialogueLine],
+    duration: float,
+    *,
+    cfg: CreditsConfig = DEFAULT_CREDITS,
 ) -> tuple[tuple[float, float] | None, tuple[float, float] | None]:
     """从已标记 kind=="credits" 的行推断 OP / ED 区间。
 
@@ -198,20 +196,22 @@ def find_credit_ranges(
     """
     credit_lines = [ln for ln in lines if ln.kind == "credits"]
     clusters = merge_intervals(
-        ((ln.start, ln.end) for ln in credit_lines), max_gap=max_gap
+        ((ln.start, ln.end) for ln in credit_lines), max_gap=cfg.cluster_max_gap
     )
 
     op_candidates = [
         c
         for c in clusters
-        if OP_START_WINDOW[0] <= c[0] <= OP_START_WINDOW[1]
-        and OP_SPAN_WINDOW[0] <= c[1] - c[0] <= OP_SPAN_WINDOW[1]
+        if cfg.op_search_start <= c[0] <= cfg.op_search_end
+        and cfg.op_span_min <= c[1] - c[0] <= cfg.op_span_max
     ]
     op = max(op_candidates, key=lambda c: c[1] - c[0]) if op_candidates else None
     if op is None:
-        op = _op_from_silence(lines)
+        op = _op_from_silence(lines, cfg)
 
-    ed_candidates = [c for c in clusters if c[0] >= duration - ED_TAIL_SECONDS]
+    ed_candidates = [
+        c for c in clusters if c[0] >= duration - cfg.ed_cluster_tail_seconds
+    ]
     ed = min(ed_candidates, key=lambda c: c[0]) if ed_candidates else None
 
     return op, ed

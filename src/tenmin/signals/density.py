@@ -5,15 +5,12 @@ from __future__ import annotations
 import re
 import statistics
 
+from tenmin.config import DEFAULT_SIGNALS, SignalsConfig
 from tenmin.intervals import spoken_lines
 from tenmin.models import DialogueLine, DialogueTrack, Signal
 
-LOW_DENSITY_RATIO = 0.4
-LOW_DENSITY_MIN_SECONDS = 2.0
-LOW_DENSITY_STRENGTH = 3
-SHIFT_WINDOW_SECONDS = 30.0
-SHIFT_Z_THRESHOLD = 1.5
-SHIFT_STRENGTH = 2
+# 阈值的权威定义在 tenmin.config.SignalsConfig；这个别名只为老调用点/文档保留。
+LOW_DENSITY_RATIO = DEFAULT_SIGNALS.low_density_ratio
 
 _WHITESPACE = re.compile(r"\s+")
 
@@ -40,14 +37,16 @@ def median_char_rate(track: DialogueTrack) -> float:
     return statistics.median(rates)
 
 
-def find_low_density(track: DialogueTrack) -> list[Signal]:
+def find_low_density(
+    track: DialogueTrack, *, cfg: SignalsConfig = DEFAULT_SIGNALS
+) -> list[Signal]:
     median = median_char_rate(track)
     if median <= 0:
         return []
-    threshold = median * LOW_DENSITY_RATIO
+    threshold = median * cfg.low_density_ratio
     signals: list[Signal] = []
     for line in _speech_lines(track):
-        if line.duration < LOW_DENSITY_MIN_SECONDS:
+        if line.duration < cfg.low_density_min_seconds:
             continue
         rate = char_rate(line)
         if rate >= threshold:
@@ -57,7 +56,7 @@ def find_low_density(track: DialogueTrack) -> list[Signal]:
                 start=line.start,
                 end=line.end,
                 source="low_density",
-                strength=LOW_DENSITY_STRENGTH,
+                strength=cfg.low_density_strength,
                 detail=f"density:{rate:.2f}",
                 anchor_lines=[line.idx],
             )
@@ -66,13 +65,13 @@ def find_low_density(track: DialogueTrack) -> list[Signal]:
 
 
 def find_density_shifts(
-    track: DialogueTrack,
-    window: float = SHIFT_WINDOW_SECONDS,
-    z_threshold: float = SHIFT_Z_THRESHOLD,
+    track: DialogueTrack, *, cfg: SignalsConfig = DEFAULT_SIGNALS
 ) -> list[Signal]:
     """不重叠 30s 桶 -> 每桶总字数 -> 一阶差分 -> 全局 z-score。"""
     if track.duration <= 0:
         return []
+    window = cfg.shift_window_seconds
+    z_threshold = cfg.shift_z_threshold
     bucket_count = int(track.duration // window) + 1
     buckets = [0] * bucket_count
     for line in _speech_lines(track):
@@ -104,7 +103,7 @@ def find_density_shifts(
                 start=start,
                 end=end,
                 source="density_shift",
-                strength=SHIFT_STRENGTH,
+                strength=cfg.shift_strength,
                 detail=f"shift:z={z:+.2f}",
                 anchor_lines=[],
             )
@@ -112,5 +111,7 @@ def find_density_shifts(
     return signals
 
 
-def find_density_signals(track: DialogueTrack) -> list[Signal]:
-    return [*find_low_density(track), *find_density_shifts(track)]
+def find_density_signals(
+    track: DialogueTrack, *, cfg: SignalsConfig = DEFAULT_SIGNALS
+) -> list[Signal]:
+    return [*find_low_density(track, cfg=cfg), *find_density_shifts(track, cfg=cfg)]
