@@ -230,4 +230,19 @@ def build_provider(cfg: LLMConfig, settings: Settings) -> LLMProvider:
             base_url=cfg.base_url or MINIMAX_BASE_URL,
             thinking=cfg.thinking,
         )
+    if cfg.provider == "openai_compatible":
+        if not settings.openai_compatible_api_key:
+            raise RuntimeError(
+                "缺少 API key，请设置环境变量 TENMIN_OPENAI_COMPATIBLE_API_KEY"
+            )
+        if not cfg.base_url:
+            raise ValueError(
+                "openai_compatible provider 必须在 project.yaml 里配置 llm.base_url"
+            )
+        return OpenAICompatibleProvider(
+            api_key=settings.openai_compatible_api_key,
+            model=cfg.model,
+            base_url=cfg.base_url,
+        )
+
     raise ValueError(f"不支持的 LLM provider：{cfg.provider}")

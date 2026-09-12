@@ -248,6 +248,37 @@ def test_build_provider_minimax_without_key_raises():
     assert "TENMIN_MINIMAX_API_KEY" in str(exc.value)
 
 
+def test_build_provider_returns_openai_compatible():
+    settings = Settings(openai_compatible_api_key="fake-key")
+    cfg = LLMConfig(
+        provider="openai_compatible",
+        model="deepseek-chat",
+        base_url="https://api.deepseek.com/v1",
+    )
+    provider = build_provider(cfg, settings)
+    assert isinstance(provider, OpenAICompatibleProvider)
+    assert provider.model == "deepseek-chat"
+    assert provider.base_url == "https://api.deepseek.com/v1"
+
+
+def test_build_provider_openai_compatible_without_key_raises():
+    settings = Settings(openai_compatible_api_key=None)
+    cfg = LLMConfig(
+        provider="openai_compatible", base_url="https://api.deepseek.com/v1"
+    )
+    with pytest.raises(RuntimeError) as exc:
+        build_provider(cfg, settings)
+    assert "TENMIN_OPENAI_COMPATIBLE_API_KEY" in str(exc.value)
+
+
+def test_build_provider_openai_compatible_without_base_url_raises():
+    settings = Settings(openai_compatible_api_key="fake-key")
+    cfg = LLMConfig(provider="openai_compatible", base_url=None)
+    with pytest.raises(ValueError) as exc:
+        build_provider(cfg, settings)
+    assert "base_url" in str(exc.value)
+
+
 def _sse(*payloads: dict, done: bool = True, extra_lines: tuple[str, ...] = ()) -> str:
     """按 MiniMax 的 SSE 线格式拼一个响应体。payloads 是每个 chunk 的原始 JSON。"""
     lines = [f"data: {json.dumps(p, ensure_ascii=False)}" for p in payloads]
