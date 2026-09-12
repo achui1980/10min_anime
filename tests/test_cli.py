@@ -301,6 +301,130 @@ def test_run_reports_ffmpeg_error(tmp_path, monkeypatch):
     assert "没编 libass" in result.output
 
 
+def _graceful(result) -> bool:
+    """CliRunner 对「typer.Exit(1)」和「异常逃到顶层」都给 exit_code == 1，
+    只能靠 result.exception 区分：优雅退出是 SystemExit，裸 traceback 是原异常本身。"""
+    return result.exception is None or isinstance(result.exception, SystemExit)
+
+
+def test_run_reports_script_validation_error(tmp_path, monkeypatch):
+    """ScriptValidationError 是 RuntimeError 子类，不在原捕获列表里，
+    于是 LLM 出的剧本过不了校验时用户看到一整页 traceback。"""
+    from tenmin.script.validate import ScriptValidationError
+
+    _minimal_project(tmp_path)
+
+    async def boom(cfg, provider, **kwargs):
+        raise ScriptValidationError("剧本只有 2 个 beat，少于 3 个")
+
+    monkeypatch.setattr("tenmin.cli.run_pipeline", boom)
+    monkeypatch.setattr("tenmin.cli.build_provider", lambda llm, settings: object())
+
+    result = runner.invoke(
+        app, ["run", "akujo2", "--work-dir", str(tmp_path), "--only", "script"]
+    )
+
+    assert result.exit_code == 1
+    assert _graceful(result), repr(result.exception)
+    assert "少于 3 个" in out(result)
+
+
+def test_run_reports_http_status_error(tmp_path, monkeypatch):
+    """provider 的 response.raise_for_status() 抛的 httpx.HTTPStatusError（429/5xx）
+    原先直接冒到顶层。"""
+    import httpx
+
+    _minimal_project(tmp_path)
+    request = httpx.Request("POST", "https://api.example.com/v1/chat/completions")
+    response = httpx.Response(429, request=request, text="rate limited")
+
+    async def boom(cfg, provider, **kwargs):
+        raise httpx.HTTPStatusError(
+            "Client error '429 Too Many Requests'", request=request, response=response
+        )
+
+    monkeypatch.setattr("tenmin.cli.run_pipeline", boom)
+    monkeypatch.setattr("tenmin.cli.build_provider", lambda llm, settings: object())
+
+    result = runner.invoke(
+        app, ["run", "akujo2", "--work-dir", str(tmp_path), "--only", "script"]
+    )
+
+    assert result.exit_code == 1
+    assert _graceful(result), repr(result.exception)
+    assert "429" in out(result)
+
+
+def test_run_reports_http_transport_error(tmp_path, monkeypatch):
+    """连不上/读超时走的是 httpx.TransportError，跟 HTTPStatusError 一样该被兜住。"""
+    import httpx
+
+    _minimal_project(tmp_path)
+
+    async def boom(cfg, provider, **kwargs):
+        raise httpx.ConnectError("[Errno 61] Connection refused")
+
+    monkeypatch.setattr("tenmin.cli.run_pipeline", boom)
+    monkeypatch.setattr("tenmin.cli.build_provider", lambda llm, settings: object())
+
+    result = runner.invoke(
+        app, ["run", "akujo2", "--work-dir", str(tmp_path), "--only", "script"]
+    )
+
+    assert result.exit_code == 1
+    assert _graceful(result), repr(result.exception)
+    assert "Connection refused" in out(result)
+
+
+def test_run_reports_error_type_when_message_is_empty(tmp_path, monkeypatch):
+    """httpx 的传输类异常经常 str() 为空，光 secho(str(error)) 会印一行空红字。"""
+    import httpx
+
+    _minimal_project(tmp_path)
+
+    async def boom(cfg, provider, **kwargs):
+        raise httpx.ReadTimeout("")
+
+    monkeypatch.setattr("tenmin.cli.run_pipeline", boom)
+    monkeypatch.setattr("tenmin.cli.build_provider", lambda llm, settings: object())
+
+    result = runner.invoke(
+        app, ["run", "akujo2", "--work-dir", str(tmp_path), "--only", "script"]
+    )
+
+    assert result.exit_code == 1
+    assert _graceful(result), repr(result.exception)
+    assert "ReadTimeout" in out(result)
+
+
+def test_run_reports_pydantic_validation_error(tmp_path, monkeypatch):
+    """pydantic 的 ValidationError 是 ValueError 子类，已被现有捕获列表覆盖——
+    这条只是把这个「已经没事」的事实钉住，免得后来人把 ValueError 换成更窄的类型。"""
+    from pydantic import ValidationError
+
+    from tenmin.models import Beat
+
+    _minimal_project(tmp_path)
+    try:
+        Beat.model_validate({})
+    except ValidationError as exc:
+        captured = exc
+
+    assert isinstance(captured, ValueError)
+
+    async def boom(cfg, provider, **kwargs):
+        raise captured
+
+    monkeypatch.setattr("tenmin.cli.run_pipeline", boom)
+
+    result = runner.invoke(
+        app, ["run", "akujo2", "--work-dir", str(tmp_path), "--only", "docgen"]
+    )
+
+    assert result.exit_code == 1
+    assert _graceful(result), repr(result.exception)
+
+
 def test_run_prints_mp4_path(tmp_path, monkeypatch):
     root = _minimal_project(tmp_path)
     mp4 = root / "07_render" / "E02.mp4"

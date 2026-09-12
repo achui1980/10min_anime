@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 
+import httpx
 import typer
 import yaml
 
@@ -22,9 +23,38 @@ from tenmin.render.ffmpeg import FFmpegError
 from tenmin.render.tts import build_tts_engine
 from tenmin.rich_progress import RichProgressReporter
 from tenmin.script.llm import build_provider
+from tenmin.script.validate import ScriptValidationError
 from tenmin.timecode import format_timestamp
 
 app = typer.Typer(add_completion=False, help="把番剧压成解说方案的流水线。")
+
+# run_pipeline 会抛、且已经自带一句人话的异常。逃出这张表就意味着用户看到一整页
+# traceback，所以新增会向上冒的异常类型时必须同步补这里。
+#
+# 逐条为什么在表里：
+# - NotImplementedError：mode: season 还没实现（run_pipeline 第一行就抛）。
+# - FileNotFoundError：上游产物缺失（_load_* 系列）、源片被移走。
+# - ValueError：阶段名非法、这一集没注册、没给 tts_engine，以及 **pydantic 的
+#   ValidationError**（它是 ValueError 子类，产物 json 被手改坏时走这条）。
+#   所以这里不许把 ValueError 换成更窄的类型。
+# - FFmpegError：ffmpeg 没编 libass / 编码器不存在 / 转码失败。
+# - ScriptValidationError：它是 RuntimeError 子类而不是 ValueError 子类，
+#   历史上漏在表外——LLM 出的剧本过不了 validate 时用户看的是裸 traceback。
+# - httpx.HTTPError：provider 的 raise_for_status()（429/5xx）抛的 HTTPStatusError，
+#   以及连不上/读超时的 TransportError。取它们的公共父类，免得再漏一个子类。
+PIPELINE_ERRORS = (
+    NotImplementedError,
+    FileNotFoundError,
+    ValueError,
+    FFmpegError,
+    ScriptValidationError,
+    httpx.HTTPError,
+)
+
+
+def _error_message(error: BaseException) -> str:
+    """httpx 的传输类异常经常 str() 为空（ReadTimeout('')），光印 str 会是一行空红字。"""
+    return str(error) or type(error).__name__
 
 WORK_DIR_OPTION = typer.Option(Path("work"), "--work-dir", help="项目根目录")
 
@@ -178,8 +208,8 @@ def run(
                     reporter=reporter,
                 )
             )
-    except (NotImplementedError, FileNotFoundError, ValueError, FFmpegError) as error:
-        typer.secho(str(error), fg="red", err=True)
+    except PIPELINE_ERRORS as error:
+        typer.secho(_error_message(error), fg="red", err=True)
         raise typer.Exit(code=1) from error
 
     for warning in warnings:
