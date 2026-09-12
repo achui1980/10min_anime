@@ -15,7 +15,7 @@ from tenmin.ingest.normalize import build_track
 from tenmin.models import DialogueTrack, Script, SignalReport, Timeline, VoiceTrack
 from tenmin.progress import NullProgressReporter, ProgressReporter
 from tenmin.render.audio import mix_audio
-from tenmin.render.ffmpeg import preflight, probe_duration
+from tenmin.render.ffmpeg import FFmpegError, preflight, probe_duration
 from tenmin.render.subtitles import render_ass
 from tenmin.render.timeline import build_timeline
 from tenmin.render.tts import TTSEngine, synthesize_track
@@ -127,6 +127,33 @@ def _is_fresh(outputs: list[Path], inputs: list[Path]) -> bool:
     return oldest_output >= newest_input
 
 
+def _source_duration(cfg: ProjectConfig, episode: EpisodeConfig) -> float | None:
+    """尽力拿这一集源视频的真实片长；拿不到就返回 None（让调用方退化到字幕末尾）。
+
+    刻意把所有失败都吞成 None：ingest 是唯一不需要视频的阶段，「只有 SRT」是文档里
+    写明的合法用法（`tenmin run <slug> --only ingest` 就能出对白轨与信号），绝不能
+    因为视频缺失/没装 ffprobe 就把它打死。三类失败：
+
+    - ValueError：project.yaml 的这一集没写 video（video_path 自己抛的）。
+    - 文件不在：写了 video 但文件还没到位（下载中、换过外置盘）。
+    - FFmpegError / OSError：文件在但 ffprobe 读不出（0 字节壳子、不是视频、
+      ffprobe 不在 PATH 上）。
+
+    降级是静默的：退化后的 duration 会照常写进 dialogue.json，`tenmin inspect`
+    第一行就打它，对着片长一眼能看出是不是字幕末尾。
+    """
+    try:
+        path = cfg.video_path(episode)
+    except ValueError:
+        return None
+    if not path.is_file():
+        return None
+    try:
+        return probe_duration(path)
+    except (FFmpegError, OSError):
+        return None
+
+
 def run_ingest(cfg: ProjectConfig) -> list[DialogueTrack]:
     paths = Paths(cfg.root)
     tracks = []
@@ -139,6 +166,7 @@ def run_ingest(cfg: ProjectConfig) -> list[DialogueTrack]:
             show_title=cfg.show,
             op_range=episode.op_range,
             ed_range=episode.ed_range,
+            duration=_source_duration(cfg, episode),
             ingest=cfg.ingest,
             credits=cfg.credits,
         )

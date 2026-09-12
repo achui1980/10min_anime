@@ -34,6 +34,7 @@ from tenmin.pipeline import (
     run_voice,
     stages_from,
 )
+from tenmin.render.ffmpeg import FFmpegError
 
 from .fakes import FakeProvider, FakeReporter, FakeTTSEngine
 
@@ -204,6 +205,80 @@ def test_run_ingest_detects_op_range(project):
     track = run_ingest(project)[0]
     assert track.op_range is not None
     assert track.op_range[0] == pytest.approx(153.486, abs=0.01)
+
+
+# --- run_ingest 的集长来源：视频真实时长优先，拿不到才退化到字幕末尾 ---
+
+
+def test_run_ingest_uses_real_video_duration(project, monkeypatch):
+    """字幕末尾早于片尾是常态，而 ED 窗/ED 聚簇/尾部间隙三个判定全挂在 duration 上。
+
+    run_timeline 早就在用 probe_duration 了，ingest 却一直在用 max(cue.end)。
+    """
+    video = _prepare_video(project)
+    calls: list[Path] = []
+
+    def fake_probe(path):
+        calls.append(Path(path))
+        return 1416.6
+
+    monkeypatch.setattr("tenmin.pipeline.probe_duration", fake_probe)
+
+    track = run_ingest(project)[0]
+
+    assert calls == [video]
+    assert track.duration == pytest.approx(1416.6)
+
+
+def test_run_ingest_falls_back_when_no_video_configured(project, monkeypatch):
+    """只登记了 SRT、没登记视频是合法状态，ingest 不能因此崩。"""
+
+    def boom(path):
+        raise AssertionError("没配 video 时不该去 probe")
+
+    monkeypatch.setattr("tenmin.pipeline.probe_duration", boom)
+
+    assert project.episodes[0].video is None
+    track = run_ingest(project)[0]
+    assert track.duration == pytest.approx(1416.6, abs=1.0)
+
+
+def test_run_ingest_falls_back_when_video_file_missing(project, monkeypatch):
+    """project.yaml 里写了 video 但文件还没到位（下载中/换过盘）也不能崩。"""
+    project.episodes[0].video = Path("video/E02.mkv")
+
+    def boom(path):
+        raise AssertionError("文件不存在时不该去 probe")
+
+    monkeypatch.setattr("tenmin.pipeline.probe_duration", boom)
+
+    track = run_ingest(project)[0]
+    assert track.duration == pytest.approx(1416.6, abs=1.0)
+
+
+def test_run_ingest_falls_back_when_ffprobe_fails(project, monkeypatch):
+    """文件在但 ffprobe 读不出（0 字节壳子、非视频文件、没装 ffprobe）也降级。"""
+    _prepare_video(project)
+
+    def boom(path):
+        raise FFmpegError("ffprobe 读不出时长")
+
+    monkeypatch.setattr("tenmin.pipeline.probe_duration", boom)
+
+    track = run_ingest(project)[0]
+    assert track.duration == pytest.approx(1416.6, abs=1.0)
+
+
+def test_run_ingest_falls_back_when_ffprobe_is_not_installed(project, monkeypatch):
+    """ffprobe 根本不在 PATH 上时 subprocess 抛 FileNotFoundError，同样降级。"""
+    _prepare_video(project)
+
+    def boom(path):
+        raise FileNotFoundError("ffprobe")
+
+    monkeypatch.setattr("tenmin.pipeline.probe_duration", boom)
+
+    assert run_ingest(project)[0].duration == pytest.approx(1416.6, abs=1.0)
 
 
 def test_run_signals_writes_signals_json(project):

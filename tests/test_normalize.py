@@ -84,6 +84,36 @@ def test_build_track_basic(tmp_path):
     assert track.lines[1].text == "才女的侍从"
 
 
+def test_build_track_duration_falls_back_to_last_cue_end(tmp_path):
+    """没传视频时长就退化到字幕末尾——历史行为，必须保住。"""
+    srt = tmp_path / "e01.srt"
+    srt.write_text("1\n00:00:01,000 --> 00:00:03,000\n台词\n", encoding="utf-8")
+    assert build_track(srt, episode=1).duration == pytest.approx(3.0)
+    assert build_track(srt, episode=1, duration=None).duration == pytest.approx(3.0)
+
+
+def test_build_track_prefers_explicit_duration(tmp_path):
+    """字幕通常在片尾前就结束了，视频真实时长才是集长的权威值。
+
+    ED 窗（in_credit_window）、ED 聚簇（ed_cluster_tail_seconds）、尾部无字幕间隙
+    三个判定全挂在 duration 上，用字幕末尾会让「距片尾多少秒」整体前移。
+    """
+    srt = tmp_path / "e01.srt"
+    srt.write_text("1\n00:00:01,000 --> 00:00:03,000\n台词\n", encoding="utf-8")
+    assert build_track(srt, episode=1, duration=1416.6).duration == pytest.approx(1416.6)
+
+
+def test_build_track_explicit_duration_shorter_than_cues_is_still_honoured(tmp_path):
+    """视频比字幕短（片源被裁过/字幕对不上）时也以视频为准，不悄悄取 max。
+
+    悄悄取两者较大值会让「字幕越界」这种真问题永远看不见；以视频为准至少让
+    越界的 cue 在下游表现为「落在片尾之后」，可查。
+    """
+    srt = tmp_path / "e01.srt"
+    srt.write_text("1\n00:00:01,000 --> 00:00:30,000\n台词\n", encoding="utf-8")
+    assert build_track(srt, episode=1, duration=10.0).duration == pytest.approx(10.0)
+
+
 def test_build_track_honours_explicit_ranges(tmp_path):
     srt = tmp_path / "e01.srt"
     srt.write_text("1\n00:00:01,000 --> 00:00:03,000\n台词\n", encoding="utf-8")

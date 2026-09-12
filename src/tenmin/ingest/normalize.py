@@ -118,6 +118,7 @@ def build_track(
     op_range: tuple[float, float] | None = None,
     ed_range: tuple[float, float] | None = None,
     merge_lines: bool = False,
+    duration: float | None = None,
     ingest: IngestConfig | None = None,
     credits: CreditsConfig | None = None,
 ) -> DialogueTrack:
@@ -126,6 +127,13 @@ def build_track(
     merge_lines 默认关闭。番剧字幕的 cue 通常是背靠背排的（本项目黄金样本间隔中位数
     0.001 秒）且基本不打句读，跨 cue 合并会把不同说话人黏成一条。句内折行本来就在
     cue 内部用 \\n 表示，_fold 已经处理掉了。带可靠说话人标注的字幕源才适合开启。
+
+    duration 是**这一集的真实片长**（秒），由调用方从源视频 probe 出来。传了就以它
+    为准，没传（None）才退化到 `max(cue.end)`。这个值不是可选的装饰：ED 窗
+    （in_credit_window 的 ed_keyword_window_seconds）、ED 聚簇（ed_cluster_tail_seconds）
+    与静区兜底 OP 的判定全是「距片尾多少秒」，而字幕通常在 ED staff 名单跑完前就停了，
+    用字幕末尾当片尾会把整个片尾窗系统性地往前挪。刻意**不**取两者较大值：视频比字幕
+    短（片源被裁过、字幕对不上片源）时悄悄回退到字幕值只会把这个真问题永久隐藏。
 
     ingest / credits 收全部数值阈值。刻意传整个 config 对象而不是散装参数：
     两者加起来有近 20 个旋钮，摊平成关键字参数这个签名就没法看了。
@@ -138,7 +146,8 @@ def build_track(
     # 错误的 duration 归因，而且全程不报错。O(n log n) 相对整条流水线可以忽略。
     # 实测 work/ 下 11 集素材本来就有序，排序后产物逐字节不变。
     cues = sorted(parsed.cues, key=lambda cue: (cue.start, cue.end))
-    duration = max((cue.end for cue in cues), default=0.0)
+    if duration is None:
+        duration = max((cue.end for cue in cues), default=0.0)
     lines: list[DialogueLine] = []
 
     for cue in cues:
