@@ -10,6 +10,7 @@ from tenmin.render.ffmpeg import (
     parse_names,
     preflight,
     probe_duration,
+    progress_seconds,
     run,
     run_with_progress,
     tail,
@@ -331,3 +332,82 @@ def test_run_with_progress_works_without_on_progress_callback(monkeypatch):
     )
     result = run_with_progress(["-i", "in.mp4", "out.mp4"], total_seconds=1.0)
     assert result == ""
+
+
+# --- 进度字段解析（纯函数，单独测） ---
+# 实测 ffmpeg 9 的 `-progress pipe:1` 一个块里同时发 out_time_us / out_time_ms /
+# out_time 三个字段，而且 out_time_us 排在 out_time_ms **前面**。所以三者必须是
+# 真正的「回退链」而不是各自独立处理，否则一个块会回调三次。
+
+
+def test_progress_seconds_prefers_out_time_ms():
+    fields = {"out_time_us": "1920000", "out_time_ms": "1920000", "out_time": "00:00:01.920000"}
+    assert progress_seconds(fields) == pytest.approx(1.92)
+
+
+def test_progress_seconds_falls_back_to_out_time_us():
+    """某个 build 停发 out_time_ms 时，进度条不该静默冻在 0。"""
+    assert progress_seconds({"out_time_us": "2500000"}) == pytest.approx(2.5)
+
+
+def test_progress_seconds_falls_back_to_out_time_timecode():
+    assert progress_seconds({"out_time": "01:02:03.500000"}) == pytest.approx(3723.5)
+
+
+def test_progress_seconds_skips_na_and_uses_next_field():
+    """ffmpeg 开跑瞬间会发 out_time_ms=N/A。它不该把整条回退链打死。"""
+    assert progress_seconds({"out_time_ms": "N/A", "out_time": "00:00:04.000000"}) == pytest.approx(
+        4.0
+    )
+
+
+def test_progress_seconds_returns_none_without_any_usable_field():
+    assert progress_seconds({"frame": "1", "fps": "0.00"}) is None
+    assert progress_seconds({"out_time_ms": "N/A", "out_time": "N/A"}) is None
+
+
+def test_run_with_progress_works_on_builds_that_only_send_out_time_us(monkeypatch):
+    lines = ["out_time_us=5000000\n", "progress=continue\n", "progress=end\n"]
+    monkeypatch.setattr(
+        "tenmin.render.ffmpeg.subprocess.Popen",
+        lambda args, **kwargs: FakePopen(lines),
+    )
+    seen: list[float] = []
+    run_with_progress(["-i", "in.mp4", "out.mp4"], total_seconds=20.0, on_progress=seen.append)
+    assert seen == [0.25, 1.0]
+
+
+def test_run_with_progress_reports_each_block_once_not_once_per_time_field(monkeypatch):
+    """真实 ffmpeg 一个块里三个时间字段都发，回调必须只响一次。"""
+    lines = [
+        "frame=50\n",
+        "out_time_us=1920000\n",
+        "out_time_ms=1920000\n",
+        "out_time=00:00:01.920000\n",
+        "progress=continue\n",
+    ]
+    monkeypatch.setattr(
+        "tenmin.render.ffmpeg.subprocess.Popen",
+        lambda args, **kwargs: FakePopen(lines),
+    )
+    seen: list[float] = []
+    run_with_progress(["-i", "in.mp4", "out.mp4"], total_seconds=3.84, on_progress=seen.append)
+    assert seen == [pytest.approx(0.5)]
+
+
+def test_run_with_progress_puts_progress_flag_before_the_input(monkeypatch):
+    """-progress 是全局选项，追加在输出文件名之后只是「碰巧能用」。
+
+    放到 -i 之前才是它该在的位置，也让报错里那条命令能原样粘回去复现。
+    """
+    executed: dict[str, list[str]] = {}
+
+    def fake_popen(args, **kwargs):
+        executed["args"] = list(args)
+        return FakePopen(["progress=end\n"])
+
+    monkeypatch.setattr("tenmin.render.ffmpeg.subprocess.Popen", fake_popen)
+    run_with_progress(["-y", "-i", "in.mp4", "out.mp4"], total_seconds=1.0)
+    args = executed["args"]
+    assert args.index("-progress") < args.index("-i")
+    assert args[args.index("-progress") + 1] == "pipe:1"

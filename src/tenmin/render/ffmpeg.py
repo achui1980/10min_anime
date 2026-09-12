@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 import shlex
 import subprocess
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from functools import lru_cache
 from pathlib import Path
 
@@ -28,6 +28,48 @@ class FFmpegError(RuntimeError):
 def parse_names(text: str) -> set[str]:
     """从 -filters / -encoders 的输出里抽出可用名字。"""
     return {m.group(1) for m in (_NAME_LINE.match(line) for line in text.splitlines()) if m}
+
+
+# `-progress` 一个块里的时间字段，按优先级排列。实测 ffmpeg 9 一个块同时发这三个，
+# 而且 out_time_us 排在 out_time_ms **前面** —— 所以它们必须是回退链而不是各自
+# 独立处理，否则一个块会把 on_progress 回调三次。
+#
+# out_time_ms 的名字带 "ms" 但单位是**微秒**（众所周知的 ffmpeg 老 bug/历史遗留），
+# 跟 out_time_us 同值，所以两者共用同一个除数 1_000_000。
+_MICROSECOND_KEYS = ("out_time_ms", "out_time_us")
+_TIMECODE_KEY = "out_time"
+
+
+def _parse_timecode(value: str) -> float | None:
+    """`HH:MM:SS.ffffff` → 秒。认不出返回 None（ffmpeg 会发 N/A）。"""
+    parts = value.strip().lstrip("-").split(":")
+    if len(parts) != 3:
+        return None
+    try:
+        hours, minutes, seconds = (float(p) for p in parts)
+    except ValueError:
+        return None
+    return hours * 3600 + minutes * 60 + seconds
+
+
+def progress_seconds(fields: Mapping[str, str]) -> float | None:
+    """从一个 `-progress` 块里读出「已经编码到第几秒」。读不出返回 None。
+
+    只认 out_time_ms 是个静默失效的隐患：某个 build 停发它，进度条就永远冻在 0，
+    而且没有任何警告 —— 渲染看起来卡死了，其实在正常跑。所以走回退链。
+    """
+    for key in _MICROSECOND_KEYS:
+        raw = fields.get(key)
+        if raw is None:
+            continue
+        try:
+            return int(raw) / 1_000_000
+        except ValueError:
+            continue  # N/A：换下一个字段，别把整条链打死
+    raw = fields.get(_TIMECODE_KEY)
+    if raw is None:
+        return None
+    return _parse_timecode(raw)
 
 
 def tail(text: str, lines: int = STDERR_TAIL_LINES) -> str:
@@ -159,14 +201,15 @@ def run_with_progress(
     on_progress: Callable[[float], None] | None = None,
 ) -> str:
     """跟 run() 一样跑 ffmpeg，但额外加 -progress pipe:1，流式解析进度，
-    每读到一条 out_time_ms 就换算成 0.0~1.0 的比例回调 on_progress。
+    每读完一个 progress 块就换算成 0.0~1.0 的比例回调 on_progress。
 
-    坑：ffmpeg 的 out_time_ms 字段名字带 "ms"，但实际单位是微秒（众所周知的
-    ffmpeg 老 bug/历史遗留），所以换算要除以 1_000_000 而不是 1_000。
+    时间字段的回退链见 progress_seconds。按「块」而不是按「行」回调，是因为一个块里
+    out_time_us / out_time_ms / out_time 三个字段都会发，逐行处理会把回调打三遍。
     """
-    # argv 只拼一次，Popen 与出错消息共用同一个变量。原来出错分支自己重建了一遍
-    # 字符串、且漏了 -progress pipe:1，报出来的命令不是真正跑的那条。
-    argv = [FFMPEG, *args, "-progress", "pipe:1"]
+    # -progress 是全局选项，放到 -i 之前才是它该在的位置（原来追加在输出文件名之后，
+    # 碰巧能用而已）。argv 只拼一次，Popen 与出错消息共用同一个变量：原来出错分支自己
+    # 重建了一遍字符串、且漏了 -progress pipe:1，报出来的命令不是真正跑的那条。
+    argv = [FFMPEG, "-progress", "pipe:1", *args]
     process = subprocess.Popen(
         argv,
         stdout=subprocess.PIPE,
@@ -174,22 +217,30 @@ def run_with_progress(
         text=True,
         errors="replace",
     )
+
+    def report(fields: dict[str, str]) -> None:
+        seconds = progress_seconds(fields)
+        if seconds is None or on_progress is None or total_seconds <= 0:
+            return
+        on_progress(max(0.0, min(1.0, seconds / total_seconds)))
+
+    block: dict[str, str] = {}
     for line in process.stdout:
         line = line.strip()
         if "=" not in line:
             continue
         key, _, value = line.partition("=")
-        if key == "out_time_ms":
-            try:
-                microseconds = int(value)
-            except ValueError:
-                continue
-            if on_progress is not None and total_seconds > 0:
-                fraction = microseconds / 1_000_000 / total_seconds
-                on_progress(max(0.0, min(1.0, fraction)))
-        elif key == "progress" and value == "end":
-            if on_progress is not None:
-                on_progress(1.0)
+        block[key] = value
+        if key != "progress":
+            continue
+        # `progress=continue` / `progress=end` 是块的结束标记
+        report(block)
+        if value == "end" and on_progress is not None:
+            on_progress(1.0)
+        block.clear()
+    # 没有以 progress= 收尾的残块也要报一次：ffmpeg 被 kill / 提前断流时最后那个块
+    # 是不完整的，丢掉它等于把「实际跑到哪」这条信息扔了。
+    report(block)
 
     stderr = process.stderr.read()
     returncode = process.wait()
