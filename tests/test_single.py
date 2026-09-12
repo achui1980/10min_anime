@@ -173,7 +173,7 @@ def test_glossary_block_empty_says_none():
 
 
 def test_to_script_maps_fields(cfg):
-    script = to_script(valid_llm_script(), cfg)
+    script = to_script(valid_llm_script(), cfg, 2)
     assert script.show == "才女的侍从"
     assert script.mode == "single_episode"
     assert script.episodes == [2]
@@ -186,9 +186,60 @@ def test_to_script_maps_fields(cfg):
 def test_to_script_moves_audio_fields_into_audio_direction(cfg):
     llm = valid_llm_script()
     llm.beats[0].original_audio = "mute"
-    script = to_script(llm, cfg)
+    script = to_script(llm, cfg, 2)
     assert script.beats[0].audio.original_audio == "mute"
     assert script.beats[0].audio.holds == []
+
+
+def test_to_script_records_only_the_episode_being_generated():
+    """单集流程只能记本集。原来写的是 cfg.episodes 的全部集数，于是 project.yaml 一旦
+    登记了 ≥2 集，每一集的 script.episodes 都是「全季」，对照表标题全变成「整季」。"""
+    multi = ProjectConfig.model_validate(
+        {
+            "show": "才女的侍从",
+            "slug": "saijo",
+            "target_seconds": 240,
+            "episodes": [
+                {"number": 1, "srt": "e01.srt"},
+                {"number": 2, "srt": "e02.srt"},
+                {"number": 3, "srt": "e03.srt"},
+            ],
+        }
+    )
+    script = to_script(valid_llm_script(), multi, 2)
+    assert script.episodes == [2]
+
+
+def test_multi_episode_project_table_title_is_not_season():
+    """episodes bug 的用户可见后果：对照表标题。"""
+    from tenmin.docgen.table import render_table
+
+    multi = ProjectConfig.model_validate(
+        {
+            "show": "才女的侍从",
+            "slug": "saijo",
+            "episodes": [{"number": n, "srt": f"e{n:02d}.srt"} for n in (1, 2, 3)],
+        }
+    )
+    title = render_table(to_script(valid_llm_script(), multi, 2)).splitlines()[0]
+    assert title == "# 才女的侍从 第 2 集 解说方案"
+    assert "整季" not in title
+
+
+@pytest.mark.asyncio
+async def test_generate_script_records_only_current_episode(track, report):
+    """端到端：注册了 3 集的 project，跑 E02 出来的 script.episodes 必须是 [2]。"""
+    multi = ProjectConfig.model_validate(
+        {
+            "show": "才女的侍从",
+            "slug": "saijo",
+            "target_seconds": 240,
+            "episodes": [{"number": n, "srt": f"e{n:02d}.srt"} for n in (1, 2, 3)],
+        }
+    )
+    provider = FakeProvider([valid_llm_script()])
+    script, _ = await generate_script(multi, track, report, provider)
+    assert script.episodes == [2]
 
 
 # --- generate_script ---

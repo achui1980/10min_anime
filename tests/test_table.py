@@ -1,3 +1,7 @@
+from pathlib import Path
+
+import pytest
+
 from tenmin.docgen.table import (
     LEGEND,
     escape_cell,
@@ -34,6 +38,26 @@ def script(beats, show="才女的侍从", episodes=(2,)):
 
 def test_escape_cell_escapes_pipe():
     assert escape_cell("a|b") == "a\\|b"
+
+
+def test_escape_cell_escapes_angle_brackets():
+    """narration 里的 `<` 会被 markdown 渲染器当 HTML 标签吃掉，整段文案消失。"""
+    assert escape_cell("他说<很生气>") == "他说&lt;很生气&gt;"
+
+
+def test_escape_cell_escapes_backtick():
+    assert escape_cell("按 `Enter`") == "按 \\`Enter\\`"
+
+
+def test_escape_cell_escapes_ampersand_before_entities():
+    """先转 & 再转 <>，否则原文里的 `&lt;` 会被渲染成 `<`。"""
+    assert escape_cell("A&B") == "A&amp;B"
+    assert escape_cell("&lt;") == "&amp;lt;"
+
+
+def test_escape_cell_keeps_generated_br_intact():
+    """换行转成的 <br> 是我们自己生成的标签，不能被 <> 转义连带干掉。"""
+    assert escape_cell("a\nb") == "a<br>b"
 
 
 def test_escape_cell_converts_newline_to_br():
@@ -184,3 +208,46 @@ def test_render_table_no_beats_still_renders_header():
     out = render_table(script([]))
     assert "| 节点 | 原片截取时间戳" in out
     assert "0 个节点" in out
+
+
+# --- 未知 original_audio 的兜底 ---
+
+
+def test_audio_cell_falls_back_on_unknown_original_audio():
+    """给 OriginalAudio Literal 加成员时，忘了同步 _ORIGINAL_AUDIO_LABELS 不该 KeyError。"""
+    audio = AudioDirection.model_construct(original_audio="karaoke", sfx=[], holds=[])
+    assert render_audio_cell(audio) == "原声处理 karaoke"
+
+
+# --- 估算时长的单一数据源 ---
+
+
+def test_render_table_prefers_stored_estimates():
+    """budget.apply_estimates 已经把估算写进 script.json 了，对照表不该再自己算一遍：
+    用户手改 script.json 后两个数字会不一致。"""
+    b = beat("Hook 开场", "啊" * 10, [clip(1.0, 2.0)], role="hook")
+    b.est_seconds = 123.0
+    s = script([b])
+    s.est_total_seconds = 123.0
+    assert "估算时长 2 分 3 秒" in render_table(s)
+
+
+def test_render_table_falls_back_when_estimates_missing():
+    """est_* 还是默认的 0（budget 没跑过）时回退到重算，输出与旧行为一致。"""
+    s = script([beat("Hook 开场", "啊" * 45, [clip(1.0, 2.0)], role="hook")])
+    assert s.est_total_seconds == 0.0
+    assert "估算时长 10 秒" in render_table(s)
+
+
+def test_render_table_stored_and_recomputed_agree_on_real_script():
+    """正常流程里 budget 一定跑过，两条路径必须给出同一个数字 —— 这条改动不改变现有输出。"""
+    path = Path(__file__).parent / "fixtures" / "akujo_e02.script.json"
+    if not path.exists():
+        pytest.skip("缺少 akujo_e02.script.json")
+    stored = Script.model_validate_json(path.read_text(encoding="utf-8"))
+    assert stored.est_total_seconds > 0
+    recomputed = stored.model_copy(deep=True)
+    recomputed.est_total_seconds = 0.0
+    for b in recomputed.beats:
+        b.est_seconds = 0.0
+    assert render_table(stored) == render_table(recomputed)

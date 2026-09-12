@@ -17,15 +17,9 @@ from tenmin.script.budget import apply_estimates, needs_rewrite, rewrite_instruc
 from tenmin.script.llm import LLMProvider
 from tenmin.script.prompt import load_prompt, render_prompt
 from tenmin.script.validate import ScriptValidationError, validate_script
-from tenmin.timecode import format_timestamp
+from tenmin.timecode import format_timestamp, readable_seconds
 
 SYSTEM_PROMPT = "你是一名资深番剧解说号写手。严格按要求输出 JSON，不要输出任何解释文字。"
-
-
-def _readable_duration(seconds: float) -> str:
-    minutes = int(seconds // 60)
-    rest = seconds - minutes * 60
-    return f"{minutes} 分 {rest:.0f} 秒"
 
 
 def build_dialogue_block(track: DialogueTrack) -> str:
@@ -71,7 +65,7 @@ def build_user_prompt(
         show=cfg.show,
         episode_number=track.episode,
         target_seconds=f"{cfg.target_seconds:.0f}",
-        duration_readable=_readable_duration(track.duration),
+        duration_readable=readable_seconds(track.duration),
         glossary_block=build_glossary_block(cfg.glossary),
         highlight_block=build_highlight_block(report),
         dialogue_block=build_dialogue_block(track),
@@ -79,7 +73,13 @@ def build_user_prompt(
     )
 
 
-def to_script(llm_script: LLMScript, cfg: ProjectConfig) -> Script:
+def to_script(llm_script: LLMScript, cfg: ProjectConfig, episode: int) -> Script:
+    """把 LLM 输出转成内部 Script。episode 是**本次生成的那一集**。
+
+    原来这里写的是 `[e.number for e in cfg.episodes]`，把 project.yaml 登记的全部集数都
+    塞进单集的 Script.episodes；配上 docgen/table.py 的 `len(script.episodes) == 1` 判断，
+    project 只要登记了 ≥2 集，每一集的对照表标题都会变成「整季 解说方案」。
+    """
     beats = []
     for llm_beat in llm_script.beats:
         beats.append(
@@ -108,7 +108,7 @@ def to_script(llm_script: LLMScript, cfg: ProjectConfig) -> Script:
     return Script(
         show=cfg.show,
         mode="single_episode",
-        episodes=[episode.number for episode in cfg.episodes],
+        episodes=[episode],
         target_seconds=cfg.target_seconds,
         beats=beats,
     )
@@ -127,7 +127,7 @@ async def generate_script(
 
     async def draft(prompt: str) -> tuple[Script, list[str]]:
         llm_script = await provider.complete(SYSTEM_PROMPT, prompt, LLMScript)
-        result = validate_script(to_script(llm_script, cfg), tracks, reports)
+        result = validate_script(to_script(llm_script, cfg, track.episode), tracks, reports)
         return apply_estimates(result.script), list(result.warnings)
 
     try:
