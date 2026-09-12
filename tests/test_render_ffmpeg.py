@@ -228,9 +228,9 @@ def test_has_filter_and_has_encoder(monkeypatch):
 def test_preflight_reports_missing_libass(monkeypatch, tmp_path):
     video = tmp_path / "E02.mkv"
     video.write_bytes(b"fake")
-    monkeypatch.setattr("tenmin.render.ffmpeg.has_filter", lambda name: False)
-    monkeypatch.setattr("tenmin.render.ffmpeg.has_encoder", lambda name: True)
-    monkeypatch.setattr("tenmin.render.ffmpeg.probe_duration", lambda path: 100.0)
+    monkeypatch.setattr("tenmin.render.ffmpeg.has_filter", lambda name, **_: False)
+    monkeypatch.setattr("tenmin.render.ffmpeg.has_encoder", lambda name, **_: True)
+    monkeypatch.setattr("tenmin.render.ffmpeg.probe_duration", lambda path, **_: 100.0)
     with pytest.raises(RuntimeError) as exc:
         preflight(video, "libx264")
     assert "libass" in str(exc.value)
@@ -239,17 +239,17 @@ def test_preflight_reports_missing_libass(monkeypatch, tmp_path):
 def test_preflight_reports_missing_encoder(monkeypatch, tmp_path):
     video = tmp_path / "E02.mkv"
     video.write_bytes(b"fake")
-    monkeypatch.setattr("tenmin.render.ffmpeg.has_filter", lambda name: True)
-    monkeypatch.setattr("tenmin.render.ffmpeg.has_encoder", lambda name: False)
-    monkeypatch.setattr("tenmin.render.ffmpeg.probe_duration", lambda path: 100.0)
+    monkeypatch.setattr("tenmin.render.ffmpeg.has_filter", lambda name, **_: True)
+    monkeypatch.setattr("tenmin.render.ffmpeg.has_encoder", lambda name, **_: False)
+    monkeypatch.setattr("tenmin.render.ffmpeg.probe_duration", lambda path, **_: 100.0)
     with pytest.raises(RuntimeError) as exc:
         preflight(video, "h264_videotoolbox")
     assert "h264_videotoolbox" in str(exc.value)
 
 
 def test_preflight_reports_missing_video(monkeypatch, tmp_path):
-    monkeypatch.setattr("tenmin.render.ffmpeg.has_filter", lambda name: True)
-    monkeypatch.setattr("tenmin.render.ffmpeg.has_encoder", lambda name: True)
+    monkeypatch.setattr("tenmin.render.ffmpeg.has_filter", lambda name, **_: True)
+    monkeypatch.setattr("tenmin.render.ffmpeg.has_encoder", lambda name, **_: True)
     with pytest.raises(FileNotFoundError) as exc:
         preflight(tmp_path / "missing.mkv", "libx264")
     assert "missing.mkv" in str(exc.value)
@@ -258,9 +258,9 @@ def test_preflight_reports_missing_video(monkeypatch, tmp_path):
 def test_preflight_returns_source_duration(monkeypatch, tmp_path):
     video = tmp_path / "E02.mkv"
     video.write_bytes(b"fake")
-    monkeypatch.setattr("tenmin.render.ffmpeg.has_filter", lambda name: True)
-    monkeypatch.setattr("tenmin.render.ffmpeg.has_encoder", lambda name: True)
-    monkeypatch.setattr("tenmin.render.ffmpeg.probe_duration", lambda path: 1425.5)
+    monkeypatch.setattr("tenmin.render.ffmpeg.has_filter", lambda name, **_: True)
+    monkeypatch.setattr("tenmin.render.ffmpeg.has_encoder", lambda name, **_: True)
+    monkeypatch.setattr("tenmin.render.ffmpeg.probe_duration", lambda path, **_: 1425.5)
     assert preflight(video, "libx264") == pytest.approx(1425.5)
 
 
@@ -411,3 +411,93 @@ def test_run_with_progress_puts_progress_flag_before_the_input(monkeypatch):
     args = executed["args"]
     assert args.index("-progress") < args.index("-i")
     assert args[args.index("-progress") + 1] == "pipe:1"
+
+
+# --- 可执行文件路径可覆盖（RenderConfig.ffmpeg_path / ffprobe_path 的接线） ---
+# 用户常有两个 ffmpeg 装（本项目自己就有「哪个编了 libass」的痛点），必须能指定用哪个。
+
+
+def test_run_uses_configured_ffmpeg_path(monkeypatch):
+    seen = {}
+
+    def fake_run(args, **kwargs):
+        seen["args"] = args
+        return FakeCompleted()
+
+    monkeypatch.setattr("tenmin.render.ffmpeg.subprocess.run", fake_run)
+    run(["-i", "a.mkv"], ffmpeg="/opt/custom/bin/ffmpeg")
+    assert seen["args"][0] == "/opt/custom/bin/ffmpeg"
+
+
+def test_run_with_progress_uses_configured_ffmpeg_path(monkeypatch):
+    seen = {}
+
+    def fake_popen(args, **kwargs):
+        seen["args"] = list(args)
+        return FakePopen(["progress=end\n"])
+
+    monkeypatch.setattr("tenmin.render.ffmpeg.subprocess.Popen", fake_popen)
+    run_with_progress(["-i", "in.mp4", "out.mp4"], total_seconds=1.0, ffmpeg="/opt/x/ffmpeg")
+    assert seen["args"][0] == "/opt/x/ffmpeg"
+
+
+def test_probe_duration_uses_configured_ffprobe_path(monkeypatch, tmp_path):
+    media = tmp_path / "a.mkv"
+    media.write_bytes(b"fake")
+    seen = {}
+
+    def fake_run(args, **kwargs):
+        seen["args"] = args
+        return FakeCompleted(stdout="12.5\n")
+
+    monkeypatch.setattr("tenmin.render.ffmpeg.subprocess.run", fake_run)
+    probe_duration(media, ffprobe="/opt/x/ffprobe")
+    assert seen["args"][0] == "/opt/x/ffprobe"
+
+
+def test_available_filters_cache_is_keyed_by_binary(monkeypatch):
+    """lru_cache 必须按可执行文件路径做 key，否则两个 ffmpeg 会互相冒充。"""
+    from tenmin.render import ffmpeg as ffmpeg_mod
+
+    calls: list[str] = []
+
+    def fake_run(args, **kwargs):
+        calls.append(args[0])
+        return FakeCompleted(stdout=FILTERS_SAMPLE)
+
+    monkeypatch.setattr("tenmin.render.ffmpeg.subprocess.run", fake_run)
+    ffmpeg_mod.available_filters.cache_clear()
+    try:
+        assert "subtitles" in ffmpeg_mod.available_filters("/opt/a/ffmpeg")
+        assert "subtitles" in ffmpeg_mod.available_filters("/opt/a/ffmpeg")
+        assert "subtitles" in ffmpeg_mod.available_filters("/opt/b/ffmpeg")
+    finally:
+        ffmpeg_mod.available_filters.cache_clear()
+    # 同一个 binary 只探一次，不同 binary 各探一次
+    assert calls == ["/opt/a/ffmpeg", "/opt/b/ffmpeg"]
+
+
+def test_preflight_threads_configured_binaries_through(monkeypatch, tmp_path):
+    video = tmp_path / "E02.mkv"
+    video.write_bytes(b"fake")
+    seen: dict[str, str] = {}
+
+    def fake_has_filter(name, *, ffmpeg="ffmpeg"):
+        seen["filter_ffmpeg"] = ffmpeg
+        return True
+
+    def fake_has_encoder(name, *, ffmpeg="ffmpeg"):
+        seen["encoder_ffmpeg"] = ffmpeg
+        return True
+
+    def fake_probe(path, *, ffprobe="ffprobe"):
+        seen["probe_ffprobe"] = ffprobe
+        return 100.0
+
+    monkeypatch.setattr("tenmin.render.ffmpeg.has_filter", fake_has_filter)
+    monkeypatch.setattr("tenmin.render.ffmpeg.has_encoder", fake_has_encoder)
+    monkeypatch.setattr("tenmin.render.ffmpeg.probe_duration", fake_probe)
+    preflight(video, "libx264", ffmpeg="/opt/x/ffmpeg", ffprobe="/opt/x/ffprobe")
+    assert seen["filter_ffmpeg"] == "/opt/x/ffmpeg"
+    assert seen["encoder_ffmpeg"] == "/opt/x/ffmpeg"
+    assert seen["probe_ffprobe"] == "/opt/x/ffprobe"

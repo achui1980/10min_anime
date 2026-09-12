@@ -216,7 +216,7 @@ def test_mix_audio_runs_ffmpeg_and_returns_path(tmp_path, monkeypatch):
 
     seen: list[list[str]] = []
 
-    def fake_run(args):
+    def fake_run(args, **_):
         seen.append(list(args))
         return ""
 
@@ -238,3 +238,26 @@ def test_mix_audio_runs_ffmpeg_and_returns_path(tmp_path, monkeypatch):
 
 def test_mix_audio_is_exported():
     assert callable(mix_audio)
+
+
+def test_mix_audio_passes_configured_ffmpeg_binary(tmp_path, monkeypatch):
+    """RenderConfig.ffmpeg_path 必须真的传到 subprocess，不然那个旋钮是哑的。"""
+    from tenmin.render import audio as audio_module
+
+    seen: dict[str, str] = {}
+
+    def fake_run(args, *, ffmpeg="ffmpeg"):
+        seen["ffmpeg"] = ffmpeg
+        return ""
+
+    monkeypatch.setattr(audio_module, "run", fake_run)
+    audio_module.mix_audio(
+        video=tmp_path / "source.mkv",
+        timeline=make_timeline(),
+        track=make_track(),
+        voice_dir=tmp_path / "04_voice" / "E02",
+        out_path=tmp_path / "06_audio" / "E02.mixed.m4a",
+        duck_db=-12.0,
+        ffmpeg="/opt/libass/bin/ffmpeg",
+    )
+    assert seen["ffmpeg"] == "/opt/libass/bin/ffmpeg"

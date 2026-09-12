@@ -216,7 +216,7 @@ def _source_duration(cfg: ProjectConfig, episode: EpisodeConfig) -> float | None
     if not path.is_file():
         return None
     try:
-        return probe_duration(path)
+        return probe_duration(path, ffprobe=cfg.render.ffprobe_path)
     except (FFmpegError, OSError):
         return None
 
@@ -479,7 +479,9 @@ def run_timeline(
     script = _load_script(cfg, episode)
     track = _load_voice(cfg, episode)
     if source_duration is None:
-        source_duration = probe_duration(cfg.video_path(episode_cfg))
+        source_duration = probe_duration(
+            cfg.video_path(episode_cfg), ffprobe=cfg.render.ffprobe_path
+        )
     timeline, warnings = build_timeline(script, track, source_duration)
     _write_json(paths.timeline(episode), timeline.model_dump_json(indent=2))
     _write_text(
@@ -509,6 +511,7 @@ def run_audio(cfg: ProjectConfig, episode: int) -> Path:
         duck_db=cfg.render.duck_db,
         fade_out_seconds=cfg.render.fade_out_seconds,
         outro_seconds=cfg.render.outro_card_seconds,
+        ffmpeg=cfg.render.ffmpeg_path,
     )
 
 
@@ -538,6 +541,7 @@ def run_render(
         outro_title=f"{cfg.show} · EP{episode:02d}",
         outro_message=cfg.render.outro_message,
         reporter=reporter,
+        ffmpeg=cfg.render.ffmpeg_path,
     )
 
 
@@ -623,7 +627,12 @@ async def run_pipeline(
     # token 之前就把「ffmpeg 不行」喊出来。
     if {"audio", "render"} & set(wanted):
         for number in target_numbers:
-            preflight(cfg.video_path(_find_episode(cfg, number)), cfg.render.video_encoder)
+            preflight(
+                cfg.video_path(_find_episode(cfg, number)),
+                cfg.render.video_encoder,
+                ffmpeg=cfg.render.ffmpeg_path,
+                ffprobe=cfg.render.ffprobe_path,
+            )
 
     for number in target_numbers:
         if episode is None:

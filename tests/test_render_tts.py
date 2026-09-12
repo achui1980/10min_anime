@@ -334,7 +334,7 @@ async def test_edge_engine_synthesizes_into_a_part_file_then_renames(tmp_path, m
     """edge_tts 的 save() 是流式 open(fname,"wb")，中断就留一个截断的 mp3。
     所以正式路径上永远只能出现「已经体检过」的文件。"""
     stub = _stub_edge_tts(monkeypatch)
-    monkeypatch.setattr(tts_module, "probe_duration", lambda path: 2.0)
+    monkeypatch.setattr(tts_module, "probe_duration", lambda path, **_: 2.0)
     out = tmp_path / "chunk_001.mp3"
 
     duration = await EdgeTTSEngine().synthesize("第一句。", out)
@@ -347,7 +347,7 @@ async def test_edge_engine_synthesizes_into_a_part_file_then_renames(tmp_path, m
 
 async def test_edge_engine_leaves_nothing_behind_when_save_fails(tmp_path, monkeypatch):
     _stub_edge_tts(monkeypatch, behaviour="boom")
-    monkeypatch.setattr(tts_module, "probe_duration", lambda path: 2.0)
+    monkeypatch.setattr(tts_module, "probe_duration", lambda path, **_: 2.0)
     out = tmp_path / "chunk_001.mp3"
 
     with pytest.raises(ConnectionResetError):
@@ -359,7 +359,7 @@ async def test_edge_engine_leaves_nothing_behind_when_save_fails(tmp_path, monke
 
 async def test_edge_engine_rejects_zero_duration_audio(tmp_path, monkeypatch):
     _stub_edge_tts(monkeypatch)
-    monkeypatch.setattr(tts_module, "probe_duration", lambda path: 0.0)
+    monkeypatch.setattr(tts_module, "probe_duration", lambda path, **_: 0.0)
     out = tmp_path / "chunk_001.mp3"
 
     with pytest.raises(TTSError):
@@ -372,7 +372,7 @@ async def test_edge_engine_rejects_zero_duration_audio(tmp_path, monkeypatch):
 async def test_edge_engine_rejects_truncated_audio(tmp_path, monkeypatch):
     """90 字的旁白按 4.5 字/秒该有 20 秒；只出 1 秒说明流被截断了。"""
     _stub_edge_tts(monkeypatch)
-    monkeypatch.setattr(tts_module, "probe_duration", lambda path: 1.0)
+    monkeypatch.setattr(tts_module, "probe_duration", lambda path, **_: 1.0)
     with pytest.raises(TTSError) as exc:
         await EdgeTTSEngine().synthesize("一" * 90, tmp_path / "chunk_001.mp3")
     assert "时长" in str(exc.value)
@@ -380,7 +380,7 @@ async def test_edge_engine_rejects_truncated_audio(tmp_path, monkeypatch):
 
 async def test_edge_engine_rejects_absurdly_long_audio(tmp_path, monkeypatch):
     _stub_edge_tts(monkeypatch)
-    monkeypatch.setattr(tts_module, "probe_duration", lambda path: 300.0)
+    monkeypatch.setattr(tts_module, "probe_duration", lambda path, **_: 300.0)
     with pytest.raises(TTSError):
         await EdgeTTSEngine().synthesize("一" * 90, tmp_path / "chunk_001.mp3")
 
@@ -399,19 +399,19 @@ async def test_edge_engine_rejects_absurdly_long_audio(tmp_path, monkeypatch):
 )
 async def test_edge_engine_accepts_real_world_durations(tmp_path, monkeypatch, text, duration):
     _stub_edge_tts(monkeypatch)
-    monkeypatch.setattr(tts_module, "probe_duration", lambda path: duration)
+    monkeypatch.setattr(tts_module, "probe_duration", lambda path, **_: duration)
     assert await EdgeTTSEngine().synthesize(text, tmp_path / "c.mp3") == duration
 
 
 async def test_edge_engine_duration_band_follows_the_rate(tmp_path, monkeypatch):
     """rate=+100% 是两倍速，同样的字数只该出一半时长。"""
     _stub_edge_tts(monkeypatch)
-    monkeypatch.setattr(tts_module, "probe_duration", lambda path: 10.0)
+    monkeypatch.setattr(tts_module, "probe_duration", lambda path, **_: 10.0)
     # 90 字 / 4.5 = 20 秒；+100% 后期望 10 秒，10.0 正中靶心。
     assert await EdgeTTSEngine(rate="+100%").synthesize("一" * 90, tmp_path / "a.mp3") == 10.0
     # 同样 10 秒在 +0% 下也仍在 band 内（下界 20*0.5-2 = 8），所以要用一个更极端的值
     # 才能证明 rate 真的进了公式：0% 时 40 秒偏高（上界 32），100% 时 40 秒更偏高。
-    monkeypatch.setattr(tts_module, "probe_duration", lambda path: 5.0)
+    monkeypatch.setattr(tts_module, "probe_duration", lambda path, **_: 5.0)
     with pytest.raises(TTSError):
         # +0% 下 5 秒远低于下界 8 秒。
         await EdgeTTSEngine(rate="+0%").synthesize("一" * 90, tmp_path / "b.mp3")
@@ -421,7 +421,7 @@ async def test_edge_engine_duration_band_follows_the_rate(tmp_path, monkeypatch)
 
 async def test_edge_engine_passes_proxy_and_timeouts_to_communicate(tmp_path, monkeypatch):
     stub = _stub_edge_tts(monkeypatch)
-    monkeypatch.setattr(tts_module, "probe_duration", lambda path: 2.0)
+    monkeypatch.setattr(tts_module, "probe_duration", lambda path, **_: 2.0)
     engine = EdgeTTSEngine(
         voice="zh-CN-XiaoxiaoNeural",
         rate="+10%",
@@ -441,7 +441,7 @@ async def test_edge_engine_passes_proxy_and_timeouts_to_communicate(tmp_path, mo
 async def test_edge_engine_gives_up_on_a_stalled_chunk(tmp_path, monkeypatch):
     """edge-tts 内部的 sock_read=60 只管单次读，涓涓细流能挂远超 60 秒。"""
     _stub_edge_tts(monkeypatch, behaviour="stall")
-    monkeypatch.setattr(tts_module, "probe_duration", lambda path: 2.0)
+    monkeypatch.setattr(tts_module, "probe_duration", lambda path, **_: 2.0)
     out = tmp_path / "chunk_001.mp3"
 
     with pytest.raises(TTSError) as exc:
@@ -458,7 +458,7 @@ async def test_edge_engine_probes_duration_off_the_event_loop(tmp_path, monkeypa
     _stub_edge_tts(monkeypatch)
     threads: list[int] = []
 
-    def spy(path):
+    def spy(path, **_):
         threads.append(threading.get_ident())
         return 2.0
 
@@ -529,7 +529,7 @@ async def test_reuse_prefers_the_duration_recorded_in_voice_json(tmp_path, monke
         sample_script(), 2, tmp_path, FakeTTSEngine([3.0, 4.0, 5.0])
     )
 
-    def boom(path):
+    def boom(path, **_):
         raise AssertionError("时长已经记在 voice.json 里了，不该再 spawn ffprobe")
 
     monkeypatch.setattr("tenmin.render.tts.probe_duration", boom)
@@ -543,7 +543,7 @@ async def test_reuse_probes_when_the_duration_is_not_recorded(tmp_path, monkeypa
     await synthesize_track(sample_script(), 2, tmp_path, FakeTTSEngine([3.0, 4.0, 5.0]))
     probed: list[Path] = []
 
-    def spy(path):
+    def spy(path, **_):
         probed.append(path)
         return 9.0
 
@@ -580,7 +580,7 @@ async def test_duplicate_text_in_one_run_reuses_without_probing(tmp_path, monkey
         ],
     )
 
-    def boom(path):
+    def boom(path, **_):
         raise AssertionError("这一轮刚合成过它，时长在内存里，不该 spawn ffprobe")
 
     monkeypatch.setattr("tenmin.render.tts.probe_duration", boom)
@@ -693,3 +693,42 @@ def test_normal_text_stays_pronounceable(text):
 @pytest.mark.parametrize("text", ["'", "——", "，、。", "「」", "  ", "…"])
 def test_punctuation_only_text_is_not_pronounceable(text):
     assert not tts_module._is_pronounceable(text)
+
+
+def test_edge_engine_uses_configured_ffprobe(monkeypatch, tmp_path):
+    """voice 阶段的时长体检也要用 render.ffprobe_path。
+
+    不接线的话「PATH 上没有 ffprobe、只配了 ffprobe_path」的用户会看到 render 能跑
+    但 voice 阶段炸 —— 半接线比不接线更难查。
+    """
+    from tenmin.render import tts as tts_module
+
+    seen: dict[str, str] = {}
+
+    def fake_probe(path, *, ffprobe="ffprobe"):
+        seen["ffprobe"] = ffprobe
+        return 2.0
+
+    monkeypatch.setattr(tts_module, "probe_duration", fake_probe)
+
+    class _FakeCommunicate:
+        def __init__(self, *a, **k):
+            pass
+
+        async def save(self, path):
+            Path(path).write_bytes(b"mp3")
+
+    monkeypatch.setitem(
+        __import__("sys").modules, "edge_tts", type("m", (), {"Communicate": _FakeCommunicate})
+    )
+    engine = tts_module.EdgeTTSEngine(ffprobe="/opt/x/ffprobe")
+    asyncio.run(engine.synthesize("九个字的一句话", tmp_path / "c.mp3"))
+    assert seen["ffprobe"] == "/opt/x/ffprobe"
+
+
+def test_build_tts_engine_wires_ffprobe_path():
+    from tenmin.config import RenderConfig
+    from tenmin.render.tts import build_tts_engine
+
+    engine = build_tts_engine(RenderConfig(ffprobe_path="/opt/x/ffprobe"))
+    assert engine.ffprobe == "/opt/x/ffprobe"

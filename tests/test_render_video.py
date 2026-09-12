@@ -185,7 +185,7 @@ def test_render_video_runs_ffmpeg_and_returns_path(tmp_path, monkeypatch):
 
     seen: list[list[str]] = []
 
-    def fake_run_with_progress(args, *, total_seconds, on_progress=None):
+    def fake_run_with_progress(args, *, total_seconds, on_progress=None, **_):
         seen.append(list(args))
         return ""
 
@@ -211,7 +211,7 @@ def test_render_video_reports_substep_progress(tmp_path, monkeypatch):
 
     captured: dict[str, float] = {}
 
-    def fake_run_with_progress(args, *, total_seconds, on_progress=None):
+    def fake_run_with_progress(args, *, total_seconds, on_progress=None, **_):
         captured["total_seconds"] = total_seconds
         if on_progress is not None:
             on_progress(0.5)
@@ -230,3 +230,26 @@ def test_render_video_reports_substep_progress(tmp_path, monkeypatch):
     )
     assert captured["total_seconds"] == pytest.approx(30.0)
     assert reporter.calls == [("substep", "render", 50, 100, "")]
+
+
+def test_render_video_passes_configured_ffmpeg_binary(tmp_path, monkeypatch):
+    """RenderConfig.ffmpeg_path 必须真的传到 subprocess，不然那个旋钮是哑的。"""
+    from tenmin.render import video as video_module
+
+    seen: dict[str, str] = {}
+
+    def fake_run_with_progress(args, *, total_seconds, on_progress=None, ffmpeg="ffmpeg"):
+        seen["ffmpeg"] = ffmpeg
+        return ""
+
+    monkeypatch.setattr(video_module, "run_with_progress", fake_run_with_progress)
+    render_video(
+        video=tmp_path / "source.mkv",
+        timeline=make_timeline(),
+        audio=tmp_path / "06_audio" / "E02.mixed.m4a",
+        ass=tmp_path / "05_timeline" / "E02.ass",
+        out_path=tmp_path / "07_render" / "E02.mp4",
+        encoder="libx264",
+        ffmpeg="/opt/libass/bin/ffmpeg",
+    )
+    assert seen["ffmpeg"] == "/opt/libass/bin/ffmpeg"

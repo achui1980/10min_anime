@@ -97,7 +97,7 @@ def tail(text: str, lines: int = STDERR_TAIL_LINES) -> str:
     return "\n".join(visible[-lines:])
 
 
-def run(args: list[str]) -> str:
+def run(args: list[str], *, ffmpeg: str = FFMPEG) -> str:
     """跑 ffmpeg，返回 stderr（ffmpeg 的进度与日志都在 stderr）。
 
     source 视频的容器元数据（title/album/description 等标签）常年是老字幕组用非
@@ -105,7 +105,7 @@ def run(args: list[str]) -> str:
     UTF-8 解码遇到这种输入必炸——所以这里用 errors="replace"，脏字节换成 U+FFFD，
     不让一段无关的元数据把整条渲染流水线搞挂。
     """
-    argv = [FFMPEG, *args]
+    argv = [ffmpeg, *args]
     completed = subprocess.run(
         argv, capture_output=True, text=True, errors="replace"
     )
@@ -118,10 +118,10 @@ def run(args: list[str]) -> str:
     return completed.stderr
 
 
-def probe_duration(path: Path) -> float:
+def probe_duration(path: Path, *, ffprobe: str = FFPROBE) -> float:
     """用 ffprobe 读时长（秒）。"""
     args = [
-        FFPROBE,
+        ffprobe,
         "-v",
         "error",
         "-show_entries",
@@ -144,54 +144,62 @@ def probe_duration(path: Path) -> float:
         ) from error
 
 
-@lru_cache(maxsize=1)
-def available_filters() -> set[str]:
+# maxsize 从 1 提到 8：key 是可执行文件路径，而 preflight 在批量模式下每集都调。
+# 写死 1 的话，只要有人在同一个进程里交替问两个 ffmpeg，缓存就退化成每次重探。
+@lru_cache(maxsize=8)
+def available_filters(ffmpeg: str = FFMPEG) -> frozenset[str]:
+    """这个 ffmpeg 编进了哪些滤镜。**按可执行文件路径缓存**，两个 ffmpeg 不会互相冒充。"""
+    return _probe_capabilities(ffmpeg, "-filters")
+
+
+@lru_cache(maxsize=8)
+def available_encoders(ffmpeg: str = FFMPEG) -> frozenset[str]:
+    """这个 ffmpeg 编进了哪些编码器。同样按可执行文件路径缓存。"""
+    return _probe_capabilities(ffmpeg, "-encoders")
+
+
+def _probe_capabilities(ffmpeg: str, flag: str) -> frozenset[str]:
     completed = subprocess.run(
-        [FFMPEG, "-hide_banner", "-filters"],
+        [ffmpeg, "-hide_banner", flag],
         capture_output=True,
         text=True,
         errors="replace",
     )
-    return parse_names(completed.stdout)
+    return frozenset(parse_names(completed.stdout))
 
 
-@lru_cache(maxsize=1)
-def available_encoders() -> set[str]:
-    completed = subprocess.run(
-        [FFMPEG, "-hide_banner", "-encoders"],
-        capture_output=True,
-        text=True,
-        errors="replace",
-    )
-    return parse_names(completed.stdout)
+def has_filter(name: str, *, ffmpeg: str = FFMPEG) -> bool:
+    return name in available_filters(ffmpeg)
 
 
-def has_filter(name: str) -> bool:
-    return name in available_filters()
+def has_encoder(name: str, *, ffmpeg: str = FFMPEG) -> bool:
+    return name in available_encoders(ffmpeg)
 
 
-def has_encoder(name: str) -> bool:
-    return name in available_encoders()
-
-
-def preflight(video: Path, video_encoder: str) -> float:
+def preflight(
+    video: Path,
+    video_encoder: str,
+    *,
+    ffmpeg: str = FFMPEG,
+    ffprobe: str = FFPROBE,
+) -> float:
     """开跑前一次性检查，返回源片时长。任一项不满足立刻抛错。
 
     渲染动辄几分钟，绝不能跑完 TTS 才在最后一步炸掉。
     """
-    if not has_filter("subtitles"):
+    if not has_filter("subtitles", ffmpeg=ffmpeg):
         raise RuntimeError(
             "你的 ffmpeg 没编 libass，subtitles 滤镜不可用，烧不了字幕。\n"
             "请重装：brew install homebrew-ffmpeg/ffmpeg/ffmpeg --with-libass"
         )
-    if not has_encoder(video_encoder):
+    if not has_encoder(video_encoder, ffmpeg=ffmpeg):
         raise RuntimeError(
             f"你的 ffmpeg 没有编码器 {video_encoder}，请改 project.yaml 的 render.video_encoder，"
             "或重装 ffmpeg"
         )
     if not Path(video).is_file():
         raise FileNotFoundError(f"找不到源视频 {video}，请检查 project.yaml 的 episodes[].video")
-    return probe_duration(Path(video))
+    return probe_duration(Path(video), ffprobe=ffprobe)
 
 
 def run_with_progress(
@@ -199,6 +207,7 @@ def run_with_progress(
     *,
     total_seconds: float,
     on_progress: Callable[[float], None] | None = None,
+    ffmpeg: str = FFMPEG,
 ) -> str:
     """跟 run() 一样跑 ffmpeg，但额外加 -progress pipe:1，流式解析进度，
     每读完一个 progress 块就换算成 0.0~1.0 的比例回调 on_progress。
@@ -209,7 +218,7 @@ def run_with_progress(
     # -progress 是全局选项，放到 -i 之前才是它该在的位置（原来追加在输出文件名之后，
     # 碰巧能用而已）。argv 只拼一次，Popen 与出错消息共用同一个变量：原来出错分支自己
     # 重建了一遍字符串、且漏了 -progress pipe:1，报出来的命令不是真正跑的那条。
-    argv = [FFMPEG, "-progress", "pipe:1", *args]
+    argv = [ffmpeg, "-progress", "pipe:1", *args]
     process = subprocess.Popen(
         argv,
         stdout=subprocess.PIPE,

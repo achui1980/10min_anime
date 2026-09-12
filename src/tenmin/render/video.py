@@ -139,6 +139,7 @@ def render_video(
     outro_title: str = "",
     outro_message: str = "",
     reporter: ProgressReporter | None = None,
+    ffmpeg: str = DEFAULT_RENDER.ffmpeg_path,
 ) -> Path:
     """真跑 ffmpeg 渲染，返回成品路径。"""
     reporter = reporter or NullProgressReporter()
@@ -162,5 +163,7 @@ def render_video(
     def _on_progress(fraction: float) -> None:
         reporter.substep("render", int(fraction * 100), 100, "")
 
-    run_with_progress(args, total_seconds=total_seconds, on_progress=_on_progress)
+    run_with_progress(
+        args, total_seconds=total_seconds, on_progress=_on_progress, ffmpeg=ffmpeg
+    )
     return out_path

@@ -10,7 +10,7 @@ import unicodedata
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
-from tenmin.config import RenderConfig
+from tenmin.config import DEFAULT_RENDER, RenderConfig
 from tenmin.models import Beat, Script, VoiceChunk, VoiceTrack
 from tenmin.progress import NullProgressReporter, ProgressReporter
 from tenmin.render.chunks import plan_chunks
@@ -139,6 +139,7 @@ class EdgeTTSEngine:
         connect_timeout: int = 10,
         receive_timeout: int = 60,
         chunk_timeout_seconds: float = 300.0,
+        ffprobe: str = DEFAULT_RENDER.ffprobe_path,
     ) -> None:
         self.voice = voice
         self.rate = rate
@@ -146,6 +147,7 @@ class EdgeTTSEngine:
         self.connect_timeout = connect_timeout
         self.receive_timeout = receive_timeout
         self.chunk_timeout_seconds = chunk_timeout_seconds
+        self.ffprobe = ffprobe
 
     @property
     def fingerprint(self) -> str:
@@ -183,7 +185,7 @@ class EdgeTTSEngine:
                 ) from error
             # 阻塞的 subprocess，必须扔到线程里：直接 await 不了，直接调会把事件循环
             # 整个卡住（P2-B 的 TTS 并发化就完全白做）。
-            duration = await asyncio.to_thread(probe_duration, part_path)
+            duration = await asyncio.to_thread(probe_duration, part_path, ffprobe=self.ffprobe)
             lower, upper = _duration_bounds(text, self.rate)
             if duration <= 0 or not (lower <= duration <= upper):
                 raise TTSError(
@@ -206,6 +208,7 @@ def build_tts_engine(cfg: RenderConfig) -> TTSEngine:
         connect_timeout=cfg.tts_connect_timeout,
         receive_timeout=cfg.tts_receive_timeout,
         chunk_timeout_seconds=cfg.tts_chunk_timeout_seconds,
+        ffprobe=cfg.ffprobe_path,
     )
 
 

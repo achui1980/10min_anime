@@ -275,7 +275,7 @@ def test_run_ingest_uses_real_video_duration(project, monkeypatch):
     video = _prepare_video(project)
     calls: list[Path] = []
 
-    def fake_probe(path):
+    def fake_probe(path, **_):
         calls.append(Path(path))
         return 1416.6
 
@@ -290,7 +290,7 @@ def test_run_ingest_uses_real_video_duration(project, monkeypatch):
 def test_run_ingest_falls_back_when_no_video_configured(project, monkeypatch):
     """只登记了 SRT、没登记视频是合法状态，ingest 不能因此崩。"""
 
-    def boom(path):
+    def boom(path, **_):
         raise AssertionError("没配 video 时不该去 probe")
 
     monkeypatch.setattr("tenmin.pipeline.probe_duration", boom)
@@ -304,7 +304,7 @@ def test_run_ingest_falls_back_when_video_file_missing(project, monkeypatch):
     """project.yaml 里写了 video 但文件还没到位（下载中/换过盘）也不能崩。"""
     project.episodes[0].video = Path("video/E02.mkv")
 
-    def boom(path):
+    def boom(path, **_):
         raise AssertionError("文件不存在时不该去 probe")
 
     monkeypatch.setattr("tenmin.pipeline.probe_duration", boom)
@@ -317,7 +317,7 @@ def test_run_ingest_falls_back_when_ffprobe_fails(project, monkeypatch):
     """文件在但 ffprobe 读不出（0 字节壳子、非视频文件、没装 ffprobe）也降级。"""
     _prepare_video(project)
 
-    def boom(path):
+    def boom(path, **_):
         raise FFmpegError("ffprobe 读不出时长")
 
     monkeypatch.setattr("tenmin.pipeline.probe_duration", boom)
@@ -330,7 +330,7 @@ def test_run_ingest_falls_back_when_ffprobe_is_not_installed(project, monkeypatc
     """ffprobe 根本不在 PATH 上时 subprocess 抛 FileNotFoundError，同样降级。"""
     _prepare_video(project)
 
-    def boom(path):
+    def boom(path, **_):
         raise FileNotFoundError("ffprobe")
 
     monkeypatch.setattr("tenmin.pipeline.probe_duration", boom)
@@ -511,8 +511,8 @@ async def test_run_pipeline_reruns_render_stages_when_project_yaml_changes(
     paths = Paths(project.root)
     _write_script(paths.script(2), render_script())
     _prepare_video(project)
-    monkeypatch.setattr("tenmin.pipeline.probe_duration", lambda path: 1400.0)
-    monkeypatch.setattr("tenmin.pipeline.preflight", lambda video, encoder: 1400.0)
+    monkeypatch.setattr("tenmin.pipeline.probe_duration", lambda path, **_: 1400.0)
+    monkeypatch.setattr("tenmin.pipeline.preflight", lambda video, encoder, **_: 1400.0)
     # voice 重跑时 synthesize_track 会复用上一轮落盘的 chunk 并用真 ffprobe 量时长，
     # 而 FakeTTSEngine 写的是假 mp3 字节。
     monkeypatch.setattr("tenmin.render.tts.probe_duration", lambda path: 8.0)
@@ -599,7 +599,7 @@ def _write_script(path: Path, script: Script) -> None:
     path.write_text(script.model_dump_json(indent=2), encoding="utf-8")
 
 
-def _touch_output(args: list[str]) -> str:
+def _touch_output(args: list[str], **_) -> str:
     """假的 ffmpeg：不跑编码，只把输出文件创建出来。
 
     刻意写非空字节：_is_fresh 现在把 0 字节产物当「被打断的半截产物」判成不新鲜，
@@ -612,7 +612,7 @@ def _touch_output(args: list[str]) -> str:
 
 
 def _touch_output_with_progress(
-    args: list[str], *, total_seconds: float, on_progress=None
+    args: list[str], *, total_seconds: float, on_progress=None, **_
 ) -> str:
     """假的 ffmpeg（run_with_progress 版）：不跑编码，只把输出文件创建出来。"""
     if on_progress is not None:
@@ -700,7 +700,7 @@ async def test_run_voice_reuses_recorded_durations_without_probing(project, monk
     _write_script(paths.script(2), render_script())
     await run_voice(project, FakeTTSEngine([8.0, 10.0, 10.0]), episode=2)
 
-    def boom(path):
+    def boom(path, **_):
         raise AssertionError("run_voice 该从 voice.json 里读时长，不该再 spawn ffprobe")
 
     monkeypatch.setattr("tenmin.render.tts.probe_duration", boom)
@@ -759,7 +759,7 @@ def test_run_timeline_probes_source_when_duration_missing(project, monkeypatch):
     video = _prepare_video(project)
     calls: list[Path] = []
 
-    def fake_probe(path):
+    def fake_probe(path, **_):
         calls.append(Path(path))
         return 1400.0
 
@@ -791,7 +791,7 @@ def test_run_audio_invokes_ffmpeg(project, monkeypatch):
     _prepare_video(project)
     captured: list[list[str]] = []
 
-    def fake_run(args):
+    def fake_run(args, **_):
         captured.append(list(args))
         return _touch_output(args)
 
@@ -824,7 +824,7 @@ def test_run_render_invokes_ffmpeg(project, monkeypatch):
     paths.mixed_audio(2).write_bytes(b"")
     captured: list[list[str]] = []
 
-    def fake_run_with_progress(args, *, total_seconds, on_progress=None):
+    def fake_run_with_progress(args, *, total_seconds, on_progress=None, **_):
         captured.append(list(args))
         return _touch_output(args)
 
@@ -853,8 +853,8 @@ async def test_run_pipeline_from_voice_runs_render_stages(project, monkeypatch):
     paths = Paths(project.root)
     _write_script(paths.script(2), render_script())
     _prepare_video(project)
-    monkeypatch.setattr("tenmin.pipeline.probe_duration", lambda path: 1400.0)
-    monkeypatch.setattr("tenmin.pipeline.preflight", lambda video, encoder: 1400.0)
+    monkeypatch.setattr("tenmin.pipeline.probe_duration", lambda path, **_: 1400.0)
+    monkeypatch.setattr("tenmin.pipeline.preflight", lambda video, encoder, **_: 1400.0)
     monkeypatch.setattr("tenmin.render.audio.run", _touch_output)
     monkeypatch.setattr("tenmin.render.video.run_with_progress", _touch_output_with_progress)
 
@@ -888,8 +888,8 @@ async def test_run_pipeline_batch_mode_runs_full_pipeline_for_all_episodes(
         (project.root / video_name).write_bytes(b"")
         episode_cfg.video = Path(video_name)
 
-    monkeypatch.setattr("tenmin.pipeline.probe_duration", lambda path: 1400.0)
-    monkeypatch.setattr("tenmin.pipeline.preflight", lambda video, encoder: 1400.0)
+    monkeypatch.setattr("tenmin.pipeline.probe_duration", lambda path, **_: 1400.0)
+    monkeypatch.setattr("tenmin.pipeline.preflight", lambda video, encoder, **_: 1400.0)
     monkeypatch.setattr("tenmin.render.audio.run", _touch_output)
     monkeypatch.setattr("tenmin.render.video.run_with_progress", _touch_output_with_progress)
 
@@ -1215,8 +1215,8 @@ async def test_run_pipeline_reports_episode_start_exactly_once_per_episode(
         (project.root / video_name).write_bytes(b"\x00")
         episode_cfg.video = Path(video_name)
 
-    monkeypatch.setattr("tenmin.pipeline.probe_duration", lambda path: 1400.0)
-    monkeypatch.setattr("tenmin.pipeline.preflight", lambda video, encoder: 1400.0)
+    monkeypatch.setattr("tenmin.pipeline.probe_duration", lambda path, **_: 1400.0)
+    monkeypatch.setattr("tenmin.pipeline.preflight", lambda video, encoder, **_: 1400.0)
     monkeypatch.setattr("tenmin.render.audio.run", _touch_output)
     monkeypatch.setattr("tenmin.render.video.run_with_progress", _touch_output_with_progress)
 
@@ -1301,10 +1301,10 @@ async def test_run_pipeline_preflights_all_episodes_before_any_tts(
             events.append("tts")
             return await super().synthesize(text, out_path)
 
-    monkeypatch.setattr("tenmin.pipeline.probe_duration", lambda path: 1400.0)
+    monkeypatch.setattr("tenmin.pipeline.probe_duration", lambda path, **_: 1400.0)
     monkeypatch.setattr(
         "tenmin.pipeline.preflight",
-        lambda video, encoder: (events.append(f"preflight:{Path(video).name}"), 1400.0)[1],
+        lambda video, encoder, **_: (events.append(f"preflight:{Path(video).name}"), 1400.0)[1],
     )
     monkeypatch.setattr("tenmin.render.audio.run", _touch_output)
     monkeypatch.setattr("tenmin.render.video.run_with_progress", _touch_output_with_progress)
@@ -1339,7 +1339,7 @@ def test_run_render_reports_substep_progress(project, monkeypatch):
     paths.mixed_audio(2).parent.mkdir(parents=True, exist_ok=True)
     paths.mixed_audio(2).write_bytes(b"")
 
-    def fake_run_with_progress(args, *, total_seconds, on_progress=None):
+    def fake_run_with_progress(args, *, total_seconds, on_progress=None, **_):
         out = Path(args[-1])
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_bytes(b"")
@@ -1351,3 +1351,88 @@ def test_run_render_reports_substep_progress(project, monkeypatch):
     reporter = FakeReporter()
     run_render(project, episode=2, reporter=reporter)
     assert ("substep", "render", 100, 100, "") in reporter.calls
+
+
+def test_run_timeline_uses_configured_ffprobe_path(project, monkeypatch):
+    """render.ffprobe_path / ffmpeg_path 必须从 project.yaml 一路传到 subprocess。"""
+    paths = Paths(project.root)
+    _write_script(paths.script(2), render_script())
+    asyncio.run(run_voice(project, FakeTTSEngine([8.0, 10.0, 10.0]), episode=2))
+    _prepare_video(project)
+    project.render.ffprobe_path = "/opt/x/ffprobe"
+    seen: dict[str, str] = {}
+
+    def fake_probe(path, *, ffprobe="ffprobe"):
+        seen["ffprobe"] = ffprobe
+        return 1400.0
+
+    monkeypatch.setattr("tenmin.pipeline.probe_duration", fake_probe)
+    run_timeline(project, episode=2)
+    assert seen["ffprobe"] == "/opt/x/ffprobe"
+
+
+def test_run_audio_uses_configured_ffmpeg_path(project, monkeypatch):
+    paths = Paths(project.root)
+    _write_script(paths.script(2), render_script())
+    asyncio.run(run_voice(project, FakeTTSEngine([8.0, 10.0, 10.0]), episode=2))
+    run_timeline(project, episode=2, source_duration=1400.0)
+    _prepare_video(project)
+    project.render.ffmpeg_path = "/opt/x/ffmpeg"
+    seen: dict[str, str] = {}
+
+    def fake_run(args, *, ffmpeg="ffmpeg"):
+        seen["ffmpeg"] = ffmpeg
+        return _touch_output(args)
+
+    monkeypatch.setattr("tenmin.render.audio.run", fake_run)
+    run_audio(project, episode=2)
+    assert seen["ffmpeg"] == "/opt/x/ffmpeg"
+
+
+def test_run_render_uses_configured_ffmpeg_path(project, monkeypatch):
+    paths = Paths(project.root)
+    _write_script(paths.script(2), render_script())
+    asyncio.run(run_voice(project, FakeTTSEngine([8.0, 10.0, 10.0]), episode=2))
+    run_timeline(project, episode=2, source_duration=1400.0)
+    _prepare_video(project)
+    paths.mixed_audio(2).parent.mkdir(parents=True, exist_ok=True)
+    paths.mixed_audio(2).write_bytes(b"\x00")
+    project.render.ffmpeg_path = "/opt/x/ffmpeg"
+    seen: dict[str, str] = {}
+
+    def fake_run_with_progress(args, *, total_seconds, on_progress=None, ffmpeg="ffmpeg"):
+        seen["ffmpeg"] = ffmpeg
+        return _touch_output(args)
+
+    monkeypatch.setattr("tenmin.render.video.run_with_progress", fake_run_with_progress)
+    run_render(project, episode=2)
+    assert seen["ffmpeg"] == "/opt/x/ffmpeg"
+
+
+def test_preflight_receives_configured_binaries(project, monkeypatch):
+    paths = Paths(project.root)
+    _write_script(paths.script(2), render_script())
+    asyncio.run(run_voice(project, FakeTTSEngine([8.0, 10.0, 10.0]), episode=2))
+    run_timeline(project, episode=2, source_duration=1400.0)
+    _prepare_video(project)
+    project.render.ffmpeg_path = "/opt/x/ffmpeg"
+    project.render.ffprobe_path = "/opt/x/ffprobe"
+    seen: dict[str, str] = {}
+
+    def fake_preflight(video, encoder, *, ffmpeg="ffmpeg", ffprobe="ffprobe", **_):
+        seen["ffmpeg"] = ffmpeg
+        seen["ffprobe"] = ffprobe
+        return 1400.0
+
+    monkeypatch.setattr("tenmin.pipeline.preflight", fake_preflight)
+    monkeypatch.setattr("tenmin.render.audio.run", _touch_output)
+    asyncio.run(
+        run_pipeline(
+            project,
+            FakeProvider(render_script()),
+            only=["audio"],
+            episode=2,
+            tts_engine=FakeTTSEngine([8.0, 10.0, 10.0]),
+        )
+    )
+    assert seen == {"ffmpeg": "/opt/x/ffmpeg", "ffprobe": "/opt/x/ffprobe"}

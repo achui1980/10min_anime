@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from tenmin.config import DEFAULT_RENDER
 from tenmin.models import SubtitleCue, Timeline, VoiceTrack
 from tenmin.render.ffmpeg import run
 
@@ -124,6 +125,7 @@ def mix_audio(
     duck_db: float,
     fade_out_seconds: float = 0.0,
     outro_seconds: float = 0.0,
+    ffmpeg: str = DEFAULT_RENDER.ffmpeg_path,
 ) -> Path:
     """真跑 ffmpeg 混音，返回产物路径。"""
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -137,6 +139,7 @@ def mix_audio(
             duck_db=duck_db,
             fade_out_seconds=fade_out_seconds,
             outro_seconds=outro_seconds,
-        )
+        ),
+        ffmpeg=ffmpeg,
     )
     return out_path
