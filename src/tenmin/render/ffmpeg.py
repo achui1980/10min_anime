@@ -160,7 +160,25 @@ def run(args: list[str], *, ffmpeg: str = FFMPEG, timeout: float | None = None) 
 
 
 def probe_duration(path: Path, *, ffprobe: str = FFPROBE) -> float:
-    """用 ffprobe 读时长（秒）。"""
+    """用 ffprobe 读时长（秒）。读不出、或读出来不是个正数，一律抛错。
+
+    容器的 `format=duration` 是**容器声明**的时长，不是解码出来的样本数。对 edge-tts
+    出的 mp3 来说它含编码器延迟与末尾 padding，所以比真实语音略长几十毫秒。这条**刻意
+    不改**：render/tts.py 的时长体检 band 是按当前这个行为标定的（115 个真实 chunk），
+    换成 `-count_frames` 之类的精确测法会让那套上下界整个失准。这里只是把这件事写明。
+
+    两条合理性检查都是「宁可响亮失败」：
+    - 文件不存在 → FileNotFoundError，说「文件不存在」而不是「读不出时长」。后者会把
+      用户送去查 ffprobe / 容器格式，而真因往往是路径写错或外置盘没挂上。顺带省掉一次
+      注定失败的子进程。刻意用 FileNotFoundError（OSError 子类），因为
+      pipeline._source_duration 靠 catch (FFmpegError, OSError) 让「只有 SRT」这条
+      合法用法降级，换成别的类型会把那条路打死。
+    - 时长 <= 0 → FFmpegError。截断/空的容器会给出一个**看起来正常**的数字，timeline
+      拿它去算偏移一路不报错，只会静默出一个时间轴全错的成片。
+    """
+    path = Path(path)
+    if not path.is_file():
+        raise FileNotFoundError(f"找不到媒体文件 {path}（读不了时长）")
     args = [
         ffprobe,
         "-v",
@@ -195,11 +213,17 @@ def probe_duration(path: Path, *, ffprobe: str = FFPROBE) -> float:
             f"{tail(completed.stderr)}"
         )
     try:
-        return float(completed.stdout.strip())
+        duration = float(completed.stdout.strip())
     except ValueError as error:
         raise FFmpegError(
             f"ffprobe 读不出 {path} 的时长，输出是 {completed.stdout.strip()!r}"
         ) from error
+    if duration <= 0:
+        raise FFmpegError(
+            f"ffprobe 报 {path} 的时长是 {duration} 秒，这不可能是个能用的媒体文件"
+            "（截断的下载？0 字节壳子？）。它会静默毒化整条时间轴，所以这里直接拦掉。"
+        )
+    return duration
 
 
 # maxsize 从 1 提到 8：key 是可执行文件路径，而 preflight 在批量模式下每集都调。

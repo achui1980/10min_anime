@@ -192,26 +192,30 @@ def test_run_with_progress_error_reports_the_argv_actually_executed(monkeypatch)
     assert shlex.join(executed["args"]) in str(exc.value)
 
 
-def test_probe_duration_parses_csv(monkeypatch):
+def test_probe_duration_parses_csv(monkeypatch, tmp_path):
     seen = {}
+    media = tmp_path / "a.mkv"
+    media.write_bytes(b"fake")
 
     def fake_run(args, **kwargs):
         seen["args"] = args
         return FakeCompleted(stdout="1425.501000\n")
 
     monkeypatch.setattr("tenmin.render.ffmpeg.subprocess.run", fake_run)
-    assert probe_duration(Path("a.mkv")) == pytest.approx(1425.501)
+    assert probe_duration(media) == pytest.approx(1425.501)
     assert seen["args"][0] == "ffprobe"
-    assert seen["args"][-1] == "a.mkv"
+    assert seen["args"][-1] == str(media)
 
 
-def test_probe_duration_raises_on_unparsable(monkeypatch):
+def test_probe_duration_raises_on_unparsable(monkeypatch, tmp_path):
+    media = tmp_path / "a.mkv"
+    media.write_bytes(b"fake")
     monkeypatch.setattr(
         "tenmin.render.ffmpeg.subprocess.run",
         lambda args, **kwargs: FakeCompleted(stdout="N/A\n"),
     )
     with pytest.raises(FFmpegError) as exc:
-        probe_duration(Path("a.mkv"))
+        probe_duration(media)
     assert "a.mkv" in str(exc.value)
 
 
@@ -896,3 +900,59 @@ def test_preflight_does_not_blame_libass_when_ffmpeg_is_missing(
     message = str(exc.value)
     assert "没编 libass" not in message, "不许把「缺二进制」诊断成「没编 libass」"
     assert "找不到可执行文件" in message
+
+
+# --- probe_duration 的合理性检查 ---
+
+
+def test_probe_duration_reports_a_missing_file_as_such(monkeypatch, tmp_path):
+    """文件不存在时该说「文件不存在」，不是「读不出时长」。
+
+    后者会把用户送去查 ffprobe / 容器格式，而真正的原因是路径写错了或者外置盘没挂上。
+    也顺带省掉一次注定失败的子进程。
+    """
+
+    def unreachable(args, **kwargs):
+        raise AssertionError("文件不存在时不该 spawn ffprobe")
+
+    monkeypatch.setattr("tenmin.render.ffmpeg.subprocess.run", unreachable)
+    missing = tmp_path / "video" / "E02.mkv"
+    with pytest.raises(FileNotFoundError) as exc:
+        probe_duration(missing)
+    assert str(missing) in str(exc.value)
+
+
+def test_probe_duration_is_a_file_not_found_error_so_ingest_still_degrades(tmp_path):
+    """pipeline._source_duration 靠 catch (FFmpegError, OSError) 做降级。
+
+    FileNotFoundError 是 OSError 子类，所以「只有 SRT 没有视频」那条合法用法不受影响。
+    """
+    assert issubclass(FileNotFoundError, OSError)
+
+
+@pytest.mark.parametrize("bad", ["0", "0.000000", "-1.5"])
+def test_probe_duration_rejects_non_positive_durations(monkeypatch, tmp_path, bad):
+    """<= 0 的时长看起来是个正常数字，然后毒化整条时间轴。
+
+    截断/空的容器就会给出这种值。timeline 拿它去算偏移不会报错，只会静默出一个
+    时间轴全错的成片 —— 必须在源头拦掉。
+    """
+    media = tmp_path / "a.mkv"
+    media.write_bytes(b"fake")
+    monkeypatch.setattr(
+        "tenmin.render.ffmpeg.subprocess.run",
+        lambda args, **kwargs: FakeCompleted(stdout=bad + "\n"),
+    )
+    with pytest.raises(FFmpegError) as exc:
+        probe_duration(media)
+    assert "a.mkv" in str(exc.value)
+
+
+def test_probe_duration_accepts_a_normal_duration(monkeypatch, tmp_path):
+    media = tmp_path / "a.mkv"
+    media.write_bytes(b"fake")
+    monkeypatch.setattr(
+        "tenmin.render.ffmpeg.subprocess.run",
+        lambda args, **kwargs: FakeCompleted(stdout="1509.994667\n"),
+    )
+    assert probe_duration(media) == pytest.approx(1509.994667)
