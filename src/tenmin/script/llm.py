@@ -12,11 +12,11 @@ from pydantic import BaseModel, ValidationError
 from tenmin.config import LLMConfig, Settings
 
 MINIMAX_BASE_URL = "https://api.minimax.cn/v1"
-MINIMAX_MAX_ATTEMPTS = 3
+OPENAI_COMPATIBLE_MAX_ATTEMPTS = 3
 # read=None：实测 MiniMax-M3 处理 ~35k 字符 prompt 需要 561 秒，非流式模式下服务端在
 # 这 561 秒里零字节返回，正好贴着旧的 600 秒读超时悬崖。流式下每个 SSE chunk 都会刷新
 # 读活性，因此读超时交给 chunk 间隔而不是整体耗时（这里直接关掉固定读超时）。
-MINIMAX_TIMEOUT = httpx.Timeout(connect=30.0, read=None, write=120.0, pool=30.0)
+OPENAI_COMPATIBLE_TIMEOUT = httpx.Timeout(connect=30.0, read=None, write=120.0, pool=30.0)
 
 _THINK_BLOCK = re.compile(r"<think>.*?</think>", re.S)
 _FENCE = re.compile(r"^```(?:json)?[ \t]*\n?|\n?```[ \t]*$", re.M)
@@ -99,25 +99,24 @@ class GeminiProvider:
         return schema.model_validate_json(response.text)
 
 
-class MiniMaxProvider:
-    """MiniMax 的 OpenAI 兼容接口。
-
-    与 GeminiProvider 的关键差别：MiniMax 接受 response_format=json_schema 却完全
-    不执行它（实测传严格嵌套 schema 后，返回的字段名全是模型自己编的），所以 schema
-    只能写进提示词正文，再靠 pydantic 校验 + 带着报错重试来兜住。
-    """
+class OpenAICompatibleProvider:
+    """通用 OpenAI 兼容 provider：走 chat/completions 流式接口，
+    schema 统一写进 prompt 文本（不依赖 response_format=json_schema），
+    用 pydantic 校验 + 报错重试。"""
 
     def __init__(
         self,
         api_key: str,
-        model: str = "MiniMax-M3",
-        base_url: str = MINIMAX_BASE_URL,
-        thinking: str = "disabled",
+        model: str,
+        base_url: str,
     ) -> None:
         self.model = model
         self.base_url = base_url.rstrip("/")
         self._api_key = api_key
-        self.thinking = thinking
+
+    def _extra_payload_fields(self) -> dict[str, Any]:
+        """子类可覆写，往请求体里加自己专属的字段（比如 MiniMax 的 thinking）。"""
+        return {}
 
     def _schema_prompt(self, user: str, schema: type[BaseModel]) -> str:
         spec = json.dumps(schema.model_json_schema(), ensure_ascii=False, indent=2)
@@ -160,14 +159,14 @@ class MiniMaxProvider:
             "model": self.model,
             "messages": messages,
             "stream": True,
-            "thinking": {"type": self.thinking},
+            **self._extra_payload_fields(),
         }
         if schema is not None:
             payload["response_format"] = {"type": "json_object"}
 
         last_error = ""
-        async with httpx.AsyncClient(timeout=MINIMAX_TIMEOUT) as client:
-            for _ in range(MINIMAX_MAX_ATTEMPTS):
+        async with httpx.AsyncClient(timeout=OPENAI_COMPATIBLE_TIMEOUT) as client:
+            for _ in range(OPENAI_COMPATIBLE_MAX_ATTEMPTS):
                 text = await self._stream_once(client, payload)
                 if schema is None:
                     return _strip_reasoning(text)
@@ -187,8 +186,30 @@ class MiniMaxProvider:
                         }
                     )
         raise RuntimeError(
-            f"MiniMax 连续 {MINIMAX_MAX_ATTEMPTS} 次输出不符合 {schema.__name__}：{last_error}"
+            f"MiniMax 连续 {OPENAI_COMPATIBLE_MAX_ATTEMPTS} 次输出不符合 {schema.__name__}：{last_error}"
         )
+
+
+class MiniMaxProvider(OpenAICompatibleProvider):
+    """MiniMax 的 OpenAI 兼容接口。
+
+    与 GeminiProvider 的关键差别：MiniMax 接受 response_format=json_schema 却完全
+    不执行它（实测传严格嵌套 schema 后，返回的字段名全是模型自己编的），所以 schema
+    只能写进提示词正文，再靠 pydantic 校验 + 带着报错重试来兜住。
+    """
+
+    def __init__(
+        self,
+        api_key: str,
+        model: str = "MiniMax-M3",
+        base_url: str = MINIMAX_BASE_URL,
+        thinking: str = "disabled",
+    ) -> None:
+        super().__init__(api_key=api_key, model=model, base_url=base_url)
+        self.thinking = thinking
+
+    def _extra_payload_fields(self) -> dict[str, Any]:
+        return {"thinking": {"type": self.thinking}}
 
 
 def build_provider(cfg: LLMConfig, settings: Settings) -> LLMProvider:

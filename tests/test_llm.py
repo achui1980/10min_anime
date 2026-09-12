@@ -7,11 +7,12 @@ from tenmin.config import LLMConfig, Settings
 from tenmin.models import LLMScript
 from tenmin.script.llm import (
     MINIMAX_BASE_URL,
-    MINIMAX_MAX_ATTEMPTS,
-    MINIMAX_TIMEOUT,
+    OPENAI_COMPATIBLE_MAX_ATTEMPTS,
+    OPENAI_COMPATIBLE_TIMEOUT,
     GeminiProvider,
     LLMProvider,
     MiniMaxProvider,
+    OpenAICompatibleProvider,
     _extract_json,
     _strip_reasoning,
     build_provider,
@@ -308,6 +309,60 @@ def _fake_httpx(monkeypatch, contents: list[str]) -> list[dict]:
     return _mock_httpx(monkeypatch, [_sse_from_chunks(c) for c in contents])
 
 
+# --- OpenAICompatibleProvider ---
+
+
+def test_openai_compatible_provider_defaults():
+    provider = OpenAICompatibleProvider(
+        api_key="fake-key",
+        model="deepseek-chat",
+        base_url="https://api.deepseek.com/v1",
+    )
+    assert provider.model == "deepseek-chat"
+    assert provider.base_url == "https://api.deepseek.com/v1"
+
+
+def test_openai_compatible_provider_strips_trailing_slash_from_base_url():
+    provider = OpenAICompatibleProvider(
+        api_key="fake-key",
+        model="deepseek-chat",
+        base_url="https://api.deepseek.com/v1/",
+    )
+    assert provider.base_url == "https://api.deepseek.com/v1"
+
+
+def test_openai_compatible_provider_extra_payload_fields_defaults_empty():
+    provider = OpenAICompatibleProvider(
+        api_key="fake-key",
+        model="deepseek-chat",
+        base_url="https://api.deepseek.com/v1",
+    )
+    assert provider._extra_payload_fields() == {}
+
+
+@pytest.mark.asyncio
+async def test_openai_compatible_complete_first_try_sends_no_thinking_field(monkeypatch):
+    log = _fake_httpx(monkeypatch, ['<think>算一下</think>\n```json\n{"value": 42}\n```'])
+    provider = OpenAICompatibleProvider(
+        api_key="secret", model="deepseek-chat", base_url="https://api.deepseek.com/v1"
+    )
+
+    result = await provider.complete("SYS", "USR", Toy)
+
+    assert result == Toy(value=42)
+    posts = [r for r in log if "url" in r]
+    assert len(posts) == 1
+    assert posts[0]["url"] == "https://api.deepseek.com/v1/chat/completions"
+    assert posts[0]["headers"]["Authorization"] == "Bearer secret"
+    body = posts[0]["json"]
+    assert body["model"] == "deepseek-chat"
+    assert body["response_format"] == {"type": "json_object"}
+    assert "thinking" not in body
+    assert body["messages"][0] == {"role": "system", "content": "SYS"}
+    assert body["messages"][1]["role"] == "user"
+    assert body["messages"][1]["content"].startswith("USR")
+
+
 @pytest.mark.asyncio
 async def test_minimax_complete_first_try(monkeypatch):
     log = _fake_httpx(monkeypatch, ['<think>算一下</think>\n```json\n{"value": 42}\n```'])
@@ -376,15 +431,15 @@ async def test_minimax_complete_retries_on_wrong_field_names(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_minimax_complete_gives_up_after_max_attempts(monkeypatch):
-    log = _fake_httpx(monkeypatch, ['{"val": 1}'] * MINIMAX_MAX_ATTEMPTS)
+    log = _fake_httpx(monkeypatch, ['{"val": 1}'] * OPENAI_COMPATIBLE_MAX_ATTEMPTS)
     provider = MiniMaxProvider(api_key="secret")
 
     with pytest.raises(RuntimeError) as exc:
         await provider.complete("SYS", "USR", Toy)
 
     assert "Toy" in str(exc.value)
-    assert str(MINIMAX_MAX_ATTEMPTS) in str(exc.value)
-    assert len([r for r in log if "url" in r]) == MINIMAX_MAX_ATTEMPTS
+    assert str(OPENAI_COMPATIBLE_MAX_ATTEMPTS) in str(exc.value)
+    assert len([r for r in log if "url" in r]) == OPENAI_COMPATIBLE_MAX_ATTEMPTS
 
 
 @pytest.mark.asyncio
@@ -534,7 +589,7 @@ async def test_minimax_stream_uses_read_none_timeout(monkeypatch):
     await provider.complete("SYS", "USR", Toy)
 
     timeout = [r for r in log if "__init__" in r][0]["__init__"]["timeout"]
-    assert timeout is MINIMAX_TIMEOUT
+    assert timeout is OPENAI_COMPATIBLE_TIMEOUT
     assert timeout.read is None
     assert timeout.connect == 30.0
     assert timeout.write == 120.0
