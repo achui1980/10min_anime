@@ -318,10 +318,12 @@ def test_run_registers_new_episode_and_updates_yaml(work, golden_srt_path, tmp_p
 
     assert result.exit_code == 0, out(result)
     assert (work / "saijo" / "srt" / "E01.srt").exists()
-    assert (work / "saijo" / "video" / "E01.mp4").exists()
+    # 源片不再被整份拷进项目目录，project.yaml 直接记它的绝对路径。
+    assert not (work / "saijo" / "video" / "E01.mp4").exists()
 
-    reloaded_yaml = (work / "saijo" / "project.yaml").read_text(encoding="utf-8")
-    assert "number: 1" in reloaded_yaml
+    reloaded = yaml.safe_load((work / "saijo" / "project.yaml").read_text(encoding="utf-8"))
+    entry = next(e for e in reloaded["episodes"] if e["number"] == 1)
+    assert entry["video"] == str(fake_video.resolve())
 
 
 def test_run_passes_progress_reporter(tmp_path, monkeypatch):

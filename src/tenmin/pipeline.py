@@ -271,31 +271,49 @@ def _find_episode(cfg: ProjectConfig, episode_number: int) -> EpisodeConfig:
 def register_episode(
     cfg: ProjectConfig, *, episode: int, srt: Path, video: Path
 ) -> ProjectConfig:
-    """把外部传入的 srt/video 拷进项目目录，并把这一集写进 project.yaml。
+    """把这一集登记进 project.yaml：SRT 拷进项目目录，视频只记路径不拷。
 
     如果这一集已经注册过，就覆盖 srt/video 路径（保留其它字段）；
     否则追加一条新的 episode 记录。返回更新后的 ProjectConfig（root 已绑定）。
+
+    为什么 SRT 拷、视频不拷：
+    - SRT 是几十 KB，而且是主要的人工编辑面（清洗规则调不好时要就地改字幕），
+      拷进 srt/E{NN}.srt 让项目自洽、路径统一，成本可以忽略。
+    - 源片实测 300MB~1.4GB。原实现 shutil.copyfile 整份拷进 video/，10 集就是
+      3~14GB 的纯冗余 + 一次全量读写，而 config.video_path 本来就支持绝对路径。
+      所以这里只把源片的绝对路径记进 yaml。
+
+    为什么记绝对路径而不是 hardlink/symlink 到 video/E{NN}.mkv：
+    - 零 I/O、零磁盘、零文件系统能力假设。hardlink 跨卷/跨网络挂载直接失败，
+      symlink 在 Windows 上要额外权限，而本项目的源片常年住在外置盘与网络共享上。
+    - 失败模式是响的：源片被移走/删掉时 render.ffmpeg.preflight 会抛
+      「找不到源视频 …，请检查 project.yaml 的 episodes[].video」，
+      而 symlink 只会留下一个悬空链接、错误信息指向 work/ 里那个假身份。
+    - 用户在 project.yaml 里直接看到源片真实位置，可查可改。
+
+    向后兼容：只有**本次登记的这一集**会被写成绝对路径。其余集的 srt/video 原样
+    走各自 EpisodeConfig 的 model_dump 落盘，存量的相对路径（work/saijo/ 下 10 个
+    已经拷好的 mp4）逐字节不变，video_path() 照旧按 project.yaml 所在目录解析。
     """
     srt_dest = cfg.root / "srt" / f"E{episode:02d}.srt"
-    video_dest = cfg.root / "video" / f"E{episode:02d}.mp4"
     srt_dest.parent.mkdir(parents=True, exist_ok=True)
-    video_dest.parent.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(srt, srt_dest)
-    shutil.copyfile(video, video_dest)
 
     relative_srt = srt_dest.relative_to(cfg.root)
-    relative_video = video_dest.relative_to(cfg.root)
+    # 绝对化：CLI 传进来的 --video 通常是相对当前工作目录的，而 project.yaml 里的
+    # 相对路径是相对 work/<slug>/ 解析的，原样存进去会指向完全不同的位置。
+    video_source = Path(video).resolve()
 
     existing = next((e for e in cfg.episodes if e.number == episode), None)
     if existing is not None:
         existing.srt = relative_srt
-        existing.video = relative_video
+        existing.video = video_source
     else:
         cfg.episodes.append(
-            EpisodeConfig(number=episode, srt=relative_srt, video=relative_video)
+            EpisodeConfig(number=episode, srt=relative_srt, video=video_source)
         )
 
-    yaml_path = cfg.root / "project.yaml"
+    yaml_path = cfg.config_path
     data = yaml.safe_load(yaml_path.read_text(encoding="utf-8"))
     # 用每个 EpisodeConfig 自己的 model_dump 序列化，而不是手挑 number/srt/video，
     # 这样 op_range/ed_range 等字段（现有的和未来新增的）都不会在改写 yaml 时被静默丢掉。

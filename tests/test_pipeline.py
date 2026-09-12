@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 
 import pytest
+import yaml
 
 from tenmin.config import EpisodeConfig, ProjectConfig, load_project
 from tenmin.models import (
@@ -817,7 +818,7 @@ def test_find_episode_raises_when_not_registered(project):
         _find_episode(project, 99)
 
 
-def test_register_episode_copies_files_and_appends_yaml_entry(tmp_path, golden_srt_path):
+def test_register_episode_copies_srt_and_appends_yaml_entry(tmp_path, golden_srt_path):
     root = tmp_path / "saijo"
     (root / "srt").mkdir(parents=True)
     (root / "video").mkdir(parents=True)
@@ -839,18 +840,102 @@ def test_register_episode_copies_files_and_appends_yaml_entry(tmp_path, golden_s
         cfg, episode=1, srt=source_srt, video=source_video
     )
 
+    # SRT 是几十 KB 的主要人工编辑面，照旧拷进项目目录。
     assert (root / "srt" / "E01.srt").exists()
-    assert (root / "video" / "E01.mp4").exists()
     assert len(updated_cfg.episodes) == 2
     new_entry = next(e for e in updated_cfg.episodes if e.number == 1)
     assert new_entry.srt == Path("srt/E01.srt")
-    assert new_entry.video == Path("video/E01.mp4")
+    assert new_entry.video == source_video.resolve()
 
     # reload from disk to confirm the yaml file itself was updated
     reloaded = load_project(yaml_path)
     assert len(reloaded.episodes) == 2
     assert any(e.number == 1 for e in reloaded.episodes)
     assert any(e.number == 2 for e in reloaded.episodes)
+
+
+def test_register_episode_does_not_copy_the_video(tmp_path, golden_srt_path):
+    """源片实测 300MB~1.4GB，整份拷进 work/ 等于磁盘占用翻倍 + 一次全量 I/O。
+
+    config.video_path 本来就支持绝对路径，所以直接记源片位置。
+    """
+    root = tmp_path / "saijo"
+    (root / "srt").mkdir(parents=True)
+    (root / "project.yaml").write_text(
+        "show: 才女的侍从\nslug: saijo\nepisodes: []\n", encoding="utf-8"
+    )
+    cfg = load_project(root / "project.yaml")
+
+    source_srt = tmp_path / "incoming_E01.srt"
+    source_srt.write_text(golden_srt_path.read_text(encoding="utf-8"), encoding="utf-8")
+    source_video = tmp_path / "incoming_E01.mp4"
+    source_video.write_bytes(b"fake video bytes")
+
+    updated_cfg = register_episode(cfg, episode=1, srt=source_srt, video=source_video)
+
+    assert not (root / "video" / "E01.mp4").exists()
+    assert not (root / "video" / "E01.mkv").exists()
+    # 记的路径必须真的能定位到源片
+    assert updated_cfg.video_path(updated_cfg.episodes[0]) == source_video.resolve()
+
+
+def test_register_episode_keeps_the_video_suffix(tmp_path, golden_srt_path):
+    """传 .mkv 不能被改名成 .mp4。
+
+    原实现无条件写 f"E{episode:02d}.mp4"，而 cli.PROJECT_TEMPLATE 的默认值恰恰是
+    video/E02.mkv —— 自相矛盾，且 ffmpeg 会按容器实际内容而不是扩展名工作，所以
+    这个错名一路不报错。
+    """
+    root = tmp_path / "saijo"
+    (root / "srt").mkdir(parents=True)
+    (root / "project.yaml").write_text(
+        "show: 才女的侍从\nslug: saijo\nepisodes: []\n", encoding="utf-8"
+    )
+    cfg = load_project(root / "project.yaml")
+
+    source_srt = tmp_path / "incoming_E01.srt"
+    source_srt.write_text(golden_srt_path.read_text(encoding="utf-8"), encoding="utf-8")
+    source_video = tmp_path / "incoming_E01.mkv"
+    source_video.write_bytes(b"fake video bytes")
+
+    register_episode(cfg, episode=1, srt=source_srt, video=source_video)
+
+    recorded = yaml.safe_load((root / "project.yaml").read_text(encoding="utf-8"))
+    assert recorded["episodes"][0]["video"].endswith(".mkv")
+
+
+def test_register_episode_leaves_existing_relative_video_paths_alone(
+    tmp_path, golden_srt_path
+):
+    """向后兼容：work/saijo/ 下已经有 10 个拷好的 mp4，yaml 里记的是相对路径。
+
+    注册新的一集会整份改写 episodes 列表，绝不能把存量集的相对路径改成别的形状
+    ——那些文件真的在 work/saijo/video/ 下，改了就读不到了。
+    """
+    root = tmp_path / "saijo"
+    (root / "srt").mkdir(parents=True)
+    (root / "video").mkdir(parents=True)
+    (root / "video" / "E02.mp4").write_bytes(b"legacy copied video")
+    yaml_path = root / "project.yaml"
+    yaml_path.write_text(
+        "show: 才女的侍从\nslug: saijo\nepisodes:\n- number: 2\n  srt: srt/E02.srt\n"
+        "  video: video/E02.mp4\n",
+        encoding="utf-8",
+    )
+    cfg = load_project(yaml_path)
+
+    source_srt = tmp_path / "incoming_E01.srt"
+    source_srt.write_text(golden_srt_path.read_text(encoding="utf-8"), encoding="utf-8")
+    source_video = tmp_path / "incoming_E01.mkv"
+    source_video.write_bytes(b"fake video bytes")
+
+    register_episode(cfg, episode=1, srt=source_srt, video=source_video)
+
+    reloaded = load_project(yaml_path)
+    legacy = next(e for e in reloaded.episodes if e.number == 2)
+    assert legacy.video == Path("video/E02.mp4")
+    assert reloaded.video_path(legacy) == (root / "video" / "E02.mp4").resolve()
+    assert reloaded.video_path(legacy).read_bytes() == b"legacy copied video"
 
 
 def test_register_episode_updates_existing_entry_in_place(tmp_path, golden_srt_path):
@@ -876,7 +961,11 @@ def test_register_episode_updates_existing_entry_in_place(tmp_path, golden_srt_p
     )
 
     assert len(updated_cfg.episodes) == 1
-    assert (root / "video" / "E02.mp4").read_bytes() == b"replacement video bytes"
+    # 重新注册会把这一集指向新的源片，存量的 video/E02.mp4 不再被引用（但也不删）。
+    assert updated_cfg.video_path(updated_cfg.episodes[0]) == source_video.resolve()
+    assert (root / "srt" / "E02.srt").read_text(encoding="utf-8") == source_srt.read_text(
+        encoding="utf-8"
+    )
 
 
 def test_register_episode_preserves_other_episodes_op_range(tmp_path, golden_srt_path):
