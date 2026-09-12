@@ -15,6 +15,7 @@ from tenmin.script.llm import (
     GeminiProvider,
     LLMBusinessError,
     LLMError,
+    LLMFinishReasonError,
     LLMHTTPError,
     LLMProvider,
     LLMResponseFormatError,
@@ -251,6 +252,102 @@ async def test_openai_compatible_schema_error_carries_raw_output(monkeypatch):
 
 def test_llm_schema_error_is_an_llm_error():
     assert issubclass(LLMSchemaError, LLMError)
+
+
+@pytest.mark.asyncio
+async def test_gemini_max_tokens_finish_reason_is_diagnosable(monkeypatch):
+    """输出是一份完整剧本 JSON（很大），撞默认 max output tokens 被截断是现实风险。
+    原实现只会让 model_validate_json(None) 抛一个看不懂的 TypeError。"""
+    provider = GeminiProvider(api_key="fake-key")
+    calls = _fake_gemini(
+        monkeypatch, provider, [_FakeGeminiResponse(None, finish_reason="MAX_TOKENS")]
+    )
+
+    with pytest.raises(LLMFinishReasonError) as exc:
+        await provider.complete("SYS", "USR", Toy)
+
+    assert "MAX_TOKENS" in str(exc.value)
+    assert "max_output_tokens" in str(exc.value)
+    # 截断不会靠重试自己好，绝不能进 schema 修复循环
+    assert len(calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_gemini_safety_finish_reason_is_diagnosable(monkeypatch):
+    provider = GeminiProvider(api_key="fake-key")
+    calls = _fake_gemini(
+        monkeypatch, provider, [_FakeGeminiResponse(None, finish_reason="SAFETY")]
+    )
+
+    with pytest.raises(LLMFinishReasonError) as exc:
+        await provider.complete("SYS", "USR", Toy)
+
+    assert "安全策略" in str(exc.value)
+    assert "SAFETY" in str(exc.value)
+    assert len(calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_gemini_enum_finish_reason_is_read_by_name(monkeypatch):
+    """真实 SDK 给的是 types.FinishReason 枚举，不是字符串。"""
+    provider = GeminiProvider(api_key="fake-key")
+    reason = SimpleNamespace(name="MAX_TOKENS")
+    _fake_gemini(monkeypatch, provider, [_FakeGeminiResponse(None, finish_reason=reason)])
+
+    with pytest.raises(LLMFinishReasonError) as exc:
+        await provider.complete("SYS", "USR", Toy)
+
+    assert "MAX_TOKENS" in str(exc.value)
+
+
+@pytest.mark.asyncio
+async def test_gemini_prompt_level_block_is_diagnosable(monkeypatch):
+    """prompt 自己被拦下时连 candidates 都没有。"""
+    provider = GeminiProvider(api_key="fake-key")
+    _fake_gemini(monkeypatch, provider, [_FakeGeminiResponse(None, block_reason="SAFETY")])
+
+    with pytest.raises(LLMFinishReasonError) as exc:
+        await provider.complete("SYS", "USR", Toy)
+
+    assert "block_reason" in str(exc.value)
+
+
+@pytest.mark.asyncio
+async def test_gemini_stop_finish_reason_passes_through(monkeypatch):
+    provider = GeminiProvider(api_key="fake-key")
+    _fake_gemini(
+        monkeypatch,
+        provider,
+        [_FakeGeminiResponse('{"value": 8}', finish_reason="STOP")],
+    )
+    assert await provider.complete("SYS", "USR", Toy) == Toy(value=8)
+
+
+@pytest.mark.asyncio
+async def test_gemini_finish_reason_is_checked_without_schema_too(monkeypatch):
+    provider = GeminiProvider(api_key="fake-key")
+    _fake_gemini(monkeypatch, provider, [_FakeGeminiResponse(None, finish_reason="SAFETY")])
+
+    with pytest.raises(LLMFinishReasonError):
+        await provider.complete("SYS", "USR")
+
+
+@pytest.mark.asyncio
+async def test_gemini_empty_text_without_finish_reason_retries(monkeypatch):
+    """text is None 但 finish_reason 正常：形态问题，值得重试一次。"""
+    provider = GeminiProvider(api_key="fake-key")
+    calls = _fake_gemini(
+        monkeypatch,
+        provider,
+        [_FakeGeminiResponse(None), _FakeGeminiResponse('{"value": 2}')],
+    )
+
+    assert await provider.complete("SYS", "USR", Toy) == Toy(value=2)
+    assert len(calls) == 2
+
+
+def test_llm_finish_reason_error_is_an_llm_error():
+    assert issubclass(LLMFinishReasonError, LLMError)
 
 
 # --- MiniMax ---

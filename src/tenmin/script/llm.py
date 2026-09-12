@@ -192,6 +192,16 @@ class LLMBusinessError(LLMError):
         )
 
 
+class LLMFinishReasonError(LLMError):
+    """Gemini 报了一个非 STOP 的 finish_reason（或 prompt 级别的 block_reason）。
+
+    原实现完全不看它，直接 `schema.model_validate_json(response.text)`；而 text 在
+    「被安全策略拦下」与「撞 max output tokens 被截断」两种情形下都是 None，用户拿到
+    的是一句 `TypeError`。这两种情形的处置还完全不同（改提示词 vs 调高
+    max_output_tokens），所以必须分开报。
+    """
+
+
 def _truncate(text: str, limit: int) -> str:
     """超长就截断并注明原长度，免得读报错的人以为模型只输出了这么点。"""
     if len(text) <= limit:
@@ -240,8 +250,11 @@ async def _complete_with_schema_repair[T: BaseModel](
     last_error = ""
     last_raw = ""
     for _ in range(max_attempts):
-        last_raw = await send(repair)
+        # send 也在 try 里面：「一个字都没返回」跟「返回了但不合 schema」同属输出形态
+        # 问题，都值得再试一次。每轮先清空 last_raw，免得把上一轮的坏输出当成本轮的。
+        last_raw = ""
         try:
+            last_raw = await send(repair)
             return schema.model_validate_json(_extract_json(last_raw))
         except (ValidationError, LLMResponseFormatError) as exc:
             last_error = str(exc)[:REPAIR_ERROR_MAX_CHARS]
@@ -394,6 +407,56 @@ _REPAIR_HEADER = (
     "任务正文这里**刻意不重复**，你只需要把输出改成合 schema 的样子。"
 )
 
+# 正常收尾。FINISH_REASON_UNSPECIFIED 也放行：某些代理/旧版本会回这个值，把它当错误
+# 会把本来能用的输出打死。
+_GEMINI_OK_FINISH_REASONS = frozenset({"STOP", "FINISH_REASON_UNSPECIFIED"})
+_GEMINI_SAFETY_FINISH_REASONS = frozenset(
+    {"SAFETY", "RECITATION", "BLOCKLIST", "PROHIBITED_CONTENT", "SPII", "IMAGE_SAFETY"}
+)
+
+
+def _enum_name(value: Any) -> str:
+    """真实 SDK 给的是 types.FinishReason 枚举，测试与某些代理给的是裸字符串。"""
+    if value is None:
+        return ""
+    return str(getattr(value, "name", None) or value)
+
+
+def _check_gemini_finish(response: Any) -> None:
+    """显式检查 finish_reason，不合格就抛一句能照着做的中文错误。
+
+    用 getattr 逐层探测而不是直接 response.candidates[0].finish_reason：这个函数要能
+    在「假 response 只有 text/parsed 两个属性」时安静放行，否则每个测试替身都得把
+    SDK 的整棵响应树补全。
+    """
+    candidates = getattr(response, "candidates", None)
+    if not candidates:
+        feedback = getattr(response, "prompt_feedback", None)
+        block = _enum_name(getattr(feedback, "block_reason", None))
+        if block:
+            raise LLMFinishReasonError(
+                f"Gemini 直接拒绝了这次请求：prompt 被安全策略拦下（block_reason={block}），"
+                "一个候选输出都没返回。请检查提示词与字幕正文里是否有触发安全策略的内容。"
+            )
+        return
+    reason = _enum_name(getattr(candidates[0], "finish_reason", None))
+    if not reason or reason in _GEMINI_OK_FINISH_REASONS:
+        return
+    if reason == "MAX_TOKENS":
+        raise LLMFinishReasonError(
+            "Gemini 的输出撞到了模型的输出上限，被截断了（finish_reason=MAX_TOKENS）。"
+            "一份完整剧本 JSON 很长，请在 project.yaml 里调高 llm.max_output_tokens，"
+            "或者把 target_seconds 调小让剧本本身变短。"
+        )
+    if reason in _GEMINI_SAFETY_FINISH_REASONS:
+        raise LLMFinishReasonError(
+            f"Gemini 的输出被安全策略拦下了（finish_reason={reason}），没有可用内容。"
+            "请检查提示词与字幕正文里是否有触发安全策略的内容。"
+        )
+    raise LLMFinishReasonError(
+        f"Gemini 异常终止了生成（finish_reason={reason}），没有可用输出。"
+    )
+
 
 class GeminiProvider:
     def __init__(
@@ -423,6 +486,13 @@ class GeminiProvider:
             model=self.model, contents=contents, config=config
         )
 
+    async def _generate_checked(
+        self, system: str, contents: str, schema: type[BaseModel] | None
+    ) -> Any:
+        response = await self._generate(system, contents, schema)
+        _check_gemini_finish(response)
+        return response
+
     def _repair_contents(self, schema: type[BaseModel], repair: RepairContext) -> str:
         return (
             f"{_REPAIR_HEADER}\n\n"
@@ -445,12 +515,12 @@ class GeminiProvider:
         self, system: str, user: str, schema: type[BaseModel] | None = None
     ) -> Any:
         if schema is None:
-            response = await self._generate(system, user, None)
+            response = await self._generate_checked(system, user, None)
             return response.text
 
         async def send(repair: RepairContext | None) -> str:
             contents = user if repair is None else self._repair_contents(schema, repair)
-            response = await self._generate(system, contents, schema)
+            response = await self._generate_checked(system, contents, schema)
             text = response.text
             if text is None:
                 raise LLMResponseFormatError(
