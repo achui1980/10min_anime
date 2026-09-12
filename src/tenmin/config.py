@@ -267,6 +267,7 @@ DEFAULT_INGEST = IngestConfig()
 DEFAULT_CREDITS = CreditsConfig()
 DEFAULT_SIGNALS = SignalsConfig()
 DEFAULT_RENDER = RenderConfig()
+DEFAULT_LLM = LLMConfig()
 
 
 def load_project(path: Path) -> ProjectConfig:

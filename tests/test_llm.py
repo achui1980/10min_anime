@@ -1,4 +1,5 @@
 import json
+from types import SimpleNamespace
 
 import pytest
 from pydantic import BaseModel
@@ -7,12 +8,12 @@ from tenmin.config import LLMConfig, Settings
 from tenmin.models import LLMScript
 from tenmin.script.llm import (
     MINIMAX_BASE_URL,
-    OPENAI_COMPATIBLE_MAX_ATTEMPTS,
     OPENAI_COMPATIBLE_TIMEOUT,
     GeminiProvider,
     LLMError,
     LLMProvider,
     LLMResponseFormatError,
+    LLMSchemaError,
     MiniMaxProvider,
     OpenAICompatibleProvider,
     _extract_json,
@@ -136,6 +137,114 @@ async def test_gemini_provider_without_schema_returns_text(monkeypatch):
     monkeypatch.setattr(provider, "_client", FakeClient())
 
     assert await provider.complete("SYS", "USR") == "纯文本回答"
+
+
+# --- Gemini 与 OpenAI 兼容路径共用同一层 schema 修复重试 ---
+
+
+class _FakeGeminiResponse:
+    """够用的 Gemini 响应替身。默认形态是「正常收尾」。"""
+
+    def __init__(
+        self,
+        text: str | None,
+        *,
+        parsed=None,
+        finish_reason: str | None = "STOP",
+        block_reason: str | None = None,
+        usage=None,
+    ):
+        self.text = text
+        self.parsed = parsed
+        self.usage_metadata = usage
+        if block_reason is not None:
+            self.candidates = []
+            self.prompt_feedback = SimpleNamespace(block_reason=block_reason)
+        else:
+            self.candidates = [SimpleNamespace(finish_reason=finish_reason)]
+
+
+def _fake_gemini(monkeypatch, provider, responses: list) -> list[dict]:
+    """按序回放 Gemini 响应，记录每次调用的 model/contents/config。"""
+    calls: list[dict] = []
+    queue = list(responses)
+
+    class FakeModels:
+        async def generate_content(self, *, model, contents, config):
+            calls.append({"model": model, "contents": contents, "config": config})
+            assert queue, "假 Gemini 的响应队列已用尽"
+            item = queue.pop(0)
+            return item if isinstance(item, _FakeGeminiResponse) else _FakeGeminiResponse(item)
+
+    monkeypatch.setattr(
+        provider, "_client", SimpleNamespace(aio=SimpleNamespace(models=FakeModels()))
+    )
+    return calls
+
+
+@pytest.mark.asyncio
+async def test_gemini_retries_on_schema_violation(monkeypatch):
+    """两个 provider 的健壮性原先严重不对称：OpenAI 兼容那条有 3 次带报错回灌的
+    自修复，Gemini 一次都没有，字段名一错就直接把 pydantic 报错冒到用户脸上。"""
+    provider = GeminiProvider(api_key="fake-key")
+    calls = _fake_gemini(monkeypatch, provider, ['{"val": 1}', '{"value": 7}'])
+
+    assert await provider.complete("SYS", "USR", Toy) == Toy(value=7)
+    assert len(calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_gemini_gives_up_after_max_attempts(monkeypatch):
+    attempts = LLMConfig().max_attempts
+    provider = GeminiProvider(api_key="fake-key")
+    calls = _fake_gemini(monkeypatch, provider, ['{"val": 1}'] * attempts)
+
+    with pytest.raises(LLMSchemaError) as exc:
+        await provider.complete("SYS", "USR", Toy)
+
+    assert "Toy" in str(exc.value)
+    assert len(calls) == attempts
+
+
+@pytest.mark.asyncio
+async def test_gemini_repair_round_omits_original_prompt(monkeypatch):
+    marked = "12 | 00:01:02,000 - 00:01:04,000 | 佐伯 | dialogue | 独特字幕轨标记串"
+    provider = GeminiProvider(api_key="fake-key")
+    calls = _fake_gemini(monkeypatch, provider, ['{"val": 1}', '{"value": 1}'])
+
+    assert await provider.complete("SYS", marked, Toy) == Toy(value=1)
+
+    assert marked in calls[0]["contents"]
+    assert marked not in calls[1]["contents"]
+    assert "value" in calls[1]["contents"]
+    assert '{"val": 1}' in calls[1]["contents"]
+
+
+@pytest.mark.asyncio
+async def test_gemini_schema_error_carries_raw_output(monkeypatch):
+    provider = GeminiProvider(api_key="fake-key")
+    _fake_gemini(monkeypatch, provider, ['{"val": 1}'] * LLMConfig().max_attempts)
+
+    with pytest.raises(LLMSchemaError) as exc:
+        await provider.complete("SYS", "USR", Toy)
+
+    assert exc.value.raw_output == '{"val": 1}'
+
+
+@pytest.mark.asyncio
+async def test_openai_compatible_schema_error_carries_raw_output(monkeypatch):
+    """失败时最需要现场的就是原始模型输出，不能只留 last_error 的前 1500 字符。"""
+    _fake_httpx(monkeypatch, ['<think>算</think>\n{"val": 1}'] * LLMConfig().max_attempts)
+    provider = MiniMaxProvider(api_key="secret")
+
+    with pytest.raises(LLMSchemaError) as exc:
+        await provider.complete("SYS", "USR", Toy)
+
+    assert exc.value.raw_output == '<think>算</think>\n{"val": 1}'
+
+
+def test_llm_schema_error_is_an_llm_error():
+    assert issubclass(LLMSchemaError, LLMError)
 
 
 # --- MiniMax ---
@@ -487,9 +596,11 @@ async def test_minimax_complete_retries_on_wrong_field_names(monkeypatch):
     first = posts[0]["json"]["messages"]
     second = posts[1]["json"]["messages"]
     assert len(first) == 2
-    # 重试请求带上了原始两条 + 助手的错误输出 + 携带报错的纠正指令
+    # 重试请求带上了 system + 只含 schema 的纠错指令 + 助手的错误输出 + 携带报错的指令
     assert len(second) == 4
-    assert second[:2] == first
+    assert second[0] == first[0]
+    # 纠错轮**不重发**首轮那份正文（见 test_..._repair_round_omits_original_prompt）
+    assert second[1] != first[1]
     assert second[2]["role"] == "assistant"
     assert '{"script": {"val": 42}}' in second[2]["content"]
     assert second[3]["role"] == "user"
@@ -499,15 +610,71 @@ async def test_minimax_complete_retries_on_wrong_field_names(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_minimax_complete_gives_up_after_max_attempts(monkeypatch):
-    log = _fake_httpx(monkeypatch, ['{"val": 1}'] * OPENAI_COMPATIBLE_MAX_ATTEMPTS)
+    attempts = LLMConfig().max_attempts
+    log = _fake_httpx(monkeypatch, ['{"val": 1}'] * attempts)
     provider = MiniMaxProvider(api_key="secret")
 
-    with pytest.raises(RuntimeError) as exc:
+    with pytest.raises(LLMSchemaError) as exc:
         await provider.complete("SYS", "USR", Toy)
 
     assert "Toy" in str(exc.value)
-    assert str(OPENAI_COMPATIBLE_MAX_ATTEMPTS) in str(exc.value)
-    assert len([r for r in log if "url" in r]) == OPENAI_COMPATIBLE_MAX_ATTEMPTS
+    assert str(attempts) in str(exc.value)
+    assert len([r for r in log if "url" in r]) == attempts
+
+
+@pytest.mark.asyncio
+async def test_openai_compatible_honours_max_attempts_override(monkeypatch):
+    """max_attempts 从 LLMConfig 接线进来，不再是模块级硬编码常量。"""
+    log = _fake_httpx(monkeypatch, ['{"val": 1}'] * 5)
+    provider = OpenAICompatibleProvider(
+        api_key="k", model="m", base_url="https://x.test/v1", max_attempts=2
+    )
+
+    with pytest.raises(LLMSchemaError):
+        await provider.complete("SYS", "USR", Toy)
+
+    assert len([r for r in log if "url" in r]) == 2
+
+
+@pytest.mark.asyncio
+async def test_openai_compatible_repair_round_omits_original_prompt(monkeypatch):
+    """纠错轮只发 schema + 报错 + 坏输出，**不重发字幕轨**。
+
+    首轮的 user 消息是 ~35k 字符（对白轨 + 高能点 + few-shot 示例），原实现把它
+    留在 messages[1] 里逐轮重发，第 3 次请求 ≈ 完整 prompt + 2 份坏输出。
+    """
+    marked = "12 | 00:01:02,000 - 00:01:04,000 | 佐伯 | dialogue | 独特字幕轨标记串"
+    log = _fake_httpx(monkeypatch, ['{"val": 1}', '{"value": 1}'])
+    provider = OpenAICompatibleProvider(
+        api_key="k", model="m", base_url="https://x.test/v1"
+    )
+
+    assert await provider.complete("SYS", marked, Toy) == Toy(value=1)
+
+    posts = [r for r in log if "url" in r]
+    assert marked in json.dumps(posts[0]["json"], ensure_ascii=False)
+    assert marked not in json.dumps(posts[1]["json"], ensure_ascii=False)
+    # 但 schema 本身必须还在，否则模型无从修正
+    assert "value" in json.dumps(posts[1]["json"], ensure_ascii=False)
+
+
+@pytest.mark.asyncio
+async def test_openai_compatible_repair_round_truncates_bad_output(monkeypatch):
+    """坏输出也要截断：整份坏剧本回灌一遍照样是几万 token。"""
+    from tenmin.script.llm import REPAIR_OUTPUT_MAX_CHARS
+
+    junk = "x" * (REPAIR_OUTPUT_MAX_CHARS + 5000)
+    log = _fake_httpx(monkeypatch, [f'{{"val": "{junk}"}}', '{"value": 1}'])
+    provider = OpenAICompatibleProvider(
+        api_key="k", model="m", base_url="https://x.test/v1"
+    )
+
+    assert await provider.complete("SYS", "USR", Toy) == Toy(value=1)
+
+    posts = [r for r in log if "url" in r]
+    echoed = posts[1]["json"]["messages"][2]["content"]
+    assert len(echoed) < len(junk)
+    assert "已截断" in echoed or "只保留前" in echoed
 
 
 @pytest.mark.asyncio
@@ -640,7 +807,8 @@ async def test_minimax_stream_retries_on_wrong_field_names(monkeypatch):
     second = posts[1]["json"]["messages"]
     assert len(first) == 2
     assert len(second) == 4
-    assert second[:2] == first
+    assert second[0] == first[0]
+    assert second[1] != first[1]
     assert second[2]["role"] == "assistant"
     assert '{"script": {"val": 42}}' in second[2]["content"]
     assert second[3]["role"] == "user"
