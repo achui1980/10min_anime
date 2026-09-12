@@ -103,6 +103,18 @@ def _parse_retry_after(value: str | None) -> float | None:
         return None
 
 
+def _truncate(text: str, limit: int) -> str:
+    """超长就截断并注明原长度，免得读报错的人以为模型只输出了这么点。"""
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit]}\n…（已截断，原输出共 {len(text)} 字符，这里只保留前 {limit} 个）"
+
+
+def _schema_spec(schema: type[BaseModel]) -> str:
+    """schema 的 JSON 文本。ensure_ascii=False：中文枚举/描述不能被转义成 \\uXXXX。"""
+    return json.dumps(schema.model_json_schema(), ensure_ascii=False, indent=2)
+
+
 class LLMError(RuntimeError):
     """provider 抛出、且已经自带一句人话的异常的基类。
 
@@ -201,18 +213,6 @@ class LLMFinishReasonError(LLMError):
     的是一句 `TypeError`。这两种情形的处置还完全不同（改提示词 vs 调高
     max_output_tokens），所以必须分开报。
     """
-
-
-def _truncate(text: str, limit: int) -> str:
-    """超长就截断并注明原长度，免得读报错的人以为模型只输出了这么点。"""
-    if len(text) <= limit:
-        return text
-    return f"{text[:limit]}\n…（已截断，原输出共 {len(text)} 字符，这里只保留前 {limit} 个）"
-
-
-def _schema_spec(schema: type[BaseModel]) -> str:
-    """schema 的 JSON 文本。ensure_ascii=False：中文枚举/描述不能被转义成 \\uXXXX。"""
-    return json.dumps(schema.model_json_schema(), ensure_ascii=False, indent=2)
 
 
 @dataclass(frozen=True)
@@ -350,7 +350,8 @@ def _business_error(event: dict[str, Any]) -> tuple[Any, str] | None:
         if isinstance(code, int) and code != 0:
             return code, str(base.get("status_msg") or base.get("msg") or "(无 message)")
     error = event.get("error")
-    if isinstance(error, dict):
+    # 空 dict / None 不算错误：有些实现在每个 chunk 里都塞一个 error 占位。
+    if isinstance(error, dict) and error:
         return (
             error.get("code") or error.get("type") or "(无错误码)",
             str(error.get("message") or "(无 message)"),

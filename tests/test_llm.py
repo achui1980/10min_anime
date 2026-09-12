@@ -1137,6 +1137,26 @@ async def test_transport_retry_count_is_reported_in_the_final_error(monkeypatch,
     assert len([r for r in log if "url" in r]) == 4
 
 
+@pytest.mark.asyncio
+async def test_empty_or_null_error_field_is_not_an_error(monkeypatch):
+    """有些实现在每个 chunk 里都塞一个空的/null 的 error 字段占位。"""
+    log = _mock_httpx(
+        monkeypatch,
+        [
+            _sse(
+                {"choices": [{"delta": {"content": '{"value": '}}], "error": None},
+                {"choices": [{"delta": {"content": "5}"}}], "error": {}},
+            )
+        ],
+    )
+    provider = OpenAICompatibleProvider(
+        api_key="k", model="m", base_url="https://x.test/v1"
+    )
+
+    assert await provider.complete("SYS", "USR", Toy) == Toy(value=5)
+    assert len([r for r in log if "url" in r]) == 1
+
+
 def test_llm_business_error_is_an_llm_error():
     assert issubclass(LLMBusinessError, LLMError)
 
