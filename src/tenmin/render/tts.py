@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import random
 import re
+import unicodedata
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
@@ -269,6 +270,68 @@ def _find_cached_chunk(voice_dir: Path, desired: str, digest: str) -> Path | Non
     return None
 
 
+def _is_pronounceable(text: str) -> bool:
+    """这段文本里有没有任何「读得出声」的字符。
+
+    实测事故：work/saijo 的 E05 旁白用 `'…'` 当引号，chunks.split_sentences 在 `。`
+    之后切开，把闭合的 `'` 留成一个独立片段（`03_script/E05.script.json` 的
+    beat-3-act2 与 beat-5-act4 都有）。一旦某个 hold 正好落在这种片段上，它就会自己成为
+    一个 chunk，Edge TTS 抛 NoAudioReceived（communicate.py:567），重试耗尽后整次运行
+    中止 —— 一个引号搞掉一整集。
+
+    判据用 unicodedata 的大类：L*（字母，含 CJK 汉字与假名）与 N*（数字）算可发音，
+    标点（P*）、符号（S*）、空白（Z*）、破折号一概不算。刻意不用字符黑名单：黑名单永远
+    补不全，而「没有任何字母或数字」正好是「没有内容可读」的等价表述。
+
+    切句本身的缺陷（`。` 后跟 `'`/`」`/`”`/`）` 时应该在闭合符之后再切）是 chunks.py
+    的问题，归后续任务；这里只负责让 tts 层对这种输入健壮。
+    """
+    return any(unicodedata.category(char)[0] in "LN" for char in text)
+
+
+def _plan_pronounceable(
+    script: Script, warnings: list[str]
+) -> list[tuple[Beat, list[tuple[str, float]]]]:
+    """切 chunk 并剔掉不可发音的那些，被剔掉的 chunk 带的留白折进前一个 chunk。
+
+    留白是成片里真实存在的静音（render/audio.py 会把它铺出来），凭空少掉一段会让此后
+    整条时间轴前移，所以只能转移、不能丢。
+    """
+    staged: list[tuple[Beat, list[tuple[str, float]]]] = []
+    # 指向最近一个保留下来的 chunk 所在的那个列表，跨 beat 也有效。
+    last_bucket: list[tuple[str, float]] | None = None
+    for beat in script.beats:
+        planned = plan_chunks(beat)
+        if not planned:
+            warnings.append(f"beat {beat.id} 没有旁白文本，已跳过配音")
+            continue
+        kept: list[tuple[str, float]] = []
+        for text, hold_after in planned:
+            if _is_pronounceable(text):
+                kept.append((text, hold_after))
+                last_bucket = kept
+                continue
+            warnings.append(
+                f"beat {beat.id} 有一个不含任何可发音字符的 chunk {text!r}，已跳过合成"
+                "（多半是切句把闭合引号留成了独立片段）"
+            )
+            if hold_after <= 0:
+                continue
+            if last_bucket:
+                previous_text, previous_hold = last_bucket[-1]
+                last_bucket[-1] = (previous_text, previous_hold + hold_after)
+            else:
+                warnings.append(
+                    f"beat {beat.id} 上面那个 chunk 带的 {hold_after:.1f} 秒留白前面没有"
+                    "任何 chunk 可以挂，已丢弃"
+                )
+        if kept:
+            staged.append((beat, kept))
+        else:
+            warnings.append(f"beat {beat.id} 的旁白没有任何可发音字符，已整段跳过配音")
+    return staged
+
+
 async def synthesize_track(
     script: Script,
     episode: int,
@@ -293,13 +356,7 @@ async def synthesize_track(
         {chunk.path: chunk.duration for chunk in previous.chunks} if previous else {}
     )
     warnings: list[str] = []
-    planned_by_beat: list[tuple[Beat, list[tuple[str, float]]]] = []
-    for beat in script.beats:
-        planned = plan_chunks(beat)
-        if not planned:
-            warnings.append(f"beat {beat.id} 没有旁白文本，已跳过配音")
-            continue
-        planned_by_beat.append((beat, planned))
+    planned_by_beat = _plan_pronounceable(script, warnings)
 
     total_chunks = sum(len(planned) for _, planned in planned_by_beat)
 

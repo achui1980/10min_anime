@@ -590,3 +590,106 @@ async def test_duplicate_text_in_one_run_reuses_without_probing(tmp_path, monkey
     assert len(engine.calls) == 1
     assert [c.duration for c in track.chunks] == [6.0, 6.0]
     assert track.chunks[0].path == track.chunks[1].path
+
+
+# --- 不可发音的 chunk ---
+
+
+def _quote_only_script(*, holds: list[Hold]) -> Script:
+    """复刻实测事故：work/saijo 的 E05 旁白用 `'…'` 当引号，chunks.split_sentences
+    在 `。` 之后切开，把闭合的 `'` 留成一个独立片段。hold 一旦落在它上面，它就会自己
+    成为一个 chunk，Edge TTS 抛 NoAudioReceived，重试三次后整次运行中止。"""
+    return Script(
+        show="剧名",
+        episodes=[2],
+        beats=[
+            Beat(
+                id="b1",
+                label="A",
+                role="hook",
+                narration="第一句。第二句。'",
+                audio=AudioDirection(holds=holds),
+            )
+        ],
+    )
+
+
+def test_the_incident_input_really_produces_a_lone_quote_chunk():
+    """先证明这个输入真的会切出一个独立的 `'` chunk，否则下面几条测的是空气。"""
+    from tenmin.render.chunks import plan_chunks
+
+    script = _quote_only_script(
+        holds=[Hold(at=1.8, duration=2.0, quote="q"), Hold(at=2.0, duration=3.0, quote="q")]
+    )
+    assert plan_chunks(script.beats[0]) == [("第一句。第二句。", 2.0), ("'", 3.0)]
+
+
+async def test_unpronounceable_chunk_is_skipped_and_its_hold_folded_back(tmp_path):
+    engine = FakeTTSEngine([6.0])
+    script = _quote_only_script(
+        holds=[Hold(at=1.8, duration=2.0, quote="q"), Hold(at=2.0, duration=3.0, quote="q")]
+    )
+
+    track, warnings = await synthesize_track(script, 2, tmp_path, engine)
+
+    assert [c["text"] for c in engine.calls] == ["第一句。第二句。"]
+    assert [c.text for c in track.chunks] == ["第一句。第二句。"]
+    # 被跳过的那个 chunk 带的 3 秒留白不能凭空消失，否则时间轴整体前移。
+    assert [c.hold_after for c in track.chunks] == [5.0]
+    assert track.total_seconds == pytest.approx(11.0)
+    assert any("b1" in w and "'" in w for w in warnings)
+
+
+async def test_beat_with_only_unpronounceable_text_is_skipped(tmp_path):
+    engine = FakeTTSEngine([])
+    script = Script(
+        show="剧名",
+        episodes=[2],
+        beats=[Beat(id="b1", label="A", role="hook", narration="——")],
+    )
+
+    track, warnings = await synthesize_track(script, 2, tmp_path, engine)
+
+    assert track.chunks == []
+    assert engine.calls == []
+    assert any("b1" in w for w in warnings)
+
+
+async def test_hold_on_a_leading_unpronounceable_chunk_is_reported_not_swallowed(tmp_path):
+    """前面没有任何 chunk 可以挂的留白只能丢，但必须吭一声。"""
+    script = Script(
+        show="剧名",
+        episodes=[2],
+        beats=[
+            Beat(
+                id="b1",
+                label="A",
+                role="hook",
+                narration="'。第二句。",
+                audio=AudioDirection(holds=[Hold(at=0.0, duration=4.0, quote="q")]),
+            )
+        ],
+    )
+    track, warnings = await synthesize_track(script, 2, tmp_path, FakeTTSEngine([5.0]))
+    assert [c.text for c in track.chunks] == ["第二句。"]
+    assert [c.hold_after for c in track.chunks] == [0.0]
+    assert any("留白" in w for w in warnings)
+
+
+async def test_progress_total_excludes_skipped_chunks(tmp_path):
+    reporter = FakeReporter()
+    script = _quote_only_script(
+        holds=[Hold(at=1.8, duration=2.0, quote="q"), Hold(at=2.0, duration=3.0, quote="q")]
+    )
+    await synthesize_track(script, 2, tmp_path, FakeTTSEngine([6.0]), reporter=reporter)
+    assert reporter.calls == [("substep", "voice", 1, 1, "第一句。第二句。")]
+
+
+@pytest.mark.parametrize("text", ["Q3 财报。", "第一句。", "ABC。", "２０２５。"])
+def test_normal_text_stays_pronounceable(text):
+    assert tts_module._is_pronounceable(text)
+
+
+@pytest.mark.parametrize("text", ["'", "——", "，、。", "「」", "  ", "…"])
+def test_punctuation_only_text_is_not_pronounceable(text):
+    assert not tts_module._is_pronounceable(text)
