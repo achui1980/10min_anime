@@ -18,6 +18,13 @@ STDERR_TAIL_LINES = 30
 # 属于「不该发生」；给个上限是为了宁可丢掉诊断信息也不把出片卡成永久挂死。
 STDERR_DRAIN_TIMEOUT_SECONDS = 10.0
 
+# --- 超时。只给「短命令」设，长时间编码刻意不设（见 run 的 docstring） ---
+# ffprobe 读容器 duration 实测 0.045 秒（346MB mkv，本地 SSD）。60 秒是它的 1300 倍，
+# 留给「源片在转速降下来的外置盘/网络挂载上」这类慢 I/O —— 本项目自己就跑在 /Volumes 上。
+PROBE_TIMEOUT_SECONDS = 60.0
+# `ffmpeg -filters` / `-encoders` 是纯进程内枚举，不碰任何媒体文件，正常是毫秒级。
+CAPABILITY_TIMEOUT_SECONDS = 30.0
+
 # ffmpeg -filters / -encoders 每行形如 " .. ass  V->V  描述"，
 # 标志列只由大写字母和点组成，名字是紧跟其后的第一个 token。
 # 宽度必须从 2 起：-encoders 的标志列是 6 列（"V....D"），但 -filters 只有 2 列
@@ -77,6 +84,15 @@ def progress_seconds(fields: Mapping[str, str]) -> float | None:
     return _parse_timecode(raw)
 
 
+def _decode(raw: str | bytes | None) -> str:
+    """TimeoutExpired.stderr 的类型随 text= 与是否真读到东西而变，统一成 str。"""
+    if raw is None:
+        return ""
+    if isinstance(raw, bytes):
+        return raw.decode("utf-8", errors="replace")
+    return raw
+
+
 def tail(text: str, lines: int = STDERR_TAIL_LINES) -> str:
     """取末尾若干行。ffmpeg 的真实错误永远在 stderr 尾部。
 
@@ -102,18 +118,37 @@ def tail(text: str, lines: int = STDERR_TAIL_LINES) -> str:
     return "\n".join(visible[-lines:])
 
 
-def run(args: list[str], *, ffmpeg: str = FFMPEG) -> str:
+def run(args: list[str], *, ffmpeg: str = FFMPEG, timeout: float | None = None) -> str:
     """跑 ffmpeg，返回 stderr（ffmpeg 的进度与日志都在 stderr）。
 
     source 视频的容器元数据（title/album/description 等标签）常年是老字幕组用非
     UTF-8 编码硬塞进去的脏数据，ffmpeg 会把这些原始字节原样打到 stderr 里。严格
     UTF-8 解码遇到这种输入必炸——所以这里用 errors="replace"，脏字节换成 U+FFFD，
     不让一段无关的元数据把整条渲染流水线搞挂。
+
+    timeout 默认 None = 不设上限，这是**刻意的**：这个函数在生产里的调用方是
+    mix_audio，一次几分钟的真实编码，设上限只会在慢机器上误杀一次已经跑了一半的活。
+    长跑任务的中止交给用户 Ctrl-C（现在会正确杀掉子进程）。只有 preflight 里那些
+    「本该毫秒级返回」的探测才传具体值进来。
     """
-    argv = [ffmpeg, *args]
-    completed = subprocess.run(
-        argv, capture_output=True, text=True, errors="replace"
-    )
+    argv = [ffmpeg, "-nostdin", *args]
+    try:
+        completed = subprocess.run(
+            argv,
+            capture_output=True,
+            text=True,
+            errors="replace",
+            # ffmpeg 会抢共享 TTY 的 stdin 然后静默挂死整条流水线。-nostdin 让它自己
+            # 不读，DEVNULL 从 OS 层面兜底 —— 后者才是结构性保证，不依赖 flag 支持。
+            stdin=subprocess.DEVNULL,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as error:
+        # subprocess.run 超时会自己 kill 子进程再抛，这里只负责把它翻译成人话。
+        raise FFmpegError(
+            f"ffmpeg 超时（超过 {timeout} 秒）：\n{shlex.join(argv)}\n\n"
+            f"stderr 末尾 {STDERR_TAIL_LINES} 行：\n{tail(_decode(error.stderr))}"
+        ) from error
     if completed.returncode != 0:
         raise FFmpegError(
             f"ffmpeg 退出码 {completed.returncode}，命令：\n"
@@ -135,7 +170,24 @@ def probe_duration(path: Path, *, ffprobe: str = FFPROBE) -> float:
         "csv=p=0",
         str(path),
     ]
-    completed = subprocess.run(args, capture_output=True, text=True, errors="replace")
+    # 刻意**不**加 -nostdin：ffprobe 不认这个选项。实测 ffprobe 9.0.1 会直接报
+    # `Failed to set value '-v' for option 'nostdin': Option not found` 并退出 1。
+    # 它这边只能靠 stdin=DEVNULL 防抢 TTY。
+    try:
+        completed = subprocess.run(
+            args,
+            capture_output=True,
+            text=True,
+            errors="replace",
+            stdin=subprocess.DEVNULL,
+            timeout=PROBE_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise FFmpegError(
+            f"ffprobe 读 {path} 的时长超时（超过 {PROBE_TIMEOUT_SECONDS} 秒）：\n"
+            f"{shlex.join(args)}\n\n"
+            f"源片是不是在一个很慢/已经掉线的盘上？\n{tail(_decode(error.stderr))}"
+        ) from error
     if completed.returncode != 0:
         raise FFmpegError(
             f"ffprobe 读不出 {path} 的时长，退出码 {completed.returncode}：\n"
@@ -164,12 +216,22 @@ def available_encoders(ffmpeg: str = FFMPEG) -> frozenset[str]:
 
 
 def _probe_capabilities(ffmpeg: str, flag: str) -> frozenset[str]:
-    completed = subprocess.run(
-        [ffmpeg, "-hide_banner", flag],
-        capture_output=True,
-        text=True,
-        errors="replace",
-    )
+    argv = [ffmpeg, "-nostdin", "-hide_banner", flag]
+    try:
+        completed = subprocess.run(
+            argv,
+            capture_output=True,
+            text=True,
+            errors="replace",
+            stdin=subprocess.DEVNULL,
+            timeout=CAPABILITY_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise FFmpegError(
+            f"探测 ffmpeg 能力超时（超过 {CAPABILITY_TIMEOUT_SECONDS} 秒）："
+            f"\n{shlex.join(argv)}\n\n"
+            f"{flag} 只是进程内枚举，正常是毫秒级 —— 这个 ffmpeg 大概率有问题。"
+        ) from error
     return frozenset(parse_names(completed.stdout))
 
 
@@ -243,7 +305,7 @@ def run_with_progress(
     # -progress 是全局选项，放到 -i 之前才是它该在的位置（原来追加在输出文件名之后，
     # 碰巧能用而已）。argv 只拼一次，Popen 与出错消息共用同一个变量：原来出错分支自己
     # 重建了一遍字符串、且漏了 -progress pipe:1，报出来的命令不是真正跑的那条。
-    argv = [ffmpeg, "-nostats", "-progress", "pipe:1", *args]
+    argv = [ffmpeg, "-nostdin", "-nostats", "-progress", "pipe:1", *args]
 
     def report(fields: dict[str, str]) -> None:
         seconds = progress_seconds(fields)
@@ -257,6 +319,7 @@ def run_with_progress(
     # 来说那个 wait() 自己就是一次挂死。
     with subprocess.Popen(
         argv,
+        stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,

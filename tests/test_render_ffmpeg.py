@@ -126,7 +126,7 @@ def test_run_returns_stderr_on_success(monkeypatch):
 
     monkeypatch.setattr("tenmin.render.ffmpeg.subprocess.run", fake_run)
     assert run(["-i", "a.mkv"]) == "frame= 100"
-    assert seen["args"] == ["ffmpeg", "-i", "a.mkv"]
+    assert seen["args"] == ["ffmpeg", "-nostdin", "-i", "a.mkv"]
 
 
 def test_run_raises_with_stderr_tail(monkeypatch):
@@ -159,14 +159,19 @@ def test_run_error_command_is_paste_safe(monkeypatch):
         "[0:v]trim=start=1;[v0]subtitles=filename='/x/E02.ass'[vout]",
     ]
 
-    def fake_run(_args, **kwargs):
+    executed: dict[str, list[str]] = {}
+
+    def fake_run(argv, **kwargs):
+        executed["argv"] = list(argv)
         return FakeCompleted(returncode=1, stderr="Invalid argument")
 
     monkeypatch.setattr("tenmin.render.ffmpeg.subprocess.run", fake_run)
     with pytest.raises(FFmpegError) as exc:
         run(args)
     message = str(exc.value)
-    assert shlex.join(["ffmpeg", *args]) in message
+    assert shlex.join(executed["argv"]) in message
+    # 具体到本项目会踩的那几个字符：粘回 shell 必须是安全的
+    assert "'/v/[LoliHouse] 番 01.mkv'" in message
 
 
 def test_run_with_progress_error_reports_the_argv_actually_executed(monkeypatch):
@@ -675,3 +680,124 @@ def test_run_with_progress_kills_ffmpeg_when_on_progress_raises(tmp_path):
     assert len(spawned) == 1
     # 进程必须已经死了（不是还在 sleep）
     assert spawned[0].poll() is not None
+
+
+# --- 不许抢 stdin，短命令要有超时 ---
+
+
+def test_run_passes_nostdin_and_detaches_stdin(monkeypatch):
+    """ffmpeg 会抢共享 TTY 的 stdin，然后静默挂死整条流水线。
+
+    subprocess.run(capture_output=True) **不**设 stdin，子进程直接继承父进程的 TTY。
+    -nostdin 让 ffmpeg 自己不读，stdin=DEVNULL 从 OS 层面兜底 —— 后者才是结构性的
+    保证，因为它不依赖被调的二进制认不认那个 flag。
+    """
+    seen: dict[str, object] = {}
+
+    def fake_run(args, **kwargs):
+        seen["args"] = list(args)
+        seen["stdin"] = kwargs.get("stdin")
+        return FakeCompleted()
+
+    monkeypatch.setattr("tenmin.render.ffmpeg.subprocess.run", fake_run)
+    run(["-i", "a.mkv"])
+    assert "-nostdin" in seen["args"]
+    assert seen["stdin"] is subprocess.DEVNULL
+
+
+def test_run_with_progress_passes_nostdin_and_detaches_stdin(monkeypatch):
+    seen: dict[str, object] = {}
+
+    def fake_popen(args, **kwargs):
+        seen["args"] = list(args)
+        seen["stdin"] = kwargs.get("stdin")
+        return FakePopen(["progress=end\n"])
+
+    monkeypatch.setattr("tenmin.render.ffmpeg.subprocess.Popen", fake_popen)
+    run_with_progress(["-i", "in.mp4", "out.mp4"], total_seconds=1.0)
+    assert "-nostdin" in seen["args"]
+    assert seen["stdin"] is subprocess.DEVNULL
+
+
+def test_probe_duration_must_not_pass_nostdin_to_ffprobe(monkeypatch, tmp_path):
+    """ffprobe **不认** -nostdin，加上去会直接把它打死。
+
+    实测 ffprobe 9.0.1：`ffprobe -nostdin -v error ...` →
+    `Failed to set value '-v' for option 'nostdin': Option not found`，退出码 1。
+    所以 ffprobe 那边只能靠 stdin=DEVNULL。这条测试锁死「别顺手给它也加上」。
+    """
+    media = tmp_path / "a.mkv"
+    media.write_bytes(b"fake")
+    seen: dict[str, object] = {}
+
+    def fake_run(args, **kwargs):
+        seen["args"] = list(args)
+        seen["stdin"] = kwargs.get("stdin")
+        return FakeCompleted(stdout="1.5\n")
+
+    monkeypatch.setattr("tenmin.render.ffmpeg.subprocess.run", fake_run)
+    probe_duration(media)
+    assert "-nostdin" not in seen["args"]
+    assert seen["stdin"] is subprocess.DEVNULL
+
+
+def test_probe_duration_has_a_timeout_and_reports_it_readably(monkeypatch, tmp_path):
+    media = tmp_path / "a.mkv"
+    media.write_bytes(b"fake")
+    seen: dict[str, object] = {}
+
+    def fake_run(args, **kwargs):
+        seen["timeout"] = kwargs.get("timeout")
+        raise subprocess.TimeoutExpired(args, kwargs.get("timeout") or 0)
+
+    monkeypatch.setattr("tenmin.render.ffmpeg.subprocess.run", fake_run)
+    with pytest.raises(FFmpegError) as exc:
+        probe_duration(media)
+    assert isinstance(seen["timeout"], (int, float))
+    message = str(exc.value)
+    assert "超时" in message
+    # 出错消息里必须有可粘贴的命令，不然「超时了」等于没说
+    assert "a.mkv" in message
+
+
+def test_capability_probe_has_a_timeout(monkeypatch):
+    from tenmin.render import ffmpeg as ffmpeg_mod
+
+    seen: dict[str, object] = {}
+
+    def fake_run(args, **kwargs):
+        seen["timeout"] = kwargs.get("timeout")
+        return FakeCompleted(stdout=FILTERS_SAMPLE)
+
+    monkeypatch.setattr("tenmin.render.ffmpeg.subprocess.run", fake_run)
+    ffmpeg_mod.available_filters.cache_clear()
+    try:
+        ffmpeg_mod.available_filters()
+    finally:
+        ffmpeg_mod.available_filters.cache_clear()
+    assert isinstance(seen["timeout"], (int, float))
+
+
+def test_run_accepts_an_explicit_timeout_and_raises_ffmpeg_error(monkeypatch):
+    """短命令（preflight 的探测）要能给超时；长时间编码刻意不给。"""
+
+    def fake_run(args, **kwargs):
+        assert kwargs.get("timeout") == 5.0
+        raise subprocess.TimeoutExpired(args, 5.0)
+
+    monkeypatch.setattr("tenmin.render.ffmpeg.subprocess.run", fake_run)
+    with pytest.raises(FFmpegError, match="超时"):
+        run(["-i", "a.mkv"], timeout=5.0)
+
+
+def test_run_defaults_to_no_timeout_because_encoding_takes_minutes(monkeypatch):
+    """mix_audio 是几分钟的真编码，给它设超时只会在慢机器上误杀。"""
+    seen: dict[str, object] = {}
+
+    def fake_run(args, **kwargs):
+        seen["timeout"] = kwargs.get("timeout")
+        return FakeCompleted()
+
+    monkeypatch.setattr("tenmin.render.ffmpeg.subprocess.run", fake_run)
+    run(["-i", "a.mkv"])
+    assert seen["timeout"] is None
