@@ -68,6 +68,12 @@ ONLY_OPTION = typer.Option(
         "（--only ingest --only signals / --only ingest,signals）"
     ),
 )
+SRT_OPTION = typer.Option(
+    None, "--srt", help="要注册的字幕文件路径，需配合 --episode 和 --video"
+)
+VIDEO_OPTION = typer.Option(
+    None, "--video", help="要注册的视频文件路径，需配合 --episode 和 --srt"
+)
 
 PROJECT_TEMPLATE = {
     "show": "剧名",
@@ -147,12 +153,8 @@ def run(
     episode: int | None = typer.Option(
         None, "--episode", help="要处理的集数；配合 --srt/--video 可注册新的一集"
     ),
-    srt: Path | None = typer.Option(
-        None, "--srt", help="要注册的字幕文件路径，需配合 --episode 和 --video"
-    ),
-    video: Path | None = typer.Option(
-        None, "--video", help="要注册的视频文件路径，需配合 --episode 和 --srt"
-    ),
+    srt: Path | None = SRT_OPTION,
+    video: Path | None = VIDEO_OPTION,
 ) -> None:
     """跑流水线：ingest -> signals -> script -> docgen -> voice -> timeline -> audio -> render。"""
     cfg = load_project(_project_file(work_dir, slug))
@@ -301,7 +303,3 @@ def inspect(
             f"  {format_timestamp(highlight.start)} | 强度 {highlight.strength} "
             f"| {'、'.join(highlight.triggers)} | {highlight.summary}"
         )
-
-
-def main() -> None:
-    app()
