@@ -7,6 +7,7 @@ import asyncio
 import json
 import random
 import re
+import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any, Protocol, overload, runtime_checkable
@@ -359,6 +360,31 @@ def _business_error(event: dict[str, Any]) -> tuple[Any, str] | None:
     return None
 
 
+@dataclass(frozen=True)
+class LLMUsage:
+    """上一次 complete() 的用量与耗时。
+
+    流里的 usage chunk 原先被整个丢弃。本项目刻意不引入 logging，也不想为了这点
+    信息去改 LLMProvider Protocol 的返回类型（那会牵动 single.py / pipeline.py /
+    FakeProvider 与一大票测试，投入产出不划算），所以只做最小暴露：挂在
+    provider.last_usage 上，谁想看谁读。字段为 None = 服务端没给这个数。
+    """
+
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
+    total_tokens: int | None = None
+    elapsed_seconds: float = 0.0
+    requests: int = 1
+
+
+def _as_int(value: Any) -> int | None:
+    """usage 里的数字偶尔是字符串，也可能整个字段缺失。"""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 @dataclass
 class _StreamTally:
     """一次 complete() 期间跨轮累计的「值得报告但不该拿去日志」的现场。
@@ -370,6 +396,7 @@ class _StreamTally:
     malformed_lines: int = 0
     transport_retries: int = 0
     requests: int = 0
+    usage: dict[str, Any] | None = None
 
     def summary(self) -> str:
         notes = []
@@ -378,6 +405,16 @@ class _StreamTally:
         if self.transport_retries:
             notes.append(f"传输层重试 {self.transport_retries} 次")
         return "；".join(notes)
+
+    def to_usage(self, elapsed_seconds: float) -> LLMUsage:
+        raw = self.usage or {}
+        return LLMUsage(
+            prompt_tokens=_as_int(raw.get("prompt_tokens")),
+            completion_tokens=_as_int(raw.get("completion_tokens")),
+            total_tokens=_as_int(raw.get("total_tokens")),
+            elapsed_seconds=elapsed_seconds,
+            requests=self.requests,
+        )
 
 
 @runtime_checkable
@@ -465,11 +502,17 @@ class GeminiProvider:
         model: str = "gemini-3.6-flash",
         *,
         max_attempts: int = DEFAULT_LLM.max_attempts,
+        temperature: float | None = DEFAULT_LLM.temperature,
+        max_output_tokens: int | None = DEFAULT_LLM.max_output_tokens,
     ):
         from google import genai
 
         self.model = model
         self.max_attempts = max_attempts
+        self.temperature = temperature
+        self.max_output_tokens = max_output_tokens
+        self.last_usage: LLMUsage | None = None
+        self._requests = 0
         self._client = genai.Client(api_key=api_key)
 
     async def _generate(
@@ -477,11 +520,16 @@ class GeminiProvider:
     ) -> Any:
         from google.genai import types
 
+        # temperature / max_output_tokens 传 None 就是 GenerateContentConfig 自己的
+        # 「不设置」默认值，所以这里无条件传，不用像 OpenAI 兼容那边那样挑着塞。
         config = types.GenerateContentConfig(
             system_instruction=system,
             response_mime_type="application/json" if schema else None,
             response_schema=schema,
+            temperature=self.temperature,
+            max_output_tokens=self.max_output_tokens,
         )
+        self._requests += 1
         return await self._client.aio.models.generate_content(
             model=self.model, contents=contents, config=config
         )
@@ -492,6 +540,16 @@ class GeminiProvider:
         response = await self._generate(system, contents, schema)
         _check_gemini_finish(response)
         return response
+
+    def _record_usage(self, response: Any, elapsed_seconds: float) -> None:
+        meta = getattr(response, "usage_metadata", None)
+        self.last_usage = LLMUsage(
+            prompt_tokens=_as_int(getattr(meta, "prompt_token_count", None)),
+            completion_tokens=_as_int(getattr(meta, "candidates_token_count", None)),
+            total_tokens=_as_int(getattr(meta, "total_token_count", None)),
+            elapsed_seconds=elapsed_seconds,
+            requests=self._requests,
+        )
 
     def _repair_contents(self, schema: type[BaseModel], repair: RepairContext) -> str:
         return (
@@ -514,23 +572,32 @@ class GeminiProvider:
     async def complete(
         self, system: str, user: str, schema: type[BaseModel] | None = None
     ) -> Any:
-        if schema is None:
-            response = await self._generate_checked(system, user, None)
-            return response.text
+        self._requests = 0
+        started = time.monotonic()
+        last_response: Any = None
+        try:
+            if schema is None:
+                last_response = await self._generate_checked(system, user, None)
+                return last_response.text
 
-        async def send(repair: RepairContext | None) -> str:
-            contents = user if repair is None else self._repair_contents(schema, repair)
-            response = await self._generate_checked(system, contents, schema)
-            text = response.text
-            if text is None:
-                raise LLMResponseFormatError(
-                    "Gemini 一个字都没返回（response.text is None），没有可校验的内容。"
+            async def send(repair: RepairContext | None) -> str:
+                nonlocal last_response
+                contents = (
+                    user if repair is None else self._repair_contents(schema, repair)
                 )
-            return text
+                last_response = await self._generate_checked(system, contents, schema)
+                text = last_response.text
+                if text is None:
+                    raise LLMResponseFormatError(
+                        "Gemini 一个字都没返回（response.text is None），没有可校验的内容。"
+                    )
+                return text
 
-        return await _complete_with_schema_repair(
-            send, schema, max_attempts=self.max_attempts, label=type(self).__name__
-        )
+            return await _complete_with_schema_repair(
+                send, schema, max_attempts=self.max_attempts, label=type(self).__name__
+            )
+        finally:
+            self._record_usage(last_response, time.monotonic() - started)
 
 
 class OpenAICompatibleProvider:
@@ -549,11 +616,16 @@ class OpenAICompatibleProvider:
         timeout_seconds: float = DEFAULT_LLM.timeout_seconds,
         read_timeout_seconds: float = DEFAULT_LLM.read_timeout_seconds,
         total_timeout_seconds: float = DEFAULT_LLM.total_timeout_seconds,
+        temperature: float | None = DEFAULT_LLM.temperature,
+        max_output_tokens: int | None = DEFAULT_LLM.max_output_tokens,
     ) -> None:
         self.model = model
         self.base_url = base_url.rstrip("/")
         self.max_attempts = max_attempts
         self.transport_max_attempts = transport_max_attempts
+        self.temperature = temperature
+        self.max_output_tokens = max_output_tokens
+        self.last_usage: LLMUsage | None = None
         self._api_key = api_key
         self._total_timeout_seconds = total_timeout_seconds
         # read 是**相邻两个 chunk 之间**最多等多久，不是整段生成时长——流式下每个
@@ -637,6 +709,13 @@ class OpenAICompatibleProvider:
         }
         if json_mode:
             payload["response_format"] = {"type": "json_object"}
+        # None = 不塞这个字段，用服务端自己的默认值（保持接线前的行为逐字节不变）。
+        # 特别是 max_tokens：payload 原先根本不带它，长剧本可能被服务端的默认输出
+        # 上限静默截断，而截断的 JSON 只会表现成一句「不合 schema」。
+        if self.temperature is not None:
+            payload["temperature"] = self.temperature
+        if self.max_output_tokens is not None:
+            payload["max_tokens"] = self.max_output_tokens
         return payload
 
     @property
@@ -683,6 +762,8 @@ class OpenAICompatibleProvider:
                         if business is not None:
                             code, message = business
                             raise LLMBusinessError(code=code, message=message)
+                        if isinstance(event.get("usage"), dict):
+                            tally.usage = event["usage"]
                         parts.append(_event_delta(event))
         except TimeoutError as exc:
             # asyncio.timeout 到点抛的是内置 TimeoutError（httpx 自己的超时是
@@ -760,36 +841,43 @@ class OpenAICompatibleProvider:
         self, system: str, user: str, schema: type[BaseModel] | None = None
     ) -> Any:
         tally = _StreamTally()
-        if schema is None:
-            messages = [
+        started = time.monotonic()
+        try:
+            if schema is None:
+                messages = [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ]
+                text = await self._stream_with_retries(
+                    self._payload(messages, json_mode=False), tally
+                )
+                return _strip_reasoning(text)
+
+            first = [
                 {"role": "system", "content": system},
-                {"role": "user", "content": user},
+                {"role": "user", "content": self._schema_prompt(user, schema)},
             ]
-            text = await self._stream_with_retries(
-                self._payload(messages, json_mode=False), tally
-            )
-            return _strip_reasoning(text)
 
-        first = [
-            {"role": "system", "content": system},
-            {"role": "user", "content": self._schema_prompt(user, schema)},
-        ]
+            async def send(repair: RepairContext | None) -> str:
+                messages = (
+                    first
+                    if repair is None
+                    else self._repair_messages(system, schema, repair)
+                )
+                return await self._stream_with_retries(
+                    self._payload(messages, json_mode=True), tally
+                )
 
-        async def send(repair: RepairContext | None) -> str:
-            messages = (
-                first if repair is None else self._repair_messages(system, schema, repair)
+            return await _complete_with_schema_repair(
+                send,
+                schema,
+                max_attempts=self.max_attempts,
+                label=type(self).__name__,
+                diagnostics=tally.summary,
             )
-            return await self._stream_with_retries(
-                self._payload(messages, json_mode=True), tally
-            )
-
-        return await _complete_with_schema_repair(
-            send,
-            schema,
-            max_attempts=self.max_attempts,
-            label=type(self).__name__,
-            diagnostics=tally.summary,
-        )
+        finally:
+            # 失败路径也记：「白烧了多少 token」正是这时候最想知道的数。
+            self.last_usage = tally.to_usage(time.monotonic() - started)
 
 
 class MiniMaxProvider(OpenAICompatibleProvider):
@@ -831,6 +919,8 @@ def _transport_kwargs(cfg: LLMConfig) -> dict[str, Any]:
     - connect / pool 不可配，见 CONNECT_TIMEOUT_SECONDS / POOL_TIMEOUT_SECONDS
     """
     return {
+        "temperature": cfg.temperature,
+        "max_output_tokens": cfg.max_output_tokens,
         "max_attempts": cfg.max_attempts,
         "transport_max_attempts": cfg.transport_max_attempts,
         "timeout_seconds": cfg.timeout_seconds,
@@ -852,6 +942,8 @@ def build_provider(cfg: LLMConfig, settings: Settings) -> LLMProvider:
             api_key=settings.gemini_api_key.get_secret_value(),
             model=cfg.model,
             max_attempts=cfg.max_attempts,
+            temperature=cfg.temperature,
+            max_output_tokens=cfg.max_output_tokens,
         )
     if cfg.provider == "minimax":
         if not settings.minimax_api_key:

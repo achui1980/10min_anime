@@ -350,6 +350,193 @@ def test_llm_finish_reason_error_is_an_llm_error():
     assert issubclass(LLMFinishReasonError, LLMError)
 
 
+# --- temperature / max_output_tokens 接线 ---
+
+
+@pytest.mark.asyncio
+async def test_openai_compatible_omits_sampling_fields_by_default(monkeypatch):
+    """None = 不往请求里塞这个字段，保持接线前的行为逐字节不变。"""
+    log = _mock_httpx(monkeypatch, [_sse_from_chunks('{"value": 1}')])
+    provider = OpenAICompatibleProvider(
+        api_key="k", model="m", base_url="https://x.test/v1"
+    )
+
+    await provider.complete("SYS", "USR", Toy)
+
+    body = [r for r in log if "url" in r][0]["json"]
+    assert "temperature" not in body
+    assert "max_tokens" not in body
+
+
+@pytest.mark.asyncio
+async def test_openai_compatible_sends_sampling_fields_when_set(monkeypatch):
+    """payload 原先根本不带 max_tokens，长剧本可能被服务端默认上限静默截断。"""
+    log = _mock_httpx(monkeypatch, [_sse_from_chunks('{"value": 1}')])
+    provider = OpenAICompatibleProvider(
+        api_key="k",
+        model="m",
+        base_url="https://x.test/v1",
+        temperature=0.4,
+        max_output_tokens=32768,
+    )
+
+    await provider.complete("SYS", "USR", Toy)
+
+    body = [r for r in log if "url" in r][0]["json"]
+    assert body["temperature"] == pytest.approx(0.4)
+    assert body["max_tokens"] == 32768
+
+
+@pytest.mark.asyncio
+async def test_openai_compatible_repair_round_keeps_sampling_fields(monkeypatch):
+    log = _mock_httpx(
+        monkeypatch,
+        [_sse_from_chunks('{"val": 1}'), _sse_from_chunks('{"value": 1}')],
+    )
+    provider = OpenAICompatibleProvider(
+        api_key="k", model="m", base_url="https://x.test/v1", max_output_tokens=999
+    )
+
+    await provider.complete("SYS", "USR", Toy)
+
+    posts = [r for r in log if "url" in r]
+    assert posts[1]["json"]["max_tokens"] == 999
+
+
+@pytest.mark.asyncio
+async def test_gemini_omits_sampling_fields_by_default(monkeypatch):
+    provider = GeminiProvider(api_key="fake-key")
+    calls = _fake_gemini(monkeypatch, provider, ['{"value": 1}'])
+
+    await provider.complete("SYS", "USR", Toy)
+
+    assert calls[0]["config"].temperature is None
+    assert calls[0]["config"].max_output_tokens is None
+
+
+@pytest.mark.asyncio
+async def test_gemini_sends_sampling_fields_when_set(monkeypatch):
+    provider = GeminiProvider(
+        api_key="fake-key", temperature=0.2, max_output_tokens=65536
+    )
+    calls = _fake_gemini(monkeypatch, provider, ['{"value": 1}'])
+
+    await provider.complete("SYS", "USR", Toy)
+
+    assert calls[0]["config"].temperature == pytest.approx(0.2)
+    assert calls[0]["config"].max_output_tokens == 65536
+
+
+def test_build_provider_wires_sampling_fields_into_every_provider():
+    cfg = LLMConfig(provider="gemini", temperature=0.3, max_output_tokens=1234)
+    gemini = build_provider(cfg, Settings(gemini_api_key="k"))
+    assert gemini.temperature == pytest.approx(0.3)
+    assert gemini.max_output_tokens == 1234
+
+    minimax = build_provider(
+        cfg.model_copy(update={"provider": "minimax"}), Settings(minimax_api_key="k")
+    )
+    assert minimax.temperature == pytest.approx(0.3)
+    assert minimax.max_output_tokens == 1234
+
+
+def test_build_provider_wires_transport_knobs():
+    cfg = LLMConfig(
+        provider="minimax",
+        max_attempts=5,
+        transport_max_attempts=2,
+        timeout_seconds=11.0,
+        read_timeout_seconds=22.0,
+        total_timeout_seconds=33.0,
+    )
+    provider = build_provider(cfg, Settings(minimax_api_key="k"))
+    assert provider.max_attempts == 5
+    assert provider.transport_max_attempts == 2
+    assert provider._timeout.write == pytest.approx(11.0)
+    assert provider._timeout.read == pytest.approx(22.0)
+    assert provider._total_timeout_seconds == pytest.approx(33.0)
+
+
+# --- usage 透传 ---
+
+
+@pytest.mark.asyncio
+async def test_openai_compatible_exposes_last_usage(monkeypatch):
+    """流里的 usage chunk 原先被整个丢弃。本项目不引入 logging，所以只做最小暴露：
+    挂在 provider.last_usage 上，不改 LLMProvider Protocol 的返回类型。"""
+    log = _mock_httpx(
+        monkeypatch,
+        [
+            _sse(
+                _delta('{"value": 1}'),
+                {
+                    "choices": [],
+                    "usage": {
+                        "prompt_tokens": 12345,
+                        "completion_tokens": 678,
+                        "total_tokens": 13023,
+                    },
+                },
+            )
+        ],
+    )
+    provider = MiniMaxProvider(api_key="secret")
+    assert provider.last_usage is None
+
+    await provider.complete("SYS", "USR", Toy)
+
+    usage = provider.last_usage
+    assert usage is not None
+    assert usage.prompt_tokens == 12345
+    assert usage.completion_tokens == 678
+    assert usage.total_tokens == 13023
+    assert usage.requests == 1
+    assert usage.elapsed_seconds >= 0.0
+    assert len([r for r in log if "url" in r]) == 1
+
+
+@pytest.mark.asyncio
+async def test_last_usage_counts_every_request_including_repairs(monkeypatch, sleeps):
+    log = _mock_httpx(
+        monkeypatch,
+        [(429, "slow"), _sse_from_chunks('{"val": 1}'), _sse_from_chunks('{"value": 1}')],
+    )
+    provider = MiniMaxProvider(api_key="secret")
+
+    await provider.complete("SYS", "USR", Toy)
+
+    assert provider.last_usage.requests == 3
+    assert len([r for r in log if "url" in r]) == 3
+
+
+@pytest.mark.asyncio
+async def test_last_usage_is_set_even_when_the_stream_has_no_usage_chunk(monkeypatch):
+    _mock_httpx(monkeypatch, [_sse_from_chunks('{"value": 1}')])
+    provider = MiniMaxProvider(api_key="secret")
+
+    await provider.complete("SYS", "USR", Toy)
+
+    assert provider.last_usage.prompt_tokens is None
+    assert provider.last_usage.requests == 1
+
+
+@pytest.mark.asyncio
+async def test_gemini_exposes_last_usage(monkeypatch):
+    provider = GeminiProvider(api_key="fake-key")
+    usage = SimpleNamespace(
+        prompt_token_count=100, candidates_token_count=20, total_token_count=120
+    )
+    _fake_gemini(
+        monkeypatch, provider, [_FakeGeminiResponse('{"value": 1}', usage=usage)]
+    )
+
+    await provider.complete("SYS", "USR", Toy)
+
+    assert provider.last_usage.prompt_tokens == 100
+    assert provider.last_usage.completion_tokens == 20
+    assert provider.last_usage.total_tokens == 120
+
+
 # --- MiniMax ---
 
 
