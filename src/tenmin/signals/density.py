@@ -5,9 +5,9 @@ from __future__ import annotations
 import re
 import statistics
 
+from tenmin.intervals import spoken_lines
 from tenmin.models import DialogueLine, DialogueTrack, Signal
 
-SPEECH_KINDS = ("dialogue", "monologue")
 LOW_DENSITY_RATIO = 0.4
 LOW_DENSITY_MIN_SECONDS = 2.0
 LOW_DENSITY_STRENGTH = 3
@@ -30,9 +30,7 @@ def char_rate(line: DialogueLine) -> float:
 
 
 def _speech_lines(track: DialogueTrack) -> list[DialogueLine]:
-    return [
-        ln for ln in track.lines if ln.kind in SPEECH_KINDS and ln.text and ln.duration > 0
-    ]
+    return spoken_lines(track.lines)
 
 
 def median_char_rate(track: DialogueTrack) -> float:

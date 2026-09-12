@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from tenmin.config import ProjectConfig
 from tenmin.models import (
+    SPEECH_KINDS,
     AudioDirection,
     Beat,
     Clip,
@@ -18,7 +19,6 @@ from tenmin.script.prompt import load_prompt, render_prompt
 from tenmin.script.validate import ScriptValidationError, validate_script
 from tenmin.timecode import format_timestamp
 
-SPEECH_KINDS = ("dialogue", "monologue")
 SYSTEM_PROMPT = "你是一名资深番剧解说号写手。严格按要求输出 JSON，不要输出任何解释文字。"
 
 
@@ -31,6 +31,9 @@ def _readable_duration(seconds: float) -> str:
 def build_dialogue_block(track: DialogueTrack) -> str:
     rows = []
     for line in track.lines:
+        # 刻意不用 intervals.is_spoken：那个谓词还要求 duration > 0，是给区间运算用的。
+        # 这里是「给 LLM 看的台词清单」，一条被坏时间码夹成零时长的行，正文照样是
+        # 剧情内容，不能从上下文里抹掉。
         if line.kind not in SPEECH_KINDS or not line.text:
             continue
         mark = " ?" if line.suspect else ""

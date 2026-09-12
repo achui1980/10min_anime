@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 
+from tenmin.intervals import merge_intervals, silent_gaps
 from tenmin.models import DialogueLine
 
 # 无条件生效：日文专有写法或高度特定的复合词，正常中文台词里不可能出现。
@@ -59,7 +60,6 @@ CLUSTER_MAX_GAP = 35.0
 OP_MIN_SILENT_SPAN = 60.0
 OP_MAX_SILENT_SPAN = 120.0
 
-_SPEECH_KINDS = ("dialogue", "monologue")
 _TITLE_OVERLAP_THRESHOLD = 0.6
 _NAME_LIST_MIN_CJK = 6
 # 段数够多时放宽字数门槛：「慧 诹 访 郎」只有 4 个 CJK 字符，
@@ -151,42 +151,20 @@ def in_credit_window(start: float, duration: float) -> bool:
     return start <= OP_START_WINDOW[1] or start >= duration - ED_WINDOW_SECONDS
 
 
-def _cluster(lines: list[DialogueLine], max_gap: float) -> list[tuple[float, float]]:
-    ordered = sorted(lines, key=lambda ln: ln.start)
-    clusters: list[tuple[float, float]] = []
-    for ln in ordered:
-        if clusters and ln.start - clusters[-1][1] <= max_gap:
-            begin, finish = clusters[-1]
-            clusters[-1] = (begin, max(finish, ln.end))
-        else:
-            clusters.append((ln.start, ln.end))
-    return clusters
-
-
 def _silent_gaps_in_window(
     lines: list[DialogueLine], window: tuple[float, float]
 ) -> list[tuple[float, float]]:
     """列出起点落在 window 内的全部无字幕静默间隙，不做任何时长筛选。
 
-    静默的定义与 signals/gaps.py 严格对齐：只有 kind 为 dialogue / monologue
-    且有正文的行算「有人说话」，credits / noise / screen_text 都不打断静默；
-    游标用 max(cursor, line.end) 单调推进，避免重叠字幕算出负长度间隙。
-    这里刻意重算而不复用 signals，因为 ingest 层不能反向依赖 signals 层。
+    静默的定义（哪种行算「有人说话」）由 tenmin.intervals 独家持有，
+    ingest 与 signals 两层共用同一份，不会再各自分叉。不传 duration，
+    因为片尾到片长的那段静默跟 OP 识别无关。
     """
-    spoken = sorted(
-        (ln for ln in lines if ln.kind in _SPEECH_KINDS and ln.text),
-        key=lambda ln: ln.start,
-    )
-    gaps: list[tuple[float, float]] = []
-    if not spoken:
-        return gaps
-
-    cursor = spoken[0].end
-    for line in spoken[1:]:
-        if line.start > cursor and window[0] <= cursor <= window[1]:
-            gaps.append((cursor, line.start))
-        cursor = max(cursor, line.end)
-    return gaps
+    return [
+        (gap.start, gap.end)
+        for gap in silent_gaps(lines)
+        if window[0] <= gap.start <= window[1]
+    ]
 
 
 def _op_from_silence(lines: list[DialogueLine]) -> tuple[float, float] | None:
@@ -219,7 +197,9 @@ def find_credit_ranges(
     ED 只走聚簇，不做兜底——片尾前的长静场（定格收尾）是真高光，兜底会吃掉它。
     """
     credit_lines = [ln for ln in lines if ln.kind == "credits"]
-    clusters = _cluster(credit_lines, max_gap)
+    clusters = merge_intervals(
+        ((ln.start, ln.end) for ln in credit_lines), max_gap=max_gap
+    )
 
     op_candidates = [
         c

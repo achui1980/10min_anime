@@ -7,6 +7,12 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 LineKind = Literal["dialogue", "monologue", "screen_text", "credits", "noise"]
+
+# 「这一行算有人在说话」的唯一 kind 白名单。screen_text / credits / noise 都不算，
+# 所以它们不会打断静默间隙、也不进字密度统计。曾经在 signals 与 ingest 里各有一份
+# 平行定义，导致过滤规则悄悄分叉；判定逻辑本身见 tenmin.intervals.is_spoken。
+SPEECH_KINDS: frozenset[LineKind] = frozenset({"dialogue", "monologue"})
+
 SignalSource = Literal["gap", "low_density", "density_shift"]
 SfxKind = Literal["impact", "whoosh", "comedy", "suspense", "uplift"]
 BeatRole = Literal["hook", "act", "climax", "outro"]

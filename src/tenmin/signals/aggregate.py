@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from tenmin.intervals import group_adjacent
 from tenmin.models import DialogueTrack, Highlight, Signal, SignalReport
 from tenmin.signals.density import (
     char_rate,
@@ -33,16 +34,11 @@ def _cluster(signals: list[Signal], min_separation: float) -> list[list[Signal]]
     邻接链刻意只由非 density_shift 信号驱动：一条 30s 宽的信号只要首尾相接就能
     无限接力，会把相隔几十秒的真间隙串成一个不存在的长段。
     """
-    precise = sorted(
+    clusters = group_adjacent(
         (s for s in signals if s.source != REGIONAL_SOURCE),
-        key=lambda s: (s.start, s.end),
+        bounds=lambda s: (s.start, s.end),
+        max_gap=min_separation,
     )
-    clusters: list[list[Signal]] = []
-    for signal in precise:
-        if clusters and signal.start - max(s.end for s in clusters[-1]) <= min_separation:
-            clusters[-1].append(signal)
-        else:
-            clusters.append([signal])
 
     # 精确簇的跨度快照。区域性信号只能挂进这些簇，不能挂进别的区域性信号自成的簇
     # —— 否则两个首尾相接的 30s 桶又会重新桥接起来。

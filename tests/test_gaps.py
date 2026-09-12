@@ -88,6 +88,29 @@ def test_credits_and_noise_lines_are_not_speech():
     assert gaps[0].duration == pytest.approx(10.0)
 
 
+def test_zero_duration_line_does_not_split_a_long_gap():
+    """回归：srt_parser 把 end < start 的坏 cue 夹成零时长（end = start）。
+
+    这类行原先会推进游标，把一整段 10s 静默切成 2.5s + 5.0s 两段，两段都低于
+    MIN_GAP_SECONDS 里 5.0 这一档以外的阈值时会双双消失 —— 真高光直接丢掉。
+    现在零时长行不算「有人说话」，长间隙保持完整。
+    """
+    lines = [dline(1, 0.0, 2.0), dline(2, 4.5, 4.5), dline(3, 12.0, 14.0)]
+    gaps = find_silent_gaps(track(lines, duration=14.0))
+    assert len(gaps) == 1
+    assert gaps[0].start == pytest.approx(2.0)
+    assert gaps[0].end == pytest.approx(12.0)
+    assert gaps[0].anchor_lines == [1, 3]
+
+
+def test_zero_duration_line_no_longer_erases_a_gap_entirely():
+    """更狠的一版：坏 cue 落在中间，切出的两段都 <3s，间隙曾经整条消失。"""
+    lines = [dline(1, 0.0, 2.0), dline(2, 4.0, 4.0), dline(3, 6.5, 8.0)]
+    gaps = find_silent_gaps(track(lines, duration=8.0))
+    assert len(gaps) == 1
+    assert gaps[0].duration == pytest.approx(4.5)
+
+
 @pytest.mark.parametrize(
     "gap_len,expected",
     [(3.5, 2), (7.9, 2), (8.0, 3), (14.9, 3), (15.0, 4), (19.8, 4)],
