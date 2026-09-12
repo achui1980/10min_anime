@@ -17,7 +17,14 @@ from tenmin.ingest.credits import find_credit_ranges, in_credit_window, is_credi
 from tenmin.ingest.srt_parser import load_srt
 from tenmin.models import DialogueLine, DialogueTrack
 
-_FULL_PAREN = re.compile(r"^[（(].*[）)]$")
+# 整行都被一对圆括号包住 —— 屏幕注释/拟声，不是台词。
+# 中间刻意禁止再出现闭括号（`[^）)]*` 而不是 `.*`）：贪婪的 `.*` 会把
+# 「（超过 40 字的长注释）真台词（小声）」整行匹配成功 → kind="screen_text" →
+# 被 SPEECH_KINDS 过滤掉，真台词从语音轨消失、两侧静默间隙还被虚假拉长。
+# 括号字符类与 clean._PAREN_PREFIX 保持一致（同样只认圆括号的全角/半角两种，
+# 不含【】《》—— 那些交给 credits._BRACKET_WRAPPED 与 is_credits 处理）。
+_FULL_PAREN = re.compile(r"^[（(][^）)]*[）)]$")
+
 _NEWLINE_RUN = re.compile(r"\s*\n\s*")
 
 # 句末标点集合。刻意不进 config：它是「中文/日文怎么断句」的语言学事实，
@@ -122,6 +129,11 @@ def build_track(
     ingest = ingest or DEFAULT_INGEST
     credits = credits or DEFAULT_CREDITS
     cues = load_srt(srt_path)
+    # merge_continuations 只比较相邻元素、in_credit_window 逐条按 duration 判断，
+    # 两者都默认 cue 按时间有序。乱序 SRT（合并多个字幕源时常见）会导致错误合并与
+    # 错误的 duration 归因，而且全程不报错。O(n log n) 相对整条流水线可以忽略。
+    # 实测 work/ 下 11 集素材本来就有序，排序后产物逐字节不变。
+    cues = sorted(cues, key=lambda cue: (cue.start, cue.end))
     duration = max((cue.end for cue in cues), default=0.0)
     lines: list[DialogueLine] = []
 

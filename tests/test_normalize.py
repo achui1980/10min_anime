@@ -157,6 +157,73 @@ def test_build_track_empty_srt_opens_no_credit_window(tmp_path):
     assert track.lines[0].kind == "dialogue"
 
 
+def test_build_track_full_paren_line_is_screen_text(tmp_path):
+    """整行都在圆括号里的注释仍然判 screen_text。"""
+    srt = tmp_path / "e01.srt"
+    srt.write_text(
+        "1\n00:00:01,000 --> 00:00:03,000\n(远处传来钟声)\n\n"
+        "2\n00:00:05,000 --> 00:00:07,000\n（这是一段超过四十个字的长注释所以不会被当成说话人前缀剥掉）\n",
+        encoding="utf-8",
+    )
+    track = build_track(srt, episode=1)
+    assert [ln.kind for ln in track.lines] == ["screen_text", "screen_text"]
+
+
+def test_build_track_paren_note_plus_dialogue_is_not_swallowed(tmp_path):
+    """贪婪 `^[（(].*[）)]$` 会把「（长注释）真台词（结尾）」整行吞成 screen_text。
+
+    后果：真台词被 SPEECH_KINDS 过滤掉，语音轨凭空少一句，两侧静默间隙虚假拉长
+    （合并成一个不存在的长「无台词演出段」高光）。禁止中间出现闭括号即可。
+
+    注释刻意超过 40 字：clean._PAREN_PREFIX 的 inner 上限是 40，超了它就整体不匹配，
+    行首括号组不会被 extract_prefix 剥掉，body 仍以「（」开头，这才踩得到 _FULL_PAREN。
+    """
+    srt = tmp_path / "e01.srt"
+    note = "这是一段刻意超过四十个中文字符的长注释用来让说话人前缀正则整体失配从而保留行首括号"
+    assert len(note) > 40
+    srt.write_text(
+        f"1\n00:00:01,000 --> 00:00:03,000\n（{note}）我绝对不会放手的（小声）\n",
+        encoding="utf-8",
+    )
+    track = build_track(srt, episode=1)
+    assert len(track.lines) == 1
+    assert track.lines[0].kind == "dialogue"
+    assert "我绝对不会放手的" in track.lines[0].text
+
+
+def test_build_track_sorts_cues_by_time(tmp_path):
+    """乱序 SRT（合并多个字幕源时常见）必须先按时间排好。
+
+    merge_continuations 只比较相邻元素、in_credit_window 逐条按 duration 判断，
+    两者都默认时间有序；乱序输入会导致错误合并与错误的 duration 归因。
+    """
+    srt = tmp_path / "e01.srt"
+    srt.write_text(
+        "1\n00:00:20,000 --> 00:00:22,000\n第三句\n\n"
+        "2\n00:00:01,000 --> 00:00:03,000\n第一句\n\n"
+        "3\n00:00:10,000 --> 00:00:12,000\n第二句\n",
+        encoding="utf-8",
+    )
+    track = build_track(srt, episode=1)
+    assert [ln.text for ln in track.lines] == ["第一句", "第二句", "第三句"]
+    assert [ln.start for ln in track.lines] == pytest.approx([1.0, 10.0, 20.0])
+
+
+def test_build_track_sorting_fixes_wrong_merge_on_unsorted_input(tmp_path):
+    """乱序时 merge_continuations 会把时间上不相邻的两条黏成一条。"""
+    srt = tmp_path / "e01.srt"
+    srt.write_text(
+        "1\n00:00:01,000 --> 00:00:02,000\n我觉得这件事\n\n"
+        "2\n00:00:30,000 --> 00:00:31,000\n完全无关的一句\n\n"
+        "3\n00:00:02,100 --> 00:00:03,000\n应该再想想\n",
+        encoding="utf-8",
+    )
+    track = build_track(srt, episode=1, merge_lines=True)
+    texts = [ln.text for ln in track.lines]
+    assert "我觉得这件事应该再想想" in texts
+    assert "完全无关的一句" in texts
+
+
 # --- 黄金样本：12 类实测脏数据 ---
 
 
