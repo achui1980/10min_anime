@@ -10,6 +10,7 @@ import pytest
 from tenmin.config import RenderConfig
 from tenmin.models import AudioDirection, Beat, Hold, Script
 from tenmin.render import tts as tts_module
+from tenmin.render.chunks import is_pronounceable
 from tenmin.render.tts import (
     TTS_MAX_ATTEMPTS,
     EdgeTTSEngine,
@@ -601,9 +602,13 @@ async def test_duplicate_text_in_one_run_reuses_without_probing(tmp_path, monkey
 
 
 def _quote_only_script(*, holds: list[Hold]) -> Script:
-    """复刻实测事故：work/saijo 的 E05 旁白用 `'…'` 当引号，chunks.split_sentences
-    在 `。` 之后切开，把闭合的 `'` 留成一个独立片段。hold 一旦落在它上面，它就会自己
-    成为一个 chunk，Edge TTS 抛 NoAudioReceived，重试三次后整次运行中止。"""
+    """复刻实测事故的**原始输入**：work/saijo 的 E05 旁白用 `'…'` 当引号。
+
+    P2-E A1 之前，chunks.split_sentences 在 `。` 之后就断开，把收尾的 `'` 留成一个独立
+    片段；hold 一旦落在它上面，它就自己成为一个 chunk，Edge TTS 抛 NoAudioReceived，
+    重试三次后整次运行中止。A1 之后这个输入在**上游**就不会再切出孤立引号了
+    （见 test_the_incident_input_no_longer_produces_a_lone_quote_chunk）。
+    """
     return Script(
         show="剧名",
         episodes=[2],
@@ -619,21 +624,47 @@ def _quote_only_script(*, holds: list[Hold]) -> Script:
     )
 
 
-def test_the_incident_input_really_produces_a_lone_quote_chunk():
-    """先证明这个输入真的会切出一个独立的 `'` chunk，否则下面几条测的是空气。"""
+def test_the_incident_input_no_longer_produces_a_lone_quote_chunk():
+    """P2-E A1 的回归测试：这条原来锁的是「事故输入真的会切出孤立 `'` chunk」。
+
+    A1 把收尾符号吸收进前一句之后，同一个输入切出来的每个 chunk 都有内容可读，
+    孤立引号从根上没有了 —— 所以这条从「证明症状存在」翻成「证明症状消失」。
+    tts 层那道跳过不可发音 chunk 的闸门仍然保留（防御纵深），由下面几条用
+    monkeypatch 直接喂输入来测。
+    """
     from tenmin.render.chunks import plan_chunks
 
     script = _quote_only_script(
         holds=[Hold(at=1.8, duration=2.0, quote="q"), Hold(at=2.0, duration=3.0, quote="q")]
     )
-    assert plan_chunks(script.beats[0]) == [("第一句。第二句。", 2.0), ("'", 3.0)]
+    planned = plan_chunks(script.beats[0])
+    assert planned == [("第一句。第二句。'", 5.0)]
+    assert all(is_pronounceable(text) for text, _ in planned)
 
 
-async def test_unpronounceable_chunk_is_skipped_and_its_hold_folded_back(tmp_path):
+@pytest.fixture
+def forced_plan(monkeypatch):
+    """把 tts.py 看到的切句结果**直接**换掉，用来测它自己那道闸。
+
+    为什么要 monkeypatch 而不是找一段真旁白：A1 之后 split_sentences 保证「切出来的
+    每一句都有可发音内容」（唯一例外是整段旁白一个字都读不出来，那时只有一个 chunk），
+    所以「多 chunk 里夹一个不可发音的」这种输入**上游已经产不出来了**。而 tts 层这道闸
+    要顶住的正是「上游哪天又变了」，它保护的东西（被跳过的 chunk 带的留白不能凭空消失，
+    否则此后整条时间轴前移）值得单独锁住。
+    """
+
+    def install(planned: list[tuple[str, float]]) -> None:
+        monkeypatch.setattr(tts_module, "plan_chunks", lambda beat: list(planned))
+
+    return install
+
+
+async def test_unpronounceable_chunk_is_skipped_and_its_hold_folded_back(
+    tmp_path, forced_plan
+):
+    forced_plan([("第一句。第二句。", 2.0), ("'", 3.0)])
     engine = FakeTTSEngine([6.0])
-    script = _quote_only_script(
-        holds=[Hold(at=1.8, duration=2.0, quote="q"), Hold(at=2.0, duration=3.0, quote="q")]
-    )
+    script = _quote_only_script(holds=[])
 
     track, warnings = await synthesize_track(script, 2, tmp_path, engine)
 
@@ -660,20 +691,15 @@ async def test_beat_with_only_unpronounceable_text_is_skipped(tmp_path):
     assert any("b1" in w for w in warnings)
 
 
-async def test_hold_on_a_leading_unpronounceable_chunk_is_reported_not_swallowed(tmp_path):
+async def test_hold_on_a_leading_unpronounceable_chunk_is_reported_not_swallowed(
+    tmp_path, forced_plan
+):
     """前面没有任何 chunk 可以挂的留白只能丢，但必须吭一声。"""
+    forced_plan([("'", 4.0), ("第二句。", 0.0)])
     script = Script(
         show="剧名",
         episodes=[2],
-        beats=[
-            Beat(
-                id="b1",
-                label="A",
-                role="hook",
-                narration="'。第二句。",
-                audio=AudioDirection(holds=[Hold(at=0.0, duration=4.0, quote="q")]),
-            )
-        ],
+        beats=[Beat(id="b1", label="A", role="hook", narration="'。第二句。")],
     )
     track, warnings = await synthesize_track(script, 2, tmp_path, FakeTTSEngine([5.0]))
     assert [c.text for c in track.chunks] == ["第二句。"]
@@ -681,11 +707,10 @@ async def test_hold_on_a_leading_unpronounceable_chunk_is_reported_not_swallowed
     assert any("留白" in w for w in warnings)
 
 
-async def test_progress_total_excludes_skipped_chunks(tmp_path):
+async def test_progress_total_excludes_skipped_chunks(tmp_path, forced_plan):
+    forced_plan([("第一句。第二句。", 2.0), ("'", 3.0)])
     reporter = FakeReporter()
-    script = _quote_only_script(
-        holds=[Hold(at=1.8, duration=2.0, quote="q"), Hold(at=2.0, duration=3.0, quote="q")]
-    )
+    script = _quote_only_script(holds=[])
     await synthesize_track(script, 2, tmp_path, FakeTTSEngine([6.0]), reporter=reporter)
     assert reporter.calls == [("substep", "voice", 1, 1, "第一句。第二句。")]
 

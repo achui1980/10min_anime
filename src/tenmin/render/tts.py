@@ -5,14 +5,13 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import random
-import unicodedata
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
 from tenmin.config import DEFAULT_RENDER, RenderConfig
 from tenmin.models import Beat, Script, VoiceChunk, VoiceTrack
 from tenmin.progress import NullProgressReporter, ProgressReporter
-from tenmin.render.chunks import plan_chunks
+from tenmin.render.chunks import is_pronounceable, plan_chunks
 from tenmin.render.ffmpeg import probe_duration
 from tenmin.script.budget import narration_chars, narration_seconds
 
@@ -276,20 +275,20 @@ def _find_cached_chunk(voice_dir: Path, desired: str, digest: str) -> Path | Non
 def _is_pronounceable(text: str) -> bool:
     """这段文本里有没有任何「读得出声」的字符。
 
-    实测事故：work/saijo 的 E05 旁白用 `'…'` 当引号，chunks.split_sentences 在 `。`
+    唯一实现在 render/chunks.py（`is_pronounceable`）：A1 之后 split_sentences 的兜底那
+    一层要用同一个判据判「这一句有没有内容可读」，两份实现随时会分叉。这里原样 re-export，
+    是为了让「从 render.tts 拿 _is_pronounceable」这个既有调用面（含测试）继续成立。
+
+    历史事故：work/saijo 的 E05 旁白用 `'…'` 当引号，chunks.split_sentences 在 `。`
     之后切开，把闭合的 `'` 留成一个独立片段（`03_script/E05.script.json` 的
     beat-3-act2 与 beat-5-act4 都有）。一旦某个 hold 正好落在这种片段上，它就会自己成为
     一个 chunk，Edge TTS 抛 NoAudioReceived（communicate.py:567），重试耗尽后整次运行
-    中止 —— 一个引号搞掉一整集。
-
-    判据用 unicodedata 的大类：L*（字母，含 CJK 汉字与假名）与 N*（数字）算可发音，
-    标点（P*）、符号（S*）、空白（Z*）、破折号一概不算。刻意不用字符黑名单：黑名单永远
-    补不全，而「没有任何字母或数字」正好是「没有内容可读」的等价表述。
-
-    切句本身的缺陷（`。` 后跟 `'`/`」`/`”`/`）` 时应该在闭合符之后再切）是 chunks.py
-    的问题，归后续任务；这里只负责让 tts 层对这种输入健壮。
+    中止 —— 一个引号搞掉一整集。切句本身的缺陷已经由 P2-E A1 在 chunks.py 修掉了；
+    本层这道闸留着当**防御纵深**：它保护的是「被跳过的 chunk 带的留白不能凭空消失」，
+    而那条不变量的代价（此后整条时间轴前移）远大于多留几行代码。
     """
-    return any(unicodedata.category(char)[0] in "LN" for char in text)
+    return is_pronounceable(text)
+
 
 
 def _plan_pronounceable(
