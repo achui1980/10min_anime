@@ -71,6 +71,10 @@ _BREAK_SEARCH_MIN_RATIO = 0.6
 # 4 格 = 2 个全角标点，标定自语料：10 集里出现过的行首标点串最长就是 `——`。
 _HANG_MAX_CELLS = 4
 
+# 可读性检查的默认阈值（见 check_cue_legibility）。从 config 派生，不写第二份字面量。
+DEFAULT_MAX_LINES = DEFAULT_RENDER.subtitle_max_lines
+DEFAULT_MIN_SECONDS = DEFAULT_RENDER.subtitle_min_seconds
+
 
 def format_ass_time(seconds: float) -> str:
     """秒 → H:MM:SS.cc。负数按 0 处理。"""
@@ -242,3 +246,53 @@ def render_ass(
             f"Narration,,0,0,0,,{escape_text(wrapped)}"
         )
     return "\n".join(lines) + "\n"
+
+
+def check_cue_legibility(
+    cues: list[SubtitleCue],
+    *,
+    font_size: int = DEFAULT_FONT_SIZE,
+    width: int = PLAY_RES_X,
+    max_lines: int = DEFAULT_MAX_LINES,
+    min_seconds: float = DEFAULT_MIN_SECONDS,
+) -> list[str]:
+    """纯读的可读性检查：太高（行数）与太快（时长）的 cue 各报一条 warning。
+
+    **只报不改**，理由（实测数据在下面）：
+
+    - 拆长 cue 需要句内的时间切点，而句内时间只能靠字数比例估。P2-E B1 拿真 Edge TTS
+      逐句合成 359 段量过这个估算器：句边界时刻误差 p50 0.365 秒、p90 0.817 秒、
+      max 1.615 秒。用一个已知有 1.6 秒误差的估算去修「字幕挂太久」，换来的是「字幕
+      对不上口型」。而 warning 指向的动作（把这句话写短）同时修好字幕与配音节奏。
+    - 合并过短的 cue 在真实数据上 0 次触发（全季最短 0.80 秒），写了也是没被跑过的代码。
+
+    实测（work/saijo 10 集、修完 A1/C1/C5 之后的 360 条 cue）：行数分布
+    `{1 行: 233, 2 行: 119, 3 行: 8}`，时长 min 0.80 / p50 5.77 / p90 9.60 / max 15.36 秒。
+    默认阈值下每季报 8 条行数 warning、0 条时长 warning。那 8 条都是 54–79 字的**单句**
+    （10.6–15.4 秒）—— 跟 chunk 粒度无关，A5 的「每句一 chunk」救不了它们。
+
+    时长下界取 0.7 秒是卡着真实数据定的：全季最短的 cue 是 0.80 秒的「下集见。」，
+    那是正常创作、绝不能报。结构上能到多短：cue 时长 ≈ 句字数 × (chunk 时长 / chunk
+    字数)，而 render/tts.py 的时长体检把后者压在 ≈0.11 秒/字以上，所以一两个字的句子
+    落在 0.11–0.44 秒 —— 可达，只是这一季没出现。
+
+    两个阈值设成 0 就关掉对应的那一项。
+    """
+    max_cells = max_cells_per_line(font_size, width)
+    warnings: list[str] = []
+    for cue in cues:
+        stamp = format_ass_time(cue.start)
+        if max_lines > 0:
+            lines = len(wrap_text(cue.text, max_cells).split("\n"))
+            if lines > max_lines:
+                warnings.append(
+                    f"字幕 {stamp} 要折成 {lines} 行（上限 {max_lines}），"
+                    f"{len(cue.text)} 字挡掉的画面偏多，建议把这句旁白写短：{cue.text[:30]}…"
+                )
+        duration = cue.end - cue.start
+        if min_seconds > 0 and duration < min_seconds:
+            warnings.append(
+                f"字幕 {stamp} 只显示 {duration:.2f} 秒（下限 {min_seconds} 秒），"
+                f"来不及读：{cue.text[:30]}"
+            )
+    return warnings

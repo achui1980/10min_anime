@@ -81,7 +81,12 @@ def fake_script_response(episode: int = 2):
                 id=f"b{i + 1}",
                 label=labels[i],
                 role=roles[i],
-                narration="啊" * 360,
+                # 360 字，但**带句读**：12 句 ×（29 字 + 「。」）。原来是光秃秃的
+                # "啊" * 360，那是一个 360 字的单句，字幕会折成 12 行 —— P2-E C2 的可读性
+                # 检查因此照实报 warning，而这个 fixture 想表达的是「一次健康的批处理」。
+                # 字数不变（时长预算、clip 长度、chunk 划分全部照旧），只是补上真实旁白
+                # 必然有的句号。
+                narration=("啊" * 29 + "。") * 12,
                 clips=[
                     LLMClip(
                         episode=episode,
@@ -944,7 +949,11 @@ async def test_run_pipeline_batch_mode_runs_full_pipeline_for_all_episodes(
 
     # 处理顺序跟 cfg.episodes 一致：project 先注册了第 2 集，再 append 第 1 集。
     provider = FakeProvider([fake_script_response(episode=2), fake_script_response(episode=1)])
-    tts_engine = FakeTTSEngine([8.0] * 20)
+    # 80 秒 = 360 字 / 4.5 字每秒，也就是这份 fixture 的旁白**真实**会有的长度。原来写
+    # 的 8.0 秒相当于每秒念 45 个字，物理上不可能；后果是每条字幕只显示 0.67 秒，
+    # P2-E C2 的可读性检查照实报了 72 条 warning，而这个 fixture 想表达的是「一次健康的
+    # 批处理」。这里不该靠调阈值绕过去，该修的是假时长。
+    tts_engine = FakeTTSEngine([80.0] * 20)
 
     warnings = await run_pipeline(project, provider, tts_engine=tts_engine)
 

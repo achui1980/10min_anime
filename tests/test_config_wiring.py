@@ -654,3 +654,27 @@ async def test_run_voice_wires_tts_concurrency(tmp_path):
     engine = _PeakEngine()
     await run_voice(cfg, engine, episode=1)
     assert engine.peak == 3
+
+
+def test_run_timeline_surfaces_subtitle_legibility_warnings(tmp_path):
+    """字幕可读性检查（P2-E C2）要接到 timeline 阶段的 warnings 上。
+
+    检查住在 render/subtitles.py（它才知道字号与画布宽度），而拿得到 cfg 与 warnings
+    的是 run_timeline —— render/timeline.py 压根不认识字体。
+    """
+    cfg = _minimal_project(tmp_path)
+    cfg.render.subtitle_max_lines = 1
+    _write_voice_and_script(cfg)
+
+    _, warnings = run_timeline(cfg, episode=1, source_duration=100.0)
+    assert any("字幕" in w and "行" in w for w in warnings)
+
+
+def test_run_timeline_legibility_check_can_be_switched_off(tmp_path):
+    cfg = _minimal_project(tmp_path)
+    cfg.render.subtitle_max_lines = 0
+    cfg.render.subtitle_min_seconds = 0
+    _write_voice_and_script(cfg)
+
+    _, warnings = run_timeline(cfg, episode=1, source_duration=100.0)
+    assert not any("字幕" in w for w in warnings)

@@ -260,6 +260,21 @@ class RenderConfig(BaseModel):
     width: int = Field(default=1920, gt=0)
     height: int = Field(default=1080, gt=0)
     subtitle_font_name: str = "Lantinghei SC"
+    # 一条字幕最多折几行；超了报 warning（不改产物，理由见
+    # render/subtitles.py 的 check_cue_legibility）。0 = 关掉这项检查。
+    #
+    # 默认 2 是字幕业界的通行上限，也卡着实测数据：work/saijo 10 集 360 条 cue 的行数
+    # 分布是 {1 行: 233, 2 行: 119, 3 行: 8}，所以这个默认值每季报 8 条 —— 每集不到 1 条，
+    # 而且那 8 条都是 54–79 字的**单句**（10.6–15.4 秒），warning 指向的动作（把这句
+    # 旁白写短）同时修好字幕高度与配音节奏。
+    subtitle_max_lines: int = Field(default=2, ge=0)
+    # 一条字幕至少显示多久；短于它报 warning。0 = 关掉。
+    #
+    # 0.7 秒是卡着真实数据定的：全季最短的 cue 是 0.80 秒的「下集见。」，那是正常创作、
+    # 绝不能报，所以下界必须落在它之下。结构上能到多短：cue 时长 ≈ 句字数 ×
+    # (chunk 时长 / chunk 字数)，而 render/tts.py 的时长体检把后者压在 ≈0.11 秒/字以上，
+    # 所以一两个字的句子落在 0.11–0.44 秒 —— 可达，只是这一季没出现（默认报 0 条）。
+    subtitle_min_seconds: float = Field(default=0.7, ge=0)
 
     # --- 已接线：视频编码质量（render/video.py 的 quality_args）---
     crf: str = "20"

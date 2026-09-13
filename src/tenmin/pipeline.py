@@ -22,7 +22,7 @@ from tenmin.render.ffmpeg import (
     probe_duration,
     probe_frame_rate,
 )
-from tenmin.render.subtitles import render_ass
+from tenmin.render.subtitles import check_cue_legibility, render_ass
 from tenmin.render.timeline import build_timeline
 from tenmin.render.tts import TTSEngine, synthesize_track
 from tenmin.render.video import render_video
@@ -537,6 +537,18 @@ def run_timeline(
             frame_rate = probe_frame_rate(video, ffprobe=cfg.render.ffprobe_path)
     timeline, warnings = build_timeline(
         script, track, source_duration, frame_rate=frame_rate, cfg=cfg.render
+    )
+    # 可读性检查（P2-E C2）住在 render/subtitles.py —— 只有它知道字号与画布宽度算出来
+    # 的行数。接在这里而不是 build_timeline 里：render/timeline.py 压根不认识字体，而
+    # 这个函数手上同时有 cfg.render 与 warnings。
+    warnings.extend(
+        check_cue_legibility(
+            timeline.subtitles,
+            font_size=cfg.render.font_size,
+            width=cfg.render.width,
+            max_lines=cfg.render.subtitle_max_lines,
+            min_seconds=cfg.render.subtitle_min_seconds,
+        )
     )
     _write_json(paths.timeline(episode), timeline.model_dump_json(indent=2))
     _write_text(
