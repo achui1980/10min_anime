@@ -1,8 +1,9 @@
 # 10 分钟看番剧 · tenmin
 
-把番剧字幕变成解说方案。输入 SRT，输出「分段文案与剪辑时间轴对照表」+ 配音纯文本。
+把番剧字幕 + 视频变成解说成片。输入 SRT 与源片，输出「分段文案与剪辑时间轴对照表」、
+配音纯文本，以及配好音、烧好硬字幕的 mp4。
 
-**v1 不碰视频文件。** 没有 ASR、没有 TTS、没有渲染。设计文档见
+**还没有 ASR**，所以只吃自带字幕的片源（生肉见下面的路线图 v3）。设计文档见
 `docs/superpowers/specs/2026-08-31-10min-anime-design.md`。
 
 ## 核心思路
@@ -71,7 +72,7 @@ project 用一个 base_url），且和 MiniMax 一样，schema 是写进 prompt
 ## 使用
 
 ```bash
-uv run tenmin init saijo               # 创建 work/saijo/project.yaml 与 srt/、video/
+uv run tenmin init saijo               # 创建 work/saijo/project.yaml 与 srt/
 ```
 
 **一个 project 对应一部番，可以装多集**。往里加一集，用 `--episode`/`--srt`/`--video`
@@ -81,8 +82,9 @@ uv run tenmin init saijo               # 创建 work/saijo/project.yaml 与 srt/
 uv run tenmin run saijo --episode 2 --srt 你的字幕.srt --video 你的视频.mp4
 ```
 
-这会把字幕和视频拷进 `work/saijo/srt/E02.srt`、`work/saijo/video/E02.mp4`，
-在 `project.yaml` 的 `episodes:` 里补一条 `number: 2` 的记录，然后跑这一集的全链路。
+这会把字幕拷进 `work/saijo/srt/E02.srt`（源片**留在原地**，只把它的绝对路径记进
+`project.yaml`——源片实测 300MB~1.4GB，拷进 work/ 是纯冗余），在 `project.yaml` 的
+`episodes:` 里补一条 `number: 2` 的记录，然后跑这一集的全链路。
 `--srt`/`--video` 必须一起传，且必须同时带 `--episode`。
 
 已经注册过的集，之后只需要带 `--episode` 就能重跑：
@@ -151,8 +153,8 @@ uv run pytest -m render     # 真跑渲染链路，需要真视频 + libass 版 
 
 ## 路线图
 
-- **v1**（本版）SRT → 对照表 + 配音文本
-- **v2** Edge-TTS 配音 + ffmpeg 切片拼接 + 混音 + 烧硬字幕 → 1920x1080 mp4
+- **v1**（已完成）SRT → 对照表 + 配音文本
+- **v2**（本版）Edge-TTS 配音 + ffmpeg 切片拼接 + 混音 + 烧硬字幕 → 1920x1080 mp4
 - **v3** Faster-Whisper ASR，支持生肉
 - **v4** 本地 Web GUI（`script.json` 可视化编辑器）
 - **v5** PySceneDetect + CLIP 视觉索引，整季 12 集压到 10 分钟
