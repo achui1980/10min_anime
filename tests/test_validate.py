@@ -19,6 +19,7 @@ from tenmin.script.validate import (
     ANCHOR_TOLERANCE_SECONDS,
     CREDITS_OVERLAP_MAX_RATIO,
     MIN_CLIP_SECONDS,
+    AnchorIndex,
     ScriptValidationError,
     check_script,
     repair_script,
@@ -371,6 +372,71 @@ def test_anchor_coverage_counts_merged_lines():
 def test_anchor_coverage_ignores_clip_without_matching_anchors():
     s = make_script([[clip(408.9, 453.9, anchors=[9999])]])
     assert run(s).warnings == []
+
+
+# --- AnchorIndex（原先每个 clip 都全量扫一遍 track.lines） ---
+
+
+def test_anchor_index_returns_lines_in_track_order():
+    """原实现是「按 track.lines 顺序过滤」，索引查表后必须还原成同一个顺序。
+
+    _anchor_time 取的是匹配行 start 的最小值，靠顺序的地方是 _check_anchor_coverage
+    的告警文本与 min() 的平手语义。
+    """
+    lines = [dline(30, 300.0, 302.0), dline(10, 100.0, 102.0), dline(20, 200.0, 202.0)]
+    index = AnchorIndex(make_track(lines=lines))
+    assert [ln.idx for ln in index.matches([10, 20, 30])] == [30, 10, 20]
+
+
+def test_anchor_index_resolves_merged_from_line_numbers():
+    """anchor_lines 里可能写的是被 merge_continuations 并掉的旧行号。"""
+    merged = DialogueLine(
+        idx=90, start=600.0, end=602.0, text="合并行", raw="合并行", merged_from=[7, 8]
+    )
+    index = AnchorIndex(make_track(lines=[dline(1, 10.0, 12.0), merged]))
+    assert [ln.idx for ln in index.matches([8])] == [90]
+    assert [ln.idx for ln in index.matches([90])] == [90]
+
+
+def test_anchor_index_counts_a_line_hit_twice_only_once():
+    """idx 与 merged_from 同时命中时原实现也只把这行算一条（它是个 or 过滤）。"""
+    merged = DialogueLine(
+        idx=90, start=600.0, end=602.0, text="合并行", raw="合并行", merged_from=[7, 8]
+    )
+    index = AnchorIndex(make_track(lines=[merged]))
+    assert [ln.idx for ln in index.matches([90, 7, 8])] == [90]
+
+
+def test_anchor_index_keeps_every_segment_sharing_one_idx():
+    """双轨拆行让同一个 idx 对应多条 line，索引的值必须是列表。"""
+    lines = [dline(7, 10.0, 12.0, "台词"), dline(7, 10.0, 12.0, "独白")]
+    index = AnchorIndex(make_track(lines=lines))
+    assert [ln.text for ln in index.matches([7])] == ["台词", "独白"]
+
+
+def test_anchor_index_unknown_line_number_matches_nothing():
+    index = AnchorIndex(make_track(lines=[dline(1, 10.0, 12.0)]))
+    assert index.matches([9999]) == []
+
+
+def test_check_script_builds_the_anchor_index_once_per_track(monkeypatch):
+    from tenmin.script import validate as validate_module
+
+    built = []
+    real = validate_module.AnchorIndex
+    monkeypatch.setattr(
+        validate_module,
+        "AnchorIndex",
+        lambda track: (built.append(track), real(track))[1],
+    )
+    track = make_track(
+        lines=[dline(i + 1, i * 2.0, i * 2.0 + 1.5) for i in range(100)]
+    )
+    s = make_script(
+        [[clip(408.9 + i, 453.9 + i, anchors=[i + 1]) for i in range(5)]]
+    )
+    check_script(s, {2: track}, {})
+    assert len(built) == 1
 
 
 # --- C1：check（纯读）与 repair（返回新对象）的拆分 ---

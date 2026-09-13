@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+from typing import NamedTuple
+
 from tenmin.config import DEFAULT_SIGNALS, SignalsConfig
 from tenmin.intervals import group_adjacent
 from tenmin.models import (
     STRENGTH_MAX,
+    DialogueLine,
     DialogueTrack,
     Highlight,
     Signal,
@@ -94,8 +97,35 @@ def _boundary_signals(cluster: list[Signal]) -> list[Signal]:
     return precise or cluster
 
 
+class _TrackIndex(NamedTuple):
+    """track.lines 的一次性索引：anchor 行号 -> 它在 track.lines 里的位置。
+
+    值是 list 而不是单个位置：idx 是 **cue 级**的键，`split_dual_track` 从同一条 cue
+    拆出的台词与内心独白共享同一个 idx。
+
+    刻意**不**像 `script/validate.py` 的 `AnchorIndex` 那样把 `merged_from` 里的旧行号
+    也指向该行 —— `_summary` 原来就只比 `ln.idx in anchors`，加进来会静默改变
+    summary 选到的那条行。两边判据不同不是重复，别合并。
+    """
+
+    lines: list[DialogueLine]
+    positions: dict[int, list[int]]
+
+
+def _index_track(track: DialogueTrack) -> _TrackIndex:
+    """O(L) 建索引，取代 `_summary` 里每簇一次的 O(L) 全量扫描。
+
+    一集 L≈400 行、H≈40 个簇，原实现是 O(H×L)。实测 11 集真实素材：
+    `for ln in track.lines` 一共比较 143752 次，只为找出 617 条候选行。
+    """
+    positions: dict[int, list[int]] = {}
+    for position, line in enumerate(track.lines):
+        positions.setdefault(line.idx, []).append(position)
+    return _TrackIndex(track.lines, positions)
+
+
 def _summary(
-    cluster: list[Signal], track: DialogueTrack | None, cfg: SignalsConfig
+    cluster: list[Signal], index: _TrackIndex | None, cfg: SignalsConfig
 ) -> str:
     start = min(s.start for s in cluster)
     end = max(s.end for s in cluster)
@@ -105,15 +135,25 @@ def _summary(
         return f"无台词演出段 {duration:.1f}s"
 
     anchors = {idx for s in cluster for idx in s.anchor_lines}
-    candidates = []
-    if track is not None:
+    candidates: list[DialogueLine] = []
+    if index is not None:
+        # 位置先去重再升序 —— 还原成原实现「按 track.lines 顺序过滤」的顺序，
+        # 因为下面 min() 平手时取的是先出现的那条。
         candidates = [
-            ln
-            for ln in track.lines
-            if ln.idx in anchors and ln.text and ln.duration > 0
+            line
+            for line in (
+                index.lines[position]
+                for position in sorted(
+                    {p for idx in anchors for p in index.positions.get(idx, ())}
+                )
+            )
+            if line.text and line.duration > 0
         ]
     if not candidates:
         return f"低语速片段 {duration:.1f}s"
+    # char_rate 直接现算，不做速率查表：item 1 已经把它里面的正则换成零分配的
+    # isspace 计数，而实测 11 集里 617 次候选行只有 31 次是重复的（586 条不同的行），
+    # 为省这 31 次去挂一份 memo 是负收益。
     slowest = min(candidates, key=char_rate)
     return slowest.text[: cfg.summary_max_chars]
 
@@ -125,6 +165,7 @@ def aggregate(
     cfg: SignalsConfig = DEFAULT_SIGNALS,
 ) -> list[Highlight]:
     highlights: list[Highlight] = []
+    index = None if track is None else _index_track(track)
     for cluster in _cluster(signals, cfg.min_separation):
         bounds = _boundary_signals(cluster)
         # 强度、trigger、anchor 都算整簇（density_shift 照样贡献）；只有边界只看 bounds。
@@ -139,7 +180,7 @@ def aggregate(
                 end=max(s.end for s in bounds),
                 strength=strength,
                 triggers=triggers,
-                summary=_summary(bounds, track, cfg),
+                summary=_summary(bounds, index, cfg),
                 anchor_lines=anchor_lines,
             )
         )

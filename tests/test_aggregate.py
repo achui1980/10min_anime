@@ -1,6 +1,7 @@
 import pytest
 
 from tenmin.models import DialogueLine, DialogueTrack, Signal
+from tenmin.signals import aggregate as aggregate_module
 from tenmin.signals.aggregate import aggregate, build_report
 
 
@@ -129,6 +130,77 @@ def test_highlights_sorted_by_start():
         [sig(100.0, 105.0, "gap", 2), sig(0.0, 5.0, "gap", 2)], track=None
     )
     assert highlights[0].start == pytest.approx(0.0)
+
+
+# --- anchor 行索引（原先 _summary 每个簇都全量扫一遍 track.lines） ---
+
+
+def test_summary_builds_the_line_index_once_for_all_clusters(monkeypatch):
+    """一集 L≈400 行、H≈40 个簇，原实现是 O(H×L) 次比较。
+
+    实测 11 集真实素材：`for ln in track.lines` 一共比较 143752 次，只为找出 617 条
+    候选行。索引改成在 aggregate 入口建一次，之后逐簇 O(1) 查表。
+    """
+    track = DialogueTrack(
+        episode=1,
+        duration=1000.0,
+        lines=[dline(i + 1, i * 2.0, i * 2.0 + 1.5, "啊啊啊") for i in range(200)],
+    )
+    calls = []
+    real = aggregate_module._index_track
+    monkeypatch.setattr(
+        aggregate_module, "_index_track", lambda t: (calls.append(t), real(t))[1]
+    )
+    signals = [
+        sig(i * 100.0, i * 100.0 + 4.0, "low_density", 3, anchors=[i * 10 + 1])
+        for i in range(9)
+    ]
+    assert len(aggregate(signals, track)) == 9
+    assert len(calls) == 1
+
+
+def test_summary_picks_slowest_among_segments_sharing_one_idx():
+    """双轨拆行让同一个 idx 对应多条 line，索引的值必须是列表而不是单个位置。"""
+    track = DialogueTrack(
+        episode=1,
+        duration=60.0,
+        lines=[
+            dline(7, 10.0, 16.0, "快快快快快快快快快快快快"),  # 2.0 字/秒
+            dline(7, 10.0, 16.0, "慢"),  # 0.167 字/秒
+        ],
+    )
+    highlights = aggregate(
+        [sig(10.0, 16.0, "low_density", 3, anchors=[7])], track=track
+    )
+    assert highlights[0].summary == "慢"
+
+
+def test_summary_breaks_char_rate_ties_by_track_order():
+    """语速相同时取 track.lines 里靠前的那条 —— 原实现 min() 的语义就是这样。"""
+    track = DialogueTrack(
+        episode=1,
+        duration=60.0,
+        lines=[dline(7, 10.0, 16.0, "先"), dline(8, 20.0, 26.0, "后")],
+    )
+    highlights = aggregate(
+        [sig(10.0, 26.0, "low_density", 3, anchors=[7, 8])], track=track
+    )
+    assert highlights[0].summary == "先"
+
+
+def test_summary_skips_zero_duration_and_empty_anchor_lines():
+    track = DialogueTrack(
+        episode=1,
+        duration=60.0,
+        lines=[
+            dline(7, 10.0, 10.0, "零时长"),  # duration == 0，不算候选
+            dline(8, 12.0, 18.0, ""),  # 空文本，不算候选
+        ],
+    )
+    highlights = aggregate(
+        [sig(10.0, 18.0, "low_density", 3, anchors=[7, 8])], track=track
+    )
+    assert highlights[0].summary == "低语速片段 8.0s"
 
 
 # --- build_report ---

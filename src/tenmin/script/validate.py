@@ -15,6 +15,7 @@ validate 就地改写并把同一个对象塞回 ValidationResult，上一版根
 from __future__ import annotations
 
 import unicodedata
+from collections.abc import Iterable
 
 from pydantic import BaseModel
 
@@ -137,19 +138,52 @@ def _reject_reason(clip: Clip, track: DialogueTrack, cfg: ValidateConfig) -> str
     return None
 
 
-def _anchor_matches(track: DialogueTrack, anchor_lines: list[int]) -> list[DialogueLine]:
-    return [
-        ln
-        for ln in track.lines
-        if ln.idx in anchor_lines or any(m in anchor_lines for m in ln.merged_from)
-    ]
+class AnchorIndex:
+    """按 anchor 行号查 track.lines，一个 track 建一次、之后逐 clip O(1) 查。
+
+    原实现 `_anchor_matches` 每个 clip 都把 `track.lines` 整个扫一遍。一集 400 行、
+    二十来个 clip，再叠上 `_anchor_time` 与 `_check_anchor_coverage` 各扫一次，
+    纯属重复劳动。
+
+    两条必须保住的语义：
+
+    1. **`merged_from` 里的旧行号也指向该行。** `merge_continuations` 把被并掉的行号
+       记进 `merged_from`，而 LLM 拿到的对白块里可能还是旧行号，所以索引对每一行
+       登记 `idx` 与 `merged_from` 的每个元素（与原来的
+       `ln.idx in anchor_lines or any(m in anchor_lines for m in ln.merged_from)` 等价）。
+    2. **返回顺序 = track.lines 顺序，且一行只出现一次。** 原实现是「按 track.lines
+       顺序过滤」，一行被 idx 与 merged_from 同时命中时也只算一条，所以这里存位置、
+       查完先去重再升序。
+
+    值是 list 而不是单个位置：idx 是 cue 级的键，`split_dual_track` 从同一条 cue 拆出的
+    台词与内心独白共享同一个 idx。
+    """
+
+    __slots__ = ("_lines", "_positions")
+
+    def __init__(self, track: DialogueTrack) -> None:
+        positions: dict[int, list[int]] = {}
+        for position, line in enumerate(track.lines):
+            for key in (line.idx, *line.merged_from):
+                positions.setdefault(key, []).append(position)
+        self._lines = track.lines
+        self._positions = positions
+
+    def matches(self, anchor_lines: Iterable[int]) -> list[DialogueLine]:
+        hits = {p for key in anchor_lines for p in self._positions.get(key, ())}
+        return [self._lines[position] for position in sorted(hits)]
+
+    def earliest_start(self, anchor_lines: Iterable[int]) -> float | None:
+        """匹配行里最早的 start。没有匹配行时 None。"""
+        starts = [line.start for line in self.matches(anchor_lines)]
+        if not starts:
+            return None
+        return min(starts)
 
 
-def _anchor_time(track: DialogueTrack, anchor_lines: list[int]) -> float | None:
-    starts = [ln.start for ln in _anchor_matches(track, anchor_lines)]
-    if not starts:
-        return None
-    return min(starts)
+def _anchor_indexes(tracks: dict[int, DialogueTrack]) -> dict[int, AnchorIndex]:
+    return {episode: AnchorIndex(track) for episode, track in tracks.items()}
+
 
 
 def _normalize_quote(text: str) -> str:
@@ -220,14 +254,14 @@ def _check_hold_quotes(beat: Beat, tracks: dict[int, DialogueTrack]) -> list[str
     return warnings
 
 
-def _check_anchor_coverage(beat: Beat, tracks: dict[int, DialogueTrack]) -> list[str]:
+def _check_anchor_coverage(beat: Beat, indexes: dict[int, AnchorIndex]) -> list[str]:
     """clip 的时间窗必须装得下自己的 anchor_lines，否则旁白讲的内容没有画面。"""
     warnings: list[str] = []
     for clip in beat.clips:
-        track = tracks.get(clip.episode)
-        if track is None:
+        index = indexes.get(clip.episode)
+        if index is None:
             continue
-        lines = _anchor_matches(track, clip.anchor_lines)
+        lines = index.matches(clip.anchor_lines)
         total = len(lines)
         if total == 0:
             continue
@@ -414,26 +448,31 @@ def check_script(
     调用方（single.py）拿同一组素材调两个函数，签名对齐比少一个参数更值。
     """
     warnings: list[str] = []
+    indexes = _anchor_indexes(tracks)
     warnings.extend(_check_structure(script, cfg))
     warnings.extend(_check_timeline_order(script, cfg))
     for beat in script.beats:
         warnings.extend(_check_narration(beat))
         warnings.extend(_check_hold_quotes(beat, tracks))
-        warnings.extend(_check_anchor_coverage(beat, tracks))
+        warnings.extend(_check_anchor_coverage(beat, indexes))
         warnings.extend(_check_cue_offsets(beat))
         warnings.extend(_check_footage_budget(beat, cfg))
     return warnings
 
 
 def _apply_anchor(
-    clip: Clip, track: DialogueTrack, label: str, cfg: ValidateConfig
+    clip: Clip,
+    track: DialogueTrack,
+    index: AnchorIndex,
+    label: str,
+    cfg: ValidateConfig,
 ) -> list[str]:
     """按 anchor 行的字幕时间校准 clip 起点（就地改 clip，clip 已是深拷贝）。
 
     偏差超过 ANCHOR_OVERWRITE_MAX_SECONDS 时**不改**，只留 warning —— 那个量级说明
     两个来源必有一个系统性错了，而我们分不清是哪一个。
     """
-    anchor_start = _anchor_time(track, clip.anchor_lines)
+    anchor_start = index.earliest_start(clip.anchor_lines)
     if anchor_start is None:
         return []
     drift = abs(anchor_start - clip.start)
@@ -478,6 +517,7 @@ def repair_script(
 
     repaired = script.model_copy(deep=True)
     warnings: list[str] = []
+    indexes = _anchor_indexes(tracks)
     # 已经为「这一集缺 SignalReport」报过警的集号。按集去重而不是按 clip：一集
     # 二十来个 clip 会刷出二十条一模一样的 warning，反而把别的信息挤掉。
     reported_missing: set[int] = set()
@@ -490,7 +530,9 @@ def repair_script(
                 warnings.append(f"{beat.label}：clip 引用了不存在的集数 {clip.episode}，丢弃")
                 continue
 
-            anchor_warnings = _apply_anchor(clip, track, beat.label, cfg)
+            anchor_warnings = _apply_anchor(
+                clip, track, indexes[clip.episode], beat.label, cfg
+            )
             reason = _reject_reason(clip, track, cfg)
             if reason is not None:
                 warnings.extend(anchor_warnings)
