@@ -412,6 +412,20 @@ class LLMUsage:
     信息去改 LLMProvider Protocol 的返回类型（那会牵动 single.py / pipeline.py /
     FakeProvider 与一大票测试，投入产出不划算），所以只做最小暴露：挂在
     provider.last_usage 上，谁想看谁读。字段为 None = 服务端没给这个数。
+
+    **`llm.script_concurrency > 1` 时它不可靠**，这是「挂在 provider 上」这个形态的固有
+    代价：批量模式下多集共用**同一个** provider 实例，N 个 `complete()` 并发在飞，
+    `last_usage` 是最后一个完成的那次赋的（`GeminiProvider._requests` 那个计数器也会被
+    后开始的调用重置回 0），所以并发下它只是「某一次调用」的用量，不是总量、也不一定是
+    你关心的那一集。
+
+    刻意不修，两条依据：
+    1. **它没有生产消费者。** 全项目没有任何代码读 `last_usage`（只有测试读），它就是
+       个诊断字段 —— 拿一次 Protocol 返回类型的大改去换一个没人读的数字不划算。
+    2. **`script_concurrency` 默认 1**，那时压根没有并发（见 config 里那三条依据）。
+
+    真要总量的话正确做法是让 `complete()` 把用量**随返回值一起交出来**，而那要改
+    Protocol —— 属于另一个任务。
     """
 
     prompt_tokens: int | None = None

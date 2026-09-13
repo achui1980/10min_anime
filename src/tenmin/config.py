@@ -117,6 +117,9 @@ class LLMConfig(BaseModel):
     #    `read_timeout_seconds` 是 120 秒，所以现在还够；但这是个只在并发 >1 时才存在
     #    的隐患（源片更长/机器更慢就会踩到），修法是把那两个阶段挪进 to_thread，
     #    属于另一个任务。
+    # 4. **provider 的 usage 诊断字段在并发下不可靠**（`provider.last_usage` 是最后一个
+    #    完成的那次调用赋的）。这条不是「不该调高」的理由，只是「调高之后别拿那个数当
+    #    总量」—— 它没有生产消费者，详见 script/llm.py 的 LLMUsage docstring。
     script_concurrency: int = Field(default=1, ge=1)
 
 

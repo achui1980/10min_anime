@@ -1666,3 +1666,39 @@ async def test_truncation_error_is_in_the_pipeline_error_table(monkeypatch):
 
     assert issubclass(LLMFinishReasonError, LLMError)
     assert issubclass(LLMFinishReasonError, PIPELINE_ERRORS)
+
+
+# --- last_usage 在并发下不可靠，这是**记录在案**的行为（N10）----------------
+
+
+@pytest.mark.asyncio
+async def test_last_usage_is_only_the_last_finished_call_under_concurrency(monkeypatch):
+    """把 LLMUsage docstring 里那条告警钉成一条测试。
+
+    批量模式下多集共用同一个 provider 实例（`llm.script_concurrency > 1`），
+    `provider.last_usage` 是最后完成的那次调用赋的 —— 既不是总量，也不一定是你关心的
+    那一集。刻意不修（没有生产消费者，修它要动 LLMProvider Protocol 的返回类型），
+    所以拿一条测试把这个事实固定下来，免得有人误以为它是累加的。
+    """
+    bodies = [
+        _sse(
+            _delta('{"value": 1}'),
+            {"usage": {"prompt_tokens": 10, "completion_tokens": 1, "total_tokens": 11}},
+        ),
+        _sse(
+            _delta('{"value": 2}'),
+            {"usage": {"prompt_tokens": 20, "completion_tokens": 2, "total_tokens": 22}},
+        ),
+    ]
+    _mock_httpx(monkeypatch, bodies)
+    provider = OpenAICompatibleProvider(
+        api_key="k", model="m", base_url="https://x.test/v1"
+    )
+    results = await asyncio.gather(
+        provider.complete("SYS", "A", Toy), provider.complete("SYS", "B", Toy)
+    )
+    assert sorted(r.value for r in results) == [1, 2]
+    # 两次一共 33 个 token，但 last_usage 只带其中**一次**的数 —— 绝不是 33。
+    assert provider.last_usage is not None
+    assert provider.last_usage.total_tokens in (11, 22)
+    assert provider.last_usage.total_tokens != 33
