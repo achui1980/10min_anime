@@ -8,6 +8,7 @@ import re
 # 所有阈值的权威定义在 tenmin.config.CreditsConfig；DEFAULT_CREDITS 只是它的
 # 默认实例，让不关心配置的调用点（单测、一次性脚本）可以继续零参数调用。
 from tenmin.config import DEFAULT_CREDITS, CreditsConfig
+from tenmin.ingest.clean import _TITLE_CARD
 from tenmin.intervals import merge_intervals, silent_gaps
 from tenmin.models import DialogueLine
 
@@ -43,7 +44,10 @@ _KEYWORDS_IN_WINDOW = (
     "演出",
     "原作",
 )
-_TITLE_CARD = re.compile(r"第\s*[一二三四五六七八九十百\d]+\s*[集話话]")
+# `_TITLE_CARD`（规则 6 用）不在这里定义，从 clean.py import：原先两处各写一份且不
+# 一致（这边多了 `\s*`，能接 `第 3 集`，clean 那边不能），已收敛成宽的那份。
+# import 方向安全 —— clean.py 只依赖 re / functools / typing，不 import ingest 里的
+# 任何东西，所以不成环。
 _NAME_LIST_EVEN = re.compile(r"^(?:[\u4e00-\u9fff]{2,4})(?:\s+[\u4e00-\u9fff]{2,4})+$")
 _NAME_LIST_RAGGED = re.compile(r"^(?:[\u4e00-\u9fff]{1,5})(?:\s+[\u4e00-\u9fff]{1,5}){2,}$")
 _BRACKET_WRAPPED = re.compile(r"^[《『「(（]\s*(?P<inner>.+?)\s*[》』」)）]$")

@@ -126,3 +126,78 @@ def test_split_dual_track_no_second_speaker_returns_single():
 def test_split_dual_track_three_segments():
     parts = split_dual_track("(甲) 一\n(乙) 二\n(丙) 三")
     assert parts == ["(甲) 一", "(乙) 二", "(丙) 三"]
+
+
+# --- 术语表：为什么**不**改成 alternation 正则 ---
+
+
+def test_apply_glossary_cascades_through_replacement_values():
+    """`{"A": "B", "B": "C"}` 作用在 `"A"` 上会连锁两次，得到 `"C"`。
+
+    这条（以及下面两条）不是「顺便测一下」，而是**否决 alternation 正则方案的依据**：
+    `re.compile("A|B")` 一次扫描只会把 `"A"` 换成 `"B"` 就收工，给出 `"B"`。
+    P2-D 第 7 项要求「必须与按长度倒序逐个 str.replace 逐字节等价」，
+    alternation 做不到，所以这次只把每条 cue 重复做的 key 排序缓存下来，
+    替换本身照旧走 str.replace。
+    """
+    assert apply_glossary("A", {"A": "B", "B": "C"}) == "C"
+
+
+def test_apply_glossary_equal_length_overlap_follows_insertion_order():
+    """等长 key 重叠时，胜负由 dict 的插入顺序决定，而不是位置最靠左者优先。
+
+    `sorted(key=len, reverse=True)` 是稳定排序，等长 key 保持插入顺序，于是先登记的
+    `"BC"` 先吃掉 `"ABC"` 的后两个字符。alternation 的最左匹配会先命中 `"AB"`，
+    给出 `"xC"` —— 两者不等价。
+    """
+    assert apply_glossary("ABC", {"BC": "y", "AB": "x"}) == "Ay"
+    assert apply_glossary("ABC", {"AB": "x", "BC": "y"}) == "xC"
+
+
+def test_apply_glossary_longer_key_beats_shorter_prefix():
+    assert apply_glossary("ABC", {"AB": "x", "ABC": "y"}) == "y"
+
+
+def test_apply_glossary_skips_empty_key():
+    assert apply_glossary("你好", {"": "X", "你": "我"}) == "我好"
+
+
+def test_apply_glossary_sorts_the_keys_only_once_across_cues(monkeypatch):
+    """normalize 在 cue 循环里调 apply_glossary，原先每条 cue 都重排一次 key。"""
+    from tenmin.ingest import clean as clean_module
+
+    clean_module._glossary_keys.cache_clear()
+    glossary = {"甲": "1", "乙乙": "2", "丙丙丙": "3"}
+    before = clean_module._glossary_keys.cache_info()
+    for _ in range(50):
+        apply_glossary("甲乙乙丙丙丙", glossary)
+    after = clean_module._glossary_keys.cache_info()
+    assert after.misses - before.misses == 1
+    assert after.hits - before.hits == 49
+
+
+def test_apply_glossary_cache_key_keeps_insertion_order_apart():
+    """两个内容相同但插入顺序不同的术语表结果不同，所以缓存必须把它们分开。
+
+    缓存键刻意用 `tuple(glossary.items())`（保持插入顺序）而**不是**
+    `tuple(sorted(items))` —— 后者会把这两个表折成同一个键，直接给出错误答案。
+    """
+    assert apply_glossary("ABC", {"BC": "y", "AB": "x"}) != apply_glossary(
+        "ABC", {"AB": "x", "BC": "y"}
+    )
+
+
+# --- 标题卡正则收敛 ---
+
+
+def test_extract_prefix_title_card_with_spaces_is_not_a_speaker():
+    """`_TITLE_CARD` 原先在 clean.py 与 credits.py 各有一份且不一致：credits 那份多了
+    `\\s*`，能接 `第 3 集`，clean 这份不能。收敛成宽的那份（严格超集），
+    因为在 extract_prefix 里「多认出一个标题卡」= 少把标题卡误当说话人，方向是安全的。
+    """
+    assert extract_prefix("（第 3 集）早上好") == (None, "早上好")
+    assert extract_prefix("（第3集）早上好") == (None, "早上好")
+
+
+def test_extract_prefix_still_accepts_a_normal_short_speaker():
+    assert extract_prefix("（伊月）我知道了") == ("伊月", "我知道了")
