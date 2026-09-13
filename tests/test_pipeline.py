@@ -962,6 +962,36 @@ async def test_run_pipeline_from_voice_runs_render_stages(project, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_run_pipeline_never_disables_frame_alignment(project, monkeypatch):
+    """run_pipeline 走 timeline 阶段时，帧率**必须**被探到并记进产物。
+
+    这条锁的是 M6 的结论：`run_timeline` 的 `source_duration` 与 `frame_rate` 共享一个
+    开关，而 preflight 只探时长、不探帧率。「让 run_timeline 复用 preflight 刚探到的
+    时长」这个看着很省的改法，只递 source_duration 就会把帧对齐**静默关掉** —— 成片
+    退回「ffmpeg 自己按帧取整」，没有任何报错，只有首尾各差不到一帧。
+    """
+    from tenmin.models import Timeline
+
+    paths = Paths(project.root)
+    _write_script(paths.script(2), render_script())
+    _prepare_video(project)
+    monkeypatch.setattr("tenmin.pipeline.probe_duration", lambda path, **_: 1400.0)
+    monkeypatch.setattr("tenmin.pipeline.probe_frame_rate", lambda path, **_: 23.976)
+    monkeypatch.setattr("tenmin.pipeline.preflight", lambda video, encoder, **_: 1400.0)
+    monkeypatch.setattr("tenmin.render.audio.run_with_progress", _touch_output)
+    monkeypatch.setattr("tenmin.render.video.run_with_progress", _touch_output_with_progress)
+
+    await run_pipeline(
+        project,
+        FakeProvider([]),
+        from_stage="voice",
+        tts_engine=FakeTTSEngine([8.0, 10.0, 10.0]),
+    )
+    timeline = Timeline.model_validate_json(paths.timeline(2).read_text(encoding="utf-8"))
+    assert timeline.frame_rate == pytest.approx(23.976)
+
+
+@pytest.mark.asyncio
 async def test_run_pipeline_batch_mode_runs_full_pipeline_for_all_episodes(
     project, golden_srt_path, monkeypatch
 ):

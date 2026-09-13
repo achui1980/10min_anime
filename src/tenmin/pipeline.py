@@ -529,9 +529,28 @@ def run_timeline(
     """重算时间轴并落盘 timeline.json + ASS 字幕。
 
     source_duration 与 frame_rate 是**同一次源片探测的两半**，所以它们共享一个开关：
-    传了 source_duration 就说明「调用方自己在管源片探测」（run_pipeline 复用刚跑过的
-    preflight 结果、只有 SRT 没有视频的降级路径、单测手上只有一个空壳文件），那时不再
-    去碰 video_path —— 那条路上压根没有可探的视频。
+    传了 source_duration 就说明「调用方自己在管源片探测」（只有 SRT 没有视频的降级
+    路径、单测手上只有一个空壳文件），那时不再去碰 video_path —— 那条路上压根没有可探
+    的视频。
+
+    **`run_pipeline` 刻意什么都不传，让这个函数自己探。** 它上面那轮 preflight 确实刚
+    读过同一个源片的时长（而且返回值被整个丢弃），但复用它买不到什么：
+
+    - 实测一次真实单集运行（work/saijo E02，346MB mp4，`--only
+      ingest,timeline,audio,render --force`）对源片一共发 **5 次 ffprobe**：ingest 的
+      `_source_duration` 1 次、preflight 的 has_audio_stream + probe_duration 2 次、
+      本函数的 probe_duration + probe_frame_rate 2 次。复用 preflight 的结果只省掉
+      其中 1 次，而单次 ffprobe 实测 31–33ms —— 对照 script 阶段一次 LLM 调用实测
+      561 秒，收益是 0.006%。
+    - 代价是一个真实的正确性陷阱：`frame_rate` 跟着同一个开关走，而 preflight **不探
+      帧率**。只把 source_duration 递进来会让帧对齐**静默关掉**（段边界退回「ffmpeg
+      自己按帧取整」），要保住它就得让 run_pipeline 自己去探帧率 —— 也就是把探测从这里
+      搬到那里，帧率那一次一次都没省。而「忘了递 frame_rate 那一半」是个不会报错、
+      只在成片首尾差不到一帧的失效模式。
+
+    preflight 里那次 probe_duration 也不是白跑的：它同时是一项**检查**（时长 <= 0 就
+    抛错，挡住截断/0 字节的容器），所以它该留在 preflight 里，只是返回值在生产路径上
+    没有消费者。
 
     frame_rate 是 None 的后果是段边界不做帧对齐（见 render/timeline.py），成片退回
     「ffmpeg 自己按帧取整」的老行为：能出片，只是首尾各差不到一帧。
