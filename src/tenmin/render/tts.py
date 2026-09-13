@@ -372,9 +372,10 @@ async def synthesize_track(
     ffprobe 子进程 —— 文件名里的哈希已经保证内容与音色都对得上，那份时长就是同一段音频
     体检过的真实时长。
 
-    `concurrency` 是同时在飞的 chunk 数（`render.tts_concurrency`）。实测每个 chunk
-    的耗时几乎全是网络往返（E01 11 个 chunk 41.8 秒、E05 13 个 chunk 71.1 秒，chunk
-    之间的间隔 2.0–12.5 秒），所以并发几乎线性提速。四条不变量：
+    `concurrency` 是同时在飞的 chunk 数（`render.tts_concurrency`）。每个 chunk 的耗时
+    几乎全是网络往返，所以并发几乎线性提速：115 个真实 chunk 串行 297.3 秒、并发 4
+    81.9 秒、并发 24 12.8 秒（完整标定表在 `config.RenderConfig.tts_concurrency`）。
+    四条不变量：
 
     1. **结果顺序 = 计划顺序**，跟完成顺序无关。`VoiceTrack.chunks` 的顺序决定
        render/audio.py 的 adelay 偏移与 timeline 的字幕顺序，所以结果按下标写进预分配
@@ -462,20 +463,20 @@ async def synthesize_track(
             cursor += 1
             await synthesize_one(position)
 
-    if jobs:
-        try:
-            async with asyncio.TaskGroup() as group:
-                for _ in range(min(max(1, concurrency), total_chunks)):
-                    group.create_task(worker())
-        except BaseExceptionGroup as error:
-            leaf = _first_leaf(error)
-            # `from leaf.__cause__` 而不是 `from error.__cause__`：TaskGroup 抛的组
-            # `__cause__` 是 None，写成后者等于 `raise leaf from None`，会把
-            # synthesize_with_retry 挂上去的那个原始网络异常从 __cause__ 里抹掉
-            # （aiohttp 的连接类异常 stringify 常常是空串，这条链是唯一的线索）。
-            # 而 `from` 的另一半作用（suppress_context）是想要的：ExceptionGroup
-            # 自己是噪音，不该再作为 "During handling of the above exception" 印一遍。
-            raise leaf from leaf.__cause__
+    # total_chunks=0 时 worker 数也是 0，TaskGroup 空跑一轮就退出 —— 不需要额外的空判。
+    try:
+        async with asyncio.TaskGroup() as group:
+            for _ in range(min(max(1, concurrency), total_chunks)):
+                group.create_task(worker())
+    except BaseExceptionGroup as error:
+        leaf = _first_leaf(error)
+        # `from leaf.__cause__` 而不是 `from error.__cause__`：TaskGroup 抛的组
+        # `__cause__` 是 None，写成后者等于 `raise leaf from None`，会把
+        # synthesize_with_retry 挂上去的那个原始网络异常从 __cause__ 里抹掉
+        # （aiohttp 的连接类异常 stringify 常常是空串，这条链是唯一的线索）。
+        # 而 `from` 的另一半作用（suppress_context）是想要的：ExceptionGroup
+        # 自己是噪音，不该再作为 "During handling of the above exception" 印一遍。
+        raise leaf from leaf.__cause__
 
     # 全部 chunk 都成功时 results 里不可能还有 None（每个 position 恰好被写一次），
     # 但类型上它是 VoiceChunk | None，所以这里显式过滤给类型检查器看。
