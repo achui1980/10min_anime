@@ -597,3 +597,32 @@ def test_mix_audio_keeps_the_previous_artifact_when_ffmpeg_fails(tmp_path, monke
     assert out_path.read_bytes() == b"good"
     assert out_path.stat().st_mtime_ns == before
     assert not part_path(out_path).exists()
+
+
+def test_mix_audio_reports_each_percent_only_once(tmp_path, monkeypatch):
+    """跟 render_video 同一个毛病、同一个修法：整数百分比没变就不回调。"""
+    from tenmin.render import audio as audio_module
+
+    from .fakes import FakeReporter
+
+    def fake_run_with_progress(args, *, total_seconds, on_progress=None, **_):
+        assert on_progress is not None
+        for fraction in (0.0, 0.002, 0.5, 0.5009, 1.0):
+            on_progress(fraction)
+        Path(args[-1]).write_bytes(b"\x00")
+        return ""
+
+    monkeypatch.setattr(audio_module, "run_with_progress", fake_run_with_progress)
+    reporter = FakeReporter()
+    voice_dir = tmp_path / "04_voice" / "E02"
+    voice_dir.mkdir(parents=True)
+    mix_audio(
+        video=tmp_path / "source.mkv",
+        timeline=make_timeline(),
+        track=make_track(),
+        voice_dir=voice_dir,
+        out_path=tmp_path / "06_audio" / "E02.mixed.m4a",
+        duck_db=-12.0,
+        reporter=reporter,
+    )
+    assert [call[2] for call in reporter.calls] == [0, 50, 100]

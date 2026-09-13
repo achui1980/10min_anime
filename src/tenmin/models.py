@@ -402,3 +402,16 @@ class Timeline(_StageModel):
     # 各自探一次的话，中途换了源片就会静默错位，而这个字段让 timeline.json 自证
     # 它是按哪个帧率算的。存量 timeline.json 没有这个键 → None → 退回老行为。
     frame_rate: float | None = None
+
+    def output_seconds(self, outro_seconds: float) -> float:
+        """成片总长：正片（total_seconds）+ 片尾卡片。**全项目唯一定义。**
+
+        原来 render/video.py 与 render/audio.py 各写一份 `total_seconds + outro`
+        （前者还漏了对负数的钳制），而这个数字同时是：混音产物被 apad+atrim 钉死的
+        长度、两边淡出起点的参照、两个进度条的分母。三处一致才谈得上「进度到 100%
+        时文件正好写完」，所以它只能有一处定义。
+
+        为什么正片长度的真相是 total_seconds（= 音频游标）而不是画面总长：
+        见 render/audio.py 里 apad+atrim 那段注释。
+        """
+        return self.total_seconds + max(outro_seconds, 0.0)

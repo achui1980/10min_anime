@@ -11,7 +11,7 @@ from tenmin.atomic import atomic_path
 from tenmin.config import DEFAULT_RENDER
 from tenmin.intervals import merge_intervals
 from tenmin.models import SubtitleCue, Timeline, VoiceTrack
-from tenmin.progress import NullProgressReporter, ProgressReporter
+from tenmin.progress import NullProgressReporter, ProgressReporter, percent_reporter
 from tenmin.render.ffmpeg import run_with_progress
 
 AUDIO_CODEC = DEFAULT_RENDER.audio_codec
@@ -41,13 +41,14 @@ def duck_gain(duck_db: float) -> float:
 
 
 def mixed_total_seconds(timeline: Timeline, outro_seconds: float) -> float:
-    """混音产物有多长。
+    """混音产物有多长。**只是 Timeline.output_seconds 的别名**，保留给现有调用点。
 
-    「多长」的唯一真相：正片是 timeline.total_seconds（build_mix_args 用 apad+atrim
-    把它钉死，理由见那边的注释），片尾卡片的静音再接在后面。mix_audio 拿它当进度条
-    的总长 —— 进度总长与产物长度必须是同一个数，否则百分比会停在别的地方。
+    「多长」的唯一真相住在 models.Timeline.output_seconds（原来这里与 render/video.py
+    各算一份同样的加法）：正片是 timeline.total_seconds（build_mix_args 用 apad+atrim
+    把它钉死，理由见那边的注释），片尾卡片的静音再接在后面。mix_audio 拿它当进度条的
+    总长 —— 进度总长与产物长度必须是同一个数，否则百分比会停在别的地方。
     """
-    return timeline.total_seconds + max(outro_seconds, 0.0)
+    return timeline.output_seconds(outro_seconds)
 
 
 def duck_volume_expr(cues: list[SubtitleCue], gain: float) -> str:
@@ -279,10 +280,6 @@ def mix_audio(
     同源，进度才不会停在别的地方。
     """
     reporter = reporter or NullProgressReporter()
-
-    def _on_progress(fraction: float) -> None:
-        reporter.substep("audio", int(fraction * 100), 100, "")
-
     with atomic_path(out_path) as part:
         run_with_progress(
             build_mix_args(
@@ -299,7 +296,7 @@ def mix_audio(
                 limiter_ceiling=limiter_ceiling,
             ),
             total_seconds=mixed_total_seconds(timeline, outro_seconds),
-            on_progress=_on_progress,
+            on_progress=percent_reporter(reporter, "audio"),
             ffmpeg=ffmpeg,
         )
     return out_path

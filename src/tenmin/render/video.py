@@ -12,7 +12,7 @@ from pathlib import Path
 from tenmin.atomic import atomic_path
 from tenmin.config import DEFAULT_RENDER
 from tenmin.models import Timeline
-from tenmin.progress import NullProgressReporter, ProgressReporter
+from tenmin.progress import NullProgressReporter, ProgressReporter, percent_reporter
 from tenmin.render.ffmpeg import run_with_progress
 
 # 全部从 config 的默认值派生。WIDTH/HEIGHT 尤其重要：它必须跟
@@ -229,6 +229,17 @@ def build_render_args(
         "-y",
         # 全局开关（不是 per-input 的）：一次就够，让每段输入的 -ss 不改写时间戳。
         "-copyts",
+        # --- 为什么这里**没有** -t / -shortest（跟 render/audio.py 刻意相反）---
+        #
+        # 画面这一路只可能比声明的长度**短**，短的那一半 -t 补不了、截的那一半没得截：
+        # 段边界按帧取整只会让每段 <= 声明时长，片尾卡是精确 d= 秒。真实 E02 实测
+        # video 流 217.342 秒、audio 流 217.404 秒，容器时长由音频给出（mp4 取两条流
+        # 的较大值），末尾 0.062 秒（约 1.5 帧）没有画面 —— 播放器停在最后一帧。
+        # 加 `-t 217.404` 实测产物 **md5 逐字节相同**（20abf057…），即纯粹的空操作。
+        # `-shortest` 方向更是反的：它钉的是最短那条输入。
+        #
+        # 音频那边需要 apad+atrim 是因为它两个方向都会跑偏（amix duration=longest），
+        # 而且它是**容器时长的来源**，所以那边钉、这边不钉。
         *[
             arg
             for segment in timeline.segments
@@ -289,10 +300,9 @@ def render_video(
     Ctrl-C 留下的截断 mp4 mtime 最新，_is_fresh 会把它当成品跳过（见 atomic 模块）。
     """
     reporter = reporter or NullProgressReporter()
-    total_seconds = timeline.total_seconds + outro_seconds
-
-    def _on_progress(fraction: float) -> None:
-        reporter.substep("render", int(fraction * 100), 100, "")
+    # 进度分母跟产物长度同源（Timeline.output_seconds 是唯一定义），否则百分比会
+    # 停在 99% 或提前撞 100%。
+    total_seconds = timeline.output_seconds(outro_seconds)
 
     with atomic_path(out_path) as part:
         args = build_render_args(
@@ -315,6 +325,9 @@ def render_video(
             outro_message=outro_message,
         )
         run_with_progress(
-            args, total_seconds=total_seconds, on_progress=_on_progress, ffmpeg=ffmpeg
+            args,
+            total_seconds=total_seconds,
+            on_progress=percent_reporter(reporter, "render"),
+            ffmpeg=ffmpeg,
         )
     return out_path

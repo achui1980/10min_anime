@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Protocol, runtime_checkable
 
 
@@ -60,3 +61,29 @@ class NullProgressReporter:
 
     def episode_done(self, number: int, index: int, total: int) -> None:
         pass
+
+
+def percent_reporter(
+    reporter: ProgressReporter, stage: str
+) -> Callable[[float], None]:
+    """把 0.0~1.0 的比例包成「整数百分比变了才上报」的回调。
+
+    ffmpeg 的 `-progress` 每秒发好几个块，而 substep 收的是整数百分比：一个 240 秒
+    的成片会把同一个数字重复发出去几十遍（render/audio.py 与 render/video.py 原来
+    都是每个块直接 `reporter.substep(..., int(fraction * 100), ...)`）。重复上报对
+    NullProgressReporter 无害，对 rich 那边就是几十次无用重绘。
+
+    刻意做成闭包工厂而不是「让 reporter 自己去重」：去重的粒度是**这一次调用**
+    （一个 stage 的一次运行），reporter 是跨阶段共享的，状态放它身上要额外管清空。
+    """
+    last = -1
+
+    def report(fraction: float) -> None:
+        nonlocal last
+        percent = int(fraction * 100)
+        if percent == last:
+            return
+        last = percent
+        reporter.substep(stage, percent, 100, "")
+
+    return report

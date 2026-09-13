@@ -624,3 +624,59 @@ def test_frame_rate_arg_restores_the_exact_rational():
     assert frame_rate_arg(23.976023976023978) == "24000/1001"
     assert frame_rate_arg(29.97002997002997) == "30000/1001"
     assert frame_rate_arg(25.0) == "25"
+
+
+def test_render_video_progress_total_is_the_timeline_output_length(tmp_path, monkeypatch):
+    """进度分母 = Timeline.output_seconds，跟混音那边同源（两份真相已经收敛）。"""
+    from tenmin.render import video as video_module
+
+    captured: dict[str, float] = {}
+
+    def fake_run_with_progress(args, *, total_seconds, on_progress=None, **_):
+        captured["total_seconds"] = total_seconds
+        Path(args[-1]).write_bytes(b"\x00")
+        return ""
+
+    monkeypatch.setattr(video_module, "run_with_progress", fake_run_with_progress)
+    timeline = make_timeline()
+    render_video(
+        video=tmp_path / "source.mkv",
+        timeline=timeline,
+        audio=tmp_path / "a.m4a",
+        ass=tmp_path / "s.ass",
+        out_path=tmp_path / "07_render" / "E02.mp4",
+        encoder="libx264",
+        outro_seconds=3.0,
+    )
+    assert captured["total_seconds"] == pytest.approx(timeline.output_seconds(3.0))
+
+
+def test_render_video_reports_each_percent_only_once(tmp_path, monkeypatch):
+    """同一个整数百分比不该回调两次。
+
+    ffmpeg 每秒发好几个 progress 块，而 substep 收的是整数百分比 —— 一个 240 秒的
+    成片会把同一个数字重复发出去几十遍（rich 那边就是几十次无用重绘）。
+    """
+    from tenmin.render import video as video_module
+
+    from .fakes import FakeReporter
+
+    def fake_run_with_progress(args, *, total_seconds, on_progress=None, **_):
+        assert on_progress is not None
+        for fraction in (0.0, 0.001, 0.004, 0.5, 0.502, 0.999, 1.0):
+            on_progress(fraction)
+        Path(args[-1]).write_bytes(b"\x00")
+        return ""
+
+    monkeypatch.setattr(video_module, "run_with_progress", fake_run_with_progress)
+    reporter = FakeReporter()
+    render_video(
+        video=tmp_path / "source.mkv",
+        timeline=make_timeline(),
+        audio=tmp_path / "a.m4a",
+        ass=tmp_path / "s.ass",
+        out_path=tmp_path / "07_render" / "E02.mp4",
+        encoder="libx264",
+        reporter=reporter,
+    )
+    assert [call[2] for call in reporter.calls] == [0, 50, 99, 100]

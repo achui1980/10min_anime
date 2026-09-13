@@ -314,3 +314,20 @@ def test_timeline_roundtrips_json():
     )
     restored = Timeline.model_validate_json(timeline.model_dump_json())
     assert restored == timeline
+
+
+def test_timeline_output_seconds_is_the_body_plus_the_outro_card():
+    """成片总长只有这一处定义。原来 render/video.py 与 render/audio.py 各算一份。"""
+    timeline = Timeline(episode=2, total_seconds=30.0)
+    assert timeline.output_seconds(0.0) == pytest.approx(30.0)
+    assert timeline.output_seconds(3.0) == pytest.approx(33.0)
+
+
+def test_timeline_output_seconds_ignores_a_negative_outro():
+    """卡片时长配成负数不该把成片算短（config 拦得住，但这里是唯一真相，自己也得站得住）。"""
+    assert Timeline(episode=2, total_seconds=30.0).output_seconds(-5.0) == pytest.approx(30.0)
+
+
+def test_timeline_frame_rate_defaults_to_none():
+    """存量 timeline.json 没有这个键，None = 「没探到」而不是「帧率是 0」。"""
+    assert Timeline(episode=2).frame_rate is None
