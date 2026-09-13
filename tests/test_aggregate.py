@@ -209,15 +209,26 @@ def test_summary_skips_zero_duration_and_empty_anchor_lines():
 
 
 def _naive_host(spans, probe, sep):
-    """改造前的写法：对 spans 全量线性扫，取第一个相邻的。"""
-    return next(
-        (i for i, span in enumerate(spans) if aggregate_module._adjacent(span, probe, sep)),
-        None,
-    )
+    """朴素参照实现：对 spans **全量**线性扫，按「重叠最大 / 中心距最近 / 下标最小」择一。
+
+    双指针只在 `[cursor, m]` 这个窗口里找宿主，这个函数不设窗口。两者结果必须一致 ——
+    那正好证明窗口一个候选都没漏。
+    """
+    hits = [i for i, span in enumerate(spans) if aggregate_module._adjacent(span, probe, sep)]
+    if not hits:
+        return None
+    centre = (probe[0] + probe[1]) / 2
+
+    def score(i):
+        span = spans[i]
+        overlap = min(span[1], probe[1]) - max(span[0], probe[0])
+        return (-max(overlap, 0.0), abs((span[0] + span[1]) / 2 - centre), i)
+
+    return min(hits, key=score)
 
 
 def test_regional_attachment_matches_the_naive_scan_on_random_inputs():
-    """双指针必须与「全量扫、取下标最小的相邻簇」逐例相同。
+    """双指针的候选窗口必须与「全量扫一遍」找出同一个宿主。
 
     spans 由 group_adjacent 产生，因此按 start 升序且互不相交（分组间隔严格
     > max_gap）；regional 也按 start 升序。这两条单调性是双指针成立的全部依据，
@@ -349,3 +360,67 @@ def test_build_report_golden_long_gaps_reach_top_strength(golden_track):
     assert len(top) == 2, [(h.start, h.end, h.strength, h.triggers) for h in top]
     for moment in (140.0, 1330.0):
         assert any(h.start <= moment <= h.end for h in top), moment
+
+
+# --- 区域信号挂到「最合适」的簇而不是「第一个」 ---
+
+
+def _strength_at(highlights, start):
+    return next(h.strength for h in highlights if h.start == pytest.approx(start))
+
+
+def test_regional_signal_attaches_to_the_cluster_it_overlaps_most():
+    """一个 30s 桶在 min_separation=2 下可能同时相邻 2-3 个精确簇。
+
+    原实现用 `next(...)` 取下标最小的那个，即时间上最早的 —— 而「区域内最早的那个簇」
+    并不是「这个区域的节奏换挡最该记在谁头上」的答案，它只是 spans 的构造顺序。
+    改成按重叠时长最大择一。
+
+    这里簇 A（1-3，重叠 2s）比簇 B（10-20，重叠 10s）靠前，所以加成从 A 换到 B。
+    """
+    signals = [
+        sig(1.0, 3.0, "gap", 2, "gap:2.0s"),
+        sig(10.0, 20.0, "gap", 2, "gap:10.0s"),
+        sig(0.0, 30.0, "density_shift", 2, "shift:z=+3.00"),
+    ]
+    highlights = aggregate(signals, track=None)
+    assert len(highlights) == 2
+    assert _strength_at(highlights, 1.0) == 2
+    assert _strength_at(highlights, 10.0) == 3
+    assert "shift:z=+3.00" in next(
+        h.triggers for h in highlights if h.start == pytest.approx(10.0)
+    )
+
+
+def test_regional_signal_breaks_overlap_ties_by_centre_distance():
+    """重叠时长相同时取中心距最近的：簇 B（20-22）离 30s 桶的中心 15 更近。"""
+    signals = [
+        sig(1.0, 3.0, "gap", 2),
+        sig(20.0, 22.0, "gap", 2),
+        sig(0.0, 30.0, "density_shift", 2),
+    ]
+    highlights = aggregate(signals, track=None)
+    assert _strength_at(highlights, 1.0) == 2
+    assert _strength_at(highlights, 20.0) == 3
+
+
+def test_regional_signal_full_tie_keeps_the_earlier_cluster():
+    """重叠与中心距都打平时取下标最小的，保证结果确定、可复现。
+
+    簇 A（4-6）与簇 B（24-26）对 0-30 这个桶的重叠都是 2s，中心距都是 10s。
+    """
+    signals = [
+        sig(4.0, 6.0, "gap", 2),
+        sig(24.0, 26.0, "gap", 2),
+        sig(0.0, 30.0, "density_shift", 2),
+    ]
+    highlights = aggregate(signals, track=None)
+    assert _strength_at(highlights, 4.0) == 3
+    assert _strength_at(highlights, 24.0) == 2
+
+
+def test_regional_signal_with_a_single_adjacent_cluster_is_unaffected():
+    signals = [sig(1.0, 3.0, "gap", 2), sig(0.0, 30.0, "density_shift", 2)]
+    highlights = aggregate(signals, track=None)
+    assert len(highlights) == 1
+    assert highlights[0].strength == 3

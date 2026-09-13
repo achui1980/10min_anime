@@ -110,9 +110,17 @@ def _attach_regional(
     于是「因为太靠左（`signal.start - span.end > sep`）而被排除」的 span 一旦被越过，
     后面 start 更大的 signal 更不可能用到它 —— 游标只进不退。
 
-    而且只需要检查游标那一个 span：`_adjacent` 的左条件在 spans 上是「后缀成立」
-    （span.end 递增），右条件是「前缀成立」（span.start 递增），两者的交是一段
-    连续区间 [cursor, m]。原实现取的是下标最小的相邻簇，那就恰好是 cursor。
+    而且 `_adjacent` 的左条件在 spans 上是「后缀成立」（span.end 递增）、右条件是
+    「前缀成立」（span.start 递增），所以两者的交恰好是连续区间 `[cursor, m]`，
+    m 由下面那个 while 守卫界定。窗口内仍然逐个 `_adjacent` 复核一遍：窗口宽度实测
+    0-3，这点开销换来「不依赖上面那段单调性推理也看得出是对的」，值得。
+
+    **宿主的选法是「重叠时长最大，平手取中心距最近，再平手取下标最小」。**
+    原实现是 `next(...)`，即下标最小 = 时间上最早的那个相邻簇 —— 而一个 30s 桶在
+    min_separation=2 下常常同时相邻 2-3 个精确簇（实测 11 集 63 条区域信号里 20 条
+    如此），「区域内最早的那个簇」并不是「这个区域的节奏换挡该记在谁头上」的答案，
+    它只是 spans 的构造顺序。挂错了簇不影响 highlight 的数量与时间码，但会把强度加成
+    与 `shift:z=` 标记发给旁边那个 highlight，污染排序。
     """
     spans = [_span_of(group) for group in precise]
     members = [list(group) for group in precise]
@@ -126,12 +134,26 @@ def _attach_regional(
         probe = (signal.start, signal.end)
         while cursor < len(spans) and signal.start - spans[cursor].end > min_separation:
             cursor += 1
-        if cursor < len(spans) and _adjacent(spans[cursor], probe, min_separation):
-            members[cursor].append(signal)
-        else:
+        centre = (signal.start + signal.end) / 2
+        host: int | None = None
+        best: tuple[float, float] | None = None
+        index = cursor
+        while index < len(spans) and spans[index].start - signal.end <= min_separation:
+            span = spans[index]
+            if _adjacent(span, probe, min_separation):
+                overlap = min(span.end, signal.end) - max(span.start, signal.start)
+                # 负重叠（纯相邻、不交叠）一律夹到 0，否则「离得更远」会被当成
+                # 「重叠更多」而排到前面去。
+                score = (-max(overlap, 0.0), abs((span.start + span.end) / 2 - centre))
+                if best is None or score < best:
+                    host, best = index, score
+            index += 1
+        if host is None:
             orphans.append(
                 _Cluster([signal], [signal], _Span(signal.start, signal.end))
             )
+        else:
+            members[host].append(signal)
 
     return [
         # bounds 就是挂载前的那份精确信号列表：整簇 = precise + 追加的 regional，
