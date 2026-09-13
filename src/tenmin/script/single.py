@@ -9,6 +9,7 @@ from tenmin.models import (
     Beat,
     Clip,
     DialogueTrack,
+    LLMBeat,
     LLMScript,
     Script,
     SignalReport,
@@ -19,7 +20,15 @@ from tenmin.script.prompt import load_prompt, render_prompt
 from tenmin.script.validate import ScriptValidationError, validate_script
 from tenmin.timecode import format_timestamp, readable_seconds
 
-SYSTEM_PROMPT = "你是一名资深番剧解说号写手。严格按要求输出 JSON，不要输出任何解释文字。"
+# 提示词一律住在 prompts/*.md（全项目策略），这句原来硬编码在代码里。
+SYSTEM_PROMPT = load_prompt("system.md").strip()
+
+# LLMBeat 上这三个字段在内部模型里住在 Beat.audio 底下，是两个模型形状上唯一的差异。
+# 从 AudioDirection 自己的字段表推导，不写死字面量：给 AudioDirection 加字段时只要
+# LLMBeat 也加了同名字段，映射自动跟上；没加就自动留默认值。
+_AUDIO_FIELDS = tuple(
+    name for name in AudioDirection.model_fields if name in LLMBeat.model_fields
+)
 
 
 def build_dialogue_block(track: DialogueTrack) -> str:
@@ -31,8 +40,14 @@ def build_dialogue_block(track: DialogueTrack) -> str:
         if line.kind not in SPEECH_KINDS or not line.text:
             continue
         mark = " ?" if line.suspect else ""
+        # 合并来源必须写出来：validate.py 的 _anchor_matches **会认** merged_from 里的
+        # 旧行号（anchor_lines=[8] 能匹配到 idx=7 这一行），而这个清单原来只印 idx，
+        # 模型根本看不见 8 和 9 —— 双向信息不对称，模型没法主动引用那些号。
+        # 格式 `7(+8,9)`。
+        extra = ",".join(str(m) for m in line.merged_from if m != line.idx)
+        number = f"{line.idx}(+{extra})" if extra else str(line.idx)
         rows.append(
-            f"{line.idx} | {format_timestamp(line.start)} - {format_timestamp(line.end)}"
+            f"{number} | {format_timestamp(line.start)} - {format_timestamp(line.end)}"
             f" | {line.speaker or '-'} | {line.kind}{mark} | {line.text}"
         )
     return "\n".join(rows)
@@ -79,32 +94,22 @@ def to_script(llm_script: LLMScript, cfg: ProjectConfig, episode: int) -> Script
     原来这里写的是 `[e.number for e in cfg.episodes]`，把 project.yaml 登记的全部集数都
     塞进单集的 Script.episodes；配上 docgen/table.py 的 `len(script.episodes) == 1` 判断，
     project 只要登记了 ≥2 集，每一集的对照表标题都会变成「整季 解说方案」。
+
+    字段映射走 `model_dump` 而不是手工逐字段搬运：原来是后者，给 Clip / Beat 新增一个
+    LLM 也该填的字段时会**静默丢失**（不报错、不传值，默认值一路漂到成片）。
+
+    刻意**不**做「全字段对拷」：`LLM*` 镜像模型不含 est_seconds / est_total_seconds /
+    is_silent_highlight（models.py:284 的注释说明这是设计意图，那三个由 budget.py 与
+    validate.py 计算），所以这里只搬 LLMBeat / LLMClip **自己声明过**的字段，其余留默认值。
     """
     beats = []
     for llm_beat in llm_script.beats:
-        beats.append(
-            Beat(
-                id=llm_beat.id,
-                label=llm_beat.label,
-                role=llm_beat.role,
-                narration=llm_beat.narration,
-                clips=[
-                    Clip(
-                        episode=clip.episode,
-                        start=clip.start,
-                        end=clip.end,
-                        visual=clip.visual,
-                        anchor_lines=list(clip.anchor_lines),
-                    )
-                    for clip in llm_beat.clips
-                ],
-                audio=AudioDirection(
-                    original_audio=llm_beat.original_audio,
-                    sfx=list(llm_beat.sfx),
-                    holds=list(llm_beat.holds),
-                ),
-            )
+        data = llm_beat.model_dump()
+        clips = [Clip.model_validate(clip) for clip in data.pop("clips")]
+        audio = AudioDirection.model_validate(
+            {name: data.pop(name) for name in _AUDIO_FIELDS}
         )
+        beats.append(Beat(**data, clips=clips, audio=audio))
     return Script(
         show=cfg.show,
         mode="single_episode",

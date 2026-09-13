@@ -2,16 +2,22 @@ import pytest
 
 from tenmin.config import ProjectConfig
 from tenmin.models import (
+    AudioDirection,
+    Beat,
+    Clip,
     DialogueLine,
     DialogueTrack,
     Highlight,
+    Hold,
     LLMBeat,
     LLMClip,
     LLMScript,
+    SfxCue,
     Signal,
     SignalReport,
 )
 from tenmin.script.single import (
+    SYSTEM_PROMPT,
     build_dialogue_block,
     build_glossary_block,
     build_highlight_block,
@@ -334,3 +340,96 @@ async def test_generate_script_marks_silent_highlight(cfg, track, report):
     provider = FakeProvider([llm])
     script, _ = await generate_script(cfg, track, report, provider)
     assert script.beats[2].clips[0].is_silent_highlight is True
+
+
+# --- E7：SYSTEM_PROMPT 搬进 prompts/system.md ---
+
+
+def test_system_prompt_comes_from_the_prompt_file():
+    from tenmin.script.prompt import load_prompt
+
+    assert load_prompt("system.md").strip() == SYSTEM_PROMPT.strip()
+
+
+# --- E8：to_script 的字段映射不能静默漏字段 ---
+
+
+def test_to_script_covers_every_llm_field():
+    """原来是手工逐字段搬运，给 Clip/Beat 新增字段时会静默丢失（不报错、不传值）。"""
+    llm = LLMScript(
+        beats=[
+            LLMBeat(
+                id="b1",
+                label="Hook 开场",
+                role="hook",
+                narration="旁白",
+                clips=[
+                    LLMClip(
+                        episode=2, start=1.0, end=9.0, visual="A ➔ B", anchor_lines=[3, 4]
+                    )
+                ],
+                original_audio="mute",
+                holds=[Hold(at=1.5, duration=2.0, quote="金句", note="备注")],
+                sfx=[SfxCue(at=0.5, cue="impact", note="砸")],
+            )
+        ]
+    )
+    cfg = ProjectConfig(show="X", slug="x")
+    beat = to_script(llm, cfg, 2).beats[0]
+    # LLMBeat 的字段要么原样落在 Beat 上，要么落进 Beat.audio；LLMClip 的全落在 Clip 上。
+    beat_side = set(Beat.model_fields) | set(AudioDirection.model_fields)
+    assert set(LLMBeat.model_fields) <= beat_side
+    assert set(LLMClip.model_fields) <= set(Clip.model_fields)
+
+    # 逐字段比值，一个都不许漏。这是 E8 的核心断言：只看「字段名对得上」抓不到
+    # 「字段名对得上但根本没赋值」。
+    llm_dump = llm.beats[0].model_dump()
+    merged = beat.model_dump() | beat.audio.model_dump()
+    for name in LLMBeat.model_fields:
+        if name == "clips":
+            continue
+        assert merged[name] == llm_dump[name], name
+    for name in LLMClip.model_fields:
+        assert beat.clips[0].model_dump()[name] == llm_dump["clips"][0][name], name
+
+
+def test_to_script_does_not_let_the_llm_fill_computed_fields():
+    """LLM* 镜像模型刻意不含 est_seconds / est_total_seconds / is_silent_highlight
+    （models.py:284 的注释说明这是设计意图），所以映射不能盲目全字段对拷。"""
+    computed = {"est_seconds", "est_total_seconds", "is_silent_highlight"}
+    assert computed & set(LLMBeat.model_fields) == set()
+    assert computed & set(LLMClip.model_fields) == set()
+    assert computed & set(LLMScript.model_fields) == set()
+    script = to_script(valid_llm_script(), ProjectConfig(show="X", slug="x"), 2)
+    assert script.est_total_seconds == 0.0
+    assert script.beats[0].est_seconds == 0.0
+    assert script.beats[0].clips[0].is_silent_highlight is False
+
+
+# --- E9：对白块要标出合并来源 ---
+
+
+def test_dialogue_block_marks_merged_source_line_numbers():
+    """validate.py 的 anchor 匹配**会认** merged_from 里的旧行号，而对白块原来不输出
+    它们——模型看不到这些号，双向信息不对称。"""
+    track = DialogueTrack(
+        episode=2,
+        duration=100.0,
+        lines=[
+            DialogueLine(
+                idx=7,
+                start=1.0,
+                end=3.0,
+                text="合并后的一整句",
+                raw="合并后的一整句",
+                merged_from=[7, 8, 9],
+            )
+        ],
+    )
+    line = build_dialogue_block(track)
+    assert "7" in line
+    assert "8" in line and "9" in line
+
+
+def test_dialogue_block_omits_the_marker_when_nothing_was_merged(track):
+    assert "+" not in build_dialogue_block(track)
