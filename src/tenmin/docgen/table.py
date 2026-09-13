@@ -75,6 +75,10 @@ def _beat_estimate(beat: Beat) -> float:
     对照表原来自己 beat_seconds() 重算一遍，于是同一个数字有两个来源：用户手改
     script.json 的 est_seconds 之后，文档里的数字和产物里的数字会对不上。
     只有 est 还是默认的 0（budget 没跑过）时才回退到重算。
+
+    兜底那一支用的是默认语速（render.rate = "+0%"）：render_table 拿不到 cfg。这不是
+    问题——script 阶段的 apply_estimates 一定跑过，est_seconds 里存的就是按真实 rate
+    算好的数，所以兜底只在「手工捏的、没有估算字段的 script.json」上才生效。
     """
     return beat.est_seconds if beat.est_seconds > 0 else beat_seconds(beat)
 

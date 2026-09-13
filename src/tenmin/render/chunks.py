@@ -36,7 +36,14 @@ def split_sentences(text: str) -> list[str]:
 
 
 def sentence_offsets(sentences: list[str]) -> list[float]:
-    """每句「结束时刻」的估算值（秒），用 v1 的 4.5 字/秒。"""
+    """每句「结束时刻」的估算值（秒），用 v1 的 4.5 字/秒。
+
+    已知不一致（范围外，未修）：这里**不看 render.rate**，而 script/budget.py 与
+    render/tts.py 的时长体检都已经跟着 rate 走了。后果是 rate != "+0%" 时 hold 会被
+    assign_holds 按到偏移不对的句边界上（rate=+20% 时偏移应该是这里算出来的 1/1.2）。
+    修法就是把 rate 一路传进 plan_chunks，但那要动 plan_chunks / _plan_pronounceable /
+    synthesize_track 三层签名，属于 render 侧的改动。
+    """
     offsets: list[float] = []
     cursor = 0.0
     for sentence in sentences:

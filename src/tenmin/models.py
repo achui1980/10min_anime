@@ -87,8 +87,24 @@ class _StageModel(BaseModel):
     实测 work/ 下 42 份真实产物（script/voice/timeline/dialogue/signals）与
     tests/fixtures、tests/snapshots 里的样本，键集与模型字段完全一致，不会误伤旧产物。
 
-    刻意**不**设 frozen=True：script/validate.py 与 script/budget.py 当前依赖就地改写
-    （clip.start 覆写、beat.est_seconds 回填），冻结会大面积炸。
+    刻意**不**设 frozen=True。这条在 script/validate.py 与 script/budget.py 都改成
+    「深拷贝后再改、返回新对象」之后重新评估过一次，结论仍然是不设，三条理由：
+
+    1. **它拦不住真正要防的东西。** pydantic 的 frozen 只挡 `__setattr__`，
+       `beat.clips.append(...)` / `beat.audio.holds.clear()` 这类就地改列表照样通过
+       （实测确认）。而「返回新对象」这个契约本身已经把数据流写明白了，frozen 只会额外
+       给一层「看着安全其实不安全」的错觉。
+    2. **代价落在测试面上，而且很宽。** 全仓 13 处测试是「先构造再改字段」的写法
+       （test_single 的 `llm.beats[0].original_audio = "mute"`、test_validate 的
+       `script.beats[i].audio.holds = [...]`、test_budget 的 `s.est_total_seconds = 999`、
+       test_e2e / test_pipeline / test_render_tts 的「模拟人工改 script.json」等）。
+       它们要的是「随手捏一个变体」，改成 model_copy(update=...) 只会让测试更难读。
+    3. **人工编辑面本来就要求可变。** script.json 与 timeline.json 是文档写明的人工编辑
+       面，读进来之后被脚本改一改再写回去是预期用法。
+
+    「不要就地改上游传进来的对象」这条纪律现在由两个具体函数的契约来保证：
+    validate.repair_script 与 budget.apply_estimates 都先 model_copy(deep=True)，
+    并各有一条「入参一字未改」的测试锁着。
     """
 
     model_config = ConfigDict(extra="forbid")

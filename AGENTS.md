@@ -43,7 +43,7 @@ cat /path/to/zscaler_ca_bundle.pem >> .venv/lib/python3.14/site-packages/certifi
 
 ## 代码结构
 
-- `src/tenmin/config.py`：`ProjectConfig`/`EpisodeConfig`/`LLMConfig`/`RenderConfig`（pydantic models，对应 `project.yaml`），`Settings`（`BaseSettings`，读 `.env`，`env_prefix="TENMIN_"`）。
+- `src/tenmin/config.py`：`ProjectConfig` 与它的 6 个子 config（`.ingest` / `.credits` / `.signals` / `.validate_script` / `.render` / `.llm`）、`EpisodeConfig`，`Settings`（`BaseSettings`，读 `.env`，`env_prefix="TENMIN_"`）。**全项目所有「经验阈值」的唯一权威来源**；分家的判据是「这部番想要什么」的创作旋钮进 config，「物理上不可能／数据坏了」的合法性边界留在各模块的模块级常量里。各阶段模块只保留 `DEFAULT_XXX.field` 的模块级别名。
 - `src/tenmin/pipeline.py`：`Paths` 类（每阶段产物路径，全部按集号 `E{episode:02d}` 前缀），`STAGES` 列表，`run_pipeline()` 顶层编排（支持单集/批量两种模式，靠 `episode: int | None` 区分），`register_episode()`（`--episode --srt --video` 注册新集）。
 - `src/tenmin/cli.py`：Typer CLI（`tenmin init` / `tenmin run` / `tenmin inspect`）。`tenmin run` 支持三种用法：
   - `--episode N --srt <path> --video <path>`：注册新集并跑。
@@ -64,7 +64,9 @@ cat /path/to/zscaler_ca_bundle.pem >> .venv/lib/python3.14/site-packages/certifi
   4. **输入健壮性**（`_plan_pronounceable`）：不含任何字母/数字的 chunk（切句留下的孤立 `'`）直接跳过，它带的 hold 折进前一个 chunk。
   5. `probe_duration` 是阻塞 subprocess，一律走 `asyncio.to_thread`（P2-B 的 TTS 并发要靠它）。
 
-- `src/tenmin/script/single.py`：单集 LLM 调用编排（`generate_script()`），拼 prompt（模板 + few-shot 示例 + schema + 对白/信号数据）。
+- `src/tenmin/script/single.py`：单集 LLM 调用编排（`generate_script()`），拼 prompt（模板 + few-shot 示例 + schema + 对白/信号数据）。轮次结构：首稿 → 最多 `llm.validation_retries` 次语义校验重试 → 最多 `llm.budget_rewrite_rounds` 轮时长返工。**返工轮跟首轮的 prompt 不一样**：摘掉 few-shot 范例（模型已经证明它会这个格式，而范例自己带着「不要学它的内容」的警告），但**必须**重发对白轨与高能点清单（占整份 prompt 的 84%，而重试要修的语义错只能对着对白原文才判得出来），另外把上一版的 `LLMScript` JSON 交回去让它做局部编辑 —— 不交回去的话 `budget.rewrite_instruction` 里那句「不要改动 clip 时间戳」是模型物理上做不到的要求。
+- `src/tenmin/script/validate.py`：LLM 输出的唯一拦网。**分成两半，改之前先分清自己在动哪一半**：`check_script()` 是纯读（只返回 warning，一个字节都不改），`repair_script()` 是显式修复（先 `model_copy(deep=True)` 再改，返回**新** Script）。`validate_script()` 是两者的组合。拆开的动因是 single.py 的返工轮要「两版择优」，而原来 validate 就地改写并把同一个对象塞回结果，上一版根本没被保留下来。降级语义（丢弃单条 clip、保留其余、附一条 warning）是生产上的重要健壮性，别改成整篇作废。
+- `src/tenmin/script/budget.py`：时长预算，全是纯函数。`SPEECH_RATE_CPS = 4.5` 是全项目唯一一份（render/tts.py 的时长体检、render/chunks.py 的句偏移、docgen/table.py 的估算列都从这里取），`speed_factor(rate)` 也住在这里、tts.py 反过来 import 它。字数换算成秒数的唯一入口是 `narration_seconds(text, rate=...)`；读全片估算的唯一入口是 `total_estimate()`（优先读存好的 `est_total_seconds`，缺了才重算）。`narration_chars` 对中文标点**全额计费是刻意的**，用 115 个真实 chunk 测过：打折只会让「实测/估算」的分布更散（docstring 里有完整数据）。
 
 ## 测试
 
