@@ -24,6 +24,40 @@ VIDEOTOOLBOX_BITRATE = DEFAULT_RENDER.videotoolbox_bitrate
 OUTRO_FONT_NAME = DEFAULT_RENDER.outro_font_name
 PIX_FMT = "yuv420p"
 
+# 每段输入的 seek 余量（秒），两端各留这么多。
+#
+# 为什么两端都要留，而不是 `-ss source_start -t duration` 打得刚刚好：
+# - **前**：`-ss` 是输入级 seek，ffmpeg 会丢掉时间戳小于它的帧。而参数是按 `%.3f`
+#   写出去的，四舍五入有可能落到 source_start **之后**（毫秒级）；source_start 恰好
+#   是一个帧边界时（render/timeline.py 的帧对齐之后这是**常态**），那一帧就被输入层
+#   丢掉了，而 trim 还想要它 —— 一段少一帧。往前多解一点永远是安全的，精确切割由
+#   filter 层的 trim 负责。
+# - **后**：`-t` 限的是 demuxer 读进来的**包**时长（按 dts 算），有 B 帧时最后一个
+#   需要的帧其 dts 会晚于 pts，掐死到 duration 有丢尾帧的风险。
+#
+# 0.5 秒的代价实测为零：真实 E02（23 段）用 0 / 0.5 / 2.0 三种余量跑完整渲染，
+# 产物 md5 全部相同，耗时 23.24 / 23.55 / 23.87 秒（都在噪声内）。
+SEEK_MARGIN_SECONDS = 0.5
+
+
+def segment_input_args(video: Path, source_start: float, source_end: float) -> list[str]:
+    """一段画面的输入参数。`-copyts` 是这套做法的关键。
+
+    `-copyts` 让 filter 看到的仍然是**原片时间戳**，于是 filtergraph 里的
+    `trim=start=…:end=…` 一个字都不用改，选出来的帧集合与「满长度输入 + trim」
+    完全相同 —— 实测（真实 E02 全片，23 段）产物 md5 逐字节相同，耗时从 33.3 秒
+    降到 24.1 秒。不带 `-copyts` 的写法（`-ss X -t D` 让时间戳归零、filter 不再
+    trim）会多出 16 帧、时长从 217.339 变成 218.006，**不是**等价变换。
+    """
+    lead = max(source_start - SEEK_MARGIN_SECONDS, 0.0)
+    duration = source_end - lead + SEEK_MARGIN_SECONDS
+    args: list[str] = []
+    # 第一段的 lead 常常被钳到 0，那时 -ss 0 与不写完全等价，省掉它让 argv 短一点。
+    if lead > 0:
+        args += ["-ss", f"{lead:.3f}"]
+    args += ["-t", f"{duration:.3f}", "-i", str(video)]
+    return args
+
 
 def escape_filter_arg(value: str) -> str:
     """把任意字符串包成 filtergraph 里安全的一个 AVOption 值（含外层单引号）。
@@ -86,15 +120,23 @@ def build_render_args(
     outro_title: str = "",
     outro_message: str = "",
 ) -> list[str]:
-    """拼出渲染用的 ffmpeg 参数列表（不含 ffmpeg 本身）。"""
+    """拼出渲染用的 ffmpeg 参数列表（不含 ffmpeg 本身）。
+
+    输入结构是「一段一个 `-ss/-t` 输入 + 全局 `-copyts`」，见 segment_input_args。
+    所以 `[N:v]` 里的 N **就是**段序号，音轨排在全部段之后（`[{段数}:a]`）。
+    """
     if not timeline.segments:
         raise ValueError("timeline 里没有任何 segment，无法渲染")
 
     parts: list[str] = []
     for index, segment in enumerate(timeline.segments):
+        # trim 用的仍然是原片时间戳（靠 -copyts 保住），所以这两个数字与「满长度
+        # 输入」时代一模一样。format=yuv420p 显式写出来是为了 concat 前两路
+        # （正片与片尾卡）格式确定：ffmpeg 的格式协商结果**跟图的形状有关**，
+        # 不该靠它现场猜（实测加上之后产物 md5 逐字节不变）。
         parts.append(
-            f"[0:v]trim=start={segment.source_start:.3f}:end={segment.source_end:.3f},"
-            f"setpts=PTS-STARTPTS,scale={width}:{height},setsar=1[v{index}]"
+            f"[{index}:v]trim=start={segment.source_start:.3f}:end={segment.source_end:.3f},"
+            f"setpts=PTS-STARTPTS,scale={width}:{height},setsar=1,format={PIX_FMT}[v{index}]"
         )
     labels = "".join(f"[v{i}]" for i in range(len(timeline.segments)))
     parts.append(f"{labels}concat=n={len(timeline.segments)}:v=1:a=0[vcat]")
@@ -134,8 +176,13 @@ def build_render_args(
 
     return [
         "-y",
-        "-i",
-        str(video),
+        # 全局开关（不是 per-input 的）：一次就够，让每段输入的 -ss 不改写时间戳。
+        "-copyts",
+        *[
+            arg
+            for segment in timeline.segments
+            for arg in segment_input_args(video, segment.source_start, segment.source_end)
+        ],
         "-i",
         str(audio),
         "-filter_complex",
@@ -143,7 +190,7 @@ def build_render_args(
         "-map",
         final_label,
         "-map",
-        "1:a",
+        f"{len(timeline.segments)}:a",
         "-c:v",
         encoder,
         *quality_args(encoder),

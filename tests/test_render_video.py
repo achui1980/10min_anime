@@ -104,23 +104,77 @@ def test_build_render_args_filter_graph_matches_expected(tmp_path):
     ass = tmp_path / "05_timeline" / "E02.ass"
     assert graph == (
         "[0:v]trim=start=100.000:end=120.000,setpts=PTS-STARTPTS,"
-        "scale=1920:1080,setsar=1[v0];"
-        "[0:v]trim=start=200.000:end=210.000,setpts=PTS-STARTPTS,"
-        "scale=1920:1080,setsar=1[v1];"
+        "scale=1920:1080,setsar=1,format=yuv420p[v0];"
+        "[1:v]trim=start=200.000:end=210.000,setpts=PTS-STARTPTS,"
+        "scale=1920:1080,setsar=1,format=yuv420p[v1];"
         "[v0][v1]concat=n=2:v=1:a=0[vcat];"
         f"[vcat]subtitles=filename='{ass}'[vout]"
     )
 
 
-def test_build_render_args_inputs_video_then_audio(tmp_path):
+def test_build_render_args_opens_one_input_per_segment_with_input_level_seek(tmp_path):
+    """每段一个 `-ss/-t` 输入，只解码用到的那几分钟，而不是把整部片解一遍。
+
+    `-copyts` 是关键：它让 filter 看到的仍然是**原片时间戳**，于是 trim 的
+    start/end 一个字都不用改，选出来的帧集合与「满长度输入 + trim」完全相同。
+    """
     args = build(tmp_path)
-    assert args[:5] == [
+    source = str(tmp_path / "source.mkv")
+    # 段 1：100.0-120.0；段 2：200.0-210.0。两端各留 0.5 秒余量。
+    assert args[:16] == [
         "-y",
+        "-copyts",
+        "-ss",
+        "99.500",
+        "-t",
+        "21.000",
         "-i",
-        str(tmp_path / "source.mkv"),
+        source,
+        "-ss",
+        "199.500",
+        "-t",
+        "11.000",
+        "-i",
+        source,
         "-i",
         str(tmp_path / "06_audio" / "E02.mixed.m4a"),
     ]
+
+
+def test_build_render_args_seek_lead_is_clamped_at_zero(tmp_path):
+    """段起点在片头 0.2 秒时不能算出负的 -ss（ffmpeg 会把负值当成「距片尾」）。
+
+    钳到 0 之后 `-ss 0` 与不写 `-ss` 完全等价，所以干脆不写。
+    """
+    timeline = make_timeline()
+    timeline.segments[0].source_start = 0.2
+    timeline.segments[0].source_end = 1.2
+    args = build(tmp_path, timeline=timeline)
+    assert args[:6] == [
+        "-y",
+        "-copyts",
+        "-t",
+        "1.700",
+        "-i",
+        str(tmp_path / "source.mkv"),
+    ]
+
+
+def test_build_render_args_maps_the_audio_input_after_every_segment(tmp_path):
+    """音轨的输入序号跟着段数走。写死 `1:a` 的话多段时会去映射段 1 的画面。"""
+    args = build(tmp_path)
+    assert args[args.index("-map") : args.index("-map") + 4] == [
+        "-map",
+        "[vout]",
+        "-map",
+        "2:a",
+    ]
+
+
+def test_build_render_args_inputs_video_then_audio(tmp_path):
+    args = build(tmp_path)
+    assert args.count("-i") == 3
+    assert args[-1] == str(tmp_path / "07_render" / "E02.mp4")
 
 
 def test_build_render_args_maps_burned_video_and_mixed_audio(tmp_path):
@@ -129,7 +183,7 @@ def test_build_render_args_maps_burned_video_and_mixed_audio(tmp_path):
         "-map",
         "[vout]",
         "-map",
-        "1:a",
+        "2:a",
     ]
 
 
