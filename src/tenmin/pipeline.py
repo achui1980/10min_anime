@@ -17,6 +17,7 @@ from tenmin.models import DialogueTrack, Script, SignalReport, Timeline, VoiceTr
 from tenmin.progress import NullProgressReporter, ProgressReporter
 from tenmin.render.audio import mix_audio
 from tenmin.render.ffmpeg import (
+    FFmpegBinaryError,
     FFmpegError,
     preflight,
     probe_duration,
@@ -213,16 +214,22 @@ def _is_fresh(outputs: list[Path], inputs: list[Path]) -> bool:
 def _source_duration(cfg: ProjectConfig, episode: EpisodeConfig) -> float | None:
     """尽力拿这一集源视频的真实片长；拿不到就返回 None（让调用方退化到字幕末尾）。
 
-    刻意把所有失败都吞成 None：ingest 是唯一不需要视频的阶段，「只有 SRT」是文档里
-    写明的合法用法（`tenmin run <slug> --only ingest` 就能出对白轨与信号），绝不能
-    因为视频缺失/没装 ffprobe 就把它打死。三类失败：
+    刻意把**探测**类失败都吞成 None：ingest 是唯一不需要视频的阶段，「只有 SRT」是
+    文档里写明的合法用法（`tenmin run <slug> --only ingest` 就能出对白轨与信号），
+    绝不能因为视频缺失就把它打死。三类被吞掉的失败：
 
     - ValueError：project.yaml 的这一集没写 video（video_path 自己抛的）。
     - 文件不在：写了 video 但文件还没到位（下载中、换过外置盘）。
     - FFmpegError / OSError：文件在但 ffprobe 读不出（0 字节壳子、不是视频、
-      ffprobe 不在 PATH 上）。
+      容器元数据坏掉）。
 
-    降级是静默的：退化后的 duration 会照常写进 dialogue.json，`tenmin inspect`
+    **`FFmpegBinaryError` 例外，它必须响亮地抛出去。** 「`render.ffprobe_path` 配错了」
+    跟「这个文件探不出时长」是两件完全不同的事：前者一路降级下去的后果是 ingest 阶段
+    **完全静默地**用字幕末尾当片长，而那会系统性挪动整个 ED 窗（实测真实片长比字幕
+    末尾长 1.8~24.3 秒）—— 用户既没有报错也没有 warning，只有一个 OP/ED 判得不对的
+    成片。它是 FFmpegError 子类，所以 except 的顺序（窄的在前）就是全部机制。
+
+    剩下的降级是静默的：退化后的 duration 会照常写进 dialogue.json，`tenmin inspect`
     第一行就打它，对着片长一眼能看出是不是字幕末尾。
     """
     try:
@@ -233,6 +240,8 @@ def _source_duration(cfg: ProjectConfig, episode: EpisodeConfig) -> float | None
         return None
     try:
         return probe_duration(path, ffprobe=cfg.render.ffprobe_path)
+    except FFmpegBinaryError:
+        raise
     except (FFmpegError, OSError):
         return None
 

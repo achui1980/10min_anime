@@ -8,7 +8,9 @@ from unittest import mock
 
 import pytest
 
+from tenmin.cli import PIPELINE_ERRORS
 from tenmin.render.ffmpeg import (
+    FFmpegBinaryError,
     FFmpegError,
     font_available,
     has_audio_stream,
@@ -47,6 +49,22 @@ ENCODERS_SAMPLE = """Encoders:
  V..... h264_videotoolbox    VideoToolbox H.264 Encoder
  A..... aac                  AAC (Advanced Audio Coding)
 """
+
+
+@pytest.fixture(autouse=True)
+def pretend_binaries_exist(monkeypatch):
+    """本文件里绝大多数用例打的是 `subprocess.run`，测的是**解析**而不是二进制发现。
+
+    `_require_binary` 现在挡在 ffmpeg **与 ffprobe** 两条路的前面（M3 之前只挡 ffmpeg
+    那条），如果不把 `shutil.which` 也桩掉，这些用例就变成「本机 PATH 上有没有
+    ffmpeg/ffprobe」的环境依赖 —— 实测把 PATH 收窄到 /usr/bin:/bin 之后，M3 之前就有
+    2 条会红（ffmpeg 侧），M3 之后是 25 条。
+
+    「二进制不存在」本身有专门的用例（`test_capability_probe_says_which_binary`、
+    `test_ffprobe_side_also_requires_the_binary` 等），它们自己再 setattr 一次覆盖掉
+    这个默认桩。
+    """
+    monkeypatch.setattr("tenmin.render.ffmpeg.shutil.which", lambda name: name)
 
 
 def test_parse_names_from_filters():
@@ -1117,6 +1135,78 @@ def test_has_audio_stream_is_false_on_empty_output(monkeypatch, tmp_path):
         lambda args, **kwargs: FakeCompleted(returncode=0, stdout="\n"),
     )
     assert has_audio_stream(media) is False
+
+
+# --- has_audio_stream 必须走 _probe_field 那个共享壳子（M3）------------------
+#
+# 它原来手写了第三份 subprocess.run，形状与 `_probe_field(..., stream="a")` 完全同构，
+# 但漏了那个壳子里的两条保护。下面三条各锁一个洞。
+
+
+def test_has_audio_stream_translates_a_probe_timeout(monkeypatch, tmp_path):
+    """原来没有 `except subprocess.TimeoutExpired`，而它传了 timeout=PROBE_TIMEOUT。
+
+    `subprocess.TimeoutExpired` **不在** cli.PIPELINE_ERRORS 里，所以「源片在掉线的
+    外置盘上」——正是那个 timeout 要处理的场景——会给用户一整页 traceback。
+    """
+    media = tmp_path / "a.mkv"
+    media.write_bytes(b"fake")
+
+    def timing_out(args, **kwargs):
+        raise subprocess.TimeoutExpired(args, 60.0)
+
+    monkeypatch.setattr("tenmin.render.ffmpeg.subprocess.run", timing_out)
+    with pytest.raises(FFmpegError) as exc:
+        has_audio_stream(media)
+    assert "超时" in str(exc.value)
+    assert isinstance(exc.value, PIPELINE_ERRORS)
+
+
+def test_has_audio_stream_checks_the_file_exists_first(monkeypatch, tmp_path):
+    """原来没有 is_file 前置检查，只靠「preflight 前一行刚查过」——那是靠调用顺序。
+
+    没有它的话，一个不存在的路径会 spawn 一次注定失败的 ffprobe，然后被
+    `bool(空 stdout)` 静默判成「这个源没有音轨」，报错方向完全指错。
+    """
+
+    def unreachable(args, **kwargs):
+        raise AssertionError("文件不存在时不该 spawn ffprobe")
+
+    monkeypatch.setattr("tenmin.render.ffmpeg.subprocess.run", unreachable)
+    missing = tmp_path / "video" / "E02.mkv"
+    with pytest.raises(FileNotFoundError) as exc:
+        has_audio_stream(missing)
+    assert str(missing) in str(exc.value)
+
+
+@pytest.mark.parametrize(
+    "probe", [has_audio_stream, probe_duration, probe_frame_rate], ids=lambda f: f.__name__
+)
+def test_ffprobe_side_also_requires_the_binary(monkeypatch, tmp_path, probe):
+    """ffprobe 那条路上也必须调 `_require_binary`，否则抛的是裸 FileNotFoundError。
+
+    `_require_binary` 的 docstring 点名了 `render.ffprobe_path`，但它原来**只**被
+    `_probe_capabilities`（ffmpeg 侧）调用。实测改前
+    `probe_duration(p, ffprobe='不存在')` 抛 `FileNotFoundError` —— 而它是 OSError
+    子类，正好落进 pipeline._source_duration 那条刻意的静默降级里。
+    """
+    media = tmp_path / "a.mkv"
+    media.write_bytes(b"fake")
+
+    def unreachable(args, **kwargs):
+        raise AssertionError("二进制不存在时不该 spawn 它")
+
+    monkeypatch.setattr("tenmin.render.ffmpeg.shutil.which", lambda _name: None)
+    monkeypatch.setattr("tenmin.render.ffmpeg.subprocess.run", unreachable)
+    with pytest.raises(FFmpegBinaryError) as exc:
+        probe(media, ffprobe="/definitely/not/a/real/ffprobe")
+    assert "render.ffprobe_path" in str(exc.value)
+
+
+def test_ffmpeg_binary_error_is_an_ffmpeg_error():
+    """必须留在 FFmpegError 那一族里，否则又逃出 cli.PIPELINE_ERRORS。"""
+    assert issubclass(FFmpegBinaryError, FFmpegError)
+    assert issubclass(FFmpegBinaryError, PIPELINE_ERRORS)
 
 
 def test_font_available_uses_fc_list(monkeypatch):

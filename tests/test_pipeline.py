@@ -343,16 +343,51 @@ def test_run_ingest_falls_back_when_ffprobe_fails(project, monkeypatch):
     assert track.duration == pytest.approx(1416.6, abs=1.0)
 
 
-def test_run_ingest_falls_back_when_ffprobe_is_not_installed(project, monkeypatch):
-    """ffprobe 根本不在 PATH 上时 subprocess 抛 FileNotFoundError，同样降级。"""
+def test_run_ingest_still_degrades_on_a_plain_os_error(project, monkeypatch):
+    """探测这个文件时撞上 OSError（换盘时的竞态、权限）仍然降级。
+
+    这条原来叫 `..._when_ffprobe_is_not_installed`，用 `FileNotFoundError("ffprobe")`
+    模拟「ffprobe 不在 PATH 上」。那个断言锁死的正是 M3 要修的 bug：二进制配错跟
+    「这个文件探不出时长」被混成同一类，于是 `project.yaml` 里 ffprobe_path 打错一个
+    字符，ingest 会完全静默地退化到「字幕末尾当片长」。现在二进制配错走
+    FFmpegBinaryError（响亮报错，见下一条），这条只保留它原本合理的那一半语义。
+    """
     _prepare_video(project)
 
     def boom(path, **_):
-        raise FileNotFoundError("ffprobe")
+        raise OSError("Input/output error")
 
     monkeypatch.setattr("tenmin.pipeline.probe_duration", boom)
-
     assert run_ingest(project)[0].duration == pytest.approx(1416.6, abs=1.0)
+
+
+def test_run_ingest_refuses_to_degrade_on_a_misconfigured_ffprobe(project, monkeypatch):
+    """`render.ffprobe_path` 配错必须**响亮**报错，绝不能静默退化到字幕末尾。
+
+    降级本身是刻意的（只有 SRT 也能跑 ingest），但「配置写错」跟「探测失败」是两件
+    不同的事：前者静默降级的后果是整个 ED 窗被系统性挪动（实测真实片长比字幕末尾长
+    1.8~24.3 秒），而用户既没有报错也没有 warning。
+    """
+    from tenmin.render.ffmpeg import FFmpegBinaryError
+
+    _prepare_video(project)
+
+    def boom(path, **_):
+        raise FFmpegBinaryError("找不到可执行文件 '/opt/typo/ffprobe'")
+
+    monkeypatch.setattr("tenmin.pipeline.probe_duration", boom)
+    with pytest.raises(FFmpegBinaryError):
+        run_ingest(project)
+
+
+def test_misconfigured_ffprobe_reaches_ingest_for_real(project):
+    """不打桩，走真实的 `probe_duration`：ffprobe_path 配错时 ingest 必须抛。"""
+    from tenmin.render.ffmpeg import FFmpegBinaryError
+
+    _prepare_video(project)
+    project.render.ffprobe_path = "/definitely/not/a/real/ffprobe"
+    with pytest.raises(FFmpegBinaryError):
+        run_ingest(project)
 
 
 def test_run_signals_writes_signals_json(project):

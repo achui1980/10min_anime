@@ -41,6 +41,21 @@ class FFmpegError(RuntimeError):
     """ffmpeg 非零退出。消息里必须带 stderr 尾部，否则等于没报错。"""
 
 
+class FFmpegBinaryError(FFmpegError):
+    """`render.ffmpeg_path` / `render.ffprobe_path` 指向的可执行文件压根不存在。
+
+    **必须跟「探测这个文件失败」分开**，因为 `pipeline._source_duration` 对后者是
+    刻意的静默降级（`catch (FFmpegError, OSError)` → 退化成「字幕末尾当片长」，好让
+    「只有 SRT」这条合法用法能跑）。如果「二进制配错」也走那条降级，那么
+    `project.yaml` 里 `ffprobe_path` 打错一个字符，ingest 阶段就会**完全静默地**用
+    字幕末尾当片长 —— 而那会系统性挪动整个 ED 窗（实测真实片长比字幕末尾长
+    1.8~24.3 秒）。配置写错必须响亮报错，所以 _source_duration 单独把它放过去。
+
+    仍然是 FFmpegError 子类，所以照旧落在 cli.PIPELINE_ERRORS 里（一行红字，不是
+    一整页 traceback）。
+    """
+
+
 def parse_names(text: str) -> set[str]:
     """从 -filters / -encoders 的输出里抽出可用名字。"""
     return {m.group(1) for m in (_NAME_LINE.match(line) for line in text.splitlines()) if m}
@@ -180,12 +195,19 @@ def _probe_field(
 ) -> str:
     """跑一次 ffprobe 读一个字段，返回 stdout（已 strip）。失败一律 FFmpegError。
 
-    从 probe_duration 里抽出来的公共壳子：两处的失败处理、超时、以及那条「刻意不加
-    -nostdin」的约束必须一模一样，各写一份迟早会漂。`what` 只进错误消息。
+    三个 ffprobe 消费者（probe_duration / probe_frame_rate / has_audio_stream）**全部**
+    走这个壳子：它们的失败处理、超时、`_require_binary` 前置检查、以及那条「刻意不加
+    -nostdin」的约束必须一模一样，各写一份迟早会漂（has_audio_stream 就漂过一次：手写
+    第三份 subprocess.run，既没有 TimeoutExpired 处理也没有 is_file 前置检查，而
+    `subprocess.TimeoutExpired` 不在 cli.PIPELINE_ERRORS 里 —— 「源片在掉线的外置盘上」
+    这个正是那个 timeout 要处理的场景，用户会看到一整页 traceback）。
+
+    `what` 只进错误消息。
     """
     path = Path(path)
     if not path.is_file():
         raise FileNotFoundError(f"找不到媒体文件 {path}（读不了{what}）")
+    _require_binary(ffprobe)
     args = [ffprobe, "-v", "error"]
     if stream is not None:
         args += ["-select_streams", stream]
@@ -301,9 +323,15 @@ def _require_binary(binary: str) -> None:
     """二进制不存在就给一句专门的人话，而不是让 subprocess 抛裸 FileNotFoundError。
 
     shutil.which 对裸名字走 PATH 查找、对绝对路径检查存在性与可执行位，两种形态都覆盖。
+
+    **ffmpeg 与 ffprobe 两条路都必须调它。** 原来只有 `_probe_capabilities`（ffmpeg 侧）
+    调，ffprobe 侧一次都没调 —— 实测 `probe_duration(p, ffprobe='不存在')` 与
+    `has_audio_stream(p, ffprobe='不存在')` 都抛裸 `FileNotFoundError`，而它是 OSError
+    子类，正好落进 `pipeline._source_duration` 那条**刻意的静默降级**里。叠加效应见
+    FFmpegBinaryError 的 docstring。
     """
     if shutil.which(binary) is None:
-        raise FFmpegError(
+        raise FFmpegBinaryError(
             f"找不到可执行文件 {binary!r}。\n"
             "装一个（brew install homebrew-ffmpeg/ffmpeg/ffmpeg --with-libass），"
             "或用 project.yaml 的 render.ffmpeg_path / render.ffprobe_path 指定完整路径。"
@@ -370,30 +398,12 @@ def has_audio_stream(path: Path, *, ffprobe: str = FFPROBE) -> bool:
     或者只拿了视频轨的下载）会让混音直接失败 —— 而那是在跑完几分钟 TTS **之后**。
 
     实测：`-select_streams a` 在没有音轨时退出码仍然是 **0**、stdout 是空的。所以判据
-    只能看 stdout 有没有内容，看 returncode 会永远判成「有音轨」。
+    只能看 stdout 有没有内容，看 returncode 会永远判成「有音轨」。而 `_probe_field`
+    的返回值正好就是那份 strip 过的 stdout，所以 `bool(...)` 就是这条判据本身 ——
+    不需要第三份手写的 subprocess.run（原来那份漏了 TimeoutExpired 与 is_file 检查，
+    后者靠「preflight 前一行刚查过」才没显形，也就是靠调用顺序而不是靠函数自己）。
     """
-    path = Path(path)
-    args = [
-        ffprobe,
-        "-v",
-        "error",
-        "-select_streams",
-        "a",
-        "-show_entries",
-        "stream=index",
-        "-of",
-        "csv=p=0",
-        str(path),
-    ]
-    completed = subprocess.run(
-        args,
-        capture_output=True,
-        text=True,
-        errors="replace",
-        stdin=subprocess.DEVNULL,
-        timeout=PROBE_TIMEOUT_SECONDS,
-    )
-    return bool(completed.stdout.strip())
+    return bool(_probe_field(path, "stream=index", "音轨", ffprobe=ffprobe, stream="a"))
 
 
 def font_available(name: str) -> bool | None:
