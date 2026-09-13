@@ -36,6 +36,20 @@ packages = ["src/tenmin"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+
+# 刻意**不**配 addopts（尤其不配 `-m "not llm and not generalize and not render"`）。
+# 三个 marker 各自已经有更准的门，而且门都在代码里、不在这份配置里：
+#   - render：tests/conftest.py 的 pytest_collection_modifyitems。没有显式 `-m render`
+#     就整批 skip。它是唯一需要**外部机制**的：这批用例会真调 Edge-TTS（联网）并真编
+#     一段视频，而它们自己没有任何可以自检的前置条件。
+#   - llm：tests/test_e2e.py 的 `@pytest.mark.skipif(not os.environ.get(
+#     "TENMIN_GEMINI_API_KEY"))`。门是「有没有 key」，比按 marker 摘更准 —— 有 key 的
+#     人跑 `uv run pytest` 就该顺带跑到它。
+#   - generalize：tests/test_generalize.py 的 `@pytest.mark.skipif(not SRT_FILES)`。
+#     这条 marker 的**约定本身**就是「把 SRT 放进 tests/fixtures/generalize/ 后自动
+#     生效」，用 addopts 按 marker 摘掉会把这条约定直接打死。
+# 换句话说 addopts deselect 对 render 是重复、对 llm 是退化、对 generalize 是有害。
+# 别再加一遍。
 markers = [
     "llm: 需要真实 LLM API key，默认跳过（跑法：TENMIN_GEMINI_API_KEY=xxx uv run pytest -m llm）",
     "generalize: 需要额外番剧 SRT fixture，默认跳过（把 SRT 放进 tests/fixtures/generalize/ 后自动生效）",
