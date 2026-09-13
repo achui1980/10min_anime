@@ -21,6 +21,7 @@ from tenmin.script.single import (
     build_dialogue_block,
     build_glossary_block,
     build_highlight_block,
+    build_user_prompt,
     generate_script,
     to_script,
 )
@@ -433,3 +434,199 @@ def test_dialogue_block_marks_merged_source_line_numbers():
 
 def test_dialogue_block_omits_the_marker_when_nothing_was_merged(track):
     assert "+" not in build_dialogue_block(track)
+
+
+# --- E4：重试轮/重写轮把上一版交回模型，且不再重发 few-shot 范例 ---
+
+
+@pytest.mark.asyncio
+async def test_retry_sends_the_previous_draft_back(cfg, track, report):
+    bad = LLMScript(
+        beats=[
+            llm_beat("b1", "Hook 开场", "hook", 360, 9000.0, 9080.0),
+            llm_beat("b2", "阶段一", "act", 360, 100.0, 180.0),
+            llm_beat("b3", "收尾：完", "outro", 360, 300.0, 380.0),
+        ]
+    )
+    provider = FakeProvider([bad, valid_llm_script()])
+    await generate_script(cfg, track, report, provider)
+    retry = provider.calls[1]["user"]
+    assert "## 上一版输出" in retry
+    assert '"id": "b1"' in retry, "上一版的 JSON 必须原样交回去"
+
+
+@pytest.mark.asyncio
+async def test_followup_rounds_drop_the_few_shot_example(cfg, track, report):
+    """few-shot 范例只教「格式、语气、节奏」，而模型这时已经交出过一份合 schema 的稿子，
+    格式它显然学会了；范例自己还带着「不要学它的内容」的警告，去掉只减少污染风险。"""
+    too_long = valid_llm_script(chars_per_beat=(600, 600, 600))
+    provider = FakeProvider([too_long, valid_llm_script()])
+    await generate_script(cfg, track, report, provider)
+    first, rewrite = provider.calls[0]["user"], provider.calls[1]["user"]
+    assert "## 参考范例" in first
+    assert "## 参考范例" not in rewrite
+
+
+@pytest.mark.asyncio
+async def test_followup_rounds_still_resend_the_dialogue_track(cfg, track, report):
+    """对白轨占整份 prompt 的 78.2%，但**必须**重发：重试要修的语义错误（时间戳越界、
+    人物关系写反、事件顺序）全部只能对着对白原文才判得出来。"""
+    too_long = valid_llm_script(chars_per_beat=(600, 600, 600))
+    provider = FakeProvider([too_long, valid_llm_script()])
+    await generate_script(cfg, track, report, provider)
+    rewrite = provider.calls[1]["user"]
+    assert "你是谁" in rewrite  # 对白轨
+    assert "gap:19.8s" in rewrite  # 高能点清单
+
+
+# --- E2/E3：两版择优 + warning 跟着被采纳的版本 ---
+
+
+@pytest.mark.asyncio
+async def test_rewrite_keeps_the_first_draft_when_the_second_is_worse(cfg, track, report):
+    """原来无条件用新稿替换旧稿，即使新稿偏差更大。"""
+    first = valid_llm_script(chars_per_beat=(430, 430, 430))  # 1290 字 = 286.7s，+19.4%
+    worse = valid_llm_script(chars_per_beat=(700, 700, 700))  # 2100 字 = 466.7s，+94.4%
+    provider = FakeProvider([first, worse])
+    script, warnings = await generate_script(cfg, track, report, provider)
+    assert script.est_total_seconds == pytest.approx(286.666, abs=0.01)
+    assert any("采纳" in w and "首版" in w for w in warnings), warnings
+
+
+@pytest.mark.asyncio
+async def test_rewrite_adopts_the_second_draft_when_it_is_better(cfg, track, report):
+    first = valid_llm_script(chars_per_beat=(700, 700, 700))
+    better = valid_llm_script(chars_per_beat=(430, 430, 430))
+    provider = FakeProvider([first, better])
+    script, warnings = await generate_script(cfg, track, report, provider)
+    assert script.est_total_seconds == pytest.approx(286.666, abs=0.01)
+    assert any("采纳" in w and "重写版" in w for w in warnings), warnings
+
+
+@pytest.mark.asyncio
+async def test_warnings_belong_to_the_adopted_draft_only(cfg, track, report):
+    """真实后果：首版触发重写时，首版的 validate warning（「clip 落在片头曲内，丢弃」）
+    已经进了列表，而那份稿子随后被丢弃——用户看到的是在描述一份**不存在的稿子**。"""
+    first = valid_llm_script(chars_per_beat=(700, 700, 700))
+    first.beats[1].clips.append(LLMClip(episode=2, start=160.0, end=200.0, visual="片头曲"))
+    better = valid_llm_script(chars_per_beat=(430, 430, 430))
+    provider = FakeProvider([first, better])
+    _, warnings = await generate_script(cfg, track, report, provider)
+    assert not any("片头" in w for w in warnings), warnings
+
+
+@pytest.mark.asyncio
+async def test_warnings_of_the_kept_first_draft_are_reported(cfg, track, report):
+    first = valid_llm_script(chars_per_beat=(430, 430, 430))
+    first.beats[1].clips.append(LLMClip(episode=2, start=160.0, end=200.0, visual="片头曲"))
+    worse = valid_llm_script(chars_per_beat=(700, 700, 700))
+    provider = FakeProvider([first, worse])
+    _, warnings = await generate_script(cfg, track, report, provider)
+    assert any("片头" in w for w in warnings), warnings
+
+
+# --- E5：重试次数/重写轮数/tolerance 可配 ---
+
+
+@pytest.mark.asyncio
+async def test_validation_retries_comes_from_config(cfg, track, report):
+    bad = LLMScript(beats=[llm_beat("b1", "Hook 开场", "hook", 360, 9000.0, 9080.0)])
+    cfg.llm.validation_retries = 2
+    provider = FakeProvider([bad, bad, valid_llm_script()])
+    script, _ = await generate_script(cfg, track, report, provider)
+    assert len(provider.calls) == 3
+    assert len(script.beats) == 3
+
+
+@pytest.mark.asyncio
+async def test_budget_rewrite_rounds_comes_from_config(cfg, track, report):
+    too_long = valid_llm_script(chars_per_beat=(600, 600, 600))
+    cfg.llm.budget_rewrite_rounds = 0
+    provider = FakeProvider([too_long])
+    _, warnings = await generate_script(cfg, track, report, provider)
+    assert len(provider.calls) == 1
+    assert any("容差" in w for w in warnings)
+
+
+@pytest.mark.asyncio
+async def test_budget_tolerance_comes_from_config(cfg, track, report):
+    """1080 字 = 240s 正好达标；把容差收到 0 之后 +0.0% 仍然不超，
+    但 1290 字（+19.4%）在默认 12% 下要重写、把容差放到 30% 就不该重写。"""
+    cfg.llm.budget_tolerance = 0.30
+    provider = FakeProvider([valid_llm_script(chars_per_beat=(430, 430, 430))])
+    _, warnings = await generate_script(cfg, track, report, provider)
+    assert len(provider.calls) == 1
+    assert warnings == []
+
+
+# --- E1：校验失败时把最后一版稿子留下来 ---
+
+
+@pytest.mark.asyncio
+async def test_final_validation_error_carries_the_rejected_script(cfg, track, report):
+    """原来第二次仍抛 ScriptValidationError 时异常直接冒出，这次几百秒的昂贵调用
+    产物一点没留。"""
+    from tenmin.script.validate import ScriptValidationError
+
+    bad = LLMScript(beats=[llm_beat("b1", "Hook 开场", "hook", 360, 9000.0, 9080.0)])
+    provider = FakeProvider([bad, bad])
+    with pytest.raises(ScriptValidationError) as exc:
+        await generate_script(cfg, track, report, provider)
+    assert exc.value.script is not None
+    assert exc.value.script.beats[0].id == "b1"
+
+
+# --- E6：script 阶段的心跳 ---
+
+
+@pytest.mark.asyncio
+async def test_generate_script_reports_each_round(cfg, track, report):
+    class Recorder:
+        def __init__(self):
+            self.substeps = []
+
+        def substep(self, stage, current, total, label):
+            self.substeps.append((stage, current, total, label))
+
+        def __getattr__(self, name):
+            return lambda *a, **k: None
+
+    too_long = valid_llm_script(chars_per_beat=(600, 600, 600))
+    provider = FakeProvider([too_long, valid_llm_script()])
+    recorder = Recorder()
+    await generate_script(cfg, track, report, provider, reporter=recorder)
+    stages = [s[0] for s in recorder.substeps]
+    assert stages == ["script", "script"]
+    assert "初稿" in recorder.substeps[0][3]
+    assert "返工" in recorder.substeps[1][3]
+
+
+# --- D3：提示词里的语速/容差/字数预算不再是第二份真相 ---
+
+
+def test_prompt_injects_the_tolerance_from_config(cfg, track, report):
+    cfg.llm.budget_tolerance = 0.05
+    text = build_user_prompt(cfg, track, report)
+    assert "正负 5%" in text
+    assert "12%" not in text
+
+
+def test_prompt_injects_the_speech_rate(cfg, track, report):
+    assert "4.5 字/秒" in build_user_prompt(cfg, track, report)
+
+
+def test_prompt_char_budget_deducts_the_hold_reserve(cfg, track, report):
+    """提示词原来写「合计约 target × 4.5 字」，跟 budget.budget_chars 犯的是同一个错：
+    没扣掉留白占走的时间。实测 13 份真实产物的全片留白是 10.5–21.0 秒。"""
+    from tenmin.script.single import HOLD_RESERVE_SECONDS
+
+    text = build_user_prompt(cfg, track, report)
+    assert str(int((240.0 - HOLD_RESERVE_SECONDS) * 4.5)) in text
+
+
+def test_prompt_char_budget_follows_the_tts_rate(cfg, track, report):
+    from tenmin.script.single import HOLD_RESERVE_SECONDS
+
+    cfg.render.rate = "+20%"
+    text = build_user_prompt(cfg, track, report)
+    assert str(int((240.0 - HOLD_RESERVE_SECONDS) * 4.5 * 1.2)) in text

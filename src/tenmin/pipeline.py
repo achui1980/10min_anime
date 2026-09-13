@@ -22,6 +22,7 @@ from tenmin.render.tts import TTSEngine, synthesize_track
 from tenmin.render.video import render_video
 from tenmin.script.llm import LLMProvider, LLMSchemaError
 from tenmin.script.single import generate_script
+from tenmin.script.validate import ScriptValidationError
 from tenmin.signals.aggregate import build_report
 
 STAGES = [
@@ -57,6 +58,12 @@ _ARTIFACTS: dict[str, tuple[str, str]] = {
     # 输出。刻意跟 script.json 同目录：出事时用户看的就是 03_script/，把现场放在别处
     # 只会让人找不到。它不是任何阶段的输入或输出，不参与 _is_fresh。
     "script_raw": ("03_script", ".raw.txt"),
+    # 只在语义校验（script/validate.py）连续 N 轮都没过时才写：存最后一次那份
+    # **schema 合法但语义没过**的 Script。刻意跟 script_raw 分开一个槽位而不是复用它：
+    # raw.txt 存的是「连 schema 都不合法的原始文本」，两者形态完全不同（一个是 JSON、
+    # 一个可能是任意垃圾），共用一个文件名会让用户打开它时不知道该期待什么。
+    # 它不是任何阶段的输入或输出，不参与 _is_fresh。
+    "script_rejected": ("03_script", ".rejected.json"),
     "table": ("out", ".解说方案.md"),
     "narration": ("out", ".narration.txt"),
     "voice_dir": ("04_voice", ""),
@@ -71,7 +78,7 @@ _ARTIFACTS: dict[str, tuple[str, str]] = {
 class Paths:
     """一个 project 的全部阶段产物路径。
 
-    12 个方法都是 _ARTIFACTS 表的一行薄包装。刻意保留显式方法而不是 __getattr__
+    13 个方法都是 _ARTIFACTS 表的一行薄包装。刻意保留显式方法而不是 __getattr__
     动态派发：调用点（pipeline / cli / 一堆测试）到处在用 paths.script(2)，
     动态派发会让拼错的名字变成运行时 AttributeError、IDE 跳转与补全全失效。
     这里要的是「布局知识只有一份」，不是「代码行数最少」。
@@ -95,6 +102,9 @@ class Paths:
 
     def script_raw(self, episode: int) -> Path:
         return self._artifact("script_raw", episode)
+
+    def script_rejected(self, episode: int) -> Path:
+        return self._artifact("script_rejected", episode)
 
     def table(self, episode: int) -> Path:
         return self._artifact("table", episode)
@@ -298,7 +308,11 @@ def _load_reports(cfg: ProjectConfig) -> list[SignalReport]:
 
 
 async def run_script(
-    cfg: ProjectConfig, provider: LLMProvider, episode: int
+    cfg: ProjectConfig,
+    provider: LLMProvider,
+    episode: int,
+    *,
+    reporter: ProgressReporter | None = None,
 ) -> tuple[Script, list[str]]:
     paths = Paths(cfg.root)
     tracks = _load_tracks(cfg)
@@ -306,7 +320,20 @@ async def run_script(
     track = next(t for t in tracks if t.episode == episode)
     report = next(r for r in reports if r.episode == episode)
     try:
-        script, warnings = await generate_script(cfg, track, report, provider)
+        script, warnings = await generate_script(
+            cfg, track, report, provider, reporter=reporter
+        )
+    except ScriptValidationError as error:
+        # 跟下面 LLMSchemaError 的落盘同理：pipeline 是唯一知道产物往哪写的一层。
+        # 一次真实调用可达 561 秒，重试耗尽后原来什么都不留。
+        if error.script is None:
+            raise
+        rejected_path = paths.script_rejected(episode)
+        _write_json(rejected_path, error.script.model_dump_json(indent=2))
+        raise ScriptValidationError(
+            f"{error}\n最后一版没通过校验的剧本已存到 {rejected_path}",
+            script=error.script,
+        ) from error
     except LLMSchemaError as error:
         # 落盘选在这一层：llm.py 不该知道 Paths（它是纯 provider 层，被单测直接实例化），
         # 而 single.py 只是拼 prompt 的无状态函数、同样拿不到项目根目录。pipeline 是
@@ -658,7 +685,9 @@ async def run_pipeline(
             inputs = [paths.dialogue(number), paths.signals(number)]
             if force or not is_fresh([paths.script(number)], inputs):
                 reporter.stage_start("script")
-                _, stage_warnings = await run_script(cfg, provider, episode=number)
+                _, stage_warnings = await run_script(
+                    cfg, provider, episode=number, reporter=reporter
+                )
                 warnings.extend(stage_warnings)
                 reporter.stage_done("script")
             else:

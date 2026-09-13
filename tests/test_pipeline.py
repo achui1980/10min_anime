@@ -37,8 +37,10 @@ from tenmin.pipeline import (
     run_voice,
     stages_from,
 )
+from tenmin.progress import NullProgressReporter
 from tenmin.render.ffmpeg import FFmpegError
 from tenmin.script.llm import LLMSchemaError
+from tenmin.script.validate import ScriptValidationError
 
 from .fakes import FakeProvider, FakeReporter, FakeTTSEngine
 
@@ -192,6 +194,7 @@ FROZEN_LAYOUT = {
     "signals": "02_signals/E02.signals.json",
     "script": "03_script/E02.script.json",
     "script_raw": "03_script/E02.raw.txt",
+    "script_rejected": "03_script/E02.rejected.json",
     "table": "out/E02.解说方案.md",
     "narration": "out/E02.narration.txt",
     "voice_dir": "04_voice/E02",
@@ -1660,3 +1663,50 @@ def test_register_episode_rewrites_project_yaml_atomically(tmp_path, monkeypatch
 
     assert cfg.config_path.read_text(encoding="utf-8") == before
     assert not part_path(cfg.config_path).exists()
+
+
+# --- E1：语义校验耗尽重试时把最后一版稿子落盘 ---
+
+
+@pytest.mark.asyncio
+async def test_run_script_persists_the_rejected_draft(project):
+    """一次真实调用可达 561 秒，原来重试耗尽后什么都不留：用户既看不到模型写了什么，
+    也无从判断是判据太严还是模型真写错了。"""
+    run_ingest(project)
+    run_signals(project)
+    bad = LLMScript(
+        beats=[
+            LLMBeat(
+                id=f"b{i + 1}",
+                label=["Hook 开场", "阶段一", "收尾：完"][i],
+                role=["hook", "act", "outro"][i],
+                narration="啊" * 360,
+                clips=[LLMClip(episode=2, start=9000.0, end=9080.0, visual="假的")],
+            )
+            for i in range(3)
+        ]
+    )
+    provider = FakeProvider([bad, bad])
+    paths = Paths(project.root)
+    with pytest.raises(ScriptValidationError) as exc:
+        await run_script(project, provider, episode=2)
+    rejected = paths.script_rejected(2)
+    assert rejected.exists()
+    assert Script.model_validate_json(rejected.read_text(encoding="utf-8")).beats
+    assert str(rejected) in str(exc.value)
+
+
+@pytest.mark.asyncio
+async def test_run_script_reports_substeps(project, monkeypatch):
+    run_ingest(project)
+    run_signals(project)
+    seen: list[tuple[str, int, int, str]] = []
+
+    class Recorder(NullProgressReporter):
+        def substep(self, stage, current, total, label):
+            seen.append((stage, current, total, label))
+
+    await run_script(
+        project, FakeProvider([fake_script_response()]), episode=2, reporter=Recorder()
+    )
+    assert seen and seen[0][0] == "script"

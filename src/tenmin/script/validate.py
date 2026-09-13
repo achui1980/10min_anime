@@ -79,7 +79,18 @@ ANCHOR_OUTSIDE_MAX_RATIO = 0.5
 
 
 class ScriptValidationError(RuntimeError):
-    """校验后剧本不可用，调用方应重试一次 LLM。"""
+    """校验后剧本不可用，调用方应重试一次 LLM。
+
+    `script` 带着**没通过校验的那一版**（可能是 None，比如节点数不足时连深拷贝都还没做）。
+    这一份是给 pipeline 落盘用的：一次真实调用可达 561 秒，重试耗尽后原来什么都不留，
+    用户既看不到模型到底写了什么，也无从判断是判据太严还是模型真的写错了。
+    与 LLMSchemaError.raw_output 的分工：那个存的是「schema 都不合法的原始文本」，
+    这个存的是「schema 合法但语义校验没过的 Script」。两者形态不同，所以落在两个产物槽位。
+    """
+
+    def __init__(self, message: str, *, script: Script | None = None) -> None:
+        super().__init__(message)
+        self.script = script
 
 
 class ValidationResult(BaseModel):
@@ -461,7 +472,8 @@ def repair_script(
     """
     if len(script.beats) < cfg.min_beats:
         raise ScriptValidationError(
-            f"剧本节点数 {len(script.beats)} 少于下限 {cfg.min_beats}，重试"
+            f"剧本节点数 {len(script.beats)} 少于下限 {cfg.min_beats}，重试",
+            script=script,
         )
 
     repaired = script.model_copy(deep=True)
@@ -518,7 +530,10 @@ def repair_script(
             # 省钱的那一半改由 single.py 承担：它现在会把这份没过校验的稿子落盘到
             # 03_script/E{NN}.rejected.json，所以昂贵的调用不再是白花的。
             raise ScriptValidationError(
-                f"{beat.label} 的所有 clip 都未通过校验，剧本不可用，重试"
+                f"{beat.label} 的所有 clip 都未通过校验，剧本不可用，重试",
+                # 带上**修到一半**的那份：它已经反映了「哪些 clip 被丢了」，
+                # 比原始输入更能说明模型错在哪。
+                script=repaired,
             )
         beat.clips = kept
 

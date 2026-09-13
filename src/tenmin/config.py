@@ -87,8 +87,14 @@ class LLMConfig(BaseModel):
     # 却能兜住绝大多数秒级的限流窗与网关抖动。设成 1 等于关掉传输层重试。
     transport_max_attempts: int = Field(default=4, ge=1)
 
-    # 抄 script/budget.py 的 DEFAULT_TOLERANCE。目前只定义不消费。
+    # 抄 script/budget.py 的 DEFAULT_TOLERANCE（那边现在反过来引用这里）。
     budget_tolerance: float = Field(default=0.12, ge=0)
+    # 语义校验（script/validate.py）失败后的重试次数，**不含**首发。原来写死在
+    # script/single.py 的函数体里，既不可配也不可在测试里调。0 = 首轮失败就直接抛。
+    validation_retries: int = Field(default=1, ge=0)
+    # 时长预算返工的轮数。0 = 只报 warning 不返工。每一轮都是一次完整的 LLM 调用
+    # （实测 ~561 秒），所以默认只给 1 轮。
+    budget_rewrite_rounds: int = Field(default=1, ge=0)
 
 
 class IngestConfig(BaseModel):
