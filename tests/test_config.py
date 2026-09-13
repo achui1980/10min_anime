@@ -462,6 +462,14 @@ def test_llm_config_timeout_and_retry_defaults():
     assert cfg.transport_max_attempts == 4
 
 
+def test_llm_config_script_concurrency_defaults_to_serial():
+    """默认 1 = 完全不预取。依据见 config.py 里那段注释（默认 provider 是 gemini，
+    而它那条路上没有传输层退避）。"""
+    assert LLMConfig().script_concurrency == 1
+    with pytest.raises(ValidationError):
+        LLMConfig(script_concurrency=0)
+
+
 def test_llm_config_rejects_non_positive_timeouts():
     for field in ("read_timeout_seconds", "total_timeout_seconds"):
         with pytest.raises(ValidationError):

@@ -96,6 +96,25 @@ class LLMConfig(BaseModel):
     # （实测 ~561 秒），所以默认只给 1 轮。
     budget_rewrite_rounds: int = Field(default=1, ge=0)
 
+    # 批量模式下同时在跑的 script 阶段数（每集一个 LLM 会话）。1 = 完全不预取，
+    # 跟改动前逐点等价。接线方式见 pipeline.run_pipeline 的「有界预取」那一段。
+    #
+    # **默认 1 是刻意的**，三条依据，一条比一条硬：
+    # 1. 默认 provider 是 gemini（见上面的 `provider` 字段），而 GeminiProvider 走的是
+    #    google.genai SDK、抛 google.genai.errors.APIError，**根本不经过 llm.py 的
+    #    `_stream_with_retries`**。也就是说这条默认路径上没有我们自己的 429/5xx 指数
+    #    退避，只有 SDK 内建的那一层（不受本项目控制、也没被测过）。并发正是最容易撞
+    #    429 的做法，而撞上就是整批失败。openai_compatible / minimax 那两条路有完整的
+    #    传输层退避（transport_max_attempts=4 + 抖动 + Retry-After），可以放心调到 2–4。
+    # 2. **并发会花掉可能白花的钱**。预取窗口里在飞的那几集，一旦前面某集的任何阶段
+    #    失败就会被取消，那几次调用的 token 已经花了。串行下它们压根不会发出去。
+    # 3. **run_audio / run_render 是同步的 ffmpeg 调用，会把事件循环整个堵住**，在飞的
+    #    LLM 流式响应在那期间收不到任何 chunk。实测单集 audio+render 约 35 秒，而
+    #    `read_timeout_seconds` 是 120 秒，所以现在还够；但这是个只在并发 >1 时才存在
+    #    的隐患（源片更长/机器更慢就会踩到），修法是把那两个阶段挪进 to_thread，
+    #    属于另一个任务。
+    script_concurrency: int = Field(default=1, ge=1)
+
 
 class IngestConfig(BaseModel):
     """ingest 阶段的续行合并阈值（原 ingest/normalize.py 的模块常量）。

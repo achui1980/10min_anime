@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -612,6 +613,67 @@ def run_render(
     )
 
 
+class _EpisodeLabelledReporter:
+    """把 substep 的 label 打上集号前缀，其余 5 个方法原样转发。
+
+    批量并发跑 script 时，N 集的 substep 全打在同一个 stage 名（"script"）上，而
+    rich_progress 的 `_substep_tasks` 是按 stage 做 key 的 —— 不带集号的话那一行会在
+    几集之间来回跳，却不告诉你现在跳的是谁。
+
+    刻意**不**改成「每集一个 stage 名」（`substep("script E02", …)`）：那样每集会多出
+    一个 rich 任务行，而 `stage_done("script")` 只 pop 得掉 `_substep_tasks["script"]`，
+    其余几行会一直堆在终端里（`_add_row` 只有在 `_in_episode` 为真时才登记进
+    `_episode_rows`，而预取的 task 可能在第一次 episode_start 之前就开始上报了）。
+    一行共享、靠 label 说清是谁，是这里唯一不引入行泄漏的选择。
+    """
+
+    def __init__(self, inner: ProgressReporter, episode: int) -> None:
+        self._inner = inner
+        self._prefix = episode_stem(episode)
+
+    def stage_start(self, stage: str) -> None:
+        self._inner.stage_start(stage)
+
+    def stage_skip(self, stage: str) -> None:
+        self._inner.stage_skip(stage)
+
+    def stage_done(self, stage: str) -> None:
+        self._inner.stage_done(stage)
+
+    def substep(self, stage: str, current: int, total: int, label: str) -> None:
+        self._inner.substep(stage, current, total, f"{self._prefix} {label}".rstrip())
+
+    def episode_start(self, number: int, index: int, total: int) -> None:
+        self._inner.episode_start(number, index, total)
+
+    def episode_done(self, number: int, index: int, total: int) -> None:
+        self._inner.episode_done(number, index, total)
+
+
+async def _drain_script_tasks(
+    tasks: dict[int, asyncio.Task[tuple[Script, list[str]]] | None],
+) -> None:
+    """收摊：取消还在飞的 script task，并把每个 task 的结果/异常都取回来。
+
+    两件事都必须做，漏一件都会在用户终端上留下噪音：
+
+    - **取消未完成的**。run_pipeline 抛出去之后它们还在后台烧 token，事件循环关闭时
+      asyncio 会印一串 "Task was destroyed but it is pending"。
+    - **把已完成但没人 await 的异常取回来**。预取窗口里某一集先炸了、而循环还没走到
+      它就因为别的原因退出时，那个异常会一直挂在 task 上，GC 时 asyncio 印
+      "Task exception was never retrieved" —— 用户以为又炸了第二次。
+
+    gather(return_exceptions=True) 一次把两类都吃掉。正常跑完的情况下每个 task 都已经
+    被 await 过，gather 立刻返回缓存好的结果。
+    """
+    live = [task for task in tasks.values() if task is not None]
+    for task in live:
+        if not task.done():
+            task.cancel()
+    if live:
+        await asyncio.gather(*live, return_exceptions=True)
+
+
 async def run_pipeline(
     cfg: ProjectConfig,
     provider: LLMProvider,
@@ -631,6 +693,10 @@ async def run_pipeline(
     episode 不传（None）时是批量模式：script/docgen/voice/timeline/audio/render
     都会对 cfg.episodes 里注册的每一集分别跑一遍。传了具体集数时是单集模式：
     只处理这一集（ingest/signals 仍然是全局阶段，一直处理所有已注册的集）。
+
+    **script 阶段的多集并发**（`llm.script_concurrency`）：编排保持 P0-C 的「按集纵向」，
+    只给 script 加一个**有界预取窗口** —— 走到第 i 集时确保前 `i + concurrency` 集的
+    script task 都已经起了，然后 await 第 i 集那个。取舍见 `_launch_scripts` 的注释。
     """
     if cfg.mode == "season":
         raise NotImplementedError("整季模式尚未实现，请使用 mode: single_episode")
@@ -711,89 +777,138 @@ async def run_pipeline(
                 warnings=warnings,
             )
 
-    for number in target_numbers:
-        if episode is None:
-            reporter.episode_start(number, number_to_index[number], len(target_numbers))
+    # --- script 阶段的有界预取 ---
+    # 值为 None 表示「这一集的 script 已经最新，不用跑」（跟「还没决定」区分开，
+    # 后者是 key 压根不在 dict 里）。
+    script_tasks: dict[int, asyncio.Task[tuple[Script, list[str]]] | None] = {}
 
-        if "script" in wanted:
+    def _launch_scripts(through: int) -> None:
+        """给 target_numbers 的前 through 集把 script task 起起来（已起过的跳过）。
+
+        为什么是「有界预取」而不是「把 script 整个抽成横向阶段」：
+
+        P0-C 刻意把批量模式从「按阶段横向」改成「按集纵向」，理由是**中途失败要留下
+        完整交付物、而不是一堆半成品**。把 script 抽成横向的并发阶段（选项 a）会直接
+        推翻它：全部集的 script 跑完之前一集成片都不会有，而 script 恰好是最容易失败、
+        也最慢的那一个阶段（实测单次调用 561 秒）—— 十集批量跑到第九集炸掉，用户手上
+        是 8 份 script.json 和 0 个 mp4。
+
+        有界预取两头都要：**纵向循环的顺序一个字没改**（第 i 集的 docgen/voice/…/render
+        仍然紧跟着它自己的 script，所以第 k 集失败时前 k-1 集都是完整成片），同时前面几集
+        跑 ffmpeg 的时候后面几集的 LLM 会话已经在飞了。窗口宽度就是并发度，所以
+        concurrency=1 时窗口只有「当前这一集」，等价于原来那句直接 await。
+
+        代价（只在 concurrency > 1 时付）：失败时预取窗口里在飞的那几集会被取消，
+        那几次 LLM 调用的 token 白花了。串行下它们压根不会发出去。这也是默认值取 1 的
+        三条依据之一，另两条见 config.LLMConfig.script_concurrency。
+
+        新鲜度在**起 task 的时刻**判，比原来早了几集。等价性：script 阶段的输入是
+        dialogue/signals（都由循环之前的全局阶段写完了）加 project.yaml，而
+        paths.script(n) 只会被第 n 集自己的 task 写 —— 没有任何一集能改变另一集的判据。
+        """
+        for number in target_numbers[:through]:
+            if number in script_tasks:
+                continue
             inputs = [paths.dialogue(number), paths.signals(number)]
             if force or not is_fresh([paths.script(number)], inputs):
-                reporter.stage_start("script")
-                _, stage_warnings = await run_script(
-                    cfg, provider, episode=number, reporter=reporter
-                )
-                warnings.extend(stage_warnings)
-                reporter.stage_done("script")
-            else:
-                reporter.stage_skip("script")
-
-        if "docgen" in wanted:
-            outputs = [paths.table(number), paths.narration(number)]
-            if force or not is_fresh(outputs, [paths.script(number)]):
-                reporter.stage_start("docgen")
-                run_docgen(cfg, episode=number)
-                reporter.stage_done("docgen")
-            else:
-                reporter.stage_skip("docgen")
-
-        if "voice" in wanted:
-            outputs = [paths.voice(number)]
-            if force or not is_fresh(outputs, [paths.script(number)]):
-                reporter.stage_start("voice")
-                if tts_engine is None:
-                    # 刻意不用 assert：python -O 下 assert 整句被剥离，None 会一路漂
-                    # 进 synthesize_track，最后炸成 render/tts.py 里的 AttributeError，
-                    # 报错指不到真正的原因。ValueError 在 cli.py 的捕获列表里，用户看到
-                    # 的是一行红字而不是一整页 traceback。
-                    raise ValueError(
-                        "要跑 voice 阶段必须传 tts_engine。"
-                        "CLI 会在 --only/--from 覆盖到 voice 时自动构造，"
-                        "库调用方请自己传 render.tts.build_tts_engine(cfg.render)。"
+                script_tasks[number] = asyncio.create_task(
+                    run_script(
+                        cfg,
+                        provider,
+                        episode=number,
+                        reporter=_EpisodeLabelledReporter(reporter, number),
                     )
-                _, stage_warnings = await run_voice(
-                    cfg, tts_engine, episode=number, reporter=reporter
                 )
-                warnings.extend(stage_warnings)
-                reporter.stage_done("voice")
             else:
-                reporter.stage_skip("voice")
+                script_tasks[number] = None
 
-        if "timeline" in wanted:
-            outputs = [paths.timeline(number), paths.subtitles(number)]
-            inputs = [paths.script(number), paths.voice(number)]
-            if force or not is_fresh(outputs, inputs):
-                reporter.stage_start("timeline")
-                _, stage_warnings = run_timeline(cfg, episode=number)
-                warnings.extend(stage_warnings)
-                reporter.stage_done("timeline")
-            else:
-                reporter.stage_skip("timeline")
+    # 预取的 task 必须被这个 try/finally 完整包住：循环里**任何**阶段抛异常时
+    # （不只是 script 自己），还在飞的那几集都得取消掉。
+    try:
+        for position, number in enumerate(target_numbers):
+            if episode is None:
+                reporter.episode_start(number, number_to_index[number], len(target_numbers))
 
-        if "audio" in wanted:
-            outputs = [paths.mixed_audio(number)]
-            inputs = [paths.timeline(number), paths.voice(number)]
-            if force or not is_fresh(outputs, inputs):
-                reporter.stage_start("audio")
-                run_audio(cfg, episode=number, reporter=reporter)
-                reporter.stage_done("audio")
-            else:
-                reporter.stage_skip("audio")
+            if "script" in wanted:
+                _launch_scripts(position + max(1, cfg.llm.script_concurrency))
+                task = script_tasks[number]
+                if task is None:
+                    reporter.stage_skip("script")
+                else:
+                    reporter.stage_start("script")
+                    _, stage_warnings = await task
+                    warnings.extend(stage_warnings)
+                    reporter.stage_done("script")
 
-        if "render" in wanted:
-            outputs = [paths.video(number)]
-            inputs = [
-                paths.mixed_audio(number),
-                paths.subtitles(number),
-                paths.timeline(number),
-            ]
-            if force or not is_fresh(outputs, inputs):
-                reporter.stage_start("render")
-                run_render(cfg, episode=number, reporter=reporter)
-                reporter.stage_done("render")
-            else:
-                reporter.stage_skip("render")
+            if "docgen" in wanted:
+                outputs = [paths.table(number), paths.narration(number)]
+                if force or not is_fresh(outputs, [paths.script(number)]):
+                    reporter.stage_start("docgen")
+                    run_docgen(cfg, episode=number)
+                    reporter.stage_done("docgen")
+                else:
+                    reporter.stage_skip("docgen")
 
-        if episode is None:
-            reporter.episode_done(number, number_to_index[number], len(target_numbers))
+            if "voice" in wanted:
+                outputs = [paths.voice(number)]
+                if force or not is_fresh(outputs, [paths.script(number)]):
+                    reporter.stage_start("voice")
+                    if tts_engine is None:
+                        # 刻意不用 assert：python -O 下 assert 整句被剥离，None 会一路漂
+                        # 进 synthesize_track，最后炸成 render/tts.py 里的 AttributeError，
+                        # 报错指不到真正的原因。ValueError 在 cli.py 的捕获列表里，用户看到
+                        # 的是一行红字而不是一整页 traceback。
+                        raise ValueError(
+                            "要跑 voice 阶段必须传 tts_engine。"
+                            "CLI 会在 --only/--from 覆盖到 voice 时自动构造，"
+                            "库调用方请自己传 render.tts.build_tts_engine(cfg.render)。"
+                        )
+                    _, stage_warnings = await run_voice(
+                        cfg, tts_engine, episode=number, reporter=reporter
+                    )
+                    warnings.extend(stage_warnings)
+                    reporter.stage_done("voice")
+                else:
+                    reporter.stage_skip("voice")
+
+            if "timeline" in wanted:
+                outputs = [paths.timeline(number), paths.subtitles(number)]
+                inputs = [paths.script(number), paths.voice(number)]
+                if force or not is_fresh(outputs, inputs):
+                    reporter.stage_start("timeline")
+                    _, stage_warnings = run_timeline(cfg, episode=number)
+                    warnings.extend(stage_warnings)
+                    reporter.stage_done("timeline")
+                else:
+                    reporter.stage_skip("timeline")
+
+            if "audio" in wanted:
+                outputs = [paths.mixed_audio(number)]
+                inputs = [paths.timeline(number), paths.voice(number)]
+                if force or not is_fresh(outputs, inputs):
+                    reporter.stage_start("audio")
+                    run_audio(cfg, episode=number, reporter=reporter)
+                    reporter.stage_done("audio")
+                else:
+                    reporter.stage_skip("audio")
+
+            if "render" in wanted:
+                outputs = [paths.video(number)]
+                inputs = [
+                    paths.mixed_audio(number),
+                    paths.subtitles(number),
+                    paths.timeline(number),
+                ]
+                if force or not is_fresh(outputs, inputs):
+                    reporter.stage_start("render")
+                    run_render(cfg, episode=number, reporter=reporter)
+                    reporter.stage_done("render")
+                else:
+                    reporter.stage_skip("render")
+
+            if episode is None:
+                reporter.episode_done(number, number_to_index[number], len(target_numbers))
+    finally:
+        await _drain_script_tasks(script_tasks)
 
     return warnings

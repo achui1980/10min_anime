@@ -42,7 +42,12 @@ from tenmin.render.ffmpeg import FFmpegError
 from tenmin.script.llm import LLMSchemaError
 from tenmin.script.validate import ScriptValidationError
 
-from .fakes import FakeProvider, FakeReporter, FakeTTSEngine
+from .fakes import (
+    EpisodeAwareProvider,
+    FakeProvider,
+    FakeReporter,
+    FakeTTSEngine,
+)
 
 # STAGES 在 v2 里扩到 8 个，voice 之后的阶段需要 TTS engine 与源视频。
 # 下面这些只关心 v1 链路的用例显式限定阶段范围。
@@ -1727,3 +1732,205 @@ async def test_run_script_reports_substeps(project, monkeypatch):
         project, FakeProvider([fake_script_response()]), episode=2, reporter=Recorder()
     )
     assert seen and seen[0][0] == "script"
+
+
+# --- script 阶段的多集并发（llm.script_concurrency）---
+
+
+def _three_episode_project(project, golden_srt_path) -> ProjectConfig:
+    """在 project fixture 上再挂两集（都用同一份黄金 SRT）。"""
+    for number in (1, 3):
+        srt = project.root / "srt" / f"E{number:02d}.srt"
+        srt.write_bytes(golden_srt_path.read_bytes())
+        project.episodes.append(
+            EpisodeConfig(number=number, srt=Path(f"srt/E{number:02d}.srt"))
+        )
+    return project
+
+
+@pytest.mark.asyncio
+async def test_run_pipeline_runs_scripts_concurrently(project, golden_srt_path):
+    """并发的全部意义：墙钟 ≈ max 而不是 sum。
+
+    单集 script 实测可达 561 秒，3 集串行就是半小时起。这里用 0.15 秒的假延迟代替。
+    """
+    _three_episode_project(project, golden_srt_path)
+    project.llm.script_concurrency = 3
+    provider = EpisodeAwareProvider(fake_script_response, delay=0.15)
+
+    started = asyncio.get_running_loop().time()
+    await run_pipeline(project, provider, only=V1_STAGES)
+    elapsed = asyncio.get_running_loop().time() - started
+
+    assert sorted(provider.called_episodes) == [1, 2, 3]
+    assert provider.peak == 3
+    assert elapsed < 0.4  # 串行至少 0.45 秒
+
+
+@pytest.mark.asyncio
+async def test_run_pipeline_caps_script_concurrency(project, golden_srt_path):
+    _three_episode_project(project, golden_srt_path)
+    project.llm.script_concurrency = 2
+    provider = EpisodeAwareProvider(fake_script_response, delay=0.05)
+    await run_pipeline(project, provider, only=V1_STAGES)
+    assert provider.peak == 2
+
+
+@pytest.mark.asyncio
+async def test_run_pipeline_does_not_prefetch_at_concurrency_one(
+    project, golden_srt_path, monkeypatch
+):
+    """默认 script_concurrency=1 必须**一点都不预取**：下一集的 LLM 请求不能在这一集的
+    后续阶段之前发出去。否则「中途失败留下完整交付物」的代价（白花的 token、被取消的
+    请求）会在没人打开并发的情况下也照样付。"""
+    _three_episode_project(project, golden_srt_path)
+    provider = EpisodeAwareProvider(fake_script_response)
+
+    real_docgen = run_docgen
+
+    def spy_docgen(cfg, episode):
+        provider.events.append(("docgen", episode))
+        return real_docgen(cfg, episode)
+
+    monkeypatch.setattr("tenmin.pipeline.run_docgen", spy_docgen)
+    await run_pipeline(project, provider, only=V1_STAGES)
+
+    assert provider.peak == 1
+    # 每一集都必须是「LLM 起 → LLM 完 → docgen」三连，中间不许插进别的集。
+    assert provider.events == [
+        item
+        for episode in (2, 1, 3)
+        for item in (("llm-start", episode), ("llm-done", episode), ("docgen", episode))
+    ]
+
+
+@pytest.mark.asyncio
+async def test_run_pipeline_writes_each_episodes_own_script(project, golden_srt_path):
+    """并发下最容易错的一件事：把 A 集的稿子写进 B 集的产物。"""
+    _three_episode_project(project, golden_srt_path)
+    project.llm.script_concurrency = 3
+    provider = EpisodeAwareProvider(fake_script_response, delay=0.05)
+    await run_pipeline(project, provider, only=V1_STAGES)
+
+    paths = Paths(project.root)
+    for number in (1, 2, 3):
+        script = Script.model_validate_json(paths.script(number).read_text("utf-8"))
+        assert script.episodes == [number]
+        assert {clip.episode for beat in script.beats for clip in beat.clips} == {number}
+
+
+@pytest.mark.asyncio
+async def test_run_pipeline_keeps_earlier_deliverables_when_a_later_script_fails(
+    project, golden_srt_path
+):
+    """P0-C 的不变量：中途失败要留下**完整**交付物，而不是一堆半成品。
+
+    并发预取不许破坏它 —— 按集纵向的循环顺序没变，所以第 3 集的 script 炸掉时前两集
+    的 docgen 产物必须都在。
+    """
+    _three_episode_project(project, golden_srt_path)
+    project.llm.script_concurrency = 3
+    project.llm.max_attempts = 1
+    project.llm.validation_retries = 0
+
+    def responder(episode):
+        if episode == 3:
+            raise LLMSchemaError("第 3 集的模型输出不合 schema", raw_output="{坏的")
+        return fake_script_response(episode)
+
+    provider = EpisodeAwareProvider(responder, delay=0.05)
+    with pytest.raises(LLMSchemaError):
+        await run_pipeline(project, provider, only=V1_STAGES)
+
+    paths = Paths(project.root)
+    # 第 3 集是 target_numbers 的最后一个，所以前两集应该已经整套跑完。
+    for number in (2, 1):
+        assert paths.script(number).exists()
+        assert paths.table(number).exists()
+        assert paths.narration(number).exists()
+    assert not paths.script(3).exists()
+
+
+@pytest.mark.asyncio
+async def test_run_pipeline_cancels_pending_script_tasks_when_a_stage_fails(
+    project, golden_srt_path, monkeypatch
+):
+    """一集的后续阶段炸了之后，还在飞的 script task 必须被取消。
+
+    留着的话它们会在 run_pipeline 抛出去之后继续烧 token，事件循环关闭时 asyncio 还会
+    印一串 "Task was destroyed but it is pending"。
+    """
+    _three_episode_project(project, golden_srt_path)
+    project.llm.script_concurrency = 3
+
+    def boom(cfg, episode):
+        raise FFmpegError("docgen 炸了")
+
+    monkeypatch.setattr("tenmin.pipeline.run_docgen", boom)
+    provider = EpisodeAwareProvider(fake_script_response, delay=0.2)
+
+    before = asyncio.all_tasks()
+    with pytest.raises(FFmpegError):
+        await run_pipeline(project, provider, only=V1_STAGES)
+    leaked = asyncio.all_tasks() - before
+    assert leaked == set()
+    # 第一集之外的两集要么没起、要么被取消，绝不该跑完。
+    assert ("llm-done", 1) not in provider.events
+    assert ("llm-done", 3) not in provider.events
+
+
+@pytest.mark.asyncio
+async def test_run_pipeline_labels_script_substeps_with_the_episode(
+    project, golden_srt_path
+):
+    """并发下 N 集的 substep 全打在同一个 stage（"script"）上，rich_progress 按 stage
+    做 key —— 不带集号的话那一行会在几集之间来回跳而不告诉你现在跳的是谁。"""
+    _three_episode_project(project, golden_srt_path)
+    project.llm.script_concurrency = 3
+    reporter = FakeReporter()
+    provider = EpisodeAwareProvider(fake_script_response, delay=0.05)
+    await run_pipeline(project, provider, only=V1_STAGES, reporter=reporter)
+
+    labels = [c[4] for c in reporter.calls if c[0] == "substep" and c[1] == "script"]
+    assert sorted(labels) == sorted(["E01 生成初稿", "E02 生成初稿", "E03 生成初稿"])
+
+
+@pytest.mark.asyncio
+async def test_run_pipeline_keeps_episode_hooks_paired_under_concurrency(
+    project, golden_srt_path
+):
+    """总进度条是按 index 推进的，episode_start/done 必须仍然严格成对、按集顺序。"""
+    _three_episode_project(project, golden_srt_path)
+    project.llm.script_concurrency = 3
+    reporter = FakeReporter()
+    provider = EpisodeAwareProvider(fake_script_response, delay=0.05)
+    await run_pipeline(project, provider, only=V1_STAGES, reporter=reporter)
+
+    assert [c for c in reporter.calls if c[0].startswith("episode_")] == [
+        ("episode_start", 2, 1, 3),
+        ("episode_done", 2, 1, 3),
+        ("episode_start", 1, 2, 3),
+        ("episode_done", 1, 2, 3),
+        ("episode_start", 3, 3, 3),
+        ("episode_done", 3, 3, 3),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_run_pipeline_does_not_launch_scripts_for_fresh_episodes(
+    project, golden_srt_path
+):
+    """已经最新的集不该起 task（也就不该发请求），并且仍然报 stage_skip。"""
+    _three_episode_project(project, golden_srt_path)
+    project.llm.script_concurrency = 3
+    await run_pipeline(
+        project, EpisodeAwareProvider(fake_script_response), only=V1_STAGES
+    )
+
+    reporter = FakeReporter()
+    provider = EpisodeAwareProvider(fake_script_response)
+    await run_pipeline(project, provider, only=V1_STAGES, reporter=reporter)
+    assert provider.called_episodes == []
+    assert [c for c in reporter.calls if c == ("stage_skip", "script")] == [
+        ("stage_skip", "script")
+    ] * 3

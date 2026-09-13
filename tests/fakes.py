@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
+import re
 from pathlib import Path
 from typing import Any
 
@@ -32,6 +34,52 @@ class FakeProvider:
         if isinstance(payload, str):
             return payload
         return json.dumps(payload, ensure_ascii=False)
+
+
+class EpisodeAwareProvider:
+    """按 prompt 里的集号返回响应，可选人为延迟。绝不联网。
+
+    FakeProvider 是「按调用顺序 pop」的，多集并发下 complete 的调用顺序不确定，
+    「哪一集拿到哪份稿子」就变成了随机数（而 script/validate.py 会拿 clip 的集号跟
+    本集的对白轨核对，串错了直接判错）。所以并发相关的测试一律用这个。
+
+    `events` 是一条 (事件, 集号) 的时间线，测试可以往同一个列表里塞别的阶段的事件，
+    用来断言「谁在谁之前」。`peak` 是并发峰值。
+    """
+
+    _EPISODE_IN_PROMPT = re.compile(r"集数：第 (\d+) 集")
+
+    def __init__(self, responder: Any, *, delay: float = 0.0):
+        self.responder = responder
+        self.delay = delay
+        self.events: list[tuple[str, int]] = []
+        self.in_flight = 0
+        self.peak = 0
+
+    def episode_of(self, user: str) -> int:
+        match = self._EPISODE_IN_PROMPT.search(user)
+        if match is None:
+            raise AssertionError("prompt 里找不到集号，EpisodeAwareProvider 没法分派")
+        return int(match.group(1))
+
+    async def complete(
+        self, system: str, user: str, schema: type[BaseModel] | None = None
+    ) -> Any:
+        episode = self.episode_of(user)
+        self.events.append(("llm-start", episode))
+        self.in_flight += 1
+        self.peak = max(self.peak, self.in_flight)
+        try:
+            if self.delay:
+                await asyncio.sleep(self.delay)
+        finally:
+            self.in_flight -= 1
+        self.events.append(("llm-done", episode))
+        return self.responder(episode)
+
+    @property
+    def called_episodes(self) -> list[int]:
+        return [episode for event, episode in self.events if event == "llm-start"]
 
 
 class FakeTTSEngine:
