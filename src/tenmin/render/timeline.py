@@ -59,6 +59,23 @@ def sentence_cues(chunk: VoiceChunk, start: float) -> list[SubtitleCue]:
     一个 chunk 常常是好几句话拼起来一次性合成的（省 TTS 调用次数），
     但字幕不能整段话挂几十秒不动——观众读完第一句时，画面上该已经是第二句了。
     没有逐句的真实音频时长，只能按字数比例估算，这是唯一可行的近似。
+
+    这个估算有多准（P2-E B1 实测，不是推理）：拿真 Edge TTS 把 10 集的每一句单独合成
+    一遍（359 段），归一化掉逐句合成多出来的静音之后，跟这里的字数比例结果对比 244 个
+    句边界 —— 时刻误差 p50 0.365 秒、p90 0.817 秒、max 1.615 秒，>1 秒的 13 个。
+    要彻底消掉它得消费 edge-tts 的 SentenceBoundary 元数据（`Communicate.save(音频,
+    元数据)` 免费给，实测切句结果与 split_sentences 逐句吻合），但那要改 voice 阶段的
+    产物契约（多一个元数据文件、VoiceChunk 加字段、存量 chunk 没有元数据要有退路），
+    属于一个独立专项，不在本次范围内。
+
+    **相邻 cue 刻意共享精确边界，不插间隙**（P2-E B3）。ASS 的时间戳只有厘秒精度，
+    理论上两条恰好相接的 cue 可能舍入到同一个值、或极短 cue 舍入成零长度。实测 10 集
+    已生成的 .ass 共 362 条 Dialogue：`end == start` 0 条、`end < start` 0 条、相邻
+    重叠 0 条，298 对相邻 cue 在厘秒级恰好首尾相接（libass 正常处理）。零长度在结构上
+    也够不到：cue 时长 ≈ 句字数 × (chunk 时长 / chunk 字数)，而 render/tts.py 的时长
+    体检把后者压在 ≈0.11 秒/字以上，所以一个字的句子也有 11 厘秒。
+    反过来，插 20–40ms 间隙会让这 298 处**每一处**都多一次字幕闪断，那是真实存在的
+    观感损失，换来的是一个测不到的问题。
     """
     sentences = split_sentences(chunk.text)
     if not sentences:

@@ -2,6 +2,13 @@
 
 ASS 的时间是 H:MM:SS.cc（厘秒、小时不补零），跟 timecode.format_timestamp 不同，
 所以这里单独写格式化函数。
+
+**行尾与 BOM（P2-E C6，判断结果是不改）**：这里一律拼 `\\n`，不写 BOM。
+「.ass 在 Windows 编辑器里显示成一行」这个担心的前提是错的 —— 落盘走
+`atomic.write_text` → `Path.write_text`，它的 `newline=None` 会把 `\\n` 翻成
+`os.linesep`，所以**在 Windows 上写出来的本来就是 CRLF**，LF-only 只是 macOS/Linux
+上的形态。剩下的只有 BOM，而真正会用来编辑 .ass 的 Aegisub / VS Code / 现代记事本
+都能识别无 BOM 的 UTF-8；为一个假设中的老编辑器去改全部 10 集的产物字节不划算。
 """
 
 from __future__ import annotations

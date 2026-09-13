@@ -8,6 +8,7 @@ from tenmin.render.timeline import (
     build_timeline,
     chunks_by_beat,
     scale_ratio,
+    sentence_cues,
 )
 
 
@@ -335,3 +336,36 @@ def test_build_timeline_drift_tolerance_comes_from_config():
         script, track, source_duration=120.0, cfg=RenderConfig(drift_tolerance=20.0)
     )
     assert not any("相差超过" in w for w in loose)
+
+
+# --- 相邻 cue 共享精确边界，不插间隙（P2-E B3 的决定，锁住它）--------------
+#
+# 这不是一个 TDD 循环（没有改任何行为），是把 B3 的结论钉下来：实测 10 集已生成的
+# .ass 共 362 条 Dialogue，`end == start` 0 条、`end < start` 0 条、相邻重叠 0 条，
+# 298 对相邻 cue 在厘秒级恰好首尾相接。插 20–40ms 间隙会让这 298 处每一处都多一次
+# 字幕闪断，换来的是一个测不到的问题。理由全文见 sentence_cues 的 docstring。
+
+
+def test_sentence_cues_hand_off_at_exactly_the_same_instant():
+    chunk = VoiceChunk(
+        beat_id="b1", index=1, text="第一句。第二句。第三句。", path="c.mp3", duration=9.0
+    )
+    cues = sentence_cues(chunk, 100.0)
+    assert len(cues) == 3
+    for before, after in zip(cues, cues[1:], strict=False):
+        assert after.start == before.end
+    assert cues[0].start == 100.0
+    assert cues[-1].end == pytest.approx(109.0)
+
+
+def test_sentence_cues_never_produce_a_zero_length_cue():
+    """最短的一句（1 个字）在最短的 chunk 里也拿得到非零时长。
+
+    结构上的下界：cue 时长 = 句字数 × (chunk 时长 / chunk 字数)，而 render/tts.py 的
+    时长体检把 chunk 时长压在 ≈0.11 秒/字以上，所以厘秒精度下也不会舍成 0。
+    """
+    chunk = VoiceChunk(
+        beat_id="b1", index=1, text="好。" + "一二三四五六七八九十" * 5, path="c.mp3", duration=11.6
+    )
+    cues = sentence_cues(chunk, 0.0)
+    assert min(cue.end - cue.start for cue in cues) > 0.01
