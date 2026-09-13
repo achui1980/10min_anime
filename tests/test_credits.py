@@ -193,3 +193,82 @@ def test_golden_sample_op_ed_ranges(golden_track):
     span = golden_track.op_range[1] - golden_track.op_range[0]
     assert 60.0 <= span <= 100.0, f"OP 跨度 {span}s 不在预期区间"
     assert golden_track.ed_range[0] == pytest.approx(1348.180, abs=0.001)
+
+
+# --- 关键词匹配的热路径 ---
+
+
+def test_keyword_matcher_matches_the_same_lines_as_the_old_upper_loop():
+    """预编译 alternation 正则必须与 `any(kw.upper() in upper for kw in keywords)`
+    逐例等价 —— alternation 命中 ⟺ 任一分支是子串。
+
+    正则是用**大写化后**的关键词编译、在大写化后的文本上搜的，所以跟原来那句
+    `.upper()` 对 `.upper()` 完全同源，不涉及 re.IGNORECASE 与 str.upper 的差异
+    （`ß` -> `SS`、`ﬅ` -> `ST` 这类）。
+    """
+    from tenmin.ingest.credits import (
+        _KEYWORDS_ALWAYS,
+        _KEYWORDS_IN_WINDOW,
+        _keyword_matcher,
+    )
+
+    samples = [
+        "制作委员会",
+        "製作委員會",
+        "作词 作曲 编曲",
+        "フォント协力",
+        "HE IYA J. C. STAFF 作画部 ディーロク",
+        "去studio看看吧",
+        "监督 山田太郎",
+        "我今天要去学院上课",
+        "",
+        "STUDIO",
+        "主题歌 演唱",
+    ]
+    for keywords in (_KEYWORDS_ALWAYS, _KEYWORDS_IN_WINDOW):
+        matcher = _keyword_matcher(keywords)
+        for text in samples:
+            upper = text.upper()
+            expected = any(kw.upper() in upper for kw in keywords)
+            assert bool(matcher.search(upper)) is expected, (text, keywords)
+
+
+def test_keyword_matcher_rejects_an_empty_keyword_tuple():
+    """`"|".join([])` 是空串，编译出来的正则匹配任何文本 —— 那会把整条字幕全判成
+    credits。空表一定是改错了，直接拒绝而不是静默生成一个吃掉一切的正则。
+    """
+    from tenmin.ingest.credits import _keyword_matcher
+
+    with pytest.raises(ValueError):
+        _keyword_matcher(())
+
+
+def test_ascii_studio_no_longer_fires_outside_the_credit_window():
+    """`Studio` / `STAFF` 是普通英文单词，`.upper()` 后按子串无条件匹配，
+    「去studio看看」这类台词会被整行判成 credits。
+
+    这跟本文件头部记录的「演出」事故是同一类风险，而修法也用同一套既有机制：
+    挪进 `_KEYWORDS_IN_WINDOW`，只在片头片尾窗内才敢认。实测 11 集真实素材里
+    `Studio` 命中 0 行、`STAFF` 命中 1 行（E04 @1348.1s 的真 ED staff 行，
+    而它落在 ED 窗内 [1340.0, 1420.0]），所以产物逐字节不变。
+    """
+    assert is_credits("去studio看看吧", in_credit_window=False) is False
+    assert is_credits("这家staff很热情", in_credit_window=False) is False
+
+
+def test_real_ed_staff_line_is_still_credits_inside_the_window():
+    text = "HE IYA J. C. STAFF 作画部 ディーロク"
+    assert is_credits(text, in_credit_window=True) is True
+
+
+def test_title_overlap_cache_keeps_different_show_titles_apart():
+    """`_title_overlap` 的字符集改成按 show_title 缓存，别把两部番的标题串味。"""
+    assert is_credits("《才女的侍从》", show_title="才女的侍从") is True
+    assert is_credits("《才女的侍从》", show_title="完全无关的作品") is False
+    assert is_credits("《完全无关的作品》", show_title="完全无关的作品") is True
+    assert is_credits("《才女的侍从》", show_title="才女的侍从") is True
+
+
+def test_title_overlap_empty_title_never_matches():
+    assert is_credits("《随便什么》", show_title="") is False
+    assert is_credits("《随便什么》", show_title="　 ") is False

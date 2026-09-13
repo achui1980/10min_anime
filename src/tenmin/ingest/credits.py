@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import re
+from functools import lru_cache
 
 # 所有阈值的权威定义在 tenmin.config.CreditsConfig；DEFAULT_CREDITS 只是它的
 # 默认实例，让不关心配置的调用点（单测、一次性脚本）可以继续零参数调用。
@@ -13,6 +14,11 @@ from tenmin.intervals import merge_intervals, silent_gaps
 from tenmin.models import DialogueLine
 
 # 无条件生效：日文专有写法或高度特定的复合词，正常中文台词里不可能出现。
+#
+# 判据是「这个词在中文台词里不可能出现」，所以**普通英文单词不够格**：`STAFF` 与
+# `Studio` 原先在这张表里，而它们是按 `.upper()` 子串无条件匹配的，
+# 「去studio看看」整行就会被判成 credits、被踢出台词轨、两侧间隙虚假合并 ——
+# 跟下面记录的「演出」事故完全同类。两者已挪进 _KEYWORDS_IN_WINDOW。
 _KEYWORDS_ALWAYS = (
     "製作委員会",
     "製作委員會",
@@ -23,13 +29,12 @@ _KEYWORDS_ALWAYS = (
     "編曲",
     "编曲",
     "フォント",
-    "STAFF",
-    "Studio",
     "主題歌",
     "主题歌",
 )
 
-# 仅片头片尾窗内生效：这些词同时是通用中文词汇，子串匹配会误伤台词。
+# 仅片头片尾窗内生效：这些词同时是通用中文词汇（或普通英文单词），
+# 子串匹配会误伤台词。
 # 实测「你现在的说话方式也是演出来的吧」被「演出」命中 → 整行被踢出台词，
 # 两侧间隙被虚假合并成一个假高光直接喂给 LLM。
 _KEYWORDS_IN_WINDOW = (
@@ -43,20 +48,66 @@ _KEYWORDS_IN_WINDOW = (
     "脚本",
     "演出",
     "原作",
+    "STAFF",
+    "Studio",
 )
+
+
+def _keyword_matcher(keywords: tuple[str, ...]) -> re.Pattern[str]:
+    """把一张关键词表编译成一条 alternation 正则，在**大写化后的**文本上搜。
+
+    与原来那句 `any(kw.upper() in upper for kw in keywords)` 逐字节等价（alternation
+    命中 ⟺ 任一分支是子串），但把每行 22 次 `.upper()` + 22 次子串扫描收成一次扫描。
+    `is_credits` 是每行都走的热路径，实测 600 行 × 200 轮：0.099s -> 0.011s（9 倍）。
+
+    正则用**大写化后的关键词**编译、搜大写化后的文本，跟原来 `.upper()` 对 `.upper()`
+    完全同源 —— 刻意不用 `re.IGNORECASE`，那条路跟 `str.upper()` 在 `ß` -> `SS`、
+    `ﬅ` -> `ST` 这类折叠上并不一致。
+
+    空表会编译成 `""`，而那条正则匹配任何文本 —— 等于把整条字幕全判成 credits。
+    两张表都是本文件里的静态字面量，真空了一定是改错了，所以直接拒绝。
+    """
+    if not keywords:
+        raise ValueError("关键词表不能为空：空的 alternation 正则会匹配任何文本")
+    return re.compile("|".join(re.escape(keyword.upper()) for keyword in keywords))
+
+
+_ALWAYS_RE = _keyword_matcher(_KEYWORDS_ALWAYS)
+_IN_WINDOW_RE = _keyword_matcher(_KEYWORDS_IN_WINDOW)
 # `_TITLE_CARD`（规则 6 用）不在这里定义，从 clean.py import：原先两处各写一份且不
 # 一致（这边多了 `\s*`，能接 `第 3 集`，clean 那边不能），已收敛成宽的那份。
 # import 方向安全 —— clean.py 只依赖 re / functools / typing，不 import ingest 里的
 # 任何东西，所以不成环。
-_NAME_LIST_EVEN = re.compile(r"^(?:[\u4e00-\u9fff]{2,4})(?:\s+[\u4e00-\u9fff]{2,4})+$")
-_NAME_LIST_RAGGED = re.compile(r"^(?:[\u4e00-\u9fff]{1,5})(?:\s+[\u4e00-\u9fff]{1,5}){2,}$")
+# `_TITLE_CARD`（规则 6 用）不在这里定义，从 clean.py import：原先两处各写一份且不
+# 一致（这边多了 `\s*`，能接 `第 3 集`，clean 那边不能），已收敛成宽的那份。
+# import 方向安全 —— clean.py 只依赖 re / functools / typing，不 import ingest 里的
+# 任何东西，所以不成环。
+#
+# 汉字字符类只写一份：规则 4 的两条人名正则与它的字数门槛用的是同一个范围。
+# 刻意**不**跟 `clean._CJK` 合并 —— 那个范围多了假名（`\u3040-\u30ff`），
+# 语义是「这段文本有没有 CJK 内容」；这里数的是「汉字有几个」（日文 staff 名的汉字），
+# 把假名算进来会改变 cjk_count。两者不是重复。
+_HAN_CLASS = r"[\u4e00-\u9fff]"
+_HAN = re.compile(_HAN_CLASS)
+_NAME_LIST_EVEN = re.compile(rf"^(?:{_HAN_CLASS}{{2,4}})(?:\s+{_HAN_CLASS}{{2,4}})+$")
+_NAME_LIST_RAGGED = re.compile(
+    rf"^(?:{_HAN_CLASS}{{1,5}})(?:\s+{_HAN_CLASS}{{1,5}}){{2,}}$"
+)
 _BRACKET_WRAPPED = re.compile(r"^[《『「(（]\s*(?P<inner>.+?)\s*[》』」)）]$")
 _LATIN = re.compile(r"[A-Za-z]")
 _NON_SPACE = re.compile(r"\S")
 
 
+@lru_cache(maxsize=8)
+def _title_chars(show_title: str) -> frozenset[str]:
+    """剧名的字符集（去掉半角/全角空格）。按剧名缓存 —— 原先每次调用都重建一遍，
+    而一次 build_track 会对每行都可能调到。实测 600 次 × 300 轮：0.051s -> 0.004s。
+    """
+    return frozenset(show_title) - frozenset(" 　")
+
+
 def _title_overlap(text: str, show_title: str) -> float:
-    title_chars = set(show_title) - set(" 　")
+    title_chars = _title_chars(show_title)
     if not title_chars:
         return 0.0
     return len(title_chars & set(text)) / len(title_chars)
@@ -78,16 +129,16 @@ def is_credits(
     stripped = text.strip()
     if not stripped:
         return False
+    # 大写化一次就够。原先规则 1 与规则 2a 各调一次 `stripped.upper()`。
+    upper = stripped.upper()
 
     # 1. 版权标记
-    if "©" in stripped or "(C)" in stripped.upper():
+    if "©" in stripped or "(C)" in upper:
         return True
 
     # 2a. staff 关键词里无条件生效的那批（繁简与日文都列）
-    upper = stripped.upper()
-    for keyword in _KEYWORDS_ALWAYS:
-        if keyword.upper() in upper:
-            return True
+    if _ALWAYS_RE.search(upper):
+        return True
 
     # 6. 标题卡
     if _TITLE_CARD.search(stripped) and len(stripped) <= cfg.title_card_max_len:
@@ -103,17 +154,16 @@ def is_credits(
     if not in_credit_window:
         return False
 
-    # 2b. staff 关键词里有中文歧义的那批，只在片头片尾窗内才敢认
-    for keyword in _KEYWORDS_IN_WINDOW:
-        if keyword.upper() in upper:
-            return True
+    # 2b. staff 关键词里有中文歧义（或本身就是普通英文单词）的那批，只在片头片尾窗内才敢认
+    if _IN_WINDOW_RE.search(upper):
+        return True
 
     # 4. 纯人名罗列。EVEN 接「河原正信 有贺史英」这种齐整两段；
     # RAGGED 接「慧 诹访 豊 和田雄一郎」这种参差不齐但至少三段的 staff 罗列。
     # RAGGED 要求 3 段以上，否则「早安 早安」这类两段短台词会被误伤。
     # 段数 >= 4 时字数门槛放宽到 4，接「慧 诹 访 郎」这种被 OCR 拆碎的人名。
     if _NAME_LIST_EVEN.match(stripped) or _NAME_LIST_RAGGED.match(stripped):
-        cjk_count = len(re.findall(r"[\u4e00-\u9fff]", stripped))
+        cjk_count = len(_HAN.findall(stripped))
         segment_count = len(stripped.split())
         min_cjk = (
             cfg.name_list_many_min_cjk
@@ -123,7 +173,11 @@ def is_credits(
         if cjk_count >= min_cjk:
             return True
 
-    # 5. 拉丁字母为主
+    # 5. 拉丁字母为主。
+    # 两个 findall 刻意保留 —— 「改成生成器求和省掉中间列表」实测是**负收益**：
+    # 600 行 × 200 轮，findall 0.074s vs 生成器 0.110s（C 层扫描比 Python 层逐字符
+    # 迭代快，即使前者要建一个小列表）。而且这段在规则 3 之后的 `not in_credit_window`
+    # 早退之下，实测 11 集只有 18.3% 的行走到（4656 行里 852 行）。
     non_space = _NON_SPACE.findall(stripped)
     if len(non_space) >= cfg.latin_min_len:
         latin_ratio = len(_LATIN.findall(stripped)) / len(non_space)
@@ -224,10 +278,13 @@ def find_credit_ranges(
 
     OP 走两条路：credits 聚簇为主路，算不出来时退到静区兜底。
     ED 只走聚簇，不做兜底——片尾前的长静场（定格收尾）是真高光，兜底会吃掉它。
+
+    `lines` 走两遍，但两遍的判据不同、不是重复劳动：这里筛的是 `kind == "credits"`，
+    `_op_from_silence` 那边筛的是 `is_spoken`（而且只在主路失败时才走）。
     """
-    credit_lines = [ln for ln in lines if ln.kind == "credits"]
     clusters = merge_intervals(
-        ((ln.start, ln.end) for ln in credit_lines), max_gap=cfg.cluster_max_gap
+        ((ln.start, ln.end) for ln in lines if ln.kind == "credits"),
+        max_gap=cfg.cluster_max_gap,
     )
 
     op_candidates = [
