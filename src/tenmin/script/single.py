@@ -32,8 +32,37 @@ from tenmin.timecode import format_timestamp, readable_seconds
 # 提示词一律住在 prompts/*.md（全项目策略），这句原来硬编码在代码里。
 SYSTEM_PROMPT = load_prompt("system.md").strip()
 
-# single_episode.md 里 few-shot 范例那一节的标题。返工轮按它切掉整节（见 build_user_prompt）。
-_EXAMPLE_SECTION_HEADING = "## 参考范例"
+# few-shot 范例那一节的标题与引子。**整节（含标题）都是注进 {{example_block}} 的**，
+# 模板里不写它 —— 返工轮要摘掉范例，原来那种 `template.split("## 参考范例")[0]` 的字符串
+# 切割只在「范例恰好是模板最后一节」时才成立，而现在它后面还跟着「输出前自检」。
+# 让「有没有这一节」变成一个变量的取值，就不需要任何切割。
+#
+# **它排在全部本集素材之后是刻意的**，别为了「静态内容前置」把它挪到前面去。
+# 实测（work/saijo 10 集真实产物，每集算首轮 + 1 轮返工，返工轮驮上一版 JSON 约 11275
+# 字符，一次批处理共发出约 74 万字符）：
+#
+#     排布                                   跨集共同前缀   首轮↔返工轮共同前缀   可缓存占比
+#     范例在末尾（现行）                          2385           31661           43.0%
+#     范例跟静态段一起前置                        5626            2388            9.9%
+#
+# 差了 4 倍，而且是反的。原因：真正被反复发送的那份前缀不是「跨集共享的静态段」，而是
+# 「同一集首轮与返工轮之间共享的整份素材」——返工轮除了摘掉范例什么都没动，所以只要
+# 范例排在最后，返工轮的 prompt 就是首轮的一个**严格前缀**，31.6k 字符全部可缓存；一旦
+# 把范例挪到前面，两轮就在第 2388 个字符处分叉，后面 29k 素材白发一遍。何况跨集那 5.6k
+# 前缀在默认模型（gemini-3.6-flash，implicit caching 门槛 4096 token）上大概率根本够不到
+# 门槛，而 31.6k 稳稳超过。
+#
+# 结尾那两个换行是这一节**自己**的分隔符（模板里写的是 `{{example_block}}## 输出前自检`，
+# 中间不留空行）：只有这样，摘掉范例之后返工轮才**逐字节**等于首轮的前缀，否则会多出
+# 两个空行 —— 一个字节的差异就足以让这个位置之后的缓存前缀全部失效。
+_EXAMPLE_SECTION = """## 参考范例
+
+下面是同一部番第 2 集的成品对照表，这就是质量标准。注意它的旁白语气、节点划分粒度、\
+画面描述写法、以及 ★ 标记的片段是怎么用无台词间隙的：
+
+{example}
+
+"""
 
 # 首轮 prompt 里给留白预留多少秒。首轮还没有稿子，所以算不出真实留白（budget.budget_chars
 # 是拿成稿的 script_hold_seconds 去扣的），只能按提示词自己要求的「3–6 处 hold、一般
@@ -92,6 +121,17 @@ def build_glossary_block(glossary: dict[str, str]) -> str:
     return "\n".join(f"- {key} → {value}" for key, value in glossary.items())
 
 
+def build_example_section(*, with_example: bool) -> str:
+    """few-shot 范例整节（含 `## 参考范例` 标题）。返工轮传 False，拿到空串。
+
+    为什么它必须排在全部素材之后（而不是跟其余静态段一起前置）见 _EXAMPLE_SECTION
+    上面那段实测数据。
+    """
+    if not with_example:
+        return ""
+    return _EXAMPLE_SECTION.format(example=load_prompt("examples/saijo_e02.md").rstrip())
+
+
 def build_user_prompt(
     cfg: ProjectConfig,
     track: DialogueTrack,
@@ -104,11 +144,8 @@ def build_user_prompt(
     `with_example=False` 用于**返工轮**：把 few-shot 范例整段摘掉（连它上面那个
     `## 参考范例` 小节标题一起）。取舍依据见 _followup_prompt 的 docstring。
     """
-    template = load_prompt("single_episode.md")
-    if not with_example:
-        template = template.split(_EXAMPLE_SECTION_HEADING)[0].rstrip() + "\n"
     return render_prompt(
-        template,
+        load_prompt("single_episode.md"),
         show=cfg.show,
         episode_number=track.episode,
         target_seconds=f"{cfg.target_seconds:.0f}",
@@ -129,7 +166,7 @@ def build_user_prompt(
         glossary_block=build_glossary_block(cfg.glossary),
         highlight_block=build_highlight_block(report),
         dialogue_block=build_dialogue_block(track),
-        example_block=load_prompt("examples/saijo_e02.md") if with_example else "",
+        example_block=build_example_section(with_example=with_example),
     )
 
 

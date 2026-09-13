@@ -650,3 +650,95 @@ def test_prompt_still_carries_the_human_readable_duration(cfg, track, report):
     from tenmin.timecode import readable_seconds
 
     assert readable_seconds(track.duration) in build_user_prompt(cfg, track, report)
+
+
+# --- P2-C-1：静态段前置，范例留在末尾（prefix 缓存） ---
+
+_DYNAMIC_ZONE_HEADING = "## 本期素材"
+
+
+def _at(text: str, heading: str) -> int:
+    """二级/三级标题在整份 prompt 里的位置。带上行首换行，免得 `## 高能点清单`
+    误命中静态段里的 `### 高能点清单`。"""
+    return text.index(f"\n{heading}\n")
+
+
+def _static_head(text: str) -> str:
+    """整份 prompt 里「一个字都不随集数变」的那段前缀。"""
+    return text[: _at(text, _DYNAMIC_ZONE_HEADING) + 1]
+
+
+def _common_prefix(a: str, b: str) -> int:
+    n = 0
+    for x, y in zip(a, b, strict=False):
+        if x != y:
+            break
+        n += 1
+    return n
+
+
+def test_static_head_comes_before_every_dynamic_block(cfg, track, report):
+    """交付要求与输出格式原来排在动态素材**后面**，任何一集变化都让它们的缓存前缀失效。"""
+    text = build_user_prompt(cfg, track, report)
+    static_end = _at(text, _DYNAMIC_ZONE_HEADING)
+    for heading in (
+        "## 素材格式说明",
+        "## 交付要求",
+        "### 硬性要求（违反任一条即为废稿）",
+        "## 输出格式",
+    ):
+        assert _at(text, heading) < static_end, heading
+    for heading in ("## 术语表（专有名词必须按这个写法）", "## 高能点清单", "## 对白轨"):
+        assert _at(text, heading) > static_end, heading
+
+
+def test_static_head_is_byte_identical_across_episodes(cfg, track, report):
+    """缓存前缀的唯一判据：换一集之后这段前缀必须**逐字节相同**。"""
+    other_track = DialogueTrack(
+        episode=7,
+        duration=1402.5,
+        lines=[dline(1, 1.0, 2.0, "完全不同的一集")],
+    )
+    other_report = SignalReport(episode=7, median_char_rate=4.0)
+    head = _static_head(build_user_prompt(cfg, track, report))
+    other_head = _static_head(build_user_prompt(cfg, other_track, other_report))
+    assert head == other_head
+    # 交付要求 + 输出格式 + 素材格式说明 合起来是 2KB 量级，不能只剩个招呼语。
+    assert len(head) > 2000
+
+
+def test_followup_prompt_is_a_strict_prefix_of_the_first_round(cfg, track, report):
+    """**本任务里最重的一条不变量。** 返工轮除了摘掉 few-shot 范例什么都没动，所以只要
+    范例排在全部素材之后，返工轮的整份素材就是首轮的一个严格前缀（实测 saijo 10 集
+    31.6k 字符全部可缓存）。把范例跟其余静态段一起前置会让两轮在第 2.4k 字符处分叉，
+    后面 29k 素材白发一遍 —— 实测「一次 10 集批处理里可缓存的字符占比」从 43.0% 掉到
+    9.9%，差 4 倍且方向是反的。"""
+    first = build_user_prompt(cfg, track, report)
+    followup = build_user_prompt(cfg, track, report, with_example=False)
+    shared = _common_prefix(first, followup)
+    # 分叉点就在 `## 参考范例` 这个标题上（两个标题共享的 "## " 让共同前缀再多 3 字节）。
+    assert shared >= _at(first, "## 参考范例") + 1
+    assert shared > _at(first, "## 对白轨"), "共同前缀必须一直延伸到对白轨之后"
+
+
+def test_example_section_sits_after_all_of_the_episode_material(cfg, track, report):
+    text = build_user_prompt(cfg, track, report)
+    assert _at(text, "## 参考范例") > _at(text, "## 对白轨")
+
+
+def test_hard_requirements_sit_next_to_the_output_format(cfg, track, report):
+    """P1-D/P1-H 的审查结论：5 条废稿条件排在末尾、而 3KB 范例又在它们之后，
+    长上下文里位置最劣。重排后它们必须紧贴「输出格式」。"""
+    text = build_user_prompt(cfg, track, report)
+    between = text[_at(text, "### 硬性要求（违反任一条即为废稿）") : _at(text, "## 输出格式")]
+    assert "\n## " not in between, "硬性要求与输出格式之间不许再插别的二级小节"
+
+
+def test_self_check_is_the_last_section_of_the_prompt(cfg, track, report):
+    """静态段前置 + 范例留在末尾之后，最后一眼看到的东西不能是「不要学它的内容」的范例。"""
+    for with_example in (True, False):
+        text = build_user_prompt(cfg, track, report, with_example=with_example)
+        tail = text[_at(text, "## 输出前自检") :]
+        assert "\n## " not in tail[1:], "自检必须是最后一节"
+        assert "JSON schema" in tail
+        assert str(int(track.duration)) in tail, "clip 上界要在末尾复述一次"
