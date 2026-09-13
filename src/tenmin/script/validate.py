@@ -1,4 +1,16 @@
-"""LLM 输出的后处理校验。LLM 会编造时间戳，这里是唯一的拦网。"""
+"""LLM 输出的后处理校验。LLM 会编造时间戳，这里是唯一的拦网。
+
+模块分成两半，别把它们混起来：
+
+- `check_script`：**纯读**。只看、只返回 warning，一个字节都不改 script。
+- `repair_script`：**显式修复**。深拷贝一份再改（丢 clip、按字幕覆写时间戳、回填
+  is_silent_highlight），返回那个**新**对象。
+
+`validate_script` 是两者的组合，对外形状与历史一致。拆开的动因是调用方
+（script/single.py）需要「先校验、后比较」：预算重写轮会拿新稿替换旧稿，而原来
+validate 就地改写并把同一个对象塞回 ValidationResult，上一版根本没被保留下来，
+「两版择优」物理上做不到。
+"""
 
 from __future__ import annotations
 
@@ -9,9 +21,14 @@ from tenmin.models import Beat, Clip, DialogueLine, DialogueTrack, Script, Signa
 ANCHOR_TOLERANCE_SECONDS = 5.0
 SILENT_OVERLAP_SECONDS = 1.0
 MIN_BEATS = 3
+# 「落在窗**外**的 anchor 行占比」的上限。名字里的 OUTSIDE 是刻意的：它原来叫
+# ANCHOR_COVERAGE_MIN_RATIO（「覆盖率下限」），而代码里比的是 outside/total，
+# 语义正好反过来 —— 读代码的人会以为 0.5 是「至少一半要被覆盖」。
+#
 # 实测真实 LLM 输出里 14/18 个 clip 至少有一条 anchor 落在窗外，多数只差 1-3 秒无害，
 # 所以只在「过半 anchor 都在窗外」时才报——那种情况说明旁白讲的内容整段没有画面。
-ANCHOR_COVERAGE_MIN_RATIO = 0.5
+# 边界语义：**严格超过**才报。恰好一半在窗外是平手，不报（有测试锁着）。
+ANCHOR_OUTSIDE_MAX_RATIO = 0.5
 
 
 class ScriptValidationError(RuntimeError):
@@ -102,7 +119,7 @@ def _check_anchor_coverage(beat: Beat, tracks: dict[int, DialogueTrack]) -> list
             for ln in lines
             if _overlap(ln.start, ln.end, clip.start, clip.end) <= 0
         )
-        if outside / total > ANCHOR_COVERAGE_MIN_RATIO:
+        if outside / total > ANCHOR_OUTSIDE_MAX_RATIO:
             warnings.append(
                 f"{beat.label}：clip {clip.start:.1f}-{clip.end:.1f} 的 anchor 行有 "
                 f"{outside}/{total} 条落在时间窗外，旁白讲的内容缺画面"
@@ -110,19 +127,42 @@ def _check_anchor_coverage(beat: Beat, tracks: dict[int, DialogueTrack]) -> list
     return warnings
 
 
-def validate_script(
+def check_script(
     script: Script,
     tracks: dict[int, DialogueTrack],
     reports: dict[int, SignalReport],
-) -> ValidationResult:
-    warnings: list[str] = []
+) -> list[str]:
+    """纯读的语义校验。返回全部 warning，**不改** script、也不抛异常。
 
+    reports 目前用不到，但保留在签名里：它与 repair_script 共用一套入参，
+    调用方（single.py）拿同一组素材调两个函数，签名对齐比少一个参数更值。
+    """
+    warnings: list[str] = []
+    for beat in script.beats:
+        warnings.extend(_check_hold_quotes(beat, tracks))
+        warnings.extend(_check_anchor_coverage(beat, tracks))
+    return warnings
+
+
+def repair_script(
+    script: Script,
+    tracks: dict[int, DialogueTrack],
+    reports: dict[int, SignalReport],
+) -> tuple[Script, list[str]]:
+    """丢掉不可用的 clip、按字幕覆写偏差过大的时间戳、回填 is_silent_highlight。
+
+    返回 **新** Script（深拷贝后再改），入参一字不动。修不了的（节点数不足、
+    某个节点的 clip 全灭）抛 ScriptValidationError，调用方重试一次 LLM。
+    """
     if len(script.beats) < MIN_BEATS:
         raise ScriptValidationError(
             f"剧本节点数 {len(script.beats)} 少于下限 {MIN_BEATS}，重试"
         )
 
-    for beat in script.beats:
+    repaired = script.model_copy(deep=True)
+    warnings: list[str] = []
+
+    for beat in repaired.beats:
         kept: list[Clip] = []
         for clip in beat.clips:
             track = tracks.get(clip.episode)
@@ -182,7 +222,16 @@ def validate_script(
                 f"{beat.label} 的所有 clip 都未通过校验，剧本不可用，重试"
             )
         beat.clips = kept
-        warnings.extend(_check_hold_quotes(beat, tracks))
-        warnings.extend(_check_anchor_coverage(beat, tracks))
 
-    return ValidationResult(script=script, warnings=warnings)
+    return repaired, warnings
+
+
+def validate_script(
+    script: Script,
+    tracks: dict[int, DialogueTrack],
+    reports: dict[int, SignalReport],
+) -> ValidationResult:
+    """repair 一遍再 check 一遍。对外形状与历史一致，但**不再改动入参**。"""
+    repaired, warnings = repair_script(script, tracks, reports)
+    warnings.extend(check_script(repaired, tracks, reports))
+    return ValidationResult(script=repaired, warnings=warnings)

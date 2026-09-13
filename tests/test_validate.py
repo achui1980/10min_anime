@@ -11,9 +11,11 @@ from tenmin.models import (
     SignalReport,
 )
 from tenmin.script.validate import (
-    ANCHOR_COVERAGE_MIN_RATIO,
+    ANCHOR_OUTSIDE_MAX_RATIO,
     ANCHOR_TOLERANCE_SECONDS,
     ScriptValidationError,
+    check_script,
+    repair_script,
     validate_script,
 )
 
@@ -291,8 +293,8 @@ def test_hold_quote_is_compared_after_stripping():
 # --- 校验 B：clip 时间窗必须覆盖自己的 anchor_lines ---
 
 
-def test_anchor_coverage_min_ratio_constant():
-    assert ANCHOR_COVERAGE_MIN_RATIO == pytest.approx(0.5)
+def test_anchor_outside_max_ratio_constant():
+    assert ANCHOR_OUTSIDE_MAX_RATIO == pytest.approx(0.5)
 
 
 def test_clip_window_missing_most_anchors_warns():
@@ -352,3 +354,35 @@ def test_anchor_coverage_counts_merged_lines():
 def test_anchor_coverage_ignores_clip_without_matching_anchors():
     s = make_script([[clip(408.9, 453.9, anchors=[9999])]])
     assert run(s).warnings == []
+
+
+# --- C1：check（纯读）与 repair（返回新对象）的拆分 ---
+
+
+def test_check_script_does_not_touch_the_input():
+    """check 是纯读：连 is_silent_highlight 这种「本来会被回填」的字段都不许动。"""
+    s = make_script([[clip(1330.0, 1340.0, silent=False)]])
+    before = s.model_dump_json()
+    check_script(s, tracks={2: make_track()}, reports={2: make_report(gaps=[(1328.4, 1348.2)])})
+    assert s.model_dump_json() == before
+
+
+def test_repair_script_returns_a_new_object_and_leaves_the_input_alone():
+    track = make_track(lines=[dline(42, 600.0, 604.0)])
+    s = make_script([[clip(100.0, 106.0, anchors=[42])]])
+    before = s.model_dump_json()
+    repaired, _ = repair_script(s, tracks={2: track}, reports={2: make_report()})
+    assert repaired is not s
+    assert repaired.beats[0].clips[0].start == pytest.approx(600.0)
+    assert s.model_dump_json() == before, "输入必须一字未改"
+
+
+def test_validate_script_no_longer_mutates_the_input_script():
+    """原来 validate_script 就地改写并把同一个对象塞回 ValidationResult，
+    调用方拿不到「校验前」那一版，无法先校验后比较。"""
+    s = make_script([[clip(1330.0, 1340.0, silent=False)]])
+    before = s.model_dump_json()
+    result = run(s, report=make_report(gaps=[(1328.4, 1348.2)]))
+    assert result.script is not s
+    assert result.script.beats[0].clips[0].is_silent_highlight is True
+    assert s.model_dump_json() == before
