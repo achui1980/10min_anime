@@ -5,6 +5,9 @@ import pytest
 
 from tenmin.models import SubtitleCue, Timeline, TimelineSegment, VoiceChunk, VoiceTrack
 from tenmin.render.audio import (
+    SILENCE_CHANNEL_LAYOUT,
+    SILENCE_SAMPLE_FMT,
+    SILENCE_SAMPLE_RATE,
     build_mix_args,
     duck_gain,
     duck_volume_expr,
@@ -232,8 +235,9 @@ def test_build_mix_args_appends_silence_for_outro_card(tmp_path):
     graph = args[args.index("-filter_complex") + 1]
     assert (
         "[mixlen]afade=t=out:st=25.000:d=5.000[mixfaded];"
+        "[mixfaded]aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo[mixfmt];"
         "anullsrc=r=48000:cl=stereo:d=3.000[silence];"
-        "[mixfaded][silence]concat=n=2:v=0:a=1,asetpts=N/SR/TB[mixfinal]"
+        "[mixfmt][silence]concat=n=2:v=0:a=1,asetpts=N/SR/TB[mixfinal]"
     ) in graph
 
 
@@ -255,8 +259,9 @@ def test_build_mix_args_outro_without_fade_concats_mix_directly(tmp_path):
     graph = args[args.index("-filter_complex") + 1]
     assert (
         "[mix]apad=whole_dur=30.000,atrim=end=30.000[mixlen];"
+        "[mixlen]aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo[mixfmt];"
         "anullsrc=r=48000:cl=stereo:d=3.000[silence];"
-        "[mixlen][silence]concat=n=2:v=0:a=1,asetpts=N/SR/TB[mixfinal]"
+        "[mixfmt][silence]concat=n=2:v=0:a=1,asetpts=N/SR/TB[mixfinal]"
     ) in graph
 
 
@@ -280,8 +285,9 @@ def test_build_mix_args_pins_length_before_fade_and_outro(tmp_path):
     assert (
         "[mix]apad=whole_dur=30.000,atrim=end=30.000[mixlen];"
         "[mixlen]afade=t=out:st=25.000:d=5.000[mixfaded];"
+        "[mixfaded]aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo[mixfmt];"
         "anullsrc=r=48000:cl=stereo:d=3.000[silence];"
-        "[mixfaded][silence]concat=n=2:v=0:a=1,asetpts=N/SR/TB[mixfinal]"
+        "[mixfmt][silence]concat=n=2:v=0:a=1,asetpts=N/SR/TB[mixfinal]"
     ) in graph
 
 
@@ -375,6 +381,39 @@ def _lavfi_peak_db(graph: str) -> float:
     ]
     assert peaks, completed.stderr
     return peaks[-1]
+
+
+# --- 片尾静音的格式（第 5 项）-----------------------------------------------
+# 图里其余分支都继承源片格式，只有 anullsrc 写死 48kHz/stereo。ffmpeg 会自动协商
+# （44.1k/mono + 48k/stereo 拼一起实测 rc=0，不是崩），但 5.1 源片会被**静默下混**。
+# 在 concat 前显式 aformat，让「下混」这件事是写出来的而不是协商出来的。
+
+
+def test_build_mix_args_forces_a_known_format_before_the_outro_concat(tmp_path):
+    args = build(tmp_path, outro_seconds=3.0)
+    graph = args[args.index("-filter_complex") + 1]
+    assert (
+        "[mix]apad=whole_dur=30.000,atrim=end=30.000[mixlen];"
+        "[mixlen]aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo[mixfmt];"
+        "anullsrc=r=48000:cl=stereo:d=3.000[silence];"
+        "[mixfmt][silence]concat=n=2:v=0:a=1,asetpts=N/SR/TB[mixfinal]"
+    ) in graph
+
+
+def test_build_mix_args_leaves_the_format_alone_without_an_outro_card(tmp_path):
+    """没有片尾静音就没有两路格式相遇的点，这条路继续继承源片格式，行为不变。"""
+    graph = build(tmp_path)[build(tmp_path).index("-filter_complex") + 1]
+    assert "aformat" not in graph
+
+
+def test_build_mix_args_keeps_silence_and_aformat_in_sync(tmp_path):
+    """静音源与 aformat 的采样率/声道布局必须来自同一组常量，不能各写一份。"""
+    args = build(tmp_path, outro_seconds=3.0)
+    graph = args[args.index("-filter_complex") + 1]
+    assert f"anullsrc=r={SILENCE_SAMPLE_RATE}:cl={SILENCE_CHANNEL_LAYOUT}" in graph
+    assert f"sample_fmts={SILENCE_SAMPLE_FMT}" in graph
+    assert f"sample_rates={SILENCE_SAMPLE_RATE}" in graph
+    assert f"channel_layouts={SILENCE_CHANNEL_LAYOUT}" in graph
 
 
 def test_mix_audio_runs_ffmpeg_and_returns_path(tmp_path, monkeypatch):

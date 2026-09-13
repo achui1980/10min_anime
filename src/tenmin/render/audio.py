@@ -17,6 +17,12 @@ AUDIO_CODEC = "aac"
 AUDIO_BITRATE = "192k"
 FULL_VOLUME = 1.0
 
+# 片尾静音的格式。anullsrc 和 concat 前那道 aformat **必须**共用这一组常量：
+# 两边各写一份的话，哪天有人只改了一边，concat 就重新退回「靠 ffmpeg 协商」。
+SILENCE_SAMPLE_FMT = "fltp"
+SILENCE_SAMPLE_RATE = 48000
+SILENCE_CHANNEL_LAYOUT = "stereo"
+
 
 def duck_gain(duck_db: float) -> float:
     """把 dB 换成线性增益。-12dB ≈ 0.2512。"""
@@ -139,7 +145,25 @@ def build_mix_args(
         final_label = "[mixfaded]"
     if outro_seconds > 0:
         # 片尾卡片没有声音，垫一段静音跟视频那边的黑卡对齐。
-        parts.append(f"anullsrc=r=48000:cl=stereo:d={outro_seconds:.3f}[silence]")
+        #
+        # concat 之前先 aformat 把混音这一路显式拍成静音源的格式。图里其余分支都
+        # 继承源片格式，只有 anullsrc 是写死的常量，两路在 concat 处相遇时格式由
+        # ffmpeg 现场协商 —— 44.1k/mono 的源实测能协商成功（rc=0，不是崩），但
+        # 5.1 源片会被**静默下混**成 stereo，没有任何提示。写出来的下混跟协商出来的
+        # 下混结果一样，区别是前者可查、可测、可改。
+        #
+        # 刻意只在这条分支上加：没有片尾静音时图里就没有两路格式相遇的点，那条路
+        # 继续继承源片格式（44.1k 源出 44.1k 产物），行为完全不变。
+        parts.append(
+            f"{final_label}aformat=sample_fmts={SILENCE_SAMPLE_FMT}:"
+            f"sample_rates={SILENCE_SAMPLE_RATE}:"
+            f"channel_layouts={SILENCE_CHANNEL_LAYOUT}[mixfmt]"
+        )
+        final_label = "[mixfmt]"
+        parts.append(
+            f"anullsrc=r={SILENCE_SAMPLE_RATE}:cl={SILENCE_CHANNEL_LAYOUT}:"
+            f"d={outro_seconds:.3f}[silence]"
+        )
         # concat 之后必须按样本数重建 pts。concat 拼音频时给第二段的偏移是按第一段
         # 「实测到的结束时刻」算的，两段之间会留下一个亚帧级的洞，mp4 muxer 拿这串
         # pts 写 moov 时**随机**少算一截：真实素材实测（work/saijo E02，同一条 argv
