@@ -1,7 +1,11 @@
 """跨模块的源码不变量。用 AST 扫 src/tenmin/，不是文本 grep。
 
-这里只放「一处漏了就会在别人的机器上炸、而本机测试永远绿」的规则。
-目前只有一条：文本 I/O 必须显式写 encoding。
+这里只放「一处漏了就会在别人的机器上炸、而本机测试永远绿」的规则。目前三条：
+
+1. 文本 I/O 必须显式写 encoding。
+2. src/ 里不许有 assert（`python -O` 会把它整句剥掉）。
+3. 产物写入必须走 `tenmin.atomic`，不许直接 `Path.write_text` / `write_bytes` /
+   `shutil.copyfile`。
 """
 
 from __future__ import annotations
@@ -154,3 +158,82 @@ def test_no_assert_statements_in_src(path: Path):
     tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
     lines = [node.lineno for node in ast.walk(tree) if isinstance(node, ast.Assert)]
     assert lines == [], f"{path.name} 第 {lines} 行有 assert"
+
+
+# --- 产物写入必须走 tenmin.atomic（M5）--------------------------------------
+#
+# `pipeline._is_fresh` 只比 mtime。被 Ctrl-C 或 ffmpeg 中途失败留下的半截产物 mtime
+# 恰好最新，于是下一次运行把它判成「已是最新」整段跳过，一个截断的 .m4a/.mp4/.json
+# 就这样一路进成片、全程零警告（见 tenmin/atomic.py 的模块 docstring）。
+#
+# 「全部产物写入走原子写」这条不变量在 M5 之前**没有任何测试或审计守着**，而
+# `cli.init` 就是它唯一的缺口。
+
+# 直接调用等于绕过原子写的那些 API。
+_NON_ATOMIC_WRITES = frozenset({"write_text", "write_bytes", "copyfile"})
+
+# 唯一豁免的文件：`atomic.py` 自己 —— 它就是那一层实现，`tmp.write_text` /
+# `shutil.copyfile(src, tmp)` 写的都是 `.part` 临时文件，正式路径由 `os.replace` 落。
+_ATOMIC_EXEMPT_FILES = frozenset({"atomic.py"})
+
+# 豁免的**接收者**：`atomic.write_text(...)` 形态上也是 `X.write_text(...)`，
+# 但它就是原子版本本身。
+_ATOMIC_RECEIVERS = frozenset({"atomic"})
+
+# 「已知非产物」白名单：{(文件名, 方法名): 理由}。
+#
+# **目前是空的。** 往里加之前先问一句：这个文件真的不是任何阶段的输入吗？
+# `project.yaml` 就是个反例 —— 它看着像「配置」，实际是**每个阶段**的隐式输入
+# （`_is_fresh` 把它加进 inputs），所以 register_episode 与 cli.init 都必须原子写。
+_NON_ARTIFACT_WRITES: dict[tuple[str, str], str] = {}
+
+
+def _non_atomic_writes(path: Path) -> list[str]:
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    out: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+            continue
+        name = node.func.attr
+        if name not in _NON_ATOMIC_WRITES:
+            continue
+        if _receiver_name(node.func) in _ATOMIC_RECEIVERS:
+            continue
+        if (path.name, name) in _NON_ARTIFACT_WRITES:
+            continue
+        out.append(f"{path.name}:{node.lineno} {name}()")
+    return out
+
+
+@pytest.mark.parametrize(
+    "path",
+    [p for p in _source_files() if p.name not in _ATOMIC_EXEMPT_FILES],
+    ids=lambda p: p.name,
+)
+def test_artifact_writes_go_through_atomic(path: Path):
+    assert _non_atomic_writes(path) == [], (
+        f"{path.name} 直接写盘了。产物写入必须走 tenmin.atomic"
+        "（write_text / copy_file / atomic_path），否则半截产物的 mtime 会让"
+        "_is_fresh 把它当成品跳过。"
+    )
+
+
+def test_the_atomic_audit_can_actually_see_a_violation(tmp_path):
+    """守住上面那条审计自己：它在 M5 之前对 `cli.init` 报的就是这个形状。"""
+    path = tmp_path / "synthetic.py"
+    path.write_text(
+        "from pathlib import Path\n"
+        "def f(p: Path):\n"
+        "    p.write_text('x', encoding='utf-8')\n",
+        encoding="utf-8",
+    )
+    assert _non_atomic_writes(path) == ["synthetic.py:3 write_text()"]
+
+
+def test_the_atomic_audit_lets_the_atomic_helper_through(tmp_path):
+    path = tmp_path / "synthetic.py"
+    path.write_text(
+        "from tenmin import atomic\ndef f(p):\n    atomic.write_text(p, 'x')\n",
+        encoding="utf-8",
+    )
+    assert _non_atomic_writes(path) == []
