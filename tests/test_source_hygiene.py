@@ -17,6 +17,9 @@ SRC = Path(__file__).resolve().parent.parent / "src" / "tenmin"
 # 本项目的产物（对照表、旁白、dialogue.json、project.yaml）全是中文，在非 UTF-8
 # locale（Windows 简中默认 cp936、部分 CI 容器是 POSIX/ascii）下读写就直接
 # UnicodeDecodeError/UnicodeEncodeError。本机是 UTF-8，所以这类漏写永远测不出来。
+#
+# 内建 `open` 也被守（见 _called_name）：它是这条规则最容易漏的形态，而 `open(p, "w")`
+# 与 `p.open("w")` 的失败模式一模一样。
 TEXT_IO_METHODS = frozenset({"read_text", "write_text"})
 
 # 唯一豁免的接收者：`tenmin.atomic`。`atomic.write_text` 不是 stdlib 的那个 ——
@@ -36,6 +39,23 @@ def _source_files() -> list[Path]:
     return sorted(p for p in SRC.rglob("*.py"))
 
 
+def _called_name(func: ast.expr) -> str | None:
+    """被调用者的「方法/函数名」。
+
+    两种形态都要认，缺一个这条守卫就有洞：
+    - `ast.Attribute`（`path.read_text(...)` / `path.open(...)`）→ `.attr`
+    - `ast.Name`（**内建** `open(...)`）→ `.id`
+
+    原实现只认前者，于是 `name == "open"` 那一支对裸 `open(p, "w")` 永不生效 ——
+    而模块 docstring 与 TEXT_IO_METHODS 旁边的注释都把 `open` 列为被守对象。
+    """
+    if isinstance(func, ast.Attribute):
+        return func.attr
+    if isinstance(func, ast.Name):
+        return func.id
+    return None
+
+
 def _offenders(path: Path) -> list[str]:
     tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
     out: list[str] = []
@@ -43,11 +63,15 @@ def _offenders(path: Path) -> list[str]:
         if not isinstance(node, ast.Call):
             continue
         func = node.func
-        name = func.attr if isinstance(func, ast.Attribute) else None
+        name = _called_name(func)
         if name is None:
             continue
         if name in TEXT_IO_METHODS or name == "open":
-            if _receiver_name(func) in UTF8_PINNED_MODULES:
+            # 豁免只对「方法调用」有意义（`atomic.write_text(...)`）；裸 `open()` 没有
+            # 接收者，_receiver_name 只接受 ast.Attribute，所以这里先判形态。
+            if isinstance(func, ast.Attribute) and _receiver_name(func) in (
+                UTF8_PINNED_MODULES
+            ):
                 continue
             keywords = {kw.arg for kw in node.keywords}
             if "encoding" not in keywords:
@@ -66,6 +90,45 @@ def test_atomic_write_text_pins_utf8():
 
     default = inspect.signature(atomic.write_text).parameters["encoding"].default
     assert default == "utf-8"
+
+
+# --- 守卫本身有洞：裸 open() 那一支（M4）------------------------------------
+#
+# `_offenders` 原来是 `name = func.attr if isinstance(func, ast.Attribute) else None`
+# 紧跟一句 `if name is None: continue`，所以 `name == "open"` 那一支**只对
+# `path.open(...)` 生效，对内建 `open()` 永不生效** —— 裸 `open(p, "w")` 的
+# `node.func` 是 `ast.Name`。而模块 docstring 与 TEXT_IO_METHODS 旁边的注释都把
+# `open` 列为被守对象。目前 src/ 里没有裸 open，所以这是潜在漏洞而不是现存违规。
+
+
+def _offenders_of(source: str, tmp_path: Path) -> list[str]:
+    path = tmp_path / "synthetic.py"
+    path.write_text(source, encoding="utf-8")
+    return _offenders(path)
+
+
+def test_audit_catches_a_bare_open_without_encoding(tmp_path):
+    assert _offenders_of("def f(p):\n    return open(p, 'w')\n", tmp_path) == [
+        "synthetic.py:2 open()"
+    ]
+
+
+def test_audit_accepts_a_bare_open_that_declares_encoding(tmp_path):
+    assert _offenders_of(
+        "def f(p):\n    return open(p, 'w', encoding='utf-8')\n", tmp_path
+    ) == []
+
+
+def test_audit_ignores_a_bare_call_that_is_not_open(tmp_path):
+    """只有 `open` 这个名字算，别把 `read_text(x)` 这种同名参数的调用也算进去。"""
+    assert _offenders_of("def f(p):\n    return dict(p)\n", tmp_path) == []
+
+
+def test_audit_still_catches_the_attribute_form(tmp_path):
+    """`path.open(...)` 那一支不能被回归。"""
+    assert _offenders_of("def f(p):\n    return p.open('w')\n", tmp_path) == [
+        "synthetic.py:2 open()"
+    ]
 
 
 def test_src_has_python_files():
