@@ -8,6 +8,7 @@ from typing import ClassVar
 
 import pytest
 
+from tenmin.atomic import PART_SUFFIX, part_path
 from tenmin.config import RenderConfig
 from tenmin.models import AudioDirection, Beat, Hold, Script
 from tenmin.render import tts as tts_module
@@ -23,6 +24,16 @@ from tenmin.render.tts import (
 )
 
 from .fakes import FailingTTSEngine, FakeReporter, FakeTTSEngine, FlakyTTSEngine
+
+
+def _leftover_parts(directory: Path) -> list[Path]:
+    """目录里残留的临时文件。
+
+    刻意**不**写 `glob("*.part")`：合成的临时文件现在走 `atomic.part_path`，`.part`
+    插在扩展名**之前**（`chunk_001.part.mp3`），那个 glob 在新命名下恒为空 —— 也就是
+    一组假绿的断言。按 `.part.` 这个中缀找才是真的在查残骸。
+    """
+    return [p for p in directory.rglob("*") if f"{PART_SUFFIX}." in p.name]
 
 
 @pytest.fixture
@@ -351,9 +362,11 @@ async def test_edge_engine_synthesizes_into_a_part_file_then_renames(tmp_path, m
     duration = await EdgeTTSEngine().synthesize("第一句。", out)
 
     assert duration == 2.0
-    assert stub.calls[0]["saved_to"].name.endswith(".part")
+    # 临时路径就是全仓共用的那一套（`.part` 插在扩展名之前），不是本模块自己拼的
+    # `out.name + ".part"` —— 收敛成一套之后 atomic.py 那句「同一个 .part 记号」才是真的。
+    assert stub.calls[0]["saved_to"] == part_path(out)
     assert out.is_file()
-    assert list(tmp_path.glob("*.part")) == []
+    assert _leftover_parts(tmp_path) == []
 
 
 async def test_edge_engine_leaves_nothing_behind_when_save_fails(tmp_path, monkeypatch):
@@ -365,7 +378,7 @@ async def test_edge_engine_leaves_nothing_behind_when_save_fails(tmp_path, monke
         await EdgeTTSEngine().synthesize("第一句。", out)
 
     assert not out.exists()
-    assert list(tmp_path.glob("*.part")) == []
+    assert _leftover_parts(tmp_path) == []
 
 
 async def test_edge_engine_rejects_zero_duration_audio(tmp_path, monkeypatch):
@@ -377,7 +390,7 @@ async def test_edge_engine_rejects_zero_duration_audio(tmp_path, monkeypatch):
         await EdgeTTSEngine().synthesize("第一句。", out)
 
     assert not out.exists()
-    assert list(tmp_path.glob("*.part")) == []
+    assert _leftover_parts(tmp_path) == []
 
 
 async def test_edge_engine_rejects_truncated_audio(tmp_path, monkeypatch):
@@ -460,7 +473,7 @@ async def test_edge_engine_gives_up_on_a_stalled_chunk(tmp_path, monkeypatch):
 
     assert "超时" in str(exc.value)
     assert not out.exists()
-    assert list(tmp_path.glob("*.part")) == []
+    assert _leftover_parts(tmp_path) == []
 
 
 async def test_edge_engine_probes_duration_off_the_event_loop(tmp_path, monkeypatch):
@@ -964,11 +977,11 @@ async def test_a_failing_chunk_keeps_the_chunks_that_already_landed(tmp_path, sl
                 raise ConnectionResetError("断了")
             if text == "第3句。":
                 # 慢到必然还在飞的时候就被取消，模拟「留下 .part 的那个 task」。
-                out_path.with_name(out_path.name + ".part").write_bytes(b"partial")
+                part_path(out_path).write_bytes(b"partial")
                 try:
                     await asyncio.sleep(10)
                 except BaseException:
-                    out_path.with_name(out_path.name + ".part").unlink(missing_ok=True)
+                    part_path(out_path).unlink(missing_ok=True)
                     raise
             out_path.write_bytes(b"fake mp3")
             return 2.0
@@ -977,7 +990,7 @@ async def test_a_failing_chunk_keeps_the_chunks_that_already_landed(tmp_path, sl
         await synthesize_track(
             _wide_script(4), 2, tmp_path, _OneBadApple(), concurrency=4, max_attempts=1
         )
-    assert list(tmp_path.glob("*.part")) == []
+    assert _leftover_parts(tmp_path) == []
     assert (tmp_path / tts_module.chunk_filename(1, "第0句。", "fake|voice|+0%")).is_file()
 
 
@@ -1100,3 +1113,36 @@ async def test_synthesize_track_surfaces_bad_hold_warnings(tmp_path):
     )
     _, warnings = await synthesize_track(script, 2, tmp_path, FakeTTSEngine([5.0]))
     assert any("900.0" in w and "最后一句" in w for w in warnings)
+
+
+# --- `.part` 命名只有一套（N8）----------------------------------------------
+
+
+def test_leftover_parts_helper_actually_sees_a_part_file(tmp_path):
+    """守住 `_leftover_parts` 自己：上面那一串「不留残骸」的断言全靠它。
+
+    原来那些断言写的是 `glob("*.part")`，而临时文件现在叫 `chunk_001.part.mp3` ——
+    那个 glob 在新命名下恒为空，整组断言会静默变成假绿。
+    """
+    (tmp_path / "chunk_001.abcd1234.part.mp3").write_bytes(b"partial")
+    assert [p.name for p in _leftover_parts(tmp_path)] == [
+        "chunk_001.abcd1234.part.mp3"
+    ]
+
+
+def test_a_part_file_is_never_mistaken_for_a_cached_chunk(tmp_path):
+    """临时文件保住了 `.mp3` 扩展名，所以必须确认它不会被复用 glob 命中。
+
+    `_find_cached_chunk` 用 `chunk_*.{digest}.mp3` 找同哈希的既有文件；一旦
+    `chunk_001.{digest}.part.mp3` 也能命中，一个**截断**的临时文件就会被当成成品复用
+    —— 正是 `.part` 这套机制要防的事。
+    """
+    fingerprint = "fake|voice|+0%"
+    text = "第一句。"
+    digest = tts_module.content_hash(text, fingerprint)
+    desired = tts_module.chunk_filename(1, text, fingerprint)
+    part = part_path(tmp_path / desired)
+    part.write_bytes(b"partial")
+
+    assert digest in part.name  # 前提：哈希确实在临时文件名里
+    assert tts_module._find_cached_chunk(tmp_path, desired, digest) is None

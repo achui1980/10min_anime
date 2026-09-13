@@ -13,8 +13,8 @@
 同样是一个「不 import 任何 tenmin 模块」的叶子层，谁都可以放心依赖。
 
 结构刻意跟 `render/tts.py` 的 `EdgeTTSEngine.synthesize` 对齐（同样的「异常路径
-unlink、成功路径 replace」），只是把它抽成了共用件。两边的 `.part` **命名**是两套，
-各自的理由见 `part_path`。
+unlink、成功路径 replace」），而且那边现在也直接用本模块的 `atomic_path` —— 全仓
+只有一套 `.part` 命名（历史上是两套，见 `part_path`）。
 """
 
 from __future__ import annotations
@@ -39,9 +39,14 @@ def part_path(path: Path) -> Path:
        `E02.mixed.m4a.part` 会让它报 `Unable to find a suitable output format`。
        所以 `.part` 插在扩展名**之前**：`E02.mixed.m4a` → `E02.mixed.part.m4a`。
 
-    刻意不掺 pid / 随机数：跟 `render/tts.py` 保持同一套记号，而且确定的名字才能在
-    下一次运行时被认出来并清掉（见 `atomic_path`）。同一集并发跑两份本来就会互相
-    踩产物，不是这一层该解决的问题。
+       `render/tts.py` 历史上自己拼的是另一套（`out_path.name + ".part"`，也就是
+       `chunk_001.abc.mp3.part`）—— edge-tts 不推容器格式，所以那样也能用，但全仓两套
+       命名而 docstring 却声称「同一个 `.part` 记号」。现在它也走本模块，只剩这一套。
+       安全性已实测：`.part.mp3` **不会**被 `tts._find_cached_chunk` 的
+       `chunk_*.{digest}.mp3` glob 命中（那个模式要求以 `.{digest}.mp3` 收尾）。
+
+    刻意不掺 pid / 随机数：确定的名字才能在下一次运行时被认出来并清掉（见
+    `atomic_path`）。同一集并发跑两份本来就会互相踩产物，不是这一层该解决的问题。
     """
     return path.with_name(f"{path.stem}{PART_SUFFIX}{path.suffix}")
 

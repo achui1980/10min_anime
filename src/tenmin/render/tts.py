@@ -8,6 +8,7 @@ import random
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
+from tenmin.atomic import atomic_path
 from tenmin.config import DEFAULT_RENDER, RenderConfig
 from tenmin.models import Beat, Script, VoiceChunk, VoiceTrack
 from tenmin.progress import NullProgressReporter, ProgressReporter
@@ -151,14 +152,25 @@ class EdgeTTSEngine:
     async def synthesize(self, text: str, out_path: Path) -> float:
         import edge_tts
 
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        # edge_tts.Communicate.save() 内部是 `open(audio_fname, "wb")` 的**流式**写
-        # （communicate.py:616）。Ctrl-C 或断网留下的是一个「非空但截断」的 mp3，
-        # 而复用判据只看 st_size > 0 —— 它偏短的时长会静默扭曲此后全部时间轴偏移。
-        # 所以合成一律落临时文件，体检通过才 os.replace 到正式名字（同目录内的
-        # rename 在 POSIX 上是原子的）。
-        part_path = out_path.with_name(out_path.name + ".part")
-        try:
+        # `atomic_path` 交出同目录的 `.part` 路径，块正常结束才 os.replace 到正式名字，
+        # 出任何事（含 KeyboardInterrupt）都把它删掉。
+        #
+        # 为什么必须走临时文件：`edge_tts.Communicate.save()` 内部是
+        # `open(audio_fname, "wb")` 的**流式**写。Ctrl-C 或断网留下的是一个「非空但
+        # 截断」的 mp3，而复用判据只看 st_size > 0 —— 它偏短的时长会静默扭曲此后全部
+        # 时间轴偏移。所以体检（下面那段时长区间）必须发生在临时文件上，通过了才改名。
+        #
+        # 为什么用共用的 `atomic_path` 而不是本地手写一份：本模块原来自己拼
+        # `out_path.name + ".part"`（`chunk_001.abc.mp3.part`），而 `atomic.part_path`
+        # 把 `.part` 插在扩展名**之前**（`chunk_001.abc.part.mp3`）—— 全仓两套命名，
+        # 而 atomic.py 的 docstring 却声称「同一个 `.part` 记号」。收敛到一套之后还
+        # 顺带白拿两件事：进块前会先清掉残留的旧 `.part`（原来是直接往上写，得到的是
+        # 「新数据覆盖旧数据前半段」这种更坏的形态），以及临时文件保住 `.mp3` 扩展名
+        # （对下面那次 ffprobe 更友好）。
+        #
+        # 新名字**不会**被 `_find_cached_chunk` 的 `chunk_*.{digest}.mp3` glob 命中：
+        # 它要求以 `.{digest}.mp3` 收尾，而临时文件以 `.part.mp3` 收尾（已实测）。
+        with atomic_path(out_path) as part:
             try:
                 async with asyncio.timeout(self.chunk_timeout_seconds):
                     communicate = edge_tts.Communicate(
@@ -169,7 +181,7 @@ class EdgeTTSEngine:
                         connect_timeout=self.connect_timeout,
                         receive_timeout=self.receive_timeout,
                     )
-                    await communicate.save(str(part_path))
+                    await communicate.save(str(part))
             except TimeoutError as error:
                 # asyncio.timeout 到点抛的是内置 TimeoutError。edge-tts 内部的
                 # sock_read 超时是 aiohttp 的异常，两者不会互相误吞。
@@ -179,7 +191,7 @@ class EdgeTTSEngine:
                 ) from error
             # 阻塞的 subprocess，必须扔到线程里：直接 await 不了，直接调会把事件循环
             # 整个卡住（synthesize_track 的并发就完全白做）。
-            duration = await asyncio.to_thread(probe_duration, part_path, ffprobe=self.ffprobe)
+            duration = await asyncio.to_thread(probe_duration, part, ffprobe=self.ffprobe)
             lower, upper = _duration_bounds(text, self.rate)
             if duration <= 0 or not (lower <= duration <= upper):
                 raise TTSError(
@@ -187,10 +199,6 @@ class EdgeTTSEngine:
                     f"[{lower:.3f}, {upper:.3f}] 内（{narration_chars(text)} 字，"
                     f"rate={self.rate}），大概率是流被截断或只出了静音：{text!r}"
                 )
-        except BaseException:
-            part_path.unlink(missing_ok=True)
-            raise
-        part_path.replace(out_path)
         return duration
 
 
