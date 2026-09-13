@@ -25,13 +25,43 @@ OUTRO_FONT_NAME = DEFAULT_RENDER.outro_font_name
 PIX_FMT = "yuv420p"
 
 
-def escape_filter_path(path: Path) -> str:
-    """filtergraph 里的路径整体用单引号包住，反斜杠与单引号再转义一次。
+def escape_filter_arg(value: str) -> str:
+    """把任意字符串包成 filtergraph 里安全的一个 AVOption 值（含外层单引号）。
 
-    源片名常带方括号和空格（`[LoliHouse] ... .mkv`），单引号包住就不用逐字符转义。
+    值要过**两层**反转义，两层的规则不一样，这是这个函数唯一的难点：
+
+    - **层 1：filtergraph 描述解析器。** 用 av_get_token 找 filter 参数的结尾，终止符
+      是 `[],;`。它对引号的处理是「见到 `'` 就一路原样拷贝到下一个 `'`」——注意是
+      *原样*，引号里的反斜杠**不**在这一层被消耗。代价是引号里放不进字面单引号。
+    - **层 2：filter 自己的 AVOption 分词器。** 拿到层 1 的输出，按 `:` 切 key=value，
+      同样用 av_get_token，这一层才会把 `\\X` 还原成 `X`、把裸的 `'` 当引号吃掉。
+
+    所以规则是「先按层 2 转义，再用层 1 的引号把结果整体裹住」：
+
+    1. 给层 2：`\\` → `\\\\`、`'` → `\\'`、`:` → `\\:`
+    2. 给层 1：把上一步结果里剩下的字面 `'` 写成 `'\\''`（闭引号 + 转义引号 + 重开引号）
+
+    于是一个字面单引号最终展开成 `\\'\\''`：`\\'` 是给层 2 的，`'...'` 的开合是给层 1 的。
+
+    空格、`[]`、`,`、`;`、中文都不用管：层 1 的引号已经护住它们，层 2 也不拿它们当分隔符
+    （实测 ffmpeg 9.0.1 这几类本来就 rc=0）。留着引号还顺带护住路径首尾的空白。
+
+    实测（ffmpeg 9.0.1，真跑 subtitles 与 drawtext）：
+    - 只做第 1 步 → 冒号让层 1 就地报 `Error parsing a filter description`
+    - 只做第 2 步 → `\\` 会被层 2 吃掉，`a\\b` 变成 `ab`
+    - 两步都做 → `' : \\ [ ] , ; = % 中文` 全部 rc=0
+
+    已知局限：层 2 会掐掉**值本身**首尾的空白（首尾要保住得在层 2 再套一层引号）。
+    路径不受影响（以 `/` 开头、以 `.ass` 结尾），drawtext 文案首尾空白会丢，但居中
+    渲染时看不出来，所以不为它把转义再复杂化。
     """
-    text = str(path).replace("\\", "\\\\").replace("'", "\\'")
-    return f"'{text}'"
+    inner = value.replace("\\", "\\\\").replace("'", "\\'").replace(":", "\\:")
+    return "'" + inner.replace("'", "'\\''") + "'"
+
+
+def escape_filter_path(path: Path) -> str:
+    """filtergraph 里的文件路径。源片名常带方括号和空格，撇号目录（`O'Brien/`）也不罕见。"""
+    return escape_filter_arg(str(path))
 
 
 def escape_drawtext(text: str) -> str:
