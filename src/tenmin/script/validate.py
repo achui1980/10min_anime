@@ -507,6 +507,16 @@ def repair_script(
             kept.append(clip)
 
         if not kept:
+            # B10 的判断：**刻意不**降级成「丢掉这个 beat、剩下的够数就继续」。
+            #
+            # 那样确实省钱（一次重试是几百秒的 LLM 调用），但代价是**静默丢内容**：
+            # 这个 beat 的旁白会同时从成片、out/*.narration.txt 和对照表里消失，
+            # 而用户很可能不会注意到少了一段。而且「某个节点的 clip 全灭」本身就是
+            # 强信号——它意味着模型把整整一段的时间戳都编错了，那份稿子的其余部分
+            # 也不值得信。
+            #
+            # 省钱的那一半改由 single.py 承担：它现在会把这份没过校验的稿子落盘到
+            # 03_script/E{NN}.rejected.json，所以昂贵的调用不再是白花的。
             raise ScriptValidationError(
                 f"{beat.label} 的所有 clip 都未通过校验，剧本不可用，重试"
             )

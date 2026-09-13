@@ -59,7 +59,12 @@ def assign_holds(sentences: list[str], holds: list[Hold]) -> dict[int, float]:
 
 
 def plan_chunks(beat: Beat) -> list[tuple[str, float]]:
-    """把一个 beat 切成 [(要合成的文本, 该 chunk 之后的静音秒数)]。"""
+    """把一个 beat 切成 [(要合成的文本, 该 chunk 之后的静音秒数)]。
+
+    空旁白返回空列表。这条路**只可能**是人工编辑走出来的：LLM 输出侧
+    LLMBeat.narration 是 NonBlankStr，空的进不来。调用方（render/tts.py 的
+    _plan_pronounceable）负责把它降级成一条 warning。
+    """
     sentences = split_sentences(beat.narration)
     if not sentences:
         return []

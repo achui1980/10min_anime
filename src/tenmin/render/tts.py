@@ -311,6 +311,10 @@ def _plan_pronounceable(
     for beat in script.beats:
         planned = plan_chunks(beat)
         if not planned:
+            # 只可能来自**人工编辑**：LLM 那条路上 LLMBeat.narration 是 NonBlankStr，
+            # 空旁白进不来（进不来的那一刻就触发 llm.py 的 schema 修复重试）。人手清空
+            # 某段旁白、只要画面不要解说是文档写明的合法编辑，所以这里降级不判错。
+            # script/validate.py 的 _check_narration 会在更早的 script 阶段先报一条。
             warnings.append(f"beat {beat.id} 没有旁白文本，已跳过配音")
             continue
         kept: list[tuple[str, float]] = []
