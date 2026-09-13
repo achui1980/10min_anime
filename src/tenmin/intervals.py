@@ -114,8 +114,15 @@ def merge_intervals(intervals: Iterable[Interval], *, max_gap: float = 0.0) -> l
     """排序后把间隔 <= max_gap 的相邻区间合并成一个跨度，按起点升序返回。
 
     默认 `max_gap=0.0`：只合并重叠或首尾相接的区间。
-    刻意不修正 `start > end` 的反向区间 —— 调用方有责任传合法区间，
+    刻意不修正、也不拒绝 `start > end` 的反向区间 —— 调用方有责任传合法区间，
     这里只保证同样的输入给出同样的输出。
+
+    「加一道 `start > end` 就抛异常的校验」考虑过，结论是不加：那会把一个全函数变成
+    偏函数，对所有调用方都是行为改动（原来返回、现在抛），属于判定改动而不是整洁改动。
+    而且两个现存调用方喂进来的都是模型字段（`ingest/credits` 的 DialogueLine、
+    `render/audio` 的字幕 cue），反向区间在这一层根本构造不出来：
+    `srt_parser` 已经把 `end < start` 的坏 cue 夹成零时长并计入 `clamped_cues`。
+    真要加，该加在能报出「哪条数据坏了」的那一层，不是这里。
     """
     return [
         (group[0][0], max(end for _, end in group))

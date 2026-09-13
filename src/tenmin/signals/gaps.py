@@ -8,7 +8,12 @@ from tenmin.models import DialogueTrack, Signal
 
 
 def _strength(duration: float, cfg: SignalsConfig) -> int:
-    """间隙时长分档。强度取值范围由 models.STRENGTH_MIN/MAX 约束。"""
+    """间隙时长分档。强度取值范围由 models.STRENGTH_MIN/MAX 约束。
+
+    末档 `return 2` 不是死代码：任何 `duration < gap_medium_seconds` 都会走到它，
+    而 find_silent_gaps 传进来的 duration 恒 `>= cfg.min_gap_seconds`（默认 3.0），
+    所以它接的是 [min_gap_seconds, gap_medium_seconds) 这一档，不需要额外守卫。
+    """
     if duration >= cfg.gap_strong_seconds:
         return 4
     if duration >= cfg.gap_medium_seconds:
@@ -39,5 +44,9 @@ def find_silent_gaps(
                     anchor_lines=anchors,
                 )
             )
+    # 这次排序**当前是空操作**：silent_gaps 按时间递增产出，subtract 保持碎片顺序，
+    # 所以 signals 生成时就已经有序。留着是防御性的 —— 下游（aggregate 的双指针挂载）
+    # 依赖「信号按起点有序」这条不变量，而它现在只是间接成立。真要去掉的话得先在
+    # aggregate 那边把有序性显式化，不值当。
     signals.sort(key=lambda s: s.start)
     return signals
