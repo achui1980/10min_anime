@@ -19,10 +19,18 @@ from tenmin.config import (
 from tenmin.ingest.credits import find_credit_ranges, in_credit_window
 from tenmin.ingest.normalize import build_track
 from tenmin.models import DialogueLine, DialogueTrack, SubtitleCue
-from tenmin.pipeline import Paths, run_ingest, run_signals, run_timeline, run_voice
+from tenmin.pipeline import (
+    Paths,
+    run_audio,
+    run_ingest,
+    run_render,
+    run_signals,
+    run_timeline,
+    run_voice,
+)
 from tenmin.render.subtitles import max_chars_per_line, render_ass
 from tenmin.render.tts import build_tts_engine
-from tenmin.render.video import build_render_args
+from tenmin.render.video import build_render_args, quality_args
 from tenmin.signals.aggregate import build_report
 from tenmin.signals.density import find_density_shifts, find_low_density
 from tenmin.signals.gaps import find_silent_gaps
@@ -285,10 +293,171 @@ def test_run_ingest_and_signals_use_project_config(tmp_path):
     assert Paths(cfg.root).signals(1).is_file()
 
 
+# --- render 的编码参数真的被消费（P2-A 第 2 项）---
+#
+# 这五个字段（crf / preset / videotoolbox_bitrate / audio_codec / audio_bitrate）
+# 以前只被 video.py / audio.py 通过 DEFAULT_RENDER 的模块别名读，所以 project.yaml
+# 里的按项目覆盖是**静默失效**的。下面这一组测试就是那件事的回归锁。
+
+
+def test_quality_args_honours_crf_and_preset():
+    assert quality_args("libx264", crf="18", preset="slow") == [
+        "-crf",
+        "18",
+        "-preset",
+        "slow",
+    ]
+
+
+def test_quality_args_appends_tune_only_when_configured():
+    assert "-tune" not in quality_args("libx264")
+    assert quality_args("libx264", tune="animation")[-2:] == ["-tune", "animation"]
+
+
+def test_quality_args_honours_videotoolbox_bitrate():
+    assert quality_args("h264_videotoolbox", videotoolbox_bitrate="9000k") == [
+        "-b:v",
+        "9000k",
+    ]
+
+
+def test_build_render_args_honours_encoder_knobs(tmp_path):
+    args = build_render_args(
+        video=tmp_path / "in.mkv",
+        timeline=_stub_timeline(),
+        audio=tmp_path / "a.m4a",
+        ass=tmp_path / "s.ass",
+        out_path=tmp_path / "out.mp4",
+        encoder="libx264",
+        crf="17",
+        preset="veryfast",
+        tune="animation",
+    )
+    assert args[args.index("-crf") + 1] == "17"
+    assert args[args.index("-preset") + 1] == "veryfast"
+    assert args[args.index("-tune") + 1] == "animation"
+
+
+def test_build_mix_args_honours_audio_codec_and_bitrate(tmp_path):
+    args = _mix_args(tmp_path, audio_codec="libopus", audio_bitrate="128k")
+    assert args[args.index("-c:a") + 1] == "libopus"
+    assert args[args.index("-b:a") + 1] == "128k"
+
+
+def test_build_mix_args_honours_limiter_ceiling(tmp_path):
+    default = _mix_args(tmp_path)
+    graph = default[default.index("-filter_complex") + 1]
+    assert "alimiter=limit=1:level=false:latency=true" in graph
+    lowered = _mix_args(tmp_path, limiter_ceiling=0.891)
+    graph = lowered[lowered.index("-filter_complex") + 1]
+    assert "alimiter=limit=0.891:level=false:latency=true" in graph
+
+
+def test_run_render_wires_the_encoder_knobs(tmp_path, monkeypatch):
+    """cfg.render 的编码参数必须一路走到 build_render_args。"""
+    from tenmin.render import video as video_module
+
+    seen: dict[str, object] = {}
+    real = video_module.build_render_args
+
+    def spy(**kwargs):
+        seen.update(kwargs)
+        return real(**kwargs)
+
+    monkeypatch.setattr("tenmin.pipeline.render_video", _capturing_render_video(seen))
+    cfg = _minimal_project(tmp_path)
+    cfg.render.crf = "16"
+    cfg.render.preset = "slower"
+    cfg.render.tune = "animation"
+    cfg.render.videotoolbox_bitrate = "7000k"
+    _write_timeline_and_inputs(cfg)
+    run_render(cfg, episode=1)
+    assert seen["crf"] == "16"
+    assert seen["preset"] == "slower"
+    assert seen["tune"] == "animation"
+    assert seen["videotoolbox_bitrate"] == "7000k"
+
+
+def test_run_audio_wires_the_audio_knobs(tmp_path, monkeypatch):
+    seen: dict[str, object] = {}
+
+    def fake_mix_audio(**kwargs):
+        seen.update(kwargs)
+        return kwargs["out_path"]
+
+    monkeypatch.setattr("tenmin.pipeline.mix_audio", fake_mix_audio)
+    cfg = _minimal_project(tmp_path)
+    cfg.render.audio_codec = "libopus"
+    cfg.render.audio_bitrate = "96k"
+    cfg.render.limiter_ceiling = 0.7
+    _write_timeline_and_inputs(cfg)
+    run_audio(cfg, episode=1)
+    assert seen["audio_codec"] == "libopus"
+    assert seen["audio_bitrate"] == "96k"
+    assert seen["limiter_ceiling"] == 0.7
+
+
 # --- helpers ---
 
 
-def _stub_timeline():
+def _mix_args(tmp_path, **overrides):
+    from tenmin.models import VoiceChunk, VoiceTrack
+    from tenmin.render.audio import build_mix_args
+
+    kwargs: dict[str, object] = {
+        "video": tmp_path / "in.mkv",
+        "timeline": _stub_timeline(offsets=[0.0]),
+        "track": VoiceTrack(
+            episode=1,
+            chunks=[
+                VoiceChunk(
+                    beat_id="b1",
+                    index=1,
+                    text="喂",
+                    path="chunk_001.mp3",
+                    duration=5.0,
+                )
+            ],
+        ),
+        "voice_dir": tmp_path / "04_voice" / "E01",
+        "out_path": tmp_path / "out.m4a",
+        "duck_db": -12.0,
+    }
+    kwargs.update(overrides)
+    return build_mix_args(**kwargs)
+
+
+def _capturing_render_video(seen: dict[str, object]):
+    def fake_render_video(**kwargs):
+        seen.update(kwargs)
+        return kwargs["out_path"]
+
+    return fake_render_video
+
+
+def _write_timeline_and_inputs(cfg: ProjectConfig) -> None:
+    """run_audio / run_render 需要的上游产物（内容不重要，它们的消费者被替掉了）。"""
+    from tenmin.models import VoiceChunk, VoiceTrack
+
+    paths = Paths(cfg.root)
+    timeline = _stub_timeline(offsets=[0.0])
+    timeline.episode = 1
+    paths.timeline(1).parent.mkdir(parents=True, exist_ok=True)
+    paths.timeline(1).write_text(timeline.model_dump_json(), encoding="utf-8")
+    paths.subtitles(1).write_text("[Script Info]\n", encoding="utf-8")
+    track = VoiceTrack(
+        episode=1,
+        chunks=[
+            VoiceChunk(beat_id="b1", index=1, text="喂", path="chunk_001.mp3", duration=5.0)
+        ],
+    )
+    paths.voice(1).parent.mkdir(parents=True, exist_ok=True)
+    paths.voice(1).write_text(track.model_dump_json(), encoding="utf-8")
+    paths.mixed_audio(1).parent.mkdir(parents=True, exist_ok=True)
+    paths.mixed_audio(1).write_bytes(b"\x00")
+
+
+def _stub_timeline(offsets: list[float] | None = None):
     from tenmin.models import Timeline, TimelineSegment
 
     return Timeline(
@@ -304,7 +473,7 @@ def _stub_timeline():
             )
         ],
         subtitles=[],
-        narration_offsets=[],
+        narration_offsets=offsets or [],
     )
 
 

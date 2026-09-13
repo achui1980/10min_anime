@@ -14,12 +14,22 @@ from tenmin.models import SubtitleCue, Timeline, VoiceTrack
 from tenmin.progress import NullProgressReporter, ProgressReporter
 from tenmin.render.ffmpeg import run_with_progress
 
-AUDIO_CODEC = "aac"
-AUDIO_BITRATE = "192k"
+AUDIO_CODEC = DEFAULT_RENDER.audio_codec
+AUDIO_BITRATE = DEFAULT_RENDER.audio_bitrate
+LIMITER_CEILING = DEFAULT_RENDER.limiter_ceiling
 FULL_VOLUME = 1.0
 
 # 片尾静音的格式。anullsrc 和 concat 前那道 aformat **必须**共用这一组常量：
 # 两边各写一份的话，哪天有人只改了一边，concat 就重新退回「靠 ffmpeg 协商」。
+#
+# 刻意**不**进 RenderConfig（判据见 AGENTS.md：创作旋钮进 config，机械边界留模块级）。
+# 它们三个不是「这部番想要什么」，而是「图里两路必须在同一个格式相遇」这条机械要求的
+# 一个具体取值 —— 谁改都得两边一起改，而且改错的唯一后果是 concat 退回现场协商，
+# 那正是这组常量存在的原因。48k/stereo 是实测所有真实源片的格式（也是它们的上界），
+# 44.1k 源会被这条分支重采样到 48k：一个**可查、可测**的下混，比协商出来的那个好。
+# 另有一层：ffmpeg 的格式协商结果**跟 filtergraph 的形状有关**（P2-A 实测：video 侧
+# 改成按段输入之后，同一张音频图的 amix 从 48k/stereo 翻成 24k/mono），所以「显式写死」
+# 这件事本身就是这里要的东西，把它做成旋钮只会让人以为可以随便调。
 SILENCE_SAMPLE_FMT = "fltp"
 SILENCE_SAMPLE_RATE = 48000
 SILENCE_CHANNEL_LAYOUT = "stereo"
@@ -80,6 +90,9 @@ def build_mix_args(
     duck_db: float,
     fade_out_seconds: float = 0.0,
     outro_seconds: float = 0.0,
+    audio_codec: str = AUDIO_CODEC,
+    audio_bitrate: str = AUDIO_BITRATE,
+    limiter_ceiling: float = LIMITER_CEILING,
 ) -> list[str]:
     """拼出混音用的 ffmpeg 参数列表（不含 ffmpeg 本身）。"""
     if not timeline.segments:
@@ -214,7 +227,9 @@ def build_mix_args(
     # 未削波的素材加上这一层之后样本**逐字节不变**；少 level=false 或少 latency=true
     # 都会变。tests/test_render_audio.py 里有两个 render 标记的用例把这三个参数的
     # 「透明」与「真的限得住」都钉住了。
-    parts.append(f"{final_label}alimiter=limit=1:level=false:latency=true[limited]")
+    parts.append(
+        f"{final_label}alimiter=limit={limiter_ceiling:g}:level=false:latency=true[limited]"
+    )
     final_label = "[limited]"
 
     args = ["-y", "-i", str(video)]
@@ -227,9 +242,9 @@ def build_mix_args(
             "-map",
             final_label,
             "-c:a",
-            AUDIO_CODEC,
+            audio_codec,
             "-b:a",
-            AUDIO_BITRATE,
+            audio_bitrate,
             str(out_path),
         ]
     )
@@ -246,6 +261,9 @@ def mix_audio(
     duck_db: float,
     fade_out_seconds: float = 0.0,
     outro_seconds: float = 0.0,
+    audio_codec: str = AUDIO_CODEC,
+    audio_bitrate: str = AUDIO_BITRATE,
+    limiter_ceiling: float = LIMITER_CEILING,
     reporter: ProgressReporter | None = None,
     ffmpeg: str = DEFAULT_RENDER.ffmpeg_path,
 ) -> Path:
@@ -276,6 +294,9 @@ def mix_audio(
                 duck_db=duck_db,
                 fade_out_seconds=fade_out_seconds,
                 outro_seconds=outro_seconds,
+                audio_codec=audio_codec,
+                audio_bitrate=audio_bitrate,
+                limiter_ceiling=limiter_ceiling,
             ),
             total_seconds=mixed_total_seconds(timeline, outro_seconds),
             on_progress=_on_progress,

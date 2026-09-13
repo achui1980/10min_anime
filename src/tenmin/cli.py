@@ -110,8 +110,8 @@ PROJECT_TEMPLATE_FIELDS: dict[str, Any] = {
 原实现是把 show/mode/target_seconds/llm/render 的默认值全部手抄一遍的字面量 dict。
 
 为什么不整份 model_dump（那样连字段名都不用挑）：ProjectConfig 底下现在有
-ingest(3) / credits(21) / signals(11) / render(24) / llm(9) 近 70 个调参旋钮，
-全吐出来的 project.yaml 没人能读，而这个文件是用户的主要编辑面。
+ingest(3) / credits(18) / signals(11) / validate_script(7) / render(28) / llm(14)
+八十来个调参旋钮，全吐出来的 project.yaml 没人能读，而这个文件是用户的主要编辑面。
 
 为什么挑漏了不要紧：漏掉的字段照样走模型默认值，行为完全不变，只是「没在模板里
 被推荐」而已，用户想调时补一行就生效。也就是说这张表过期是良性的（少一句广告），

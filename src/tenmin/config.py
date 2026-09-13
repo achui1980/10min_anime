@@ -242,14 +242,45 @@ class RenderConfig(BaseModel):
     height: int = Field(default=1080, gt=0)
     subtitle_font_name: str = "Lantinghei SC"
 
-    # --- 以下"只定义不消费"，等各自的 render 专项任务接线 ---
-    # 抄 render/video.py 的 CRF / PRESET / VIDEOTOOLBOX_BITRATE。
+    # --- 已接线：视频编码质量（render/video.py 的 quality_args）---
     crf: str = "20"
+    # 刻意保持 medium。实测真实 E02（217.4 秒成片，画质基准是同一条 filtergraph 的
+    # 无损编码，PSNR-Y / SSIM 全片统计）：
+    #
+    # | preset+tune        | 耗时  | 体积   | PSNR-Y | SSIM    |
+    # |--------------------|-------|--------|--------|---------|
+    # | medium（现状）     | 24.1s | 60.0MB | 48.47  | 0.99664 |
+    # | faster             | 16.8s | 58.6MB | 47.51  | 0.99544 |
+    # | veryfast           | 11.7s | 53.2MB | 45.75  | 0.99413 |
+    # | medium + animation | 28.5s | 56.7MB | 49.47  | 0.99677 |
+    # | faster + animation | 17.2s | 56.4MB | 48.57  | 0.99565 |
+    # | veryfast+animation | 12.1s | 50.5MB | 46.66  | 0.99428 |
+    #
+    # 不改默认值的依据：渲染压根不是这条流水线的瓶颈（script 阶段一次 LLM 调用实测
+    # 561 秒，voice 阶段几分钟），拿 2.7dB PSNR 去换十几秒没有意义。想要快的人现在
+    # 可以自己配 —— 这才是这个字段真正修掉的东西。
     preset: str = "medium"
+    # x264 的 -tune。空字符串 = 不传这个参数（保持现状产物逐字节不变）。
+    #
+    # 番剧线条画面理论上该用 "animation"，实测也确实是「更小 + PSNR 更高」，但它
+    # **不是** Pareto 更优，所以不做默认：E02 上 +14% 耗时、E01 上 +20% 耗时，而
+    # SSIM 两集分别是 +0.0001 / −0.00004（等于打平）。也就是说它买到的是「体积
+    # −6~8% + PSNR +0.6~1.0dB」，卖掉的是耗时 —— 值不值得由项目自己定。
+    tune: str = ""
+    # videotoolbox 不认 -crf/-preset，只能给码率。**这条不是提速路径**：实测
+    # h264_videotoolbox @6000k 22.97 秒（libx264 medium 24.1 秒，差在噪声内），
+    # 但产物 163.9MB（2.7 倍）、PSNR-Y 45.42（比 veryfast 还低）。它的用途是
+    # 「机器没有可用的 libx264」，不是「渲染太慢」。
     videotoolbox_bitrate: str = "6000k"
-    # 抄 render/audio.py 的 AUDIO_CODEC / AUDIO_BITRATE。
+
+    # --- 已接线：混音输出（render/audio.py）---
     audio_codec: str = "aac"
     audio_bitrate: str = "192k"
+    # alimiter 的天花板（线性幅度，1.0 = 满刻度）。1.0 时对没超标的信号完全透明，
+    # 见 render/audio.py 里那段听感验证。想留 headroom 的项目可以调到 0.891（-1dB）。
+    limiter_ceiling: float = Field(default=1.0, gt=0, le=1)
+
+    # --- 以下"只定义不消费"，等各自的 render 专项任务接线 ---
     # 片尾黑卡 drawtext 用的字体。跟 subtitle_font_name 是两个独立旋钮：
     # 字幕字体换了不代表片尾卡也要换（卡片是纯 ASCII+中文标题，选择面更宽）。
     outro_font_name: str = "Lantinghei SC"

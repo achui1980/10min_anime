@@ -20,6 +20,7 @@ WIDTH = DEFAULT_RENDER.width
 HEIGHT = DEFAULT_RENDER.height
 CRF = DEFAULT_RENDER.crf
 PRESET = DEFAULT_RENDER.preset
+TUNE = DEFAULT_RENDER.tune
 VIDEOTOOLBOX_BITRATE = DEFAULT_RENDER.videotoolbox_bitrate
 OUTRO_FONT_NAME = DEFAULT_RENDER.outro_font_name
 PIX_FMT = "yuv420p"
@@ -98,11 +99,25 @@ def escape_filter_path(path: Path) -> str:
     return escape_filter_arg(str(path))
 
 
-def quality_args(encoder: str) -> list[str]:
-    """videotoolbox 不认 -crf/-preset，只能给码率。"""
+def quality_args(
+    encoder: str,
+    *,
+    crf: str = CRF,
+    preset: str = PRESET,
+    tune: str = TUNE,
+    videotoolbox_bitrate: str = VIDEOTOOLBOX_BITRATE,
+) -> list[str]:
+    """videotoolbox 不认 -crf/-preset，只能给码率。
+
+    tune 空字符串 = 不传 `-tune`。空值也照传的话 x264 会报
+    `Unknown tune ''`，而「不调」是默认状态、不该需要一个哨兵值。
+    """
     if encoder.endswith("videotoolbox"):
-        return ["-b:v", VIDEOTOOLBOX_BITRATE]
-    return ["-crf", CRF, "-preset", PRESET]
+        return ["-b:v", videotoolbox_bitrate]
+    args = ["-crf", crf, "-preset", preset]
+    if tune:
+        args += ["-tune", tune]
+    return args
 
 
 def build_render_args(
@@ -115,6 +130,10 @@ def build_render_args(
     encoder: str,
     width: int = WIDTH,
     height: int = HEIGHT,
+    crf: str = CRF,
+    preset: str = PRESET,
+    tune: str = TUNE,
+    videotoolbox_bitrate: str = VIDEOTOOLBOX_BITRATE,
     fade_out_seconds: float = 0.0,
     outro_seconds: float = 0.0,
     outro_title: str = "",
@@ -193,7 +212,13 @@ def build_render_args(
         f"{len(timeline.segments)}:a",
         "-c:v",
         encoder,
-        *quality_args(encoder),
+        *quality_args(
+            encoder,
+            crf=crf,
+            preset=preset,
+            tune=tune,
+            videotoolbox_bitrate=videotoolbox_bitrate,
+        ),
         "-pix_fmt",
         PIX_FMT,
         "-c:a",
@@ -214,6 +239,10 @@ def render_video(
     encoder: str,
     width: int = WIDTH,
     height: int = HEIGHT,
+    crf: str = CRF,
+    preset: str = PRESET,
+    tune: str = TUNE,
+    videotoolbox_bitrate: str = VIDEOTOOLBOX_BITRATE,
     fade_out_seconds: float = 0.0,
     outro_seconds: float = 0.0,
     outro_title: str = "",
@@ -242,6 +271,10 @@ def render_video(
             encoder=encoder,
             width=width,
             height=height,
+            crf=crf,
+            preset=preset,
+            tune=tune,
+            videotoolbox_bitrate=videotoolbox_bitrate,
             fade_out_seconds=fade_out_seconds,
             outro_seconds=outro_seconds,
             outro_title=outro_title,
