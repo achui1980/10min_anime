@@ -645,6 +645,7 @@ def test_sfx_at_beyond_the_beat_span_warns():
 # --- A3：画面总时长 vs 旁白时长 ---
 
 
+
 def test_beat_with_far_too_little_footage_warns():
     """clip 太少时 render/timeline.py 会按 ratio = 旁白/画面 把每个 clip 往后延长，
     延到超出源片长再钳到片尾，成片画面错位。"""
@@ -673,6 +674,63 @@ def test_beat_within_the_measured_stretch_range_does_not_warn():
 def test_stretch_bounds_constants():
     assert DEFAULT_VALIDATE.stretch_max == pytest.approx(4.0)
     assert DEFAULT_VALIDATE.stretch_min == pytest.approx(0.125)
+
+
+# --- render.rate 必须一路穿到 validate（M2）-------------------------------
+#
+# validate 的两处 `beat_seconds(beat)` 原来不传 rate，落到 budget.DEFAULT_RATE
+# （"+0%"）；而 render/chunks.py 的 assign_holds 传了 rate，两边的注释都写着
+# 「同口径」。rate != "+0%" 时同一个 hold.at 在 script 阶段与 voice 阶段拿到两个
+# 不同上界（一个放过一个报警），stretch_max/min 那两个实测阈值的前提也被整体乘上
+# 1/speed_factor(rate)。
+
+
+@pytest.mark.parametrize("rate", ["+20%", "-20%", "+50%"])
+def test_cue_offset_span_matches_the_voice_stage_span(rate):
+    """validate 判 hold.at 的上界，必须跟 voice 阶段真正用的那个上界是同一个数。"""
+    from tenmin.render.chunks import sentence_offsets, split_sentences
+
+    s = make_script([[clip(10.0, 30.0)]])
+    beat = s.beats[0]
+    beat.audio.holds = [Hold(at=0.5, duration=2.0, quote="金句")]
+
+    sentences = split_sentences(beat.narration)
+    voice_span = sentence_offsets(sentences, rate=rate)[-1] + 2.0
+
+    # 恰好落在 voice 阶段那个上界上 → 两边都不该报。
+    beat.audio.holds = [Hold(at=voice_span, duration=2.0, quote="金句")]
+    warnings = check_script(s, {2: make_track()}, {2: make_report()}, rate=rate)
+    assert [w for w in warnings if "留白落点" in w] == [], warnings
+
+    # 明显越过它 → 必须报。
+    beat.audio.holds = [Hold(at=voice_span + 5.0, duration=2.0, quote="金句")]
+    warnings = check_script(s, {2: make_track()}, {2: make_report()}, rate=rate)
+    assert len([w for w in warnings if "留白落点" in w]) == 1, warnings
+
+
+def test_footage_budget_span_follows_the_configured_rate():
+    """A3 的拉伸倍率分母是旁白秒数，语速一变它就变。"""
+    # 40 字旁白 ≈ 8.889 秒（+0%）。画面给 2.3 秒 → 拉伸 3.87 倍，默认语速下不报。
+    s = make_script([[clip(10.0, 12.3)]])
+    assert [w for w in check_script(s, {2: make_track()}, {2: make_report()})
+            if "画面只有" in w] == []
+    # rate="-40%" 让旁白变成 14.8 秒 → 拉伸 6.4 倍，超过 stretch_max=4，必须报。
+    hits = [
+        w
+        for w in check_script(s, {2: make_track()}, {2: make_report()}, rate="-40%")
+        if "画面只有" in w
+    ]
+    assert len(hits) == 1, hits
+
+
+def test_validate_script_and_repair_script_take_rate():
+    """三个入口的签名必须一致 —— single.py 手上只有一个 rate，三处都要能收。"""
+    s = make_script([[clip(10.0, 30.0)]])
+    s.beats[0].audio.holds = [Hold(at=300.0, duration=2.0, quote="金句")]
+    tracks, reports = {2: make_track()}, {2: make_report()}
+    repair_script(s, tracks, reports, rate="+20%")
+    result = validate_script(s, tracks, reports, rate="+20%")
+    assert any("留白落点" in w for w in result.warnings)
 
 
 # --- B1：节点结构约定（提示词 single_episode.md:34,36,37）---

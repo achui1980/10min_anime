@@ -21,7 +21,7 @@ from pydantic import BaseModel
 
 from tenmin.config import DEFAULT_VALIDATE, ValidateConfig
 from tenmin.models import Beat, Clip, DialogueLine, DialogueTrack, Script, SignalReport
-from tenmin.script.budget import beat_seconds
+from tenmin.script.budget import DEFAULT_RATE, beat_seconds
 
 # 阈值的权威定义在 tenmin.config.ValidateConfig；下面三个只是 DEFAULT_VALIDATE 的
 # 模块级别名，给老调用点、文档与测试用（全项目一律这个惯例，见 config.py 的模块 docstring）。
@@ -316,7 +316,7 @@ def _check_timeline_order(script: Script, cfg: ValidateConfig) -> list[str]:
     return warnings
 
 
-def _check_cue_offsets(beat: Beat) -> list[str]:
+def _check_cue_offsets(beat: Beat, rate: str) -> list[str]:
     """A2：hold.at / sfx.at 是相对本节点旁白起点的偏移，不能落到本节点之外。
 
     模型层已经保证 `at >= 0` 与 `0 < duration <= 15`，缺的是**跨字段**这一条。超出去
@@ -324,13 +324,18 @@ def _check_cue_offsets(beat: Beat) -> list[str]:
     而句偏移是本节点旁白的累计秒数，所以一个 at=300 的 hold 会被无声无息地按到最后
     一句后面。
 
-    上界取 `beat_seconds(beat)`（旁白秒数 + 本节点全部留白秒数），也就是这个节点在成片
-    里的总跨度。实测 76 个 hold 与 51 个 sfx：`at / 纯旁白秒数` 的最大值分别是 1.004 与
+    上界取 `beat_seconds(beat, rate=rate)`（旁白秒数 + 本节点全部留白秒数），也就是这个
+    节点在成片里的总跨度。**`rate` 必须传**：它就是 `render.rate`，而 assign_holds 那边
+    算同一个上界时是按 rate 缩放的。原来这里不传，于是 `render.rate != "+0%"` 的项目在
+    script 阶段与 voice 阶段拿到两个不同的上界（实测 60 字旁白 + 一个 2 秒留白：
+    不传 rate 15.556 秒、rate="+20%" 13.296 秒、"-20%" 18.944 秒），一个放过一个报警。
+
+    实测 76 个 hold 与 51 个 sfx：`at / 纯旁白秒数` 的最大值分别是 1.004 与
     1.115（p50 0.647 / 0.603），按 beat_seconds 这个上界一个都不越界。换句话说
     「把留白放在这段旁白的最后」是正常创作，而 at 绝对值最大的那个 hold（36.0 秒）
     对应的节点旁白本身就有 35.9 秒——它不是 bug。
     """
-    span = beat_seconds(beat)
+    span = beat_seconds(beat, rate=rate)
     if span <= 0:
         return []
     warnings: list[str] = []
@@ -348,7 +353,7 @@ def _check_cue_offsets(beat: Beat) -> list[str]:
     return warnings
 
 
-def _check_footage_budget(beat: Beat, cfg: ValidateConfig) -> list[str]:
+def _check_footage_budget(beat: Beat, cfg: ValidateConfig, rate: str) -> list[str]:
     """A3：本节点的画面总时长与旁白时长得在同一个量级。
 
     render/timeline.py:107 按 `ratio = 旁白秒数 / 画面秒数` 缩放本节点每一个 clip
@@ -359,9 +364,12 @@ def _check_footage_budget(beat: Beat, cfg: ValidateConfig) -> list[str]:
     在 script 阶段就能提前拦住，不用等到 timeline。阈值来自实测：85 个真实 beat 的
     拉伸倍率落在 **0.193–2.526**（画面/旁白比值 0.396–5.176，中位 1.319），
     上下界（4.0 / 0.125）各留约 1.6 倍余量，只拦数量级级别的配错。
+
+    `rate` 的必要性同 `_check_cue_offsets`：分子是旁白秒数，语速一变整条阈值前提就被
+    乘上 1/speed_factor(rate)。
     """
     footage = sum(clip.duration for clip in beat.clips)
-    span = beat_seconds(beat)
+    span = beat_seconds(beat, rate=rate)
     if footage <= 0 or span <= 0:
         return []
     stretch = span / footage
@@ -441,11 +449,17 @@ def check_script(
     reports: dict[int, SignalReport],
     *,
     cfg: ValidateConfig = DEFAULT_VALIDATE,
+    rate: str = DEFAULT_RATE,
 ) -> list[str]:
     """纯读的语义校验。返回全部 warning，**不改** script、也不抛异常。
 
     reports 目前用不到，但保留在签名里：它与 repair_script 共用一套入参，
     调用方（single.py）拿同一组素材调两个函数，签名对齐比少一个参数更值。
+
+    `rate` 是 `render.rate`（默认 `"+0%"`，speed_factor 恒为 1.0，所以默认路径与它
+    加入之前逐点等价）。两条按秒数判的检查（_check_cue_offsets 的 hold/sfx 落点上界、
+    _check_footage_budget 的拉伸倍率）都要按语速缩放，否则它们跟 voice 阶段真正用的
+    口径分叉 —— 见那两个函数各自的 docstring。
     """
     warnings: list[str] = []
     indexes = _anchor_indexes(tracks)
@@ -455,8 +469,8 @@ def check_script(
         warnings.extend(_check_narration(beat))
         warnings.extend(_check_hold_quotes(beat, tracks))
         warnings.extend(_check_anchor_coverage(beat, indexes))
-        warnings.extend(_check_cue_offsets(beat))
-        warnings.extend(_check_footage_budget(beat, cfg))
+        warnings.extend(_check_cue_offsets(beat, rate))
+        warnings.extend(_check_footage_budget(beat, cfg, rate))
     return warnings
 
 
@@ -499,6 +513,7 @@ def repair_script(
     reports: dict[int, SignalReport],
     *,
     cfg: ValidateConfig = DEFAULT_VALIDATE,
+    rate: str = DEFAULT_RATE,
 ) -> tuple[Script, list[str]]:
     """丢掉不可用的 clip、按字幕覆写偏差过大的时间戳、回填 is_silent_highlight。
 
@@ -508,6 +523,10 @@ def repair_script(
     顺序是刻意的：**先**按 anchor 校准时间戳，**再**拿校准后的最终值跑窗口检查。
     原来是反的（先查、再覆写、只重查 end<=start），于是被 anchor 拽进片头曲或推出
     片长的 clip 会原样留到成片里。
+
+    `rate` 目前修复路径本身用不到（这里的判据全是绝对秒数的窗口检查，跟语速无关），
+    但跟 check_script / validate_script 保持同一套签名：调用方（single.py）手上就一个
+    rate，三个入口形状一致才不会出现「传了两个、漏了第三个」。
     """
     if len(script.beats) < cfg.min_beats:
         raise ScriptValidationError(
@@ -588,8 +607,9 @@ def validate_script(
     reports: dict[int, SignalReport],
     *,
     cfg: ValidateConfig = DEFAULT_VALIDATE,
+    rate: str = DEFAULT_RATE,
 ) -> ValidationResult:
     """repair 一遍再 check 一遍。对外形状与历史一致，但**不再改动入参**。"""
-    repaired, warnings = repair_script(script, tracks, reports, cfg=cfg)
-    warnings.extend(check_script(repaired, tracks, reports, cfg=cfg))
+    repaired, warnings = repair_script(script, tracks, reports, cfg=cfg, rate=rate)
+    warnings.extend(check_script(repaired, tracks, reports, cfg=cfg, rate=rate))
     return ValidationResult(script=repaired, warnings=warnings)

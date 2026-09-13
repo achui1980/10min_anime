@@ -300,6 +300,9 @@ async def generate_script(
             tracks,
             reports,
             cfg=cfg.validate_script,
+            # validate 里两条按秒数判的检查（hold/sfx 落点上界、画面/旁白拉伸倍率）
+            # 必须跟 voice 阶段同口径，见 validate.check_script 的 docstring。
+            rate=rate,
         )
         return (
             apply_estimates(result.script, rate=rate),
