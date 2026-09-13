@@ -1,9 +1,10 @@
 from tenmin.models import SubtitleCue
 from tenmin.render.subtitles import (
     DEFAULT_FONT_SIZE,
+    display_cells,
     escape_text,
     format_ass_time,
-    max_chars_per_line,
+    max_cells_per_line,
     render_ass,
     wrap_text,
 )
@@ -89,38 +90,40 @@ def test_render_ass_without_cues_still_has_headers():
     assert "Dialogue:" not in out
 
 
-def test_max_chars_per_line_for_default_font_size():
-    # 1920 - 2*60 margins = 1800px 可用宽度；48号字按 1.05 倍宽度估算。
-    assert max_chars_per_line(48) == 35
+def test_max_cells_per_line_for_default_font_size():
+    # 1920 - 2*60 margins = 1800px 可用宽度；48 号字一格按 1.05×48/2 = 25.2px 估算
+    # → 71 格（P2-E C1 把口径从「字符数」换成「格数」，取整发生在更细的粒度上，
+    # 所以是 71 而不是「35 个全角字 ×2」的 70）。
+    assert max_cells_per_line(48) == 71
 
 
-def test_max_chars_per_line_shrinks_with_bigger_font():
-    assert max_chars_per_line(96) < max_chars_per_line(48)
+def test_max_cells_per_line_shrinks_with_bigger_font():
+    assert max_cells_per_line(96) < max_cells_per_line(48)
 
 
 def test_wrap_text_leaves_short_line_untouched():
-    assert wrap_text("第一句。", 35) == "第一句。"
+    assert wrap_text("第一句。", 70) == "第一句。"
 
 
 def test_wrap_text_breaks_long_line_without_spaces():
     # libass 只在空格处自动换行，中文没有空格，所以必须手动断行插入 \n。
     text = "一二三四五六七八九十一二三四五六七八九十一二三四五六七八九十"  # 30 字
-    wrapped = wrap_text(text, 10)
+    wrapped = wrap_text(text, 20)  # 20 格 = 10 个全角字
     lines = wrapped.split("\n")
     assert len(lines) > 1
-    assert all(len(line) <= 10 for line in lines)
+    assert all(display_cells(line) <= 20 for line in lines)
     assert "".join(lines) == text
 
 
 def test_wrap_text_prefers_breaking_after_punctuation():
     text = "前半句内容刚好十个字，后面还有一些字"
-    wrapped = wrap_text(text, 12)
+    wrapped = wrap_text(text, 24)  # 24 格 = 12 个全角字
     first_line = wrapped.split("\n")[0]
     assert first_line.endswith("，")
 
 
 def test_wrap_text_preserves_existing_newlines():
-    assert wrap_text("第一行\n第二行", 35) == "第一行\n第二行"
+    assert wrap_text("第一行\n第二行", 70) == "第一行\n第二行"
 
 
 def test_render_ass_wraps_long_cue_into_multiple_lines():
@@ -129,10 +132,10 @@ def test_render_ass_wraps_long_cue_into_multiple_lines():
     out = render_ass(cues)
     dialogue_line = next(line for line in out.splitlines() if line.startswith("Dialogue"))
     assert "\\N" in dialogue_line
-    # 每个物理行都不应超过按字号估算出的单行字符上限。
+    # 每个物理行都不应超过按字号估算出的单行格数上限。
     text_part = dialogue_line.split(",", 9)[-1]
     for segment in text_part.split("\\N"):
-        assert len(segment) <= max_chars_per_line(DEFAULT_FONT_SIZE)
+        assert display_cells(segment) <= max_cells_per_line(DEFAULT_FONT_SIZE)
 
 
 # --- 反斜杠 = ASS 控制字符（P2-E C3）---------------------------------------
@@ -174,8 +177,82 @@ def test_changing_margin_lr_moves_both_the_wrap_width_and_the_style_line(monkeyp
     """改一个常量，断行宽度与 Style 行必须一起动。"""
     from tenmin.render import subtitles as module
 
-    before = module.max_chars_per_line(DEFAULT_FONT_SIZE)
+    before = module.max_cells_per_line(DEFAULT_FONT_SIZE)
     monkeypatch.setattr(module, "MARGIN_LR", 300)
     style = next(line for line in module.render_ass([]).splitlines() if line.startswith("Style:"))
     assert style.split(",")[-4:-2] == ["300", "300"]
-    assert module.max_chars_per_line(DEFAULT_FONT_SIZE) < before
+    assert module.max_cells_per_line(DEFAULT_FONT_SIZE) < before
+
+
+# --- 行宽按「格」量，不按字符数（P2-E C1）----------------------------------
+#
+# 原来断行宽度用 len() 度量，把半角字符当成跟汉字一样宽，于是混了拉丁字母/数字的
+# 行被提前折断（保守，从不超宽，但白扔掉可用宽度）。
+#
+# 分档判据用 unicodedata.east_asian_width，**Ambiguous（A）算宽**。这一条是真
+# libass 实测定下来的，不是照搬 wcwidth 的通俗版本（W/F 算 2、其余算 1）：
+# Lantinghei SC / 字号 52 下逐帧量墨迹包围盒，`—`(A) 47.2px、`…`(A) 47.3px、
+# `·`(A) 47.3px，跟 `字`(W) 的 47.3px 一模一样 —— 在 CJK 字体里 A 就是全角。
+# 而语料（10 集 10338 字）里非 W/F 的字符只有 9 个：`—`×196、`'`×42、`…`×6、
+# `·`×1、`B`/`I`/`T`/`O`/`K` 各 1。也就是说「A 算窄」会把 203/250 个非 W/F 字符
+# 全部低估一半 —— 一行 64 个 `—` 会被判成刚好放得下，实测却是 3021px，超出可用
+# 宽度 1800px 的 68%。
+
+
+def test_display_cells_counts_cjk_as_two():
+    from tenmin.render.subtitles import display_cells
+
+    assert display_cells("汉字") == 4
+
+
+def test_display_cells_counts_ascii_as_one():
+    from tenmin.render.subtitles import display_cells
+
+    assert display_cells("ab1") == 3
+
+
+def test_display_cells_counts_ambiguous_width_as_wide():
+    """`—` / `…` / `·` 的 EAW 是 A，但在 CJK 字体里实测就是全角（47.3px）。"""
+    from tenmin.render.subtitles import display_cells
+
+    assert display_cells("——") == 4
+    assert display_cells("…·") == 4
+
+
+def test_max_cells_per_line_keeps_the_pure_cjk_capacity_unchanged():
+    """预算翻倍、度量也翻倍，所以纯 CJK 一行还是装同样多个字。
+
+    取整在更细的粒度上做，预算不是整整两倍（52 号字 32 → 65 而不是 64），但
+    `floor(2x) // 2 == floor(x)` 恒成立，所以**全角字的容量逐点不变** —— 这正是
+    「10 集 .ass 只有 2 条 cue 变化」的原因。
+    """
+    from tenmin.render.subtitles import max_cells_per_line
+
+    assert max_cells_per_line(52) == 65
+    assert max_cells_per_line(52) // 2 == 32
+    assert max_cells_per_line(48) // 2 == 35
+
+
+def test_wrap_text_fits_more_ascii_on_one_line_than_before():
+    """32 个汉字与 64 个半角字符都刚好占满一行。"""
+    assert wrap_text("a" * 64, 64) == "a" * 64
+    assert wrap_text("字" * 32, 65) == "字" * 32
+    assert wrap_text("字" * 33, 65).count("\n") == 1
+
+
+def test_render_ass_never_exceeds_the_usable_width():
+    from tenmin.render.subtitles import (
+        MARGIN_LR,
+        PLAY_RES_X,
+        display_cells,
+        max_cells_per_line,
+    )
+
+    long_text = "他把伪装一个一个拆掉：不是IT企业的继承人，是此花家的佣人；每一天都是他自己的选择。"
+    out = render_ass([SubtitleCue(start=0.0, end=10.0, text=long_text)])
+    dialogue = next(line for line in out.splitlines() if line.startswith("Dialogue"))
+    budget = max_cells_per_line(DEFAULT_FONT_SIZE)
+    for segment in dialogue.split(",", 9)[-1].split("\\N"):
+        assert display_cells(segment) <= budget
+    # 预算换算回像素也必须落在可用宽度里
+    assert budget * DEFAULT_FONT_SIZE * 1.05 / 2 <= PLAY_RES_X - 2 * MARGIN_LR

@@ -28,7 +28,7 @@ from tenmin.pipeline import (
     run_timeline,
     run_voice,
 )
-from tenmin.render.subtitles import max_chars_per_line, render_ass
+from tenmin.render.subtitles import max_cells_per_line, render_ass
 from tenmin.render.tts import build_tts_engine
 from tenmin.render.video import build_render_args, quality_args
 from tenmin.signals.aggregate import build_report
@@ -226,8 +226,8 @@ def test_render_ass_honours_width_and_height():
     assert "PlayResY: 720" in out
 
 
-def test_max_chars_per_line_honours_width():
-    assert max_chars_per_line(52, width=1280) < max_chars_per_line(52, width=1920)
+def test_max_cells_per_line_honours_width():
+    assert max_cells_per_line(52, width=1280) < max_cells_per_line(52, width=1920)
 
 
 def test_render_ass_wraps_against_configured_width():

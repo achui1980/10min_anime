@@ -6,6 +6,8 @@ ASS 的时间是 H:MM:SS.cc（厘秒、小时不补零），跟 timecode.format_
 
 from __future__ import annotations
 
+import unicodedata
+
 from tenmin.config import DEFAULT_RENDER
 from tenmin.models import SubtitleCue
 
@@ -96,29 +98,59 @@ def escape_text(text: str) -> str:
     return cleaned.replace("\r\n", "\n").replace("\n", "\\N").strip()
 
 
-def max_chars_per_line(font_size: int, width: int = PLAY_RES_X) -> int:
-    """给定字号与画布宽度，估算一行能塞下多少个全角字符。
+def display_cells(text: str) -> int:
+    """这段文本占多少个「半角格」。一个全角字 = 2 格。
+
+    分档判据是 unicodedata.east_asian_width，**Ambiguous（A）跟 W/F 一样算宽**。
+    这一条是真 libass 实测定下来的，不是照搬 wcwidth 的通俗版本（W/F 算 2、其余算 1）：
+    Lantinghei SC / 字号 52 / Spacing=3 下逐帧量墨迹包围盒，一个字符的真实前进宽度
+
+        `字`(W) 47.3px   `，`(F) 47.3px   `—`(A) 47.2px   `…`(A) 47.3px   `·`(A) 47.3px
+        `'`(Na) 12.8px   `i`(Na) 14.6px   `(`(Na) 20.4px  `0`(Na) 32.6px  `A`(Na) 37.8px
+
+    也就是说在 CJK 字体里 A 就是全角。而语料（work/saijo 10 集 10338 字）里非 W/F 的
+    字符只有 9 个：`—`×196、`'`×42、`…`×6、`·`×1、`B`/`I`/`T`/`O`/`K` 各 1 —— 「A 算窄」
+    会把 203/250 个非 W/F 字符全部低估一半，一行 64 个 `—` 会被判成刚好放得下，实测却是
+    3021px，超出可用宽度 1800px 的 68%。
+
+    已知上界（刻意接受）：半角字符是**比例**宽度，不是恒定半格。实测 `W` 49.7px、
+    `O` 42.2px、`0` 32.6px 都比 1 格的模型值（27.3px）宽。吸收它的是
+    CJK_CHAR_WIDTH_RATIO 那 15% 余量：满一行 64 格纯 CJK 实测 1514px，离 1800px 还有
+    286px，够 19 个大写字母各超出的 14.9px。一行**全是**大写拉丁字母才会真超宽，那属于
+    「旁白从中文变成英文」的形态变化，届时该调的是 font_size 而不是这个度量。
+    """
+    return sum(2 if unicodedata.east_asian_width(char) in "WFA" else 1 for char in text)
+
+
+def max_cells_per_line(font_size: int, width: int = PLAY_RES_X) -> int:
+    """给定字号与画布宽度，估算一行能塞下多少个**半角格**（全角字 ×2）。
 
     libass 的自动换行（WrapStyle）只在空格处断行，中文没有空格，
     长句会被当成一个不可断的“单词”直接冲出画面。所以断行必须自己算好、
     手动插 \\N，不能指望 libass 帮忙。
+
+    口径原来是「全角字符个数」，配 len() 度量 —— 半角字符被当成跟汉字一样宽，混了
+    拉丁字母/数字的行提前折断（保守，从不超宽，但白扔可用宽度）。现在预算与度量都换成
+    格，两边同时 ×2，所以**纯 CJK 的断行结果逐点不变**。
     """
     usable_width = width - 2 * MARGIN_LR
     if font_size <= 0:
         return usable_width
-    chars = int(usable_width // (font_size * CJK_CHAR_WIDTH_RATIO))
-    return max(chars, 1)
+    cells = int(usable_width // (font_size * CJK_CHAR_WIDTH_RATIO / 2))
+    return max(cells, 1)
 
 
-def _wrap_single_line(line: str, max_chars: int) -> list[str]:
-    if len(line) <= max_chars:
+def _wrap_single_line(line: str, max_cells: int) -> list[str]:
+    if display_cells(line) <= max_cells:
         return [line]
     pieces: list[str] = []
     remaining = line
-    while len(remaining) > max_chars:
-        window_start = max(1, int(max_chars * _BREAK_SEARCH_MIN_RATIO))
-        break_at = max_chars
-        for i in range(max_chars, window_start, -1):
+    while display_cells(remaining) > max_cells:
+        # 先找「放得下的最长前缀」有多少个字符，再在这个上限内往回找标点。
+        limit = _cells_prefix_length(remaining, max_cells)
+        window_start = max(1, int(limit * _BREAK_SEARCH_MIN_RATIO))
+        break_at = limit
+        for i in range(limit, window_start, -1):
             if remaining[i - 1] in _BREAK_AFTER:
                 break_at = i
                 break
@@ -129,13 +161,24 @@ def _wrap_single_line(line: str, max_chars: int) -> list[str]:
     return pieces
 
 
-def wrap_text(text: str, max_chars: int) -> str:
-    """按字符数手动断行；已有的换行原样保留，只处理其中过长的单行。"""
-    if max_chars <= 0:
+def _cells_prefix_length(text: str, max_cells: int) -> int:
+    """最多占 max_cells 格的最长前缀有几个字符。至少 1，否则一格都放不下时会死循环。"""
+    used = 0
+    for index, char in enumerate(text):
+        width = display_cells(char)
+        if used + width > max_cells:
+            return max(index, 1)
+        used += width
+    return len(text)
+
+
+def wrap_text(text: str, max_cells: int) -> str:
+    """按显示格数手动断行；已有的换行原样保留，只处理其中过长的单行。"""
+    if max_cells <= 0:
         return text
     result: list[str] = []
     for raw_line in text.split("\n"):
-        result.extend(_wrap_single_line(raw_line, max_chars))
+        result.extend(_wrap_single_line(raw_line, max_cells))
     return "\n".join(result)
 
 
@@ -163,9 +206,9 @@ def render_ass(
         "[Events]",
         _EVENT_FORMAT,
     ]
-    max_chars = max_chars_per_line(font_size, width)
+    max_cells = max_cells_per_line(font_size, width)
     for cue in cues:
-        wrapped = wrap_text(cue.text, max_chars)
+        wrapped = wrap_text(cue.text, max_cells)
         lines.append(
             f"Dialogue: 0,{format_ass_time(cue.start)},{format_ass_time(cue.end)},"
             f"Narration,,0,0,0,,{escape_text(wrapped)}"
