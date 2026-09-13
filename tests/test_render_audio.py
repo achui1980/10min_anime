@@ -12,6 +12,7 @@ from tenmin.render.audio import (
     duck_gain,
     duck_volume_expr,
     mix_audio,
+    mixed_total_seconds,
 )
 
 
@@ -416,6 +417,68 @@ def test_build_mix_args_keeps_silence_and_aformat_in_sync(tmp_path):
     assert f"channel_layouts={SILENCE_CHANNEL_LAYOUT}" in graph
 
 
+# --- 进度反馈（第 6 项）-----------------------------------------------------
+# mix_audio 原来用 ffmpeg.run()，一次几分钟的真实编码期间界面上什么都不动。
+# render 阶段早就在用 run_with_progress 了。
+
+
+def test_mixed_total_seconds_is_the_body_plus_the_outro_card():
+    """产物长度的唯一真相：正片长度（build_mix_args 钉的那个）+ 片尾卡片。"""
+    timeline = make_timeline()
+    assert mixed_total_seconds(timeline, 0.0) == pytest.approx(30.0)
+    assert mixed_total_seconds(timeline, 3.0) == pytest.approx(33.0)
+
+
+def test_mix_audio_reports_progress_against_the_pinned_length(tmp_path, monkeypatch):
+    """进度条的总长必须跟钉住的产物长度一致，否则百分比会停在别的地方。"""
+    from tenmin.render import audio as audio_module
+
+    seen: dict[str, float] = {}
+
+    def fake_run_with_progress(args, *, total_seconds, on_progress=None, **_):
+        seen["total_seconds"] = total_seconds
+        Path(args[-1]).write_bytes(b"\x00")
+        return ""
+
+    monkeypatch.setattr(audio_module, "run_with_progress", fake_run_with_progress)
+    audio_module.mix_audio(
+        video=tmp_path / "source.mkv",
+        timeline=make_timeline(),
+        track=make_track(),
+        voice_dir=tmp_path / "04_voice" / "E02",
+        out_path=tmp_path / "06_audio" / "E02.mixed.m4a",
+        duck_db=-12.0,
+        fade_out_seconds=1.5,
+        outro_seconds=3.0,
+    )
+    assert seen["total_seconds"] == pytest.approx(33.0)
+
+
+def test_mix_audio_forwards_progress_to_the_reporter(tmp_path, monkeypatch):
+    from tenmin.render import audio as audio_module
+
+    from .fakes import FakeReporter
+
+    def fake_run_with_progress(args, *, total_seconds, on_progress=None, **_):
+        if on_progress is not None:
+            on_progress(0.5)
+        Path(args[-1]).write_bytes(b"\x00")
+        return ""
+
+    monkeypatch.setattr(audio_module, "run_with_progress", fake_run_with_progress)
+    reporter = FakeReporter()
+    audio_module.mix_audio(
+        video=tmp_path / "source.mkv",
+        timeline=make_timeline(),
+        track=make_track(),
+        voice_dir=tmp_path / "04_voice" / "E02",
+        out_path=tmp_path / "06_audio" / "E02.mixed.m4a",
+        duck_db=-12.0,
+        reporter=reporter,
+    )
+    assert reporter.calls == [("substep", "audio", 50, 100, "")]
+
+
 def test_mix_audio_runs_ffmpeg_and_returns_path(tmp_path, monkeypatch):
     from tenmin.atomic import part_path
     from tenmin.render import audio as audio_module
@@ -428,7 +491,7 @@ def test_mix_audio_runs_ffmpeg_and_returns_path(tmp_path, monkeypatch):
         Path(args[-1]).write_bytes(b"\x00")
         return ""
 
-    monkeypatch.setattr(audio_module, "run", fake_run)
+    monkeypatch.setattr(audio_module, "run_with_progress", fake_run)
     out_path = tmp_path / "06_audio" / "E02.mixed.m4a"
     result = audio_module.mix_audio(
         video=tmp_path / "source.mkv",
@@ -456,12 +519,12 @@ def test_mix_audio_passes_configured_ffmpeg_binary(tmp_path, monkeypatch):
 
     seen: dict[str, str] = {}
 
-    def fake_run(args, *, ffmpeg="ffmpeg"):
+    def fake_run(args, *, ffmpeg="ffmpeg", **_):
         seen["ffmpeg"] = ffmpeg
         Path(args[-1]).write_bytes(b"\x00")
         return ""
 
-    monkeypatch.setattr(audio_module, "run", fake_run)
+    monkeypatch.setattr(audio_module, "run_with_progress", fake_run)
     audio_module.mix_audio(
         video=tmp_path / "source.mkv",
         timeline=make_timeline(),
@@ -490,7 +553,7 @@ def test_mix_audio_tells_ffmpeg_to_write_a_part_file(tmp_path, monkeypatch):
         Path(args[-1]).write_bytes(b"\x00")
         return ""
 
-    monkeypatch.setattr(audio_module, "run", fake_run)
+    monkeypatch.setattr(audio_module, "run_with_progress", fake_run)
     out_path = tmp_path / "06_audio" / "E02.mixed.m4a"
     audio_module.mix_audio(
         video=tmp_path / "source.mkv",
@@ -521,7 +584,7 @@ def test_mix_audio_keeps_the_previous_artifact_when_ffmpeg_fails(tmp_path, monke
         Path(args[-1]).write_bytes(b"truncated")
         raise FFmpegError("boom")
 
-    monkeypatch.setattr(audio_module, "run", fake_run)
+    monkeypatch.setattr(audio_module, "run_with_progress", fake_run)
     with pytest.raises(FFmpegError):
         audio_module.mix_audio(
             video=tmp_path / "source.mkv",

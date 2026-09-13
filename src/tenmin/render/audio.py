@@ -11,7 +11,8 @@ from tenmin.atomic import atomic_path
 from tenmin.config import DEFAULT_RENDER
 from tenmin.intervals import merge_intervals
 from tenmin.models import SubtitleCue, Timeline, VoiceTrack
-from tenmin.render.ffmpeg import run
+from tenmin.progress import NullProgressReporter, ProgressReporter
+from tenmin.render.ffmpeg import run_with_progress
 
 AUDIO_CODEC = "aac"
 AUDIO_BITRATE = "192k"
@@ -27,6 +28,16 @@ SILENCE_CHANNEL_LAYOUT = "stereo"
 def duck_gain(duck_db: float) -> float:
     """把 dB 换成线性增益。-12dB ≈ 0.2512。"""
     return 10 ** (duck_db / 20)
+
+
+def mixed_total_seconds(timeline: Timeline, outro_seconds: float) -> float:
+    """混音产物有多长。
+
+    「多长」的唯一真相：正片是 timeline.total_seconds（build_mix_args 用 apad+atrim
+    把它钉死，理由见那边的注释），片尾卡片的静音再接在后面。mix_audio 拿它当进度条
+    的总长 —— 进度总长与产物长度必须是同一个数，否则百分比会停在别的地方。
+    """
+    return timeline.total_seconds + max(outro_seconds, 0.0)
 
 
 def duck_volume_expr(cues: list[SubtitleCue], gain: float) -> str:
@@ -235,6 +246,7 @@ def mix_audio(
     duck_db: float,
     fade_out_seconds: float = 0.0,
     outro_seconds: float = 0.0,
+    reporter: ProgressReporter | None = None,
     ffmpeg: str = DEFAULT_RENDER.ffmpeg_path,
 ) -> Path:
     """真跑 ffmpeg 混音，返回产物路径。
@@ -242,9 +254,19 @@ def mix_audio(
     ffmpeg 写的是同目录的 `.part` 文件，跑完才原子改名到 out_path：`-y` 直接写目标
     路径的话，Ctrl-C 或编码中途失败会留下一个 mtime 最新的截断 m4a，而
     pipeline._is_fresh 只比 mtime，下一轮就把它当最新产物跳过、坏音频一路进成片。
+
+    走 run_with_progress 而不是 run：这是一次几分钟的真实编码（23 段 atrim + 11 路
+    adelay + 两级 amix，全程解码整部源片的音轨），原来跑它的时候界面上什么都不动，
+    跟卡死没有区别。总长取 mixed_total_seconds —— 跟 build_mix_args 钉住的产物长度
+    同源，进度才不会停在别的地方。
     """
+    reporter = reporter or NullProgressReporter()
+
+    def _on_progress(fraction: float) -> None:
+        reporter.substep("audio", int(fraction * 100), 100, "")
+
     with atomic_path(out_path) as part:
-        run(
+        run_with_progress(
             build_mix_args(
                 video=video,
                 timeline=timeline,
@@ -255,6 +277,8 @@ def mix_audio(
                 fade_out_seconds=fade_out_seconds,
                 outro_seconds=outro_seconds,
             ),
+            total_seconds=mixed_total_seconds(timeline, outro_seconds),
+            on_progress=_on_progress,
             ffmpeg=ffmpeg,
         )
     return out_path

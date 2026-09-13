@@ -500,7 +500,9 @@ def run_timeline(
     return timeline, warnings
 
 
-def run_audio(cfg: ProjectConfig, episode: int) -> Path:
+def run_audio(
+    cfg: ProjectConfig, episode: int, reporter: ProgressReporter | None = None
+) -> Path:
     paths = Paths(cfg.root)
     episode_cfg = _find_episode(cfg, episode)
     timeline = _load_timeline(cfg, episode)
@@ -514,6 +516,7 @@ def run_audio(cfg: ProjectConfig, episode: int) -> Path:
         duck_db=cfg.render.duck_db,
         fade_out_seconds=cfg.render.fade_out_seconds,
         outro_seconds=cfg.render.outro_card_seconds,
+        reporter=reporter,
         ffmpeg=cfg.render.ffmpeg_path,
     )
 
@@ -708,7 +711,7 @@ async def run_pipeline(
             inputs = [paths.timeline(number), paths.voice(number)]
             if force or not is_fresh(outputs, inputs):
                 reporter.stage_start("audio")
-                run_audio(cfg, episode=number)
+                run_audio(cfg, episode=number, reporter=reporter)
                 reporter.stage_done("audio")
             else:
                 reporter.stage_skip("audio")
