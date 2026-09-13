@@ -1050,3 +1050,26 @@ def test_build_tts_engine_wires_ffprobe_path():
 
     engine = build_tts_engine(RenderConfig(ffprobe_path="/opt/x/ffprobe"))
     assert engine.ffprobe == "/opt/x/ffprobe"
+
+
+async def test_synthesize_track_surfaces_bad_hold_warnings(tmp_path):
+    """chunks.assign_holds 报的坏 hold 要一路冒到 voice 阶段的 warnings 里（P2-E A3）。
+
+    voice 是这条流水线上第一个真正**消费** hold.at 的阶段，也是人工改完
+    03_script/*.json 之后第一个跑到的阶段（validate_script() 只在 script 阶段跑）。
+    """
+    script = Script(
+        show="剧名",
+        episodes=[2],
+        beats=[
+            Beat(
+                id="b1",
+                label="Hook",
+                role="hook",
+                narration="第一句。第二句。",
+                audio=AudioDirection(holds=[Hold(at=900.0, duration=2.0, quote="金句")]),
+            )
+        ],
+    )
+    _, warnings = await synthesize_track(script, 2, tmp_path, FakeTTSEngine([5.0]))
+    assert any("900.0" in w and "最后一句" in w for w in warnings)

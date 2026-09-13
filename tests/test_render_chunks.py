@@ -187,3 +187,82 @@ def test_plan_chunks_without_holds_is_one_chunk():
 def test_plan_chunks_on_empty_narration_returns_empty():
     beat = Beat(id="b1", label="Hook", role="hook", narration="")
     assert plan_chunks(beat) == []
+
+
+# --- 两种被静默掩盖的坏 hold（P2-E A3）-------------------------------------
+#
+# 原来 assign_holds 对两种坏输入一声不响：多个 hold 落到同一句边界时直接相加，
+# hold.at 超出这段旁白的总跨度时直接贴到最后一句。两者都不失同步，所以走
+# warnings 通道（跟 render/tts.py 的 _plan_pronounceable 同一种传法），不判错。
+
+
+def test_assign_holds_warns_when_two_holds_land_on_the_same_sentence():
+    """两个 hold 落到同一句 → 静音时长照旧相加，但要说出来。
+
+    相加本身不算错（成片里就是一段更长的静音），错的是「其中一个 hold 的落点
+    被吞掉了」：它本来想停在别的地方。实测 11 份真实 script.json 的 58 个带 hold
+    的 beat：0 次发生，所以这条 warning 在健康数据上完全不出声。
+    """
+    sentences = ["第一句。", "第二句。"]
+    holds = [Hold(at=1.7, duration=2.0, quote="甲"), Hold(at=1.9, duration=1.0, quote="乙")]
+    warnings: list[str] = []
+    assert assign_holds(sentences, holds, warnings=warnings) == {1: 3.0}
+    assert len(warnings) == 1
+    assert "同一句" in warnings[0]
+    assert "乙" in warnings[0]
+
+
+def test_assign_holds_warns_when_hold_is_beyond_the_whole_beat():
+    """hold.at 超出「旁白 + 本节点全部留白」→ 贴到最后一句，同时报一条。
+
+    上界刻意跟 script/validate.py 的 _check_hold_quotes 那道闸（`beat_seconds`）
+    完全一致，所以「把留白放在这段旁白的最后」这种正常创作不会触发：实测 11 份真实
+    script.json 的 61 个 hold，一条 warning 都不出。真正会踩到的是**人工改过
+    03_script/*.json 之后直接 `--from voice`** —— validate_script() 只在 script
+    阶段跑，那条路上没有任何人再查一遍 at。
+    """
+    sentences = ["第一句。", "第二句。"]  # 估算总长 1.778 秒
+    holds = [Hold(at=300.0, duration=2.0, quote="金句")]
+    warnings: list[str] = []
+    assert assign_holds(sentences, holds, warnings=warnings) == {1: 2.0}
+    assert len(warnings) == 1
+    assert "300.0" in warnings[0]
+    assert "最后一句" in warnings[0]
+
+
+def test_assign_holds_stays_quiet_within_the_beat_span():
+    """at 落在「旁白估算总长」之后、但仍在「旁白 + 留白」之内 → 不出声。
+
+    这正是真实数据里唯一一处越过纯旁白总长的形态（work/saijo E09 的 climax：
+    at=27.0，纯旁白估算 26.89 秒），它是正常创作，不该报。
+    """
+    sentences = ["第一句。", "第二句。"]  # 1.778 秒
+    holds = [Hold(at=3.0, duration=2.0, quote="金句")]
+    warnings: list[str] = []
+    assert assign_holds(sentences, holds, warnings=warnings) == {1: 2.0}
+    assert warnings == []
+
+
+def test_plan_chunks_passes_hold_warnings_up():
+    beat = Beat(
+        id="b1",
+        label="Hook",
+        role="hook",
+        narration="第一句。第二句。",
+        audio=AudioDirection(holds=[Hold(at=900.0, duration=2.0, quote="金句")]),
+    )
+    warnings: list[str] = []
+    plan_chunks(beat, warnings=warnings)
+    assert any("900.0" in w for w in warnings)
+
+
+def test_plan_chunks_without_a_warnings_list_still_works():
+    """warnings 是可选的：既有调用点（含测试）不传也照旧。"""
+    beat = Beat(
+        id="b1",
+        label="Hook",
+        role="hook",
+        narration="第一句。第二句。",
+        audio=AudioDirection(holds=[Hold(at=900.0, duration=2.0, quote="金句")]),
+    )
+    assert plan_chunks(beat) == [("第一句。第二句。", 2.0)]

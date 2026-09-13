@@ -300,12 +300,17 @@ def _plan_pronounceable(
     整条时间轴前移，所以只能转移、不能丢。
 
     `rate` 只往下传给 plan_chunks 决定 hold 落在哪个句边界上，不影响切句本身。
+    `warnings` 也往下传：chunks.assign_holds 那边的两条坏 hold warning（P2-E A3）
+    必须冒到这一层才看得见 —— voice 是第一个真正消费 hold.at 的阶段，也是人工改完
+    03_script/*.json 之后第一个跑到的阶段（validate_script() 只在 script 阶段跑）。
     """
     staged: list[tuple[Beat, list[tuple[str, float]]]] = []
     # 指向最近一个保留下来的 chunk 所在的那个列表，跨 beat 也有效。
     last_bucket: list[tuple[str, float]] | None = None
     for beat in script.beats:
-        planned = plan_chunks(beat, rate=rate)
+        beat_warnings: list[str] = []
+        planned = plan_chunks(beat, rate=rate, warnings=beat_warnings)
+        warnings.extend(f"beat {beat.id}：{message}" for message in beat_warnings)
         if not planned:
             # 只可能来自**人工编辑**：LLM 那条路上 LLMBeat.narration 是 NonBlankStr，
             # 空旁白进不来（进不来的那一刻就触发 llm.py 的 schema 修复重试）。人手清空

@@ -132,24 +132,63 @@ def sentence_offsets(sentences: list[str], *, rate: str = DEFAULT_RATE) -> list[
 
 
 def assign_holds(
-    sentences: list[str], holds: list[Hold], *, rate: str = DEFAULT_RATE
+    sentences: list[str],
+    holds: list[Hold],
+    *,
+    rate: str = DEFAULT_RATE,
+    warnings: list[str] | None = None,
 ) -> dict[int, float]:
-    """把每个 hold 落到最近的句边界上。返回 {句索引: 该句之后的静音秒数}。"""
+    """把每个 hold 落到最近的句边界上。返回 {句索引: 该句之后的静音秒数}。
+
+    两种坏输入原来是**静默**吞掉的，现在各报一条 warning（传法跟 render/tts.py 的
+    `_plan_pronounceable` 一致：调用方给一个列表，这里往里 append）。两条都不改
+    返回值 —— 它们不失同步，只是「有个 hold 的落点没实现」，属于本项目惯用的降级：
+
+    1. **两个 hold 落到同一句**：静音时长相加是对的（成片里就是一段更长的静音），
+       但其中一个 hold 想停的位置被吞了。实测 11 份真实 script.json 的 58 个带 hold
+       的 beat、61 个 hold：**0 次发生**，所以这条在健康数据上完全不出声。
+    2. **hold.at 超出本节点总跨度**：那时「最近的边界」永远是最后一句，等于把留白
+       无声地搬到了段尾。上界取 `旁白估算秒数 + 本节点全部留白秒数`，跟
+       script/validate.py 的 `_check_cue_offsets` 用的 `beat_seconds` 是同一个口径，
+       所以「把留白放在这段旁白的最后」这种正常创作不触发：实测 61 个真实 hold 一条
+       都不报（唯一越过**纯旁白**总长的是 work/saijo E09 的 climax，at=27.0 vs
+       26.89 秒，差 0.11 秒，正落在这个宽度里）。
+       这条不是 validate.py 那道闸的重复：`validate_script()` **只在 script 阶段跑**
+       （唯一调用点是 script/single.py），人手改完 `03_script/*.json` 直接
+       `--from voice` 时没有任何人再查一遍 at，一个 at=300 照旧一路静默到成片。
+    """
     if not sentences:
         return {}
     offsets = sentence_offsets(sentences, rate=rate)
+    # 与 script/validate.py 的 beat_seconds 同口径：旁白 + 本节点全部留白。
+    span = offsets[-1] + sum(hold.duration for hold in holds)
     assigned: dict[int, float] = {}
     for hold in holds:
+        if warnings is not None and hold.at > span:
+            warnings.append(
+                f"留白「{hold.quote}」的落点 at={hold.at:.1f} 秒超出本节点跨度 "
+                f"{span:.1f} 秒（旁白 + 留白），已贴到最后一句之后"
+                "（人工改过 script.json？script 阶段的校验不会再跑一遍）"
+            )
         # 平手取靠前的边界：min 遇到相等的 key 保留第一个
         index = min(range(len(offsets)), key=lambda i: abs(offsets[i] - hold.at))
+        if warnings is not None and index in assigned:
+            warnings.append(
+                f"留白「{hold.quote}」（at={hold.at:.1f} 秒）跟前一段留白落到了同一句"
+                f"（第 {index + 1} 句）之后，两段静音已合并成 "
+                f"{assigned[index] + hold.duration:.1f} 秒"
+            )
         assigned[index] = assigned.get(index, 0.0) + hold.duration
     return assigned
 
 
-def plan_chunks(beat: Beat, *, rate: str = DEFAULT_RATE) -> list[tuple[str, float]]:
+def plan_chunks(
+    beat: Beat, *, rate: str = DEFAULT_RATE, warnings: list[str] | None = None
+) -> list[tuple[str, float]]:
     """把一个 beat 切成 [(要合成的文本, 该 chunk 之后的静音秒数)]。
 
     `rate` 只影响 hold 落在哪个句边界上（见 sentence_offsets），不影响切句本身。
+    `warnings` 原样传给 assign_holds（见那边关于两种坏 hold 的说明）。
 
     空旁白返回空列表。这条路**只可能**是人工编辑走出来的：LLM 输出侧
     LLMBeat.narration 是 NonBlankStr，空的进不来。调用方（render/tts.py 的
@@ -158,7 +197,7 @@ def plan_chunks(beat: Beat, *, rate: str = DEFAULT_RATE) -> list[tuple[str, floa
     sentences = split_sentences(beat.narration)
     if not sentences:
         return []
-    hold_after = assign_holds(sentences, beat.audio.holds, rate=rate)
+    hold_after = assign_holds(sentences, beat.audio.holds, rate=rate, warnings=warnings)
 
     chunks: list[tuple[str, float]] = []
     buffer: list[str] = []
