@@ -78,10 +78,6 @@ _IN_WINDOW_RE = _keyword_matcher(_KEYWORDS_IN_WINDOW)
 # 一致（这边多了 `\s*`，能接 `第 3 集`，clean 那边不能），已收敛成宽的那份。
 # import 方向安全 —— clean.py 只依赖 re / functools / typing，不 import ingest 里的
 # 任何东西，所以不成环。
-# `_TITLE_CARD`（规则 6 用）不在这里定义，从 clean.py import：原先两处各写一份且不
-# 一致（这边多了 `\s*`，能接 `第 3 集`，clean 那边不能），已收敛成宽的那份。
-# import 方向安全 —— clean.py 只依赖 re / functools / typing，不 import ingest 里的
-# 任何东西，所以不成环。
 #
 # 汉字字符类只写一份：规则 4 的两条人名正则与它的字数门槛用的是同一个范围。
 # 刻意**不**跟 `clean._CJK` 合并 —— 那个范围多了假名（`\u3040-\u30ff`），

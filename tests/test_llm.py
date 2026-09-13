@@ -1576,3 +1576,20 @@ async def test_openai_compatible_rebuilds_client_after_aclose(monkeypatch):
     assert await provider.complete("SYS", "USR", Toy) == Toy(value=2)
     assert len([r for r in log if "__init__" in r]) == 2
 
+
+
+@pytest.mark.asyncio
+async def test_max_attempts_of_one_means_a_single_request(monkeypatch):
+    """`max_attempts` 是「发出去几次」的**总**次数，含首发 —— 不是自修复轮数。
+
+    实现是 `for _ in range(max_attempts)`，所以 1 = 只发一次、一轮自修复都不做。
+    config 那边的说明原来写的是「自修复轮数」，跟这个语义差一。
+    """
+    log = _fake_httpx(monkeypatch, ["不是 JSON"] * 5)
+    provider = OpenAICompatibleProvider(
+        api_key="k", model="m", base_url="https://x.test/v1", max_attempts=1
+    )
+    with pytest.raises(LLMSchemaError) as exc:
+        await provider.complete("SYS", "USR", Toy)
+    assert len([r for r in log if "url" in r]) == 1
+    assert "连续 1 次" in str(exc.value)

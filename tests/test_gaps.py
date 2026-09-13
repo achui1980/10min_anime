@@ -241,3 +241,25 @@ def test_fragment_touching_neither_neighbour_has_no_anchor():
         (12.0, 20.0, [7]),
         (90.0, 100.0, []),
     ]
+
+
+def test_silent_gaps_are_returned_in_start_order():
+    """`find_silent_gaps` 末尾那次 sort 的**真实**理由是「产物顺序确定」。
+
+    它原来的注释说是「下游（aggregate 的双指针挂载）依赖信号按起点有序」，而那个依赖
+    不成立：`aggregate._attach_regional` 自己 `sorted(...)`、`_cluster_precise` 靠
+    `intervals.group_adjacent` 内部排序。既然理由改成了「产物顺序」，就该由这条测试守着
+    —— 否则那次 sort 又变成一个没人守的空操作。
+    """
+    t = track(
+        [
+            dline(1, 0.0, 1.0),
+            dline(2, 10.0, 11.0),
+            dline(3, 25.0, 26.0),
+            dline(4, 45.0, 46.0),
+        ],
+        duration=60.0,
+    )
+    gaps = find_silent_gaps(t)
+    assert len(gaps) >= 3
+    assert [g.start for g in gaps] == sorted(g.start for g in gaps)

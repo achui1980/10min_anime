@@ -70,8 +70,12 @@ def find_silent_gaps(
                 )
             )
     # 这次排序**当前是空操作**：silent_gaps 按时间递增产出，subtract 保持碎片顺序，
-    # 所以 signals 生成时就已经有序。留着是防御性的 —— 下游（aggregate 的双指针挂载）
-    # 依赖「信号按起点有序」这条不变量，而它现在只是间接成立。真要去掉的话得先在
-    # aggregate 那边把有序性显式化，不值当。
+    # 所以 signals 生成时就已经有序。
+    #
+    # 留着的理由是「产物顺序确定」，**不是**「下游依赖有序性」—— 后者查过，不成立：
+    # aggregate 的 `_attach_regional` 自己 `sorted(...)`，`_cluster_precise` 靠
+    # `group_adjacent` 内部排序。也就是说下游对乱序输入是健壮的。
+    # 排序本身零成本、且让 02_signals/*.json 里 silent_gaps 的顺序不依赖上游产出顺序，
+    # 所以不删。
     signals.sort(key=lambda s: s.start)
     return signals

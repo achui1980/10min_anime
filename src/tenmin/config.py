@@ -80,7 +80,11 @@ class LLMConfig(BaseModel):
     total_timeout_seconds: float = Field(default=1200.0, gt=0)
 
     # --- 重试。两类失败**分开计数** ---
-    # schema 校验失败的自修复轮数（把报错回灌给模型再来一次）。
+    # schema 校验失败时「发出去几次」的**总**次数，**含首发**（口径与下面的
+    # transport_max_attempts 一致；validation_retries 那个才是不含首发的「重试次数」）。
+    # 实现是 `for _ in range(max_attempts)`，所以默认 3 = 首发 + 2 次自修复轮
+    # （把 schema、报错与截断后的坏输出回灌给模型），报错文本也是「连续 3 次输出不符合」。
+    # 设成 1 等于关掉自修复。
     max_attempts: int = Field(default=3, ge=1)
     # 传输层（429 / 5xx / 连接失败 / chunk 间隔超时 / 提前断流）的尝试次数，
     # 含首发。4 = 首发 + 3 次重试，配上 1 秒基数的指数退避总共只多等 ~7 秒，
