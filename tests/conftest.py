@@ -1,8 +1,34 @@
+import re
 from pathlib import Path
 
 import pytest
 
 FIXTURES = Path(__file__).parent / "fixtures"
+
+# `-m` 表达式里的标识符。按**词**切而不是子串匹配 —— 见 selects_render_marker。
+_MARKER_TOKEN = re.compile(r"\w+")
+
+
+def selects_render_marker(expression: str | None) -> bool:
+    """`-m` 表达式是否**正向**点名了 render 这个 marker。
+
+    原判据是子串匹配（`"render" in expression`）。`-m "not render"` 在它下面当前是安全
+    的（pytest 自己的 deselect 先生效，那些用例压根不进 items），所以那不是个现存 bug；
+    但它对「以后加一个名字含 render 的 marker」零容错 —— `-m render_e2e` 会让子串命中、
+    门打开，于是默认不该跑的 render 用例（真调 Edge-TTS、真编一段视频）被放进来。
+
+    收紧成「按标识符切词，且不能是紧跟在 `not` 后面的那个」。刻意**不**实现完整的布尔
+    表达式求值：这个门只需要回答「用户有没有明确点名 render」，而方向一律取保守
+    （拿不准就跳过）—— 它保护的是「别在一次普通 `pytest` 里意外联网/编码」，误跳的代价
+    是一句「跑法：uv run pytest -m render」，误跑的代价是网络一抖整个测试套变红。
+
+    判据与用例在 tests/test_marker_gate.py。
+    """
+    tokens = _MARKER_TOKEN.findall(expression or "")
+    return any(
+        token == "render" and (index == 0 or tokens[index - 1] != "not")
+        for index, token in enumerate(tokens)
+    )
 
 
 def pytest_collection_modifyitems(config, items):
@@ -19,7 +45,7 @@ def pytest_collection_modifyitems(config, items):
     - generalize 的约定是「把 SRT 放进 tests/fixtures/generalize/ 后**自动生效**」，
       按 marker 摘掉会把这条约定打死。
     """
-    if "render" in (config.getoption("-m") or ""):
+    if selects_render_marker(config.getoption("-m")):
         return
     skip = pytest.mark.skip(reason="需要真实素材与 ffmpeg，跑法：uv run pytest -m render")
     for item in items:
