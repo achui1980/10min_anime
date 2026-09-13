@@ -77,8 +77,8 @@ EXPECTED_GRAPH = (
     "[0:a]atrim=start=100.000:end=120.000,asetpts=PTS-STARTPTS[o0];"
     "[0:a]atrim=start=200.000:end=210.000,asetpts=PTS-STARTPTS[o1];"
     "[o0][o1]concat=n=2:v=0:a=1[orig];"
-    "[orig]volume='if(gt(between(t,0.000,8.000)+between(t,10.000,20.000)"
-    "+between(t,20.000,30.000),0),0.2512,1.0000)':eval=frame[ducked];"
+    "[orig]volume='if(gt(between(t,0.000,8.000)+between(t,10.000,30.000)"
+    ",0),0.2512,1.0000)':eval=frame[ducked];"
     "[1:a]adelay=delays=0:all=1[n0];"
     "[2:a]adelay=delays=10000:all=1[n1];"
     "[3:a]adelay=delays=20000:all=1[n2];"
@@ -114,10 +114,43 @@ def test_duck_volume_expr_without_cues_stays_full():
     assert duck_volume_expr([], 0.2512) == "1.0000"
 
 
-def test_duck_volume_expr_lists_every_cue_window():
+def test_duck_volume_expr_keeps_windows_separated_by_a_gap():
     cues = [SubtitleCue(start=0.0, end=8.0, text="a"), SubtitleCue(start=10.0, end=20.0, text="b")]
     assert duck_volume_expr(cues, 0.2512) == (
         "if(gt(between(t,0.000,8.000)+between(t,10.000,20.000),0),0.2512,1.0000)"
+    )
+
+
+# --- ducking 区间合并（第 4 项）---------------------------------------------
+# 相邻 cue 大多首尾相接（真实素材实测约 87%），一个 cue 一个 between() 会拼出
+# 几十项的表达式，而它们本可以是少数几个连续窗。between() 是闭区间，所以合并
+# 相接/重叠的区间在数学上逐点等价。
+
+
+def test_duck_volume_expr_merges_touching_cues():
+    """前一条的 end 正好是后一条的 start：between 是闭区间，合并后逐点等价。"""
+    cues = [SubtitleCue(start=0.0, end=8.0, text="a"), SubtitleCue(start=8.0, end=20.0, text="b")]
+    assert duck_volume_expr(cues, 0.2512) == (
+        "if(gt(between(t,0.000,20.000),0),0.2512,1.0000)"
+    )
+
+
+def test_duck_volume_expr_merges_overlapping_cues():
+    cues = [
+        SubtitleCue(start=0.0, end=8.0, text="a"),
+        SubtitleCue(start=5.0, end=6.0, text="被包住的短句"),
+        SubtitleCue(start=7.5, end=20.0, text="b"),
+    ]
+    assert duck_volume_expr(cues, 0.2512) == (
+        "if(gt(between(t,0.000,20.000),0),0.2512,1.0000)"
+    )
+
+
+def test_duck_volume_expr_sorts_before_merging():
+    """cue 顺序不该影响结果 —— 合并前先按起点排序。"""
+    cues = [SubtitleCue(start=8.0, end=20.0, text="b"), SubtitleCue(start=0.0, end=8.0, text="a")]
+    assert duck_volume_expr(cues, 0.2512) == (
+        "if(gt(between(t,0.000,20.000),0),0.2512,1.0000)"
     )
 
 

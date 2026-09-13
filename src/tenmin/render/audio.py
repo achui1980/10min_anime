@@ -9,6 +9,7 @@ from pathlib import Path
 
 from tenmin.atomic import atomic_path
 from tenmin.config import DEFAULT_RENDER
+from tenmin.intervals import merge_intervals
 from tenmin.models import SubtitleCue, Timeline, VoiceTrack
 from tenmin.render.ffmpeg import run
 
@@ -26,10 +27,29 @@ def duck_volume_expr(cues: list[SubtitleCue], gain: float) -> str:
     """有旁白的区间压到 gain，其余（留白）回到原声全开。
 
     没有任何旁白时返回常量 1，让 volume 滤镜变成空操作。
+
+    相接/重叠的 cue 先合并成连续窗，再一个窗一个 between()。原来是一个 cue 一个
+    between()，而真实素材里约 87% 的相邻 cue 恰好首尾相接（`前.end == 后.start`
+    —— render/timeline.py 的 sentence_cues 按字数比例切句时游标是连续推进的），
+    于是几十项里绝大多数只是把同一段连续区间拆成了碎片。真实素材实测
+    （work/saijo 10 集）：33→5、29→7、41→6、36→5、42→7、33→6、36→7、34→7、
+    38→6、40→8 项，表达式长度从 778~1125 字符降到 154~231。
+
+    合并是**逐点等价**的，不是近似：ffmpeg 的 `between(x,min,max)` 是**闭**区间
+    （两端都算命中），所以 `end == 下一条 start` 时两个 between 的并集就是合并后
+    那一个；重叠与被包住的情形同理。取 max(end) 而不是最后一条的 end，才不会被
+    「短句被长句包住」的 cue 把窗口右界拉回去。用 intervals.merge_intervals 而不是
+    自己再写一份区间合并（默认 max_gap=0.0 就是「只合并重叠或首尾相接」）。
+
+    副作用是 volume 的求值成本也降了：eval=frame 意味着这串表达式**每帧**都要算
+    一遍，项数少一个数量级等于少一个数量级的 between 调用。
     """
     if not cues:
         return f"{FULL_VOLUME:.4f}"
-    windows = "+".join(f"between(t,{cue.start:.3f},{cue.end:.3f})" for cue in cues)
+    windows = "+".join(
+        f"between(t,{start:.3f},{end:.3f})"
+        for start, end in merge_intervals((cue.start, cue.end) for cue in cues)
+    )
     return f"if(gt({windows},0),{gain:.4f},{FULL_VOLUME:.4f})"
 
 
