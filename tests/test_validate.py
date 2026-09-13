@@ -721,7 +721,10 @@ def test_quote_that_is_a_fragment_of_a_longer_line_is_matched():
 def test_quote_stitched_from_two_cues_matches_the_longer_half():
     """LLM 常把相邻两条字幕缝成一句金句。要求「行是金句的一大半」才算命中。"""
     track = make_track(
-        lines=[dline(17, 41.1, 43.0, "伊月肯听我的话"), dline(18, 43.0, 45.5, "只是因为那是他的工作吗")]
+        lines=[
+            dline(17, 41.1, 43.0, "伊月肯听我的话"),
+            dline(18, 43.0, 45.5, "只是因为那是他的工作吗"),
+        ]
     )
     s = with_holds(
         make_script([[clip(0.6, 20.0)]]), [hold("伊月肯听我的话 只是因为那是他的工作吗")]
