@@ -6,8 +6,13 @@ clip 时长按 ratio 缩放（clip.end 是 LLM 猜的，只用来算比例）。
 
 from __future__ import annotations
 
+import math
+from collections.abc import Iterable
+
+from tenmin.config import DEFAULT_RENDER, RenderConfig
 from tenmin.models import (
     Beat,
+    Clip,
     Script,
     SubtitleCue,
     Timeline,
@@ -19,7 +24,33 @@ from tenmin.render.chunks import split_sentences
 from tenmin.script.budget import narration_chars
 
 # 画面与音频总时长的容忍差。超过就报 warning，不报错。
-DRIFT_TOLERANCE = 0.5
+DRIFT_TOLERANCE = DEFAULT_RENDER.drift_tolerance
+
+
+def align_to_frame(seconds: float, frame_rate: float | None) -> float:
+    """把秒数吸附到最近的帧边界。frame_rate 为 None（帧率未知）时原样返回。
+
+    为什么要对齐：ffmpeg 的 trim 只能按帧切，`trim=start=100.000:end=120.000` 实际
+    留下的是 `[ceil(100×fps), ceil(120×fps))` 那些帧，段时长与声明值差最多一帧
+    （23.976fps → 41.7ms）。不对齐的话 timeline.json 里记的数字与 ffmpeg 真正用的
+    数字不是一回事，而每段的差随机正负，累起来就是「成片时长与 total_seconds 差
+    零点几秒」（真实 E02 修前 0.062 秒 = 1.5 帧）。对齐之后段时长恒为整数个帧，
+    声明值与实测值就对得上了。
+
+    取**最近**的帧而不是向上/向下取整：偏差上界是半帧而不是一帧，且不会把 clip
+    的起点系统性地往后推。
+
+    已知局限（刻意不处理）：这里假设帧落在 `k/fps` 上，而真实源片的视频轨可能有
+    非零 start_time（实测 work/saijo 的 mp4 是 0.021333 秒，正好约半帧），那时真实
+    帧格在 `start_time + k/fps`。**这不影响每段的帧数**（长度恰好 N/fps 的区间里
+    永远正好装 N 个帧格，不管相位），只影响「边界落在两帧中间还是正好压在一帧上」：
+    压在帧上时 `%.3f` 的四舍五入（±0.5ms）有可能把首/尾那一帧多算或少算一个，也就
+    退回对齐之前的行为。要彻底消掉得把相位也探出来记进产物，收益（最多一帧）不值得
+    再加一个字段与一次探测。drift 检查是这件事的兜底。
+    """
+    if frame_rate is None:
+        return seconds
+    return math.floor(seconds * frame_rate + 0.5) / frame_rate
 
 
 def sentence_cues(chunk: VoiceChunk, start: float) -> list[SubtitleCue]:
@@ -57,14 +88,67 @@ def beat_audio_seconds(chunks: list[VoiceChunk]) -> float:
     return sum(chunk.duration + chunk.hold_after for chunk in chunks)
 
 
+def clip_seconds(clips: Iterable[Clip]) -> float:
+    """这些 clip 的总时长。ratio 的分母只能有一处算法。"""
+    return sum(clip.duration for clip in clips)
+
+
 def beat_clip_seconds(beat: Beat) -> float:
-    return sum(clip.duration for clip in beat.clips)
+    """本 beat **声明**的画面总时长（含那些会被 usable_clips 丢掉的 clip）。"""
+    return clip_seconds(beat.clips)
 
 
 def scale_ratio(audio_seconds: float, clip_seconds: float) -> float:
     if clip_seconds <= 0:
         return 0.0
     return audio_seconds / clip_seconds
+
+
+def usable_clips(
+    beat: Beat, source_duration: float
+) -> tuple[list[Clip], list[str]]:
+    """挑出「起点本身合法」的 clip，返回 (能用的, warnings)。
+
+    这一遍刻意只查**跟 ratio 无关**的条件，因为 ratio 是拿这些 clip 的时长算出来的：
+    一条坏 clip 不该改变它兄弟的缩放倍率。原来是边算边查，于是
+
+    - `start=NaN`（人工改坏 script.json）→ beat_clip_seconds 变成 NaN → ratio 变成
+      NaN → **整个 beat 的每一段**都算不出终点，一条不剩；
+    - 起点越界的 clip 虽然被丢掉，它的时长仍然算进了 clip_seconds → 幸存的那条被
+      按偏小的 ratio 缩放，画面比旁白短一截（实测：真实 E02 的 script 配 900 秒源片，
+      画面 143 秒 vs 旁白 214 秒）。
+
+    过滤之后 ratio 只按真的会出画面的 clip 算，上面两条都不成立：坏 clip 只影响自己，
+    幸存的 clip 会被拉长到撑满这个 beat 的旁白时长（代价是镜头更慢，但**不失同步**，
+    而且丢弃本身已经报了 warning）。
+    """
+    kept: list[Clip] = []
+    warnings: list[str] = []
+    for clip in beat.clips:
+        # 负数会原样变成 `trim=start=-3.000`（ffmpeg 把它当 0 之前，等于静默改了这一段
+        # 的内容），NaN 则**两道**边界比较都为 False，一路漏到 JSON 里变成非法字面量
+        # `NaN`。两者都只可能来自人工编辑 script.json —— validate.py 按
+        # DialogueTrack.duration 查过 [0, 片长]，但它管不到人手改的那一版。
+        if not (math.isfinite(clip.start) and clip.start >= 0):
+            warnings.append(
+                f"beat {beat.id} 的 clip 起点 {clip.start} 不是 [0, 片长) 里的秒数，"
+                "已丢弃该段（人工改过 script.json？）"
+            )
+            continue
+        if clip.start >= source_duration:
+            warnings.append(
+                f"beat {beat.id} 的 clip 起点 {clip.start:.1f}s 超出源片长 "
+                f"{source_duration:.1f}s，已丢弃该段"
+            )
+            continue
+        if not (math.isfinite(clip.duration) and clip.duration > 0):
+            warnings.append(
+                f"beat {beat.id} 的 clip {clip.start:.1f}s 时长是 {clip.duration}，"
+                "已丢弃该段（人工改过 script.json？）"
+            )
+            continue
+        kept.append(clip)
+    return kept, warnings
 
 
 def chunks_by_beat(track: VoiceTrack) -> dict[str, list[VoiceChunk]]:
@@ -80,6 +164,7 @@ def build_timeline(
     source_duration: float,
     *,
     frame_rate: float | None = None,
+    cfg: RenderConfig = DEFAULT_RENDER,
 ) -> tuple[Timeline, list[str]]:
     """按 beat 逐段重算画面时长，产出成片时间轴。
 
@@ -129,35 +214,40 @@ def build_timeline(
             audio_cursor += chunk.duration + chunk.hold_after
 
         audio_seconds = beat_audio_seconds(chunks)
-        # clip 总时长为 0（clips 为空、或每条都是零长）时 ratio 是 0，于是下面每条
-        # clip 都会缩放成零长被丢掉，最后由 beat 级的那道闸统一报错 —— 刻意不在这里
-        # 提前 continue，免得同一个失同步条件有两条出口、两套消息。
-        ratio = scale_ratio(audio_seconds, beat_clip_seconds(beat))
+        # 先筛掉起点不合法的 clip，再拿**剩下的**算 ratio（理由见 usable_clips）。
+        # clip 总时长为 0（clips 为空、或全被筛掉）时 ratio 是 0，于是下面每条 clip 都会
+        # 缩放成零长被丢掉，最后由 beat 级的那道闸统一报错 —— 刻意不在这里提前 continue，
+        # 免得同一个失同步条件有两条出口、两套消息。
+        clips, clip_warnings = usable_clips(beat, source_duration)
+        warnings.extend(clip_warnings)
+        beat_warnings = list(clip_warnings)
+        ratio = scale_ratio(audio_seconds, clip_seconds(clips))
         emitted = 0
-        for clip in beat.clips:
-            if clip.start >= source_duration:
-                warnings.append(
-                    f"beat {beat.id} 的 clip 起点 {clip.start:.1f}s 超出源片长 "
-                    f"{source_duration:.1f}s，已丢弃该段"
-                )
-                continue
-            source_end = clip.start + clip.duration * ratio
+        for clip in clips:
+            source_start = align_to_frame(clip.start, frame_rate)
+            source_end = align_to_frame(source_start + clip.duration * ratio, frame_rate)
             if source_end > source_duration:
-                warnings.append(
+                message = (
                     f"beat {beat.id} 的 clip {clip.start:.1f}s 延长到 {source_end:.1f}s "
                     f"超出源片长 {source_duration:.1f}s，已钳到片尾"
                 )
+                warnings.append(message)
+                beat_warnings.append(message)
+                # 钳到片尾的这个值刻意**不**再对齐：片尾之后没有下一帧可选，
+                # 而往回退一帧会凭空丢掉最后那点画面。
                 source_end = source_duration
-            if source_end <= clip.start:
-                warnings.append(
+            if source_end <= source_start:
+                message = (
                     f"beat {beat.id} 的 clip {clip.start:.1f}s 缩放后时长为 0，已丢弃该段"
                 )
+                warnings.append(message)
+                beat_warnings.append(message)
                 continue
-            length = source_end - clip.start
+            length = source_end - source_start
             segments.append(
                 TimelineSegment(
                     beat_id=beat.id,
-                    source_start=clip.start,
+                    source_start=source_start,
                     source_end=source_end,
                     timeline_start=picture_cursor,
                     timeline_end=picture_cursor + length,
@@ -167,20 +257,26 @@ def build_timeline(
             emitted += 1
 
         if emitted == 0:
+            # warnings 在抛异常时是拿不到的（调用方只看得到异常消息），所以把这个
+            # beat 自己那几条**拼进消息里** —— 它们才是「为什么一段都没有」的答案。
+            detail = "\n".join(f"  - {w}" for w in beat_warnings) or "  - （这个节点没有 clip）"
             raise ValueError(
-                f"beat {beat.id} 有 {audio_seconds:.1f}s 旁白却一段画面都没有"
-                f"（clips 为空，或每一条都落在源片长 {source_duration:.1f}s 之外／"
-                f"缩放后成了零长）。这会让这个节点之后的画面全部相对旁白前移、"
-                f"整片失同步，所以这里直接拦掉。\n"
-                f"先看上面那几条 clip 的 warning：源片是不是配错集数／被截断了？"
-                f"（project.yaml 的 episodes[].video）"
+                f"beat {beat.id} 有 {audio_seconds:.1f}s 旁白却一段画面都没有。"
+                f"这会让这个节点之后的画面全部相对旁白前移、整片失同步，"
+                f"所以这里直接拦掉。逐条原因：\n{detail}\n"
+                f"源片是不是配错集数／被截断了？（project.yaml 的 episodes[].video）"
                 f"要么改 03_script/ 里这个节点的 clip 时间戳，再跑 --from timeline。"
             )
 
-    if abs(picture_cursor - audio_cursor) > DRIFT_TOLERANCE:
+    # 这道检查在健康数据上**近乎恒真**（画面长度是从音频长度按 ratio 推出来的，两个
+    # 游标按构造必然吻合，实测 10 集残余舍入 ±0.002 秒），它真正的作用是兜住两条降级
+    # 路径：clip 被「钳到片尾」而缩短，以及帧对齐带来的半帧级抖动。所以它留着，但
+    # 容忍度必须可配（原来写死 0.5）。
+    if abs(picture_cursor - audio_cursor) > cfg.drift_tolerance:
         warnings.append(
             f"画面总时长 {picture_cursor:.1f}s 与音频总时长 {audio_cursor:.1f}s "
-            f"相差超过 {DRIFT_TOLERANCE}s，成片尾部会有画面缺失或黑屏，请检查 timeline.json"
+            f"相差超过 {cfg.drift_tolerance}s，成片尾部会有画面缺失或黑屏，"
+            "请检查 timeline.json"
         )
 
     timeline = Timeline(

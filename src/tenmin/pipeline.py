@@ -533,7 +533,7 @@ def run_timeline(
         if frame_rate is None:
             frame_rate = probe_frame_rate(video, ffprobe=cfg.render.ffprobe_path)
     timeline, warnings = build_timeline(
-        script, track, source_duration, frame_rate=frame_rate
+        script, track, source_duration, frame_rate=frame_rate, cfg=cfg.render
     )
     _write_json(paths.timeline(episode), timeline.model_dump_json(indent=2))
     _write_text(

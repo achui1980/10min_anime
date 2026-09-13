@@ -2,6 +2,7 @@ import pytest
 
 from tenmin.models import AudioDirection, Beat, Clip, Hold, Script, VoiceChunk, VoiceTrack
 from tenmin.render.timeline import (
+    align_to_frame,
     beat_audio_seconds,
     beat_clip_seconds,
     build_timeline,
@@ -238,3 +239,99 @@ def test_build_timeline_segments_are_contiguous_and_monotonic():
     for previous, current in zip(timeline.segments, timeline.segments[1:], strict=False):
         assert current.timeline_start == pytest.approx(previous.timeline_end)
     assert timeline.segments[-1].timeline_end == pytest.approx(timeline.total_seconds)
+
+
+# --- 帧边界对齐（P2-A 第 6 项）---------------------------------------------
+
+
+def test_align_to_frame_snaps_to_the_nearest_frame():
+    fps = 24000 / 1001  # 23.976023976…
+    assert align_to_frame(0.0, fps) == pytest.approx(0.0)
+    # 一帧 = 0.0417 秒。0.05 秒最近的是第 1 帧（0.04171），不是第 0 帧。
+    assert align_to_frame(0.05, fps) == pytest.approx(1 / fps)
+    assert align_to_frame(0.02, fps) == pytest.approx(0.0)
+    # 已经落在边界上的值必须原样返回（不能被浮点误差推走一帧）
+    assert align_to_frame(2400 / fps, fps) == pytest.approx(2400 / fps)
+
+
+def test_align_to_frame_is_a_noop_without_a_frame_rate():
+    assert align_to_frame(1.234, None) == pytest.approx(1.234)
+
+
+def test_build_timeline_aligns_segment_bounds_to_frame_boundaries():
+    """记进 timeline.json 的数字必须就是 ffmpeg 会用的那个帧边界。
+
+    不对齐时每段首尾各被 ffmpeg 按帧取整一次，段时长与声明值差最多一帧，
+    23 段累起来就是成片时长与 total_seconds 对不上的那个零点几秒。
+    """
+    fps = 24000 / 1001
+    script = one_beat_script([Clip(episode=2, start=100.0, end=140.0)])
+    timeline, warnings = build_timeline(
+        script, two_chunk_track(), source_duration=1400.0, frame_rate=fps
+    )
+    assert warnings == []
+    seg = timeline.segments[0]
+    for value in (seg.source_start, seg.source_end):
+        # 每个边界都必须是整数个帧
+        assert (value * fps) == pytest.approx(round(value * fps), abs=1e-6)
+    assert seg.source_start == pytest.approx(align_to_frame(100.0, fps))
+    # 段时长是整数个帧，所以画面坐标也跟着变成帧的整数倍
+    assert (seg.duration * fps) == pytest.approx(round(seg.duration * fps), abs=1e-6)
+    assert timeline.frame_rate == pytest.approx(fps)
+
+
+def test_build_timeline_without_frame_rate_keeps_the_raw_bounds():
+    """帧率未知时不猜：边界原样落盘（老行为）。"""
+    script = one_beat_script([Clip(episode=2, start=100.0, end=140.0)])
+    timeline, _ = build_timeline(script, two_chunk_track(), source_duration=1400.0)
+    assert timeline.segments[0].source_start == pytest.approx(100.0)
+    assert timeline.segments[0].source_end == pytest.approx(120.0)
+    assert timeline.frame_rate is None
+
+
+def test_build_timeline_drops_a_clip_with_a_negative_start():
+    """`clip.start` 只被拦过上界。负数会原样变成 `trim=start=-3.000`。
+
+    validate.py 拦得住 LLM 那条路（它按 DialogueTrack.duration 查 [0, 片长]），
+    但 script.json 是文档里写明的人工编辑面，手改成负数就直接漏到这里。
+    """
+    script = one_beat_script(
+        [Clip(episode=2, start=-3.0, end=20.0), Clip(episode=2, start=10.0, end=50.0)]
+    )
+    timeline, warnings = build_timeline(
+        script, two_chunk_track(), source_duration=1400.0
+    )
+    assert [s.source_start for s in timeline.segments] == pytest.approx([10.0])
+    assert any("-3.0" in w and "丢弃" in w for w in warnings)
+
+
+def test_build_timeline_drops_a_clip_with_a_non_finite_start():
+    """NaN 比谁都不大也不小，两道边界检查都拦不住它，最后会写出非法 JSON。"""
+    script = one_beat_script(
+        [
+            Clip(episode=2, start=float("nan"), end=20.0),
+            Clip(episode=2, start=10.0, end=50.0),
+        ]
+    )
+    timeline, warnings = build_timeline(
+        script, two_chunk_track(), source_duration=1400.0
+    )
+    assert [s.source_start for s in timeline.segments] == pytest.approx([10.0])
+    assert any("nan" in w.lower() for w in warnings)
+
+
+def test_build_timeline_drift_tolerance_comes_from_config():
+    from tenmin.config import RenderConfig
+
+    script = one_beat_script([Clip(episode=2, start=100.0, end=110.0)])
+    chunks = [
+        VoiceChunk(beat_id="b1", index=1, text="第一句。", path="chunk_001.mp3", duration=30.0)
+    ]
+    track = VoiceTrack(episode=2, chunks=chunks, total_seconds=30.0)
+    # 画面被钳到片尾只剩 20 秒，音频 30 秒 → 默认 0.5 秒容忍度下必报
+    _, warnings = build_timeline(script, track, source_duration=120.0)
+    assert any("相差超过" in w for w in warnings)
+    _, loose = build_timeline(
+        script, track, source_duration=120.0, cfg=RenderConfig(drift_tolerance=20.0)
+    )
+    assert not any("相差超过" in w for w in loose)
