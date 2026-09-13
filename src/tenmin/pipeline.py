@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-import shutil
 from collections.abc import Sequence
 from pathlib import Path
 
 import yaml
 
+from tenmin import atomic
 from tenmin.config import EpisodeConfig, ProjectConfig
 from tenmin.docgen.narration import render_narration
 from tenmin.docgen.table import render_table
@@ -147,14 +147,14 @@ def resolve_stages(
     return stages_from(from_stage)
 
 
+# 两个都走 atomic.write_text：产物半途被打断时，正式路径上要么是完整的旧内容、
+# 要么根本不存在，绝不会留下一个 mtime 最新的半截文件让 _is_fresh 判成「已最新」。
 def _write_json(path: Path, payload: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(payload, encoding="utf-8")
+    atomic.write_text(path, payload)
 
 
 def _write_text(path: Path, text: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(text, encoding="utf-8")
+    atomic.write_text(path, text)
 
 
 def _is_fresh(outputs: list[Path], inputs: list[Path]) -> bool:
@@ -377,8 +377,9 @@ def register_episode(
     已经拷好的 mp4）逐字节不变，video_path() 照旧按 project.yaml 所在目录解析。
     """
     srt_dest = cfg.root / "srt" / f"E{episode:02d}.srt"
-    srt_dest.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copyfile(srt, srt_dest)
+    # 原子拷：这份 SRT 是 ingest 阶段的输入，半截字幕会静默产出一条缺对白的对白轨
+    # （srt_parser 对截断输入不报错），而它的 mtime 是最新的，_is_fresh 不会重跑。
+    atomic.copy_file(srt, srt_dest)
 
     relative_srt = srt_dest.relative_to(cfg.root)
     # 绝对化：CLI 传进来的 --video 通常是相对当前工作目录的，而 project.yaml 里的
@@ -401,8 +402,10 @@ def register_episode(
     data["episodes"] = [
         e.model_dump(exclude_none=True, mode="json") for e in cfg.episodes
     ]
-    yaml_path.write_text(
-        yaml.safe_dump(data, allow_unicode=True, sort_keys=False), encoding="utf-8"
+    # 原子写：project.yaml 是**每个阶段**的隐式输入（_is_fresh 把它加进 inputs），
+    # 而这里是**改写**一个已有文件 —— 中途被打断会把用户已注册的全部集数毁掉。
+    atomic.write_text(
+        yaml_path, yaml.safe_dump(data, allow_unicode=True, sort_keys=False)
     )
 
     return cfg

@@ -181,12 +181,15 @@ def test_build_render_args_appends_outro_card(tmp_path):
 
 
 def test_render_video_runs_ffmpeg_and_returns_path(tmp_path, monkeypatch):
+    from tenmin.atomic import part_path
     from tenmin.render import video as video_module
 
     seen: list[list[str]] = []
 
     def fake_run_with_progress(args, *, total_seconds, on_progress=None, **_):
         seen.append(list(args))
+        # 真 ffmpeg 一定会把输出文件写出来；假的也得写，否则原子改名无从下手。
+        Path(args[-1]).write_bytes(b"\x00")
         return ""
 
     monkeypatch.setattr(video_module, "run_with_progress", fake_run_with_progress)
@@ -201,7 +204,9 @@ def test_render_video_runs_ffmpeg_and_returns_path(tmp_path, monkeypatch):
     )
     assert result == out_path
     assert out_path.parent.is_dir()
-    assert seen[0][-1] == str(out_path)
+    # ffmpeg 写的是同目录的 .part，跑完才原子改名到 out_path
+    assert seen[0][-1] == str(part_path(out_path))
+    assert out_path.is_file()
 
 
 def test_render_video_reports_substep_progress(tmp_path, monkeypatch):
@@ -215,6 +220,7 @@ def test_render_video_reports_substep_progress(tmp_path, monkeypatch):
         captured["total_seconds"] = total_seconds
         if on_progress is not None:
             on_progress(0.5)
+        Path(args[-1]).write_bytes(b"\x00")
         return ""
 
     monkeypatch.setattr(video_module, "run_with_progress", fake_run_with_progress)
@@ -240,6 +246,7 @@ def test_render_video_passes_configured_ffmpeg_binary(tmp_path, monkeypatch):
 
     def fake_run_with_progress(args, *, total_seconds, on_progress=None, ffmpeg="ffmpeg"):
         seen["ffmpeg"] = ffmpeg
+        Path(args[-1]).write_bytes(b"\x00")
         return ""
 
     monkeypatch.setattr(video_module, "run_with_progress", fake_run_with_progress)
@@ -253,3 +260,62 @@ def test_render_video_passes_configured_ffmpeg_binary(tmp_path, monkeypatch):
         ffmpeg="/opt/libass/bin/ffmpeg",
     )
     assert seen["ffmpeg"] == "/opt/libass/bin/ffmpeg"
+
+
+# --- 产物原子写（P1-G 第 1 项）---------------------------------------------
+
+
+def test_render_video_tells_ffmpeg_to_write_a_part_file(tmp_path, monkeypatch):
+    from tenmin.atomic import part_path
+    from tenmin.render import video as video_module
+
+    seen: list[list[str]] = []
+
+    def fake_run_with_progress(args, *, total_seconds, on_progress=None, **_):
+        seen.append(list(args))
+        Path(args[-1]).write_bytes(b"\x00")
+        return ""
+
+    monkeypatch.setattr(video_module, "run_with_progress", fake_run_with_progress)
+    out_path = tmp_path / "07_render" / "E02.mp4"
+    render_video(
+        video=tmp_path / "source.mkv",
+        timeline=make_timeline(),
+        audio=tmp_path / "06_audio" / "E02.mixed.m4a",
+        ass=tmp_path / "05_timeline" / "E02.ass",
+        out_path=out_path,
+        encoder="libx264",
+    )
+    assert seen[0][-1] == str(part_path(out_path))
+    assert seen[0][-1].endswith(".mp4")
+    assert out_path.is_file()
+    assert not part_path(out_path).exists()
+
+
+def test_render_video_keeps_the_previous_artifact_when_ffmpeg_fails(tmp_path, monkeypatch):
+    from tenmin.atomic import part_path
+    from tenmin.render import video as video_module
+    from tenmin.render.ffmpeg import FFmpegError
+
+    out_path = tmp_path / "07_render" / "E02.mp4"
+    out_path.parent.mkdir(parents=True)
+    out_path.write_bytes(b"good")
+    before = out_path.stat().st_mtime_ns
+
+    def fake_run_with_progress(args, *, total_seconds, on_progress=None, **_):
+        Path(args[-1]).write_bytes(b"truncated")
+        raise FFmpegError("boom")
+
+    monkeypatch.setattr(video_module, "run_with_progress", fake_run_with_progress)
+    with pytest.raises(FFmpegError):
+        render_video(
+            video=tmp_path / "source.mkv",
+            timeline=make_timeline(),
+            audio=tmp_path / "06_audio" / "E02.mixed.m4a",
+            ass=tmp_path / "05_timeline" / "E02.ass",
+            out_path=out_path,
+            encoder="libx264",
+        )
+    assert out_path.read_bytes() == b"good"
+    assert out_path.stat().st_mtime_ns == before
+    assert not part_path(out_path).exists()

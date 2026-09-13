@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 import yaml
 
+from tenmin.atomic import part_path
 from tenmin.config import EpisodeConfig, ProjectConfig, load_project
 from tenmin.models import (
     AudioDirection,
@@ -802,7 +803,9 @@ def test_run_audio_invokes_ffmpeg(project, monkeypatch):
     assert out == paths.mixed_audio(2)
     assert out.exists()
     assert captured[0][:2] == ["-y", "-i"]
-    assert captured[0][-1] == str(paths.mixed_audio(2))
+    # ffmpeg 写的是同目录的 .part，run_audio 返回前才原子改名到正式产物路径
+    assert captured[0][-1] == str(part_path(paths.mixed_audio(2)))
+    assert not part_path(paths.mixed_audio(2)).exists()
     assert "amix=inputs=2:normalize=0[mix]" in captured[0][captured[0].index("-filter_complex") + 1]
 
 
@@ -835,7 +838,9 @@ def test_run_render_invokes_ffmpeg(project, monkeypatch):
     assert out == paths.video(2)
     assert out.exists()
     assert "-movflags" in captured[0]
-    assert captured[0][-1] == str(paths.video(2))
+    # 同上：ffmpeg 写 .part，run_render 返回前才原子改名到 07_render/E02.mp4
+    assert captured[0][-1] == str(part_path(paths.video(2)))
+    assert not part_path(paths.video(2)).exists()
 
 
 def test_run_render_without_audio_raises(project):
@@ -1519,3 +1524,113 @@ def test_preflight_warnings_reach_the_user(project, monkeypatch):
     monkeypatch.setattr("tenmin.pipeline.preflight", fake_preflight)
     result = asyncio.run(_run_audio_only(project, monkeypatch))
     assert any("Lantinghei SC" in w for w in result)
+
+
+def _project_config(tmp_path: Path) -> ProjectConfig:
+    """一个已经落好 project.yaml 的最小项目，给原子写用例当底座。"""
+    root = tmp_path / "saijo"
+    (root / "srt").mkdir(parents=True)
+    yaml_path = root / "project.yaml"
+    yaml_path.write_text(
+        "show: 才女的侍从\nslug: saijo\nmode: single_episode\n"
+        "target_seconds: 240\nepisodes:\n- number: 2\n  srt: srt/E02.srt\n",
+        encoding="utf-8",
+    )
+    return load_project(yaml_path)
+
+
+# --- 产物原子写（P1-G 第 1 项）---------------------------------------------
+# _is_fresh 只比 mtime，所以每一个「会被当成输入或产物」的文件都必须原子落盘，
+# 否则半截文件的 mtime 恰好最新，下一轮直接跳过、坏产物一路进成片。
+
+
+def test_write_text_never_leaves_a_partial_file_at_the_target(tmp_path, monkeypatch):
+    """写文本的中途炸掉时，目标路径上必须还是旧内容（或干脆不存在）。"""
+    from tenmin import pipeline as pipeline_module
+    from tenmin.atomic import part_path
+
+    target = tmp_path / "out" / "E02.narration.txt"
+    target.parent.mkdir(parents=True)
+    target.write_text("上一轮的完整旁白", encoding="utf-8")
+
+    real_replace = Path.replace
+
+    def boom(self, other):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(Path, "replace", boom)
+    with pytest.raises(KeyboardInterrupt):
+        pipeline_module._write_text(target, "半截")
+    monkeypatch.setattr(Path, "replace", real_replace)
+
+    assert target.read_text(encoding="utf-8") == "上一轮的完整旁白"
+    assert not part_path(target).exists()
+
+
+def test_write_json_goes_through_the_atomic_helper(tmp_path, monkeypatch):
+    from tenmin import pipeline as pipeline_module
+
+    seen: list[Path] = []
+
+    def spy(path, text, **kwargs):
+        seen.append(Path(path))
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        Path(path).write_text(text, encoding="utf-8")
+
+    monkeypatch.setattr(pipeline_module.atomic, "write_text", spy)
+    target = tmp_path / "05_timeline" / "E02.timeline.json"
+    pipeline_module._write_json(target, "{}")
+    assert seen == [target]
+    assert target.read_text(encoding="utf-8") == "{}"
+
+
+def test_register_episode_copies_the_srt_atomically(tmp_path, monkeypatch):
+    """拷进来的 SRT 是 ingest 的输入。半截字幕会静默产出缺对白的对白轨。"""
+    from tenmin import atomic as atomic_module
+    from tenmin.atomic import part_path
+
+    cfg = _project_config(tmp_path)
+    srt = tmp_path / "source.srt"
+    srt.write_text("1\n00:00:01,000 --> 00:00:02,000\n台词\n", encoding="utf-8")
+    dest = cfg.root / "srt" / "E03.srt"
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_text("上一轮的完整字幕", encoding="utf-8")
+
+    def boom(src, target):
+        Path(target).write_text("半截", encoding="utf-8")
+        raise OSError("盘满了")
+
+    # 打在 tenmin.atomic 上而不是 tenmin.pipeline 上：拷贝现在由 atomic.copy_file 做，
+    # pipeline 自己已经不再直接 import shutil。
+    monkeypatch.setattr(atomic_module.shutil, "copyfile", boom)
+    with pytest.raises(OSError):
+        register_episode(cfg, episode=3, srt=srt, video=tmp_path / "E03.mkv")
+    assert dest.read_text(encoding="utf-8") == "上一轮的完整字幕"
+    assert not part_path(dest).exists()
+
+
+def test_register_episode_rewrites_project_yaml_atomically(tmp_path, monkeypatch):
+    """project.yaml 是**每个阶段**的输入。改写它被打断不能把已注册的集数全毁掉。"""
+    from tenmin.atomic import part_path
+
+    cfg = _project_config(tmp_path)
+    before = cfg.config_path.read_text(encoding="utf-8")
+    srt = tmp_path / "source.srt"
+    srt.write_text("1\n00:00:01,000 --> 00:00:02,000\n台词\n", encoding="utf-8")
+
+    real_replace = Path.replace
+    calls: list[Path] = []
+
+    def boom(self, other):
+        if Path(other) == cfg.config_path:
+            raise KeyboardInterrupt
+        calls.append(Path(other))
+        return real_replace(self, other)
+
+    monkeypatch.setattr(Path, "replace", boom)
+    with pytest.raises(KeyboardInterrupt):
+        register_episode(cfg, episode=3, srt=srt, video=tmp_path / "E03.mkv")
+    monkeypatch.setattr(Path, "replace", real_replace)
+
+    assert cfg.config_path.read_text(encoding="utf-8") == before
+    assert not part_path(cfg.config_path).exists()

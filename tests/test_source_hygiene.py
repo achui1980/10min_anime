@@ -19,6 +19,18 @@ SRC = Path(__file__).resolve().parent.parent / "src" / "tenmin"
 # UnicodeDecodeError/UnicodeEncodeError。本机是 UTF-8，所以这类漏写永远测不出来。
 TEXT_IO_METHODS = frozenset({"read_text", "write_text"})
 
+# 唯一豁免的接收者：`tenmin.atomic`。`atomic.write_text` 不是 stdlib 的那个 ——
+# 它自己的签名把 encoding 钉成了 "utf-8"（下面 test_atomic_write_text_pins_utf8
+# 就是守这一条的），所以调用点不写 encoding= 也不可能退化到 locale。
+# 刻意做成「白名单 + 一条验证白名单前提的测试」而不是直接放宽规则：规则的本意是
+# 「绝不让 locale 决定编码」，这个豁免不违反本意，而且前提是被断言住的。
+# atomic.py 自己照旧被扫（它内部那句 tmp.write_text 是显式传 encoding 的）。
+UTF8_PINNED_MODULES = frozenset({"atomic"})
+
+
+def _receiver_name(func: ast.Attribute) -> str | None:
+    return func.value.id if isinstance(func.value, ast.Name) else None
+
 
 def _source_files() -> list[Path]:
     return sorted(p for p in SRC.rglob("*.py"))
@@ -35,10 +47,25 @@ def _offenders(path: Path) -> list[str]:
         if name is None:
             continue
         if name in TEXT_IO_METHODS or name == "open":
+            if _receiver_name(func) in UTF8_PINNED_MODULES:
+                continue
             keywords = {kw.arg for kw in node.keywords}
             if "encoding" not in keywords:
                 out.append(f"{path.name}:{node.lineno} {name}()")
     return out
+
+
+def test_atomic_write_text_pins_utf8():
+    """守住上面那条豁免的前提：atomic.write_text 的 encoding 必须默认 UTF-8。
+
+    这个默认值一旦被改成 None / locale，_offenders 的豁免就会变成一个静默的漏洞。
+    """
+    import inspect
+
+    from tenmin import atomic
+
+    default = inspect.signature(atomic.write_text).parameters["encoding"].default
+    assert default == "utf-8"
 
 
 def test_src_has_python_files():

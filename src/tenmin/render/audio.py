@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from tenmin.atomic import atomic_path
 from tenmin.config import DEFAULT_RENDER
 from tenmin.models import SubtitleCue, Timeline, VoiceTrack
 from tenmin.render.ffmpeg import run
@@ -127,19 +128,24 @@ def mix_audio(
     outro_seconds: float = 0.0,
     ffmpeg: str = DEFAULT_RENDER.ffmpeg_path,
 ) -> Path:
-    """真跑 ffmpeg 混音，返回产物路径。"""
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    run(
-        build_mix_args(
-            video=video,
-            timeline=timeline,
-            track=track,
-            voice_dir=voice_dir,
-            out_path=out_path,
-            duck_db=duck_db,
-            fade_out_seconds=fade_out_seconds,
-            outro_seconds=outro_seconds,
-        ),
-        ffmpeg=ffmpeg,
-    )
+    """真跑 ffmpeg 混音，返回产物路径。
+
+    ffmpeg 写的是同目录的 `.part` 文件，跑完才原子改名到 out_path：`-y` 直接写目标
+    路径的话，Ctrl-C 或编码中途失败会留下一个 mtime 最新的截断 m4a，而
+    pipeline._is_fresh 只比 mtime，下一轮就把它当最新产物跳过、坏音频一路进成片。
+    """
+    with atomic_path(out_path) as part:
+        run(
+            build_mix_args(
+                video=video,
+                timeline=timeline,
+                track=track,
+                voice_dir=voice_dir,
+                out_path=part,
+                duck_db=duck_db,
+                fade_out_seconds=fade_out_seconds,
+                outro_seconds=outro_seconds,
+            ),
+            ffmpeg=ffmpeg,
+        )
     return out_path

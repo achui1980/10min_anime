@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import pytest
 
 from tenmin.models import SubtitleCue, Timeline, TimelineSegment, VoiceChunk, VoiceTrack
@@ -212,12 +214,15 @@ def test_build_mix_args_outro_without_fade_concats_mix_directly(tmp_path):
 
 
 def test_mix_audio_runs_ffmpeg_and_returns_path(tmp_path, monkeypatch):
+    from tenmin.atomic import part_path
     from tenmin.render import audio as audio_module
 
     seen: list[list[str]] = []
 
     def fake_run(args, **_):
         seen.append(list(args))
+        # 真 ffmpeg 一定会把输出文件写出来；假的也得写，否则原子改名无从下手。
+        Path(args[-1]).write_bytes(b"\x00")
         return ""
 
     monkeypatch.setattr(audio_module, "run", fake_run)
@@ -233,7 +238,9 @@ def test_mix_audio_runs_ffmpeg_and_returns_path(tmp_path, monkeypatch):
     assert result == out_path
     assert out_path.parent.is_dir()
     assert seen[0][0] == "-y"
-    assert seen[0][-1] == str(out_path)
+    # ffmpeg 写的是同目录的 .part，跑完才原子改名到 out_path
+    assert seen[0][-1] == str(part_path(out_path))
+    assert out_path.is_file()
 
 
 def test_mix_audio_is_exported():
@@ -248,6 +255,7 @@ def test_mix_audio_passes_configured_ffmpeg_binary(tmp_path, monkeypatch):
 
     def fake_run(args, *, ffmpeg="ffmpeg"):
         seen["ffmpeg"] = ffmpeg
+        Path(args[-1]).write_bytes(b"\x00")
         return ""
 
     monkeypatch.setattr(audio_module, "run", fake_run)
@@ -261,3 +269,65 @@ def test_mix_audio_passes_configured_ffmpeg_binary(tmp_path, monkeypatch):
         ffmpeg="/opt/libass/bin/ffmpeg",
     )
     assert seen["ffmpeg"] == "/opt/libass/bin/ffmpeg"
+
+
+# --- 产物原子写（P1-G 第 1 项）---------------------------------------------
+# mix_audio 原来直接 `-y` 写最终路径，被打断就留一个 mtime 最新的截断 m4a，
+# 而 pipeline._is_fresh 只比 mtime，于是下一轮把它当最新产物跳过、坏音频进成片。
+
+
+def test_mix_audio_tells_ffmpeg_to_write_a_part_file(tmp_path, monkeypatch):
+    from tenmin.atomic import part_path
+    from tenmin.render import audio as audio_module
+
+    seen: list[list[str]] = []
+
+    def fake_run(args, **_):
+        seen.append(list(args))
+        Path(args[-1]).write_bytes(b"\x00")
+        return ""
+
+    monkeypatch.setattr(audio_module, "run", fake_run)
+    out_path = tmp_path / "06_audio" / "E02.mixed.m4a"
+    audio_module.mix_audio(
+        video=tmp_path / "source.mkv",
+        timeline=make_timeline(),
+        track=make_track(),
+        voice_dir=tmp_path / "04_voice" / "E02",
+        out_path=out_path,
+        duck_db=-12.0,
+    )
+    assert seen[0][-1] == str(part_path(out_path))
+    # 扩展名必须留着：ffmpeg 靠它推断容器格式
+    assert seen[0][-1].endswith(".m4a")
+    assert out_path.is_file()
+    assert not part_path(out_path).exists()
+
+
+def test_mix_audio_keeps_the_previous_artifact_when_ffmpeg_fails(tmp_path, monkeypatch):
+    from tenmin.atomic import part_path
+    from tenmin.render import audio as audio_module
+    from tenmin.render.ffmpeg import FFmpegError
+
+    out_path = tmp_path / "06_audio" / "E02.mixed.m4a"
+    out_path.parent.mkdir(parents=True)
+    out_path.write_bytes(b"good")
+    before = out_path.stat().st_mtime_ns
+
+    def fake_run(args, **_):
+        Path(args[-1]).write_bytes(b"truncated")
+        raise FFmpegError("boom")
+
+    monkeypatch.setattr(audio_module, "run", fake_run)
+    with pytest.raises(FFmpegError):
+        audio_module.mix_audio(
+            video=tmp_path / "source.mkv",
+            timeline=make_timeline(),
+            track=make_track(),
+            voice_dir=tmp_path / "04_voice" / "E02",
+            out_path=out_path,
+            duck_db=-12.0,
+        )
+    assert out_path.read_bytes() == b"good"
+    assert out_path.stat().st_mtime_ns == before
+    assert not part_path(out_path).exists()

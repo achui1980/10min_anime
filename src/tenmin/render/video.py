@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from tenmin.atomic import atomic_path
 from tenmin.config import DEFAULT_RENDER
 from tenmin.models import Timeline
 from tenmin.progress import NullProgressReporter, ProgressReporter
@@ -141,29 +142,33 @@ def render_video(
     reporter: ProgressReporter | None = None,
     ffmpeg: str = DEFAULT_RENDER.ffmpeg_path,
 ) -> Path:
-    """真跑 ffmpeg 渲染，返回成品路径。"""
+    """真跑 ffmpeg 渲染，返回成品路径。
+
+    跟 mix_audio 一样先落同目录的 `.part` 再原子改名 —— 一次渲染要几分钟，中途
+    Ctrl-C 留下的截断 mp4 mtime 最新，_is_fresh 会把它当成品跳过（见 atomic 模块）。
+    """
     reporter = reporter or NullProgressReporter()
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    args = build_render_args(
-        video=video,
-        timeline=timeline,
-        audio=audio,
-        ass=ass,
-        out_path=out_path,
-        encoder=encoder,
-        width=width,
-        height=height,
-        fade_out_seconds=fade_out_seconds,
-        outro_seconds=outro_seconds,
-        outro_title=outro_title,
-        outro_message=outro_message,
-    )
     total_seconds = timeline.total_seconds + outro_seconds
 
     def _on_progress(fraction: float) -> None:
         reporter.substep("render", int(fraction * 100), 100, "")
 
-    run_with_progress(
-        args, total_seconds=total_seconds, on_progress=_on_progress, ffmpeg=ffmpeg
-    )
+    with atomic_path(out_path) as part:
+        args = build_render_args(
+            video=video,
+            timeline=timeline,
+            audio=audio,
+            ass=ass,
+            out_path=part,
+            encoder=encoder,
+            width=width,
+            height=height,
+            fade_out_seconds=fade_out_seconds,
+            outro_seconds=outro_seconds,
+            outro_title=outro_title,
+            outro_message=outro_message,
+        )
+        run_with_progress(
+            args, total_seconds=total_seconds, on_progress=_on_progress, ffmpeg=ffmpeg
+        )
     return out_path
