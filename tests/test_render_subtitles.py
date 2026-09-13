@@ -127,7 +127,10 @@ def test_wrap_text_preserves_existing_newlines():
 
 
 def test_render_ass_wraps_long_cue_into_multiple_lines():
-    long_text = "下午的任务是去女厕取回大小姐落下的钱包，定位来自缝在钱包里的追踪器——这家人对女儿的管理精度已经到这地步了。"
+    long_text = (
+        "下午的任务是去女厕取回大小姐落下的钱包，"
+        "定位来自缝在钱包里的追踪器——这家人对女儿的管理精度已经到这地步了。"
+    )
     cues = [SubtitleCue(start=0.0, end=10.0, text=long_text)]
     out = render_ass(cues)
     dialogue_line = next(line for line in out.splitlines() if line.startswith("Dialogue"))
