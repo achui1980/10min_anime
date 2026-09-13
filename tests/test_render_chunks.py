@@ -120,6 +120,54 @@ def test_assign_holds_on_empty_sentences_returns_empty():
     assert assign_holds([], [Hold(at=1.0, duration=1.0, quote="金句")]) == {}
 
 
+# --- 句偏移跟着 render.rate 走（P2-E A2）-----------------------------------
+#
+# budget.narration_seconds 与 tts 的时长体检在 P1-H 之后都按 render.rate 缩放了，
+# 只有这里还写死 4.5 字/秒。后果：rate != "+0%" 时 hold 被按到偏移不对的句边界上。
+
+
+def _rate_sensitive_sentences() -> list[str]:
+    """10 字 + 3 字。offsets 在 +0% 下是 [2.222, 2.889]，+20% 下是 [1.852, 2.407]。
+
+    hold.at=2.4 恰好夹在两个 rate 的「中点」之间（2.4 / 2.13），所以最近的边界会翻面：
+    +0% 选第 0 句，+20% 选第 1 句。
+    """
+    return ["一二三四五六七八九。", "甲乙。"]
+
+
+def test_sentence_offsets_default_rate_matches_the_historical_numbers():
+    """默认 rate 必须逐点等于改动前的行为（speed_factor("+0%") 恒为 1.0）。"""
+    assert sentence_offsets(_rate_sensitive_sentences()) == pytest.approx(
+        [2.2222, 2.8889], abs=1e-4
+    )
+
+
+def test_sentence_offsets_scale_with_rate():
+    """语速快 20% → 同样的字数少占 1/1.2 的时间。"""
+    assert sentence_offsets(_rate_sensitive_sentences(), rate="+20%") == pytest.approx(
+        [2.2222 / 1.2, 2.8889 / 1.2], abs=1e-4
+    )
+
+
+def test_assign_holds_follows_rate():
+    holds = [Hold(at=2.4, duration=2.0, quote="金句")]
+    sentences = _rate_sensitive_sentences()
+    assert assign_holds(sentences, holds) == {0: 2.0}
+    assert assign_holds(sentences, holds, rate="+20%") == {1: 2.0}
+
+
+def test_plan_chunks_follows_rate():
+    beat = Beat(
+        id="b1",
+        label="Hook",
+        role="hook",
+        narration="一二三四五六七八九。甲乙。",
+        audio=AudioDirection(holds=[Hold(at=2.4, duration=2.0, quote="金句")]),
+    )
+    assert plan_chunks(beat) == [("一二三四五六七八九。", 2.0), ("甲乙。", 0.0)]
+    assert plan_chunks(beat, rate="+20%") == [("一二三四五六七八九。甲乙。", 2.0)]
+
+
 def test_plan_chunks_merges_sentences_between_holds():
     beat = Beat(
         id="b1",

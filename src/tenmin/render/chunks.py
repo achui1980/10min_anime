@@ -9,7 +9,7 @@ from __future__ import annotations
 import unicodedata
 
 from tenmin.models import Beat, Hold
-from tenmin.script.budget import SPEECH_RATE_CPS, narration_chars
+from tenmin.script.budget import DEFAULT_RATE, narration_seconds
 
 # 一句 = 若干非句末字符 + 一串句末标点；末尾没标点的残句单独成句。
 _SENTENCE_ENDINGS = "。！？!?"
@@ -111,28 +111,33 @@ def _merge_unpronounceable(sentences: list[str]) -> list[str]:
 
 
 
-def sentence_offsets(sentences: list[str]) -> list[float]:
-    """每句「结束时刻」的估算值（秒），用 v1 的 4.5 字/秒。
+def sentence_offsets(sentences: list[str], *, rate: str = DEFAULT_RATE) -> list[float]:
+    """每句「结束时刻」的估算值（秒）。
 
-    已知不一致（范围外，未修）：这里**不看 render.rate**，而 script/budget.py 与
-    render/tts.py 的时长体检都已经跟着 rate 走了。后果是 rate != "+0%" 时 hold 会被
-    assign_holds 按到偏移不对的句边界上（rate=+20% 时偏移应该是这里算出来的 1/1.2）。
-    修法就是把 rate 一路传进 plan_chunks，但那要动 plan_chunks / _plan_pronounceable /
-    synthesize_track 三层签名，属于 render 侧的改动。
+    换算走 budget.narration_seconds，所以它跟 render.rate 是**同一份**语速：
+    P1-H 之后 script/budget.py 的预算与 render/tts.py 的合成结果时长体检都按 rate 缩放，
+    只有这里还写死 4.5 字/秒。后果不是「估算不准」而是**定位错**：assign_holds 把 hold
+    贴到「偏移最近的句边界」，rate="+20%" 时真实的句边界比这里算的早 1/1.2，于是留白被
+    插到了另一句后面。实测 10 集 52 个带 hold 的 beat：rate="+20%" 会让 29 个的落点变、
+    "-20%" 会让 31 个变 —— 也就是说这个缺陷一旦用户动了 rate 就立刻显形。
+
+    `rate` 默认 `"+0%"`（speed_factor 恒为 1.0），所以默认路径与改动前逐点等价。
     """
     offsets: list[float] = []
     cursor = 0.0
     for sentence in sentences:
-        cursor += narration_chars(sentence) / SPEECH_RATE_CPS
+        cursor += narration_seconds(sentence, rate=rate)
         offsets.append(cursor)
     return offsets
 
 
-def assign_holds(sentences: list[str], holds: list[Hold]) -> dict[int, float]:
+def assign_holds(
+    sentences: list[str], holds: list[Hold], *, rate: str = DEFAULT_RATE
+) -> dict[int, float]:
     """把每个 hold 落到最近的句边界上。返回 {句索引: 该句之后的静音秒数}。"""
     if not sentences:
         return {}
-    offsets = sentence_offsets(sentences)
+    offsets = sentence_offsets(sentences, rate=rate)
     assigned: dict[int, float] = {}
     for hold in holds:
         # 平手取靠前的边界：min 遇到相等的 key 保留第一个
@@ -141,8 +146,10 @@ def assign_holds(sentences: list[str], holds: list[Hold]) -> dict[int, float]:
     return assigned
 
 
-def plan_chunks(beat: Beat) -> list[tuple[str, float]]:
+def plan_chunks(beat: Beat, *, rate: str = DEFAULT_RATE) -> list[tuple[str, float]]:
     """把一个 beat 切成 [(要合成的文本, 该 chunk 之后的静音秒数)]。
+
+    `rate` 只影响 hold 落在哪个句边界上（见 sentence_offsets），不影响切句本身。
 
     空旁白返回空列表。这条路**只可能**是人工编辑走出来的：LLM 输出侧
     LLMBeat.narration 是 NonBlankStr，空的进不来。调用方（render/tts.py 的
@@ -151,7 +158,8 @@ def plan_chunks(beat: Beat) -> list[tuple[str, float]]:
     sentences = split_sentences(beat.narration)
     if not sentences:
         return []
-    hold_after = assign_holds(sentences, beat.audio.holds)
+    hold_after = assign_holds(sentences, beat.audio.holds, rate=rate)
+
     chunks: list[tuple[str, float]] = []
     buffer: list[str] = []
     for index, sentence in enumerate(sentences):

@@ -654,7 +654,7 @@ def forced_plan(monkeypatch):
     """
 
     def install(planned: list[tuple[str, float]]) -> None:
-        monkeypatch.setattr(tts_module, "plan_chunks", lambda beat: list(planned))
+        monkeypatch.setattr(tts_module, "plan_chunks", lambda beat, **_: list(planned))
 
     return install
 
@@ -713,6 +713,46 @@ async def test_progress_total_excludes_skipped_chunks(tmp_path, forced_plan):
     script = _quote_only_script(holds=[])
     await synthesize_track(script, 2, tmp_path, FakeTTSEngine([6.0]), reporter=reporter)
     assert reporter.calls == [("substep", "voice", 1, 1, "第一句。第二句。")]
+
+
+# --- rate 一路传到切句（P2-E A2）-------------------------------------------
+
+
+def _rate_sensitive_script() -> Script:
+    """hold.at=2.4 落在两个 rate 的「句边界中点」之间，所以 chunk 划分会随 rate 翻面。
+
+    +0% 的句偏移是 [2.222, 2.889] → 留白落在第 0 句后面，切成两个 chunk；
+    +20% 是 [1.852, 2.407] → 落在第 1 句（最后一句）后面，整段只有一个 chunk。
+    """
+    return Script(
+        show="剧名",
+        episodes=[2],
+        beats=[
+            Beat(
+                id="b1",
+                label="A",
+                role="hook",
+                narration="一二三四五六七八九。甲乙。",
+                audio=AudioDirection(holds=[Hold(at=2.4, duration=2.0, quote="q")]),
+            )
+        ],
+    )
+
+
+async def test_synthesize_track_default_rate_keeps_the_historical_split(tmp_path):
+    engine = FakeTTSEngine([4.0, 2.0])
+    track, _ = await synthesize_track(_rate_sensitive_script(), 2, tmp_path, engine)
+    assert [c.text for c in track.chunks] == ["一二三四五六七八九。", "甲乙。"]
+
+
+async def test_synthesize_track_passes_rate_down_to_chunk_planning(tmp_path):
+    """rate 不传下去的话，用户把 render.rate 调成 +20% 之后留白就插错句子。"""
+    engine = FakeTTSEngine([5.0])
+    track, _ = await synthesize_track(
+        _rate_sensitive_script(), 2, tmp_path, engine, rate="+20%"
+    )
+    assert [c.text for c in track.chunks] == ["一二三四五六七八九。甲乙。"]
+    assert [c.hold_after for c in track.chunks] == [2.0]
 
 
 # --- 并发合成（tts_concurrency）---

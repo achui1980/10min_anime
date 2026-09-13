@@ -13,7 +13,7 @@ from tenmin.models import Beat, Script, VoiceChunk, VoiceTrack
 from tenmin.progress import NullProgressReporter, ProgressReporter
 from tenmin.render.chunks import is_pronounceable, plan_chunks
 from tenmin.render.ffmpeg import probe_duration
-from tenmin.script.budget import narration_chars, narration_seconds
+from tenmin.script.budget import DEFAULT_RATE, narration_chars, narration_seconds
 
 # speed_factor 历史上住在本模块（叫 _speed_factor），现在唯一实现在 script/budget.py
 # ——预算估算与本模块的时长体检必须共用同一份 rate 解析。这里原样 re-export，是为了让
@@ -292,18 +292,20 @@ def _is_pronounceable(text: str) -> bool:
 
 
 def _plan_pronounceable(
-    script: Script, warnings: list[str]
+    script: Script, warnings: list[str], *, rate: str = DEFAULT_RATE
 ) -> list[tuple[Beat, list[tuple[str, float]]]]:
     """切 chunk 并剔掉不可发音的那些，被剔掉的 chunk 带的留白折进前一个 chunk。
 
     留白是成片里真实存在的静音（render/audio.py 会把它铺出来），凭空少掉一段会让此后
     整条时间轴前移，所以只能转移、不能丢。
+
+    `rate` 只往下传给 plan_chunks 决定 hold 落在哪个句边界上，不影响切句本身。
     """
     staged: list[tuple[Beat, list[tuple[str, float]]]] = []
     # 指向最近一个保留下来的 chunk 所在的那个列表，跨 beat 也有效。
     last_bucket: list[tuple[str, float]] | None = None
     for beat in script.beats:
-        planned = plan_chunks(beat)
+        planned = plan_chunks(beat, rate=rate)
         if not planned:
             # 只可能来自**人工编辑**：LLM 那条路上 LLMBeat.narration 是 NonBlankStr，
             # 空旁白进不来（进不来的那一刻就触发 llm.py 的 schema 修复重试）。人手清空
@@ -364,6 +366,7 @@ async def synthesize_track(
     max_attempts: int = TTS_MAX_ATTEMPTS,
     previous: VoiceTrack | None = None,
     concurrency: int = DEFAULT_RENDER.tts_concurrency,
+    rate: str = DEFAULT_RATE,
 ) -> tuple[VoiceTrack, list[str]]:
     """合成整集旁白。chunk 独立落盘，重跑只补内容变了的那几个。
 
@@ -401,7 +404,7 @@ async def synthesize_track(
         {chunk.path: chunk.duration for chunk in previous.chunks} if previous else {}
     )
     warnings: list[str] = []
-    planned_by_beat = _plan_pronounceable(script, warnings)
+    planned_by_beat = _plan_pronounceable(script, warnings, rate=rate)
 
     # 展平成带全局序号的作业清单。序号在这里就定下来，跟后面谁先跑完无关。
     jobs: list[tuple[Beat, int, str, float]] = [
