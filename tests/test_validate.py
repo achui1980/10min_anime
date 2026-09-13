@@ -12,7 +12,10 @@ from tenmin.models import (
 )
 from tenmin.script.validate import (
     ANCHOR_OUTSIDE_MAX_RATIO,
+    ANCHOR_OVERWRITE_MAX_SECONDS,
     ANCHOR_TOLERANCE_SECONDS,
+    CREDITS_OVERLAP_MAX_RATIO,
+    MIN_CLIP_SECONDS,
     ScriptValidationError,
     check_script,
     repair_script,
@@ -135,7 +138,10 @@ def test_clip_inside_ed_is_dropped():
 
 
 def test_clip_partially_overlapping_op_is_kept():
-    s = make_script([[clip(148.0, 160.0)]])
+    """重叠比例低于 CREDITS_OVERLAP_MAX_RATIO 才算「只是擦到片头曲」。
+    原来这里写的是 clip(148.0, 160.0)——6.5/12 = 54% 是片头曲画面，旧的「完全落入」
+    判据把它放过，正是 B5 要修的缺陷，所以那组数字不能留。"""
+    s = make_script([[clip(140.0, 160.0)]])  # 6.5/20 = 33%
     result = run(s, track=make_track(op=(153.486, 224.681)))
     assert len(result.script.beats[0].clips) == 1
 
@@ -149,12 +155,14 @@ def test_clip_for_unknown_episode_is_dropped():
 
 
 def test_anchor_mismatch_beyond_tolerance_overwrites_start():
-    track = make_track(lines=[dline(42, 600.0, 604.0)])
+    # 原来这里 anchor 在 600、clip 在 100（幅度 500 秒），而 B4 之后那个量级会被
+    # 拒绝覆写。改成 40 秒的幅度：仍然远超 5 秒容差，是这条规则的正常工作区间。
+    track = make_track(lines=[dline(42, 140.0, 144.0)])
     s = make_script([[clip(100.0, 106.0, anchors=[42])]])
     result = run(s, track=track)
     kept = result.script.beats[0].clips[0]
-    assert kept.start == pytest.approx(600.0)
-    assert kept.end == pytest.approx(606.0)  # 保留原 6 秒时长
+    assert kept.start == pytest.approx(140.0)
+    assert kept.end == pytest.approx(146.0)  # 保留原 6 秒时长
     assert any("anchor" in w for w in result.warnings)
 
 
@@ -167,8 +175,9 @@ def test_anchor_mismatch_within_tolerance_keeps_start():
 
 
 def test_anchor_overwrite_clamped_to_episode_end():
+    # 幅度 46 秒，落在 ANCHOR_OVERWRITE_MAX_SECONDS 之内，覆写照做。
     track = make_track(duration=1000.0, lines=[dline(42, 996.0, 999.0)])
-    s = make_script([[clip(100.0, 130.0, anchors=[42])]])
+    s = make_script([[clip(950.0, 980.0, anchors=[42])]])
     result = run(s, track=track)
     kept = result.script.beats[0].clips[0]
     assert kept.end <= 1000.0
@@ -194,7 +203,8 @@ def test_silent_highlight_recomputed_false_when_llm_lied():
 
 
 def test_silent_highlight_needs_one_second_overlap():
-    s = make_script([[clip(1328.0, 1328.9, silent=False)]])
+    # 与间隙只重叠 0.633 秒。clip 本身给足 3 秒，避免撞上 MIN_CLIP_SECONDS。
+    s = make_script([[clip(1326.0, 1329.0, silent=False)]])
     result = run(s, report=make_report(gaps=[(1328.367, 1348.18)]))
     assert result.script.beats[0].clips[0].is_silent_highlight is False
 
@@ -368,12 +378,12 @@ def test_check_script_does_not_touch_the_input():
 
 
 def test_repair_script_returns_a_new_object_and_leaves_the_input_alone():
-    track = make_track(lines=[dline(42, 600.0, 604.0)])
+    track = make_track(lines=[dline(42, 140.0, 144.0)])
     s = make_script([[clip(100.0, 106.0, anchors=[42])]])
     before = s.model_dump_json()
     repaired, _ = repair_script(s, tracks={2: track}, reports={2: make_report()})
     assert repaired is not s
-    assert repaired.beats[0].clips[0].start == pytest.approx(600.0)
+    assert repaired.beats[0].clips[0].start == pytest.approx(140.0)
     assert s.model_dump_json() == before, "输入必须一字未改"
 
 
@@ -386,3 +396,96 @@ def test_validate_script_no_longer_mutates_the_input_script():
     assert result.script is not s
     assert result.script.beats[0].clips[0].is_silent_highlight is True
     assert s.model_dump_json() == before
+
+
+# --- B4：anchor 覆写的两个漏洞 ---
+
+
+def test_anchor_overwrite_reruns_the_op_window_check():
+    """漏洞 (a)：覆写后原来只重查了 end <= start，被拽进片头曲的 clip 会保留。"""
+    track = make_track(op=(153.486, 224.681), lines=[dline(42, 160.0, 164.0)])
+    s = make_script([[clip(10.0, 15.0), clip(210.0, 220.0, anchors=[42])]])
+    result = run(s, track=track)
+    kept = [c for c in result.script.beats[0].clips]
+    assert len(kept) == 1, [(c.start, c.end) for c in kept]
+    assert kept[0].start == pytest.approx(10.0)
+    assert any("片头" in w for w in result.warnings), result.warnings
+
+
+def test_anchor_overwrite_clamped_too_short_is_dropped():
+    """覆写把起点推到离片尾只剩 0.5 秒时，钳完的 clip 短得没有画面可用。
+    原来这里只重查 `end <= start`，0.5 秒的残段照样留到成片里。"""
+    track = make_track(duration=1000.0, lines=[dline(42, 999.5, 999.9)])
+    s = make_script([[clip(10.0, 15.0), clip(950.0, 960.0, anchors=[42])]])
+    result = run(s, track=track)
+    assert len(result.script.beats[0].clips) == 1
+    assert any("过短" in w for w in result.warnings), result.warnings
+
+
+def test_anchor_overwrite_beyond_the_cap_is_refused_with_a_warning():
+    """漏洞 (b)：_anchor_time 取所有匹配行 start 的最小值，anchor_lines 跨长场景时
+    起点会被拉到很早的位置，而这一步原来是**强制覆写**。实测 saijo E02 的 script.json
+    因为行号过期，22 个 clip 的覆写幅度达 14.6–118.9 秒。"""
+    track = make_track(lines=[dline(42, 700.0, 704.0)])
+    s = make_script([[clip(100.0, 106.0, anchors=[42])]])
+    result = run(s, track=track)
+    kept = result.script.beats[0].clips[0]
+    assert kept.start == pytest.approx(100.0), "幅度超过上限就不该改写"
+    assert kept.end == pytest.approx(106.0)
+    assert any("没有覆写" in w for w in result.warnings), result.warnings
+
+
+def test_anchor_overwrite_within_the_cap_still_happens():
+    track = make_track(lines=[dline(42, 130.0, 134.0)])
+    s = make_script([[clip(100.0, 106.0, anchors=[42])]])
+    result = run(s, track=track)
+    assert result.script.beats[0].clips[0].start == pytest.approx(130.0)
+
+
+def test_anchor_overwrite_cap_constant():
+    assert ANCHOR_OVERWRITE_MAX_SECONDS == pytest.approx(60.0)
+
+
+# --- B5：OP/ED 判据从「完全落入」改成重叠比例 ---
+
+
+def test_clip_mostly_inside_op_is_dropped():
+    """真实缺陷：saijo E06 stage1 的 clip 195.6-225.6 有 19.1 秒（63.5%）压在
+    OP(104.5, 214.7) 上，只有 10.9 秒是正片；旧的「完全落入」判据原样放过它，
+    成片里就出现片头曲画面。"""
+    s = make_script([[clip(10.0, 15.0), clip(195.6, 225.6)]])
+    result = run(s, track=make_track(op=(104.5, 214.7)))
+    assert len(result.script.beats[0].clips) == 1
+    assert any("片头" in w for w in result.warnings), result.warnings
+
+
+def test_clip_grazing_op_tail_is_kept():
+    """实测 saijo E07/E09 的擦边重叠只有 1.5 秒 / 0.3 秒（1.1%-12.2%），无害，必须放过。"""
+    s = make_script([[clip(258.0, 270.0)]])
+    result = run(s, track=make_track(op=(181.5, 259.5)))
+    assert len(result.script.beats[0].clips) == 1
+    assert result.warnings == []
+
+
+def test_credits_overlap_max_ratio_constant():
+    assert CREDITS_OVERLAP_MAX_RATIO == pytest.approx(0.5)
+
+
+# --- B3：最小 clip 时长 ---
+
+
+def test_flash_frame_clip_is_dropped():
+    """0.2 秒的 clip 一路进渲染就是一帧闪屏。实测 263 个真实 clip 最短 3.09 秒。"""
+    s = make_script([[clip(10.0, 15.0), clip(50.0, 50.2)]])
+    result = run(s)
+    assert len(result.script.beats[0].clips) == 1
+    assert any("过短" in w for w in result.warnings), result.warnings
+
+
+def test_clip_at_exactly_the_minimum_is_kept():
+    s = make_script([[clip(50.0, 50.0 + MIN_CLIP_SECONDS)]])
+    assert len(run(s).script.beats[0].clips) == 1
+
+
+def test_min_clip_seconds_constant():
+    assert MIN_CLIP_SECONDS == pytest.approx(1.5)
