@@ -1,3 +1,5 @@
+import random
+
 import pytest
 
 from tenmin.models import DialogueLine, DialogueTrack, Signal
@@ -201,6 +203,103 @@ def test_summary_skips_zero_duration_and_empty_anchor_lines():
         [sig(10.0, 18.0, "low_density", 3, anchors=[7, 8])], track=track
     )
     assert highlights[0].summary == "低语速片段 8.0s"
+
+
+# --- 区域信号挂载：双指针与朴素全扫等价 ---
+
+
+def _naive_host(spans, probe, sep):
+    """改造前的写法：对 spans 全量线性扫，取第一个相邻的。"""
+    return next(
+        (i for i, span in enumerate(spans) if aggregate_module._adjacent(span, probe, sep)),
+        None,
+    )
+
+
+def test_regional_attachment_matches_the_naive_scan_on_random_inputs():
+    """双指针必须与「全量扫、取下标最小的相邻簇」逐例相同。
+
+    spans 由 group_adjacent 产生，因此按 start 升序且互不相交（分组间隔严格
+    > max_gap）；regional 也按 start 升序。这两条单调性是双指针成立的全部依据，
+    这里用随机输入把它钉住。
+    """
+    rng = random.Random(20260913)
+    for _ in range(500):
+        sep = rng.choice([0.0, 0.5, 2.0, 30.0])
+        # 精确信号：随机撒点，交给 group_adjacent 去分组，保证 spans 的形状是真实的。
+        precise = [
+            sig(s, s + rng.uniform(0.5, 20.0), "gap", 2)
+            for s in sorted(rng.uniform(0.0, 600.0) for _ in range(rng.randint(0, 12)))
+        ]
+        regional = [
+            sig(b * 30.0, b * 30.0 + 30.0, "density_shift", 2)
+            for b in sorted(rng.sample(range(20), rng.randint(0, 8)))
+        ]
+        groups = aggregate_module._cluster_precise(precise, sep)
+        spans = [aggregate_module._span_of(g) for g in groups]
+        expected = [
+            _naive_host(spans, (s.start, s.end), sep)
+            for s in sorted(regional, key=lambda s: (s.start, s.end))
+        ]
+        clusters = aggregate_module._cluster([*precise, *regional], sep)
+        actual = []
+        for signal in sorted(regional, key=lambda s: (s.start, s.end)):
+            hosts = [
+                i
+                for i, c in enumerate(clusters[: len(groups)])
+                if signal in c.signals
+            ]
+            actual.append(hosts[0] if hosts else None)
+        assert actual == expected, (sep, spans, [(s.start, s.end) for s in regional])
+
+
+def test_regional_signal_entirely_before_a_precise_cluster_still_attaches():
+    """`_adjacent` 是双向的：30s 桶整个落在精确簇**之前**也要挂上去。
+
+    单向判据（只问「下一条离已见右界够近吗」）会漏掉这种情况，于是 density_shift
+    自成一簇，凭空多出一个「只有节奏换挡、没有任何精确证据」的 highlight。
+    双指针不能把这条语义弄丢。
+    """
+    signals = [sig(31.0, 36.0, "gap", 4), sig(0.0, 30.0, "density_shift", 2)]
+    highlights = aggregate(signals, track=None)
+    assert len(highlights) == 1
+    assert highlights[0].start == pytest.approx(31.0)
+    assert highlights[0].strength == 5  # 4 + 1 个额外来源
+
+
+def test_regional_signal_out_of_reach_forms_its_own_cluster():
+    signals = [sig(500.0, 505.0, "gap", 4), sig(0.0, 30.0, "density_shift", 2)]
+    highlights = aggregate(signals, track=None)
+    assert [h.strength for h in highlights] == [2, 4]
+    assert highlights[0].start == pytest.approx(0.0)
+    assert highlights[0].end == pytest.approx(30.0)
+
+
+def test_cluster_span_is_computed_once_per_cluster(monkeypatch):
+    """同一批 min(start)/max(end) 原先在 _cluster、aggregate、_summary 里各算一次。"""
+    calls = []
+    real = aggregate_module._span_of
+    monkeypatch.setattr(
+        aggregate_module, "_span_of", lambda g: (calls.append(g), real(g))[1]
+    )
+    signals = [sig(i * 100.0, i * 100.0 + 5.0, "gap", 2) for i in range(6)]
+    assert len(aggregate(signals, track=None)) == 6
+    assert len(calls) == 6
+
+
+def test_summary_duration_always_matches_the_highlight_time_window():
+    """summary 里的秒数必须等于 highlight 自己的 end-start。
+
+    `aggregate` 里那句注释原先写「强度、trigger、anchor 都算整簇；只有边界只看
+    bounds」，读起来像是 summary 也该拿整簇。但传下去的一直是 bounds，而这才是对的：
+    实测 11 集 338 个簇里有 35 个两种传参结果不同，全部形如
+    `无台词演出段 5.3s`（bounds）vs `无台词演出段 30.0s`（整簇）—— 后者会让 summary
+    自称 30 秒而 highlight 自己的时间窗只有 5.3 秒，直接把自相矛盾的素材喂给 LLM。
+    """
+    signals = [sig(31.0, 36.3, "gap", 4, "gap:5.3s"), sig(0.0, 30.0, "density_shift", 2)]
+    highlight = aggregate(signals, track=None)[0]
+    assert highlight.summary == f"无台词演出段 {highlight.end - highlight.start:.1f}s"
+    assert highlight.summary == "无台词演出段 5.3s"
 
 
 # --- build_report ---

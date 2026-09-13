@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import NamedTuple
 
 from tenmin.config import DEFAULT_SIGNALS, SignalsConfig
@@ -52,49 +53,97 @@ def _adjacent(
     return b[0] - a[1] <= min_separation and a[0] - b[1] <= min_separation
 
 
-def _cluster(signals: list[Signal], min_separation: float) -> list[list[Signal]]:
-    """先用精确信号连成邻接链，再把区域性信号挂到它重叠/相邻的那个簇上。
+class _Span(NamedTuple):
+    """一个簇的时间跨度。聚簇阶段算一次就固化，别再对同一批信号反复 min/max。"""
 
-    邻接链刻意只由非 density_shift 信号驱动：一条 30s 宽的信号只要首尾相接就能
-    无限接力，会把相隔几十秒的真间隙串成一个不存在的长段。
+    start: float
+    end: float
+
+
+def _span_of(signals: Sequence[Signal]) -> _Span:
+    return _Span(min(s.start for s in signals), max(s.end for s in signals))
+
+
+class _Cluster(NamedTuple):
+    """一个聚簇及其派生量。
+
+    - `signals`：**整簇**，含挂上来的 density_shift。强度、trigger、anchor 都算它。
+    - `bounds`：决定 highlight 时间码的子集。只要簇里有精确信号就只看它们；整簇都是
+      density_shift 时才退回用桶区间本身 —— 那类 highlight 表达的就是「这一区域节奏
+      变了」，没有更精确的时间码可用。
+    - `span`：`bounds` 的跨度。对精确簇来说它就是挂载前算好的那个跨度（挂 regional
+      不会动 bounds），所以整条流程只算一次。
     """
-    clusters = group_adjacent(
+
+    signals: list[Signal]
+    bounds: list[Signal]
+    span: _Span
+
+
+def _cluster_precise(signals: Sequence[Signal], min_separation: float) -> list[list[Signal]]:
+    """只用精确（非 density_shift）信号连成邻接链。
+
+    邻接链刻意不让 density_shift 参与：一条 30s 宽的信号只要首尾相接就能无限接力，
+    会把相隔几十秒的真间隙串成一个不存在的长段。
+    """
+    return group_adjacent(
         (s for s in signals if s.source != REGIONAL_SOURCE),
         bounds=lambda s: (s.start, s.end),
         max_gap=min_separation,
     )
 
-    # 精确簇的跨度快照。区域性信号只能挂进这些簇，不能挂进别的区域性信号自成的簇
-    # —— 否则两个首尾相接的 30s 桶又会重新桥接起来。
-    spans = [(min(s.start for s in c), max(s.end for s in c)) for c in clusters]
-    regional = sorted(
+
+def _attach_regional(
+    signals: Sequence[Signal], precise: list[list[Signal]], min_separation: float
+) -> list[_Cluster]:
+    """把区域性信号挂到它重叠/相邻的那个精确簇上，挂不上的自成一簇。
+
+    区域性信号只能挂进精确簇，不能挂进别的区域性信号自成的簇 —— 否则两个首尾相接的
+    30s 桶又会重新桥接起来。所以跨度快照 `spans` 取的是**挂载前**的精确簇。
+
+    挂载用双指针而不是对 spans 全量线性扫（原实现是 O(R × C)）。两条单调性撑着它：
+
+    1. `group_adjacent` 按起点排序后单调分组，新组的条件是 `start - 组内最大右界
+       > max_gap`，所以 spans 按 start **与** end 都严格升序、互不相交。
+    2. `regional` 按 start 升序遍历。
+
+    于是「因为太靠左（`signal.start - span.end > sep`）而被排除」的 span 一旦被越过，
+    后面 start 更大的 signal 更不可能用到它 —— 游标只进不退。
+
+    而且只需要检查游标那一个 span：`_adjacent` 的左条件在 spans 上是「后缀成立」
+    （span.end 递增），右条件是「前缀成立」（span.start 递增），两者的交是一段
+    连续区间 [cursor, m]。原实现取的是下标最小的相邻簇，那就恰好是 cursor。
+    """
+    spans = [_span_of(group) for group in precise]
+    members = [list(group) for group in precise]
+    orphans: list[_Cluster] = []
+
+    cursor = 0
+    for signal in sorted(
         (s for s in signals if s.source == REGIONAL_SOURCE),
         key=lambda s: (s.start, s.end),
-    )
-    for signal in regional:
-        host = next(
-            (
-                index
-                for index, span in enumerate(spans)
-                if _adjacent(span, (signal.start, signal.end), min_separation)
-            ),
-            None,
-        )
-        if host is None:
-            clusters.append([signal])
+    ):
+        probe = (signal.start, signal.end)
+        while cursor < len(spans) and signal.start - spans[cursor].end > min_separation:
+            cursor += 1
+        if cursor < len(spans) and _adjacent(spans[cursor], probe, min_separation):
+            members[cursor].append(signal)
         else:
-            clusters[host].append(signal)
-    return clusters
+            orphans.append(
+                _Cluster([signal], [signal], _Span(signal.start, signal.end))
+            )
+
+    return [
+        # bounds 就是挂载前的那份精确信号列表：整簇 = precise + 追加的 regional，
+        # 按 source 过滤掉 regional 之后逐元素等于 precise，顺序也一致。
+        _Cluster(members[index], group, spans[index])
+        for index, group in enumerate(precise)
+    ] + orphans
 
 
-def _boundary_signals(cluster: list[Signal]) -> list[Signal]:
-    """决定 highlight 时间码的信号子集。
-
-    只要簇里有精确信号就只看它们；整簇都是 density_shift 时才退回用桶区间本身 ——
-    这类 highlight 表达的就是「这一区域节奏变了」，没有更精确的时间码可用。
-    """
-    precise = [s for s in cluster if s.source != REGIONAL_SOURCE]
-    return precise or cluster
+def _cluster(signals: Sequence[Signal], min_separation: float) -> list[_Cluster]:
+    precise = _cluster_precise(signals, min_separation)
+    return _attach_regional(signals, precise, min_separation)
 
 
 class _TrackIndex(NamedTuple):
@@ -125,16 +174,14 @@ def _index_track(track: DialogueTrack) -> _TrackIndex:
 
 
 def _summary(
-    cluster: list[Signal], index: _TrackIndex | None, cfg: SignalsConfig
+    bounds: list[Signal], span: _Span, index: _TrackIndex | None, cfg: SignalsConfig
 ) -> str:
-    start = min(s.start for s in cluster)
-    end = max(s.end for s in cluster)
-    duration = end - start
-    strongest = max(cluster, key=lambda s: s.strength)
+    duration = span.end - span.start
+    strongest = max(bounds, key=lambda s: s.strength)
     if strongest.source == "gap":
         return f"无台词演出段 {duration:.1f}s"
 
-    anchors = {idx for s in cluster for idx in s.anchor_lines}
+    anchors = {idx for s in bounds for idx in s.anchor_lines}
     candidates: list[DialogueLine] = []
     if index is not None:
         # 位置先去重再升序 —— 还原成原实现「按 track.lines 顺序过滤」的顺序，
@@ -167,20 +214,27 @@ def aggregate(
     highlights: list[Highlight] = []
     index = None if track is None else _index_track(track)
     for cluster in _cluster(signals, cfg.min_separation):
-        bounds = _boundary_signals(cluster)
-        # 强度、trigger、anchor 都算整簇（density_shift 照样贡献）；只有边界只看 bounds。
-        base = max(s.strength for s in cluster)
-        extra = len({s.source for s in cluster}) - 1
+        # 强度、trigger、anchor 都算**整簇**（density_shift 照样贡献）；时间码与
+        # summary 都只看 bounds。
+        #
+        # summary 跟着 bounds 走是刻意的，别按上面那半句「只有边界只看 bounds」去改：
+        # summary 里的秒数就是 `span.end - span.start`，拿整簇算会让它自称 30 秒
+        # 而 highlight 自己的时间窗只有 5.3 秒（实测 11 集 338 个簇里有 35 个如此），
+        # 等于把自相矛盾的素材喂给 LLM。
+        # anchor 那半句对 bounds/整簇其实无差别：density_shift 的 anchor_lines 恒为空
+        # （见 density.find_density_shifts），所以两种取法给出同一个集合。
+        base = max(s.strength for s in cluster.signals)
+        extra = len({s.source for s in cluster.signals}) - 1
         strength = min(base + extra, MAX_STRENGTH)
-        triggers = sorted({s.detail for s in cluster if s.detail})
-        anchor_lines = sorted({idx for s in cluster for idx in s.anchor_lines})
+        triggers = sorted({s.detail for s in cluster.signals if s.detail})
+        anchor_lines = sorted({idx for s in cluster.signals for idx in s.anchor_lines})
         highlights.append(
             Highlight(
-                start=min(s.start for s in bounds),
-                end=max(s.end for s in bounds),
+                start=cluster.span.start,
+                end=cluster.span.end,
                 strength=strength,
                 triggers=triggers,
-                summary=_summary(bounds, index, cfg),
+                summary=_summary(cluster.bounds, cluster.span, index, cfg),
                 anchor_lines=anchor_lines,
             )
         )
