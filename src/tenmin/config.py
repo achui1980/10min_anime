@@ -178,6 +178,47 @@ class SignalsConfig(BaseModel):
     summary_max_chars: int = Field(default=30, gt=0)
 
 
+class ValidateConfig(BaseModel):
+    """script/validate.py 的创作旋钮（原来是那个文件里的四个硬编码字面量）。
+
+    分家的判据沿用全项目一致的那一条：**「这部番想要什么」的创作旋钮进 config，
+    「物理上不可能／数据坏了」的合法性边界留在模块级**。所以留在 validate.py 里的是
+    ANCHOR_OUTSIDE_MAX_RATIO / CREDITS_OVERLAP_MAX_RATIO（两个都是「过半」这个**定义**，
+    不是偏好）、SILENT_OVERLAP_SECONDS（「算不算命中静音间隙」的机械口径，跟 signals
+    阶段同源）、ANCHOR_OVERWRITE_MAX_SECONDS（「超过这个幅度已经分不清谁对」的可信度
+    边界）。它们四个都不是「换一部番会想改」的东西。
+    """
+
+    # --- 节点结构。提示词 single_episode.md:37 要求 5–8 个节点 ---
+    # 下限沿用历史值 3（低于它直接判错重试），刻意比提示词的 5 松：3 个节点的剧本
+    # 虽然不合规格，但结构完整、能出片，不该烧掉一次几百秒的 LLM 调用。
+    min_beats: int = Field(default=3, ge=1)
+    # 上限只给 warning。实测 13 份样本的节点数是 6–7，全落在 5–8 内。
+    max_beats: int = Field(default=8, ge=1)
+
+    # clip 起点与 anchor 行字幕时间的容差：差得比这个多就以字幕时间为准。
+    # 它取决于这部番的 SRT 时间码有多准，是数据质量旋钮。
+    anchor_tolerance_seconds: float = Field(default=5.0, ge=0)
+
+    # clip 的最短可用时长。比它短一律丢弃。实测 263 个真实 clip 最短 3.09 秒，
+    # 取一半留两倍余量。做成旋钮是因为「最短能用的镜头有多长」本身是剪辑风格
+    # （快切风格的番会想调低）。
+    min_clip_seconds: float = Field(default=1.5, gt=0)
+
+    # A1 时间轴单调性：本节点画面起点比上一节点倒退超过这么多秒才报 warning。
+    # 倒叙是合法创作手法，所以只报不拦。实测 13 份样本按「beat 内 clip 起点最小值」
+    # 口径只有 1 处逆序（saijo E02，倒退 230 秒）；换成中位数口径会多抓一个只倒退
+    # 5.0 秒的抖动，所以口径选最小值。60 秒 = 远高于那个 5 秒噪声、远低于 230 秒的
+    # 真实逆序，而正常相邻节点的前进步长是 100–400 秒。
+    timeline_regression_max_seconds: float = Field(default=60.0, ge=0)
+
+    # A3 画面/旁白预算：render/timeline.py 会按 ratio = 旁白秒数 / 画面秒数 缩放每个
+    # clip，比值就是这里的「拉伸倍率」。实测 85 个真实 beat 的倍率落在 0.193–2.526，
+    # 上下界各留约 1.6 倍余量，只拦「一个数量级级别的配错」。
+    stretch_max: float = Field(default=4.0, gt=0)
+    stretch_min: float = Field(default=0.125, gt=0)
+
+
 class RenderConfig(BaseModel):
     """v2 渲染参数。voice 与 rate 直接喂 Edge-TTS。"""
 
@@ -241,6 +282,7 @@ class ProjectConfig(BaseModel):
     ingest: IngestConfig = Field(default_factory=IngestConfig)
     credits: CreditsConfig = Field(default_factory=CreditsConfig)
     signals: SignalsConfig = Field(default_factory=SignalsConfig)
+    validate_script: ValidateConfig = Field(default_factory=ValidateConfig)
     render: RenderConfig = Field(default_factory=RenderConfig)
 
     _root: Path = PrivateAttr(default=Path("."))
@@ -291,6 +333,7 @@ class ProjectConfig(BaseModel):
 DEFAULT_INGEST = IngestConfig()
 DEFAULT_CREDITS = CreditsConfig()
 DEFAULT_SIGNALS = SignalsConfig()
+DEFAULT_VALIDATE = ValidateConfig()
 DEFAULT_RENDER = RenderConfig()
 DEFAULT_LLM = LLMConfig()
 

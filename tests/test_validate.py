@@ -1,5 +1,6 @@
 import pytest
 
+from tenmin.config import DEFAULT_VALIDATE
 from tenmin.models import (
     Beat,
     Clip,
@@ -7,9 +8,11 @@ from tenmin.models import (
     DialogueTrack,
     Hold,
     Script,
+    SfxCue,
     Signal,
     SignalReport,
 )
+from tenmin.script.budget import beat_seconds
 from tenmin.script.validate import (
     ANCHOR_OUTSIDE_MAX_RATIO,
     ANCHOR_OVERWRITE_MAX_SECONDS,
@@ -489,3 +492,114 @@ def test_clip_at_exactly_the_minimum_is_kept():
 
 def test_min_clip_seconds_constant():
     assert MIN_CLIP_SECONDS == pytest.approx(1.5)
+
+
+# --- A1：时间轴单调性 ---
+
+
+def timeline_script(starts, roles=None):
+    """按给定起点造一串 beat。roles 不给时全是 act（都参与单调性检查）。"""
+    beats = []
+    for i, start in enumerate(starts):
+        beats.append(
+            Beat(
+                id=f"t{i + 1}",
+                label=f"阶段{i + 1}",
+                role=(roles[i] if roles else "act"),
+                narration="旁白" * 20,
+                clips=[clip(start, start + 10.0)],
+            )
+        )
+    return Script(show="才女的侍从", episodes=[2], beats=beats)
+
+
+def test_beats_going_backwards_beyond_the_cap_warns():
+    """提示词把「事件顺序必须与时间戳一致」列为废稿条件，但代码里原来没有任何
+    跨 beat 的时序检查。实测 saijo E02 的 act4 起点比 act3 早 230 秒。"""
+    s = timeline_script([100.0, 700.0, 470.0, 900.0])
+    result = run(s)
+    hits = [w for w in result.warnings if "倒退" in w]
+    assert len(hits) == 1, result.warnings
+    assert "阶段3" in hits[0]
+
+
+def test_beats_going_backwards_within_the_cap_does_not_warn():
+    """实测 13 份样本里用中位数口径会抓到一个只倒退 5.0 秒的抖动，纯噪声。"""
+    s = timeline_script([100.0, 200.0, 190.0, 300.0])
+    assert [w for w in run(s).warnings if "倒退" in w] == []
+
+
+def test_hook_is_exempt_from_monotonicity():
+    """hook 本来就允许抓全片任何位置的钩子。"""
+    s = timeline_script([1200.0, 100.0, 300.0], roles=["hook", "act", "act"])
+    assert [w for w in run(s).warnings if "倒退" in w] == []
+
+
+def test_outro_is_exempt_from_monotonicity():
+    s = timeline_script([100.0, 900.0, 200.0], roles=["hook", "act", "outro"])
+    assert [w for w in run(s).warnings if "倒退" in w] == []
+
+
+def test_timeline_regression_cap_constant():
+    assert DEFAULT_VALIDATE.timeline_regression_max_seconds == pytest.approx(60.0)
+
+
+# --- A2：hold / sfx 的落点不能超出本节点旁白 ---
+
+
+def test_hold_at_beyond_the_beat_span_warns():
+    """at 是相对本 beat 旁白起点的偏移。超过本 beat 的总跨度意味着留白落在旁白之外，
+    而 render/chunks.py 的 assign_holds 会静默把它贴到最后一句。"""
+    s = make_script([[clip(10.0, 30.0)]])
+    s.beats[0].audio.holds = [Hold(at=300.0, duration=2.0, quote="金句")]
+    hits = [w for w in run(s).warnings if "留白落点" in w]
+    assert len(hits) == 1, run(s).warnings
+
+
+def test_hold_at_at_the_very_end_of_the_narration_does_not_warn():
+    """实测 76 个真实 hold 的 at/旁白秒数最大 1.004——「把留白放在这段旁白最后」
+    是正常创作，不能报。"""
+    s = make_script([[clip(10.0, 30.0)]])
+    seconds = beat_seconds(s.beats[0])
+    s.beats[0].audio.holds = [Hold(at=seconds, duration=2.0, quote="金句")]
+    assert [w for w in run(s).warnings if "留白落点" in w] == []
+
+
+def test_sfx_at_beyond_the_beat_span_warns():
+    s = make_script([[clip(10.0, 30.0)]])
+    s.beats[0].audio.sfx = [SfxCue(at=300.0, cue="impact")]
+    hits = [w for w in run(s).warnings if "音效落点" in w]
+    assert len(hits) == 1, run(s).warnings
+
+
+# --- A3：画面总时长 vs 旁白时长 ---
+
+
+def test_beat_with_far_too_little_footage_warns():
+    """clip 太少时 render/timeline.py 会按 ratio = 旁白/画面 把每个 clip 往后延长，
+    延到超出源片长再钳到片尾，成片画面错位。"""
+    # make_script 的旁白是 40 字 ≈ 8.9 秒；1.6 秒画面 → 拉伸 5.6 倍
+    s = make_script([[clip(10.0, 11.6)]])
+    hits = [w for w in run(s).warnings if "画面只有" in w]
+    assert len(hits) == 1, run(s).warnings
+
+
+def test_beat_with_far_too_much_footage_warns():
+    s = make_script([[clip(10.0, 800.0)]])  # 790 秒画面 vs 8.9 秒旁白 → 只用得上 1.1%
+    hits = [w for w in run(s).warnings if "画面多达" in w]
+    assert len(hits) == 1, run(s).warnings
+
+
+def test_beat_within_the_measured_stretch_range_does_not_warn():
+    """实测 85 个真实 beat 的 画面/旁白 比值落在 0.396–5.176（拉伸 0.19–2.53 倍），
+    这整段区间都必须放过。"""
+    s = make_script([[clip(10.0, 25.0)]])
+    seconds = beat_seconds(s.beats[0])
+    for ratio in (0.40, 1.0, 5.0):
+        one = make_script([[clip(10.0, 10.0 + seconds * ratio)]])
+        assert [w for w in run(one).warnings if "画面" in w] == [], ratio
+
+
+def test_stretch_bounds_constants():
+    assert DEFAULT_VALIDATE.stretch_max == pytest.approx(4.0)
+    assert DEFAULT_VALIDATE.stretch_min == pytest.approx(0.125)

@@ -110,9 +110,12 @@ def valid_llm_script(chars_per_beat=(360, 360, 360)):
             # 10/310/610 三个起点全部避开 op_range (153.486, 224.681) 与 ed_range
             # 只有 beat1 anchor 到第 1 行（偏差 2.88s 在 5s 容差内）；
             # track 只有 6 行覆盖 7-51s，物理上覆盖不到 310s/610s
+            # clip 长度按 chars/4.5 给足：原来固定 5 秒，对 360 字（80 秒）的旁白
+            # 就是 16 倍拉伸，validate 的 A3「画面/旁白预算」会报 warning。clip 长度
+            # 对这些测试是无关变量，给成跟旁白同量级才不会掩盖真正要断言的东西。
             llm_beat(
                 f"b{i + 1}", labels[i], roles[i], chars,
-                10.0 + i * 300, 15.0 + i * 300,
+                10.0 + i * 300, 10.0 + i * 300 + chars / 4.5,
                 anchors=[1] if i == 0 else [],
             )
             for i, chars in enumerate(chars_per_beat)

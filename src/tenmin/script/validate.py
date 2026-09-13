@@ -16,11 +16,17 @@ from __future__ import annotations
 
 from pydantic import BaseModel
 
+from tenmin.config import DEFAULT_VALIDATE, ValidateConfig
 from tenmin.models import Beat, Clip, DialogueLine, DialogueTrack, Script, SignalReport
+from tenmin.script.budget import beat_seconds
 
-ANCHOR_TOLERANCE_SECONDS = 5.0
+# 阈值的权威定义在 tenmin.config.ValidateConfig；下面三个只是 DEFAULT_VALIDATE 的
+# 模块级别名，给老调用点、文档与测试用（全项目一律这个惯例，见 config.py 的模块 docstring）。
+ANCHOR_TOLERANCE_SECONDS = DEFAULT_VALIDATE.anchor_tolerance_seconds
+MIN_BEATS = DEFAULT_VALIDATE.min_beats
+MIN_CLIP_SECONDS = DEFAULT_VALIDATE.min_clip_seconds
+
 SILENT_OVERLAP_SECONDS = 1.0
-MIN_BEATS = 3
 
 # anchor 覆写的幅度上限（秒）。超过它就**不改写**，只留一条 warning。
 #
@@ -38,18 +44,6 @@ MIN_BEATS = 3
 # 实测语料里 E02 之外的 10 个样本一次覆写都不触发，所以这个值没有真实的「合法覆写」
 # 样本可标定，它是从推理来的，不是从数据来的。
 ANCHOR_OVERWRITE_MAX_SECONDS = 60.0
-
-# clip 的最短可用时长（秒）。比它短的一律丢弃 + warning。
-#
-# 实测 263 个真实 clip 的时长分布：min 3.09 / p01 3.34 / p05 4.00 / p50 15.81 /
-# max 92.73，`< 3.0 秒` 的一个都没有。取 1.5 = 实测下界的一半，留足两倍余量，只拦
-# 「0.2 秒」这种一路进渲染就是一帧闪屏的值。
-#
-# 处理策略选「丢弃」而不是「延长到最小值」：延长会把 clip 推进 OP/ED 或推出片长
-# （两者都得再走一遍窗口检查），而一条 1.5 秒以下的 clip 本来就没有可用画面。丢弃
-# 也跟本模块其余全部 clip 判据（越界／时长非正／片头片尾）的降级口径一致，
-# 「某个节点的 clip 全灭就重试」那道网照样兜着。
-MIN_CLIP_SECONDS = 1.5
 
 # clip 与 OP/ED 的重叠比例上限。达到它就丢弃。
 #
@@ -93,7 +87,7 @@ def _credits_overlap_ratio(clip: Clip, window: tuple[float, float] | None) -> fl
     return _overlap(clip.start, clip.end, window[0], window[1]) / clip.duration
 
 
-def _reject_reason(clip: Clip, track: DialogueTrack) -> str | None:
+def _reject_reason(clip: Clip, track: DialogueTrack, cfg: ValidateConfig) -> str | None:
     """这条 clip 为什么不能用。返回 None 表示能用。
 
     刻意做成一个纯函数：anchor 覆写会改 start/end，改完必须把**全部**窗口检查再跑
@@ -107,10 +101,10 @@ def _reject_reason(clip: Clip, track: DialogueTrack) -> str | None:
             f"clip {clip.start:.1f}-{clip.end:.1f} 越界"
             f"（正片 0-{track.duration:.1f}），丢弃"
         )
-    if clip.duration < MIN_CLIP_SECONDS:
+    if clip.duration < cfg.min_clip_seconds:
         return (
             f"clip {clip.start:.1f}-{clip.end:.1f} 只有 {clip.duration:.2f} 秒，"
-            f"短于下限 {MIN_CLIP_SECONDS} 秒（进渲染就是一帧闪屏），过短丢弃"
+            f"短于下限 {cfg.min_clip_seconds} 秒（进渲染就是一帧闪屏），过短丢弃"
         )
     for name, window in (("片头曲", track.op_range), ("片尾曲", track.ed_range)):
         ratio = _credits_overlap_ratio(clip, window)
@@ -198,10 +192,114 @@ def _check_anchor_coverage(beat: Beat, tracks: dict[int, DialogueTrack]) -> list
     return warnings
 
 
+def _check_timeline_order(script: Script, cfg: ValidateConfig) -> list[str]:
+    """A1：节点的画面起点应该跟正片时间轴同向前进。
+
+    提示词（script/prompts/single_episode.md:74）把「事件顺序必须与时间戳一致」列为
+    废稿条件，但原来代码里**没有任何跨 beat 的时序检查**——beat 3 的 clip 全在 60 秒、
+    beat 4 全在 20 秒也照样通过。
+
+    口径与豁免（都是实测定下来的，别凭感觉改）：
+
+    - 排序键取「本 beat 全部 clip 起点的**最小值**」。实测 13 份真实 script.json 用这个
+      口径只抓到 1 处逆序（saijo E02，倒退 230 秒，确实是真问题）；换成中位数会额外
+      抓到一个只倒退 5.0 秒的抖动，那是噪声。
+    - `hook` 与 `outro` 豁免：hook 本来就允许抓全片任何位置最抓人的画面（实测 saijo E06
+      的 hook 起点 86 秒、E02 的 hook 起点 134 秒都在后面节点之前，但也有 hook 抓片尾
+      定格的写法），outro 是收尾。
+    - 只报 warning 不判错：倒叙是合法的创作手法，提示词自己也写了「用了倒叙就明确标出来」。
+    """
+    warnings: list[str] = []
+    previous_start: float | None = None
+    previous_label = ""
+    for beat in script.beats:
+        if beat.role in ("hook", "outro") or not beat.clips:
+            continue
+        start = min(clip.start for clip in beat.clips)
+        if previous_start is not None:
+            regression = previous_start - start
+            if regression > cfg.timeline_regression_max_seconds:
+                warnings.append(
+                    f"{beat.label}：画面起点 {start:.1f} 秒比上一节点（{previous_label}，"
+                    f"{previous_start:.1f} 秒）倒退了 {regression:.1f} 秒，"
+                    f"超过 {cfg.timeline_regression_max_seconds:.0f} 秒。"
+                    f"如果不是刻意的倒叙，事件顺序与时间戳就不一致了"
+                )
+        previous_start = start
+        previous_label = beat.label
+    return warnings
+
+
+def _check_cue_offsets(beat: Beat) -> list[str]:
+    """A2：hold.at / sfx.at 是相对本节点旁白起点的偏移，不能落到本节点之外。
+
+    模型层已经保证 `at >= 0` 与 `0 < duration <= 15`，缺的是**跨字段**这一条。超出去
+    的后果是静默的：render/chunks.py 的 assign_holds 把 at 贴到「偏移最近的句边界」，
+    而句偏移是本节点旁白的累计秒数，所以一个 at=300 的 hold 会被无声无息地按到最后
+    一句后面。
+
+    上界取 `beat_seconds(beat)`（旁白秒数 + 本节点全部留白秒数），也就是这个节点在成片
+    里的总跨度。实测 76 个 hold 与 51 个 sfx：`at / 纯旁白秒数` 的最大值分别是 1.004 与
+    1.115（p50 0.647 / 0.603），按 beat_seconds 这个上界一个都不越界。换句话说
+    「把留白放在这段旁白的最后」是正常创作，而 at 绝对值最大的那个 hold（36.0 秒）
+    对应的节点旁白本身就有 35.9 秒——它不是 bug。
+    """
+    span = beat_seconds(beat)
+    if span <= 0:
+        return []
+    warnings: list[str] = []
+    for hold in beat.audio.holds:
+        if hold.at > span:
+            warnings.append(
+                f"{beat.label}：留白落点 at={hold.at:.1f} 秒超出本节点跨度 "
+                f"{span:.1f} 秒（旁白 + 留白），这段留白会被静默按到最后一句后面"
+            )
+    for cue in beat.audio.sfx:
+        if cue.at > span:
+            warnings.append(
+                f"{beat.label}：音效落点 at={cue.at:.1f} 秒超出本节点跨度 {span:.1f} 秒"
+            )
+    return warnings
+
+
+def _check_footage_budget(beat: Beat, cfg: ValidateConfig) -> list[str]:
+    """A3：本节点的画面总时长与旁白时长得在同一个量级。
+
+    render/timeline.py:107 按 `ratio = 旁白秒数 / 画面秒数` 缩放本节点每一个 clip
+    （`source_end = clip.start + clip.duration * ratio`）。ratio 远大于 1 时每段都要
+    往后多吃几倍源片，吃到超出片长就被钳到片尾（timeline.py:116 那条 warning 就是
+    这个），成片画面与旁白错位；ratio 远小于 1 时每段的尾巴被大幅截掉。
+
+    在 script 阶段就能提前拦住，不用等到 timeline。阈值来自实测：85 个真实 beat 的
+    拉伸倍率落在 **0.193–2.526**（画面/旁白比值 0.396–5.176，中位 1.319），
+    上下界（4.0 / 0.125）各留约 1.6 倍余量，只拦数量级级别的配错。
+    """
+    footage = sum(clip.duration for clip in beat.clips)
+    span = beat_seconds(beat)
+    if footage <= 0 or span <= 0:
+        return []
+    stretch = span / footage
+    if stretch > cfg.stretch_max:
+        return [
+            f"{beat.label}：画面只有 {footage:.1f} 秒，旁白要 {span:.1f} 秒，"
+            f"渲染时每段要拉伸 {stretch:.1f} 倍（上限 {cfg.stretch_max:.1f}），"
+            f"片段会被延到源片之外再钳到片尾，成片画面错位。请给这个节点补 clip"
+        ]
+    if stretch < cfg.stretch_min:
+        return [
+            f"{beat.label}：画面多达 {footage:.1f} 秒，旁白只有 {span:.1f} 秒，"
+            f"渲染时每段只用得上 {stretch:.1%}（下限 {cfg.stretch_min:.1%}），"
+            f"绝大部分画面会被截掉。请减少 clip 或加长旁白"
+        ]
+    return []
+
+
 def check_script(
     script: Script,
     tracks: dict[int, DialogueTrack],
     reports: dict[int, SignalReport],
+    *,
+    cfg: ValidateConfig = DEFAULT_VALIDATE,
 ) -> list[str]:
     """纯读的语义校验。返回全部 warning，**不改** script、也不抛异常。
 
@@ -209,13 +307,18 @@ def check_script(
     调用方（single.py）拿同一组素材调两个函数，签名对齐比少一个参数更值。
     """
     warnings: list[str] = []
+    warnings.extend(_check_timeline_order(script, cfg))
     for beat in script.beats:
         warnings.extend(_check_hold_quotes(beat, tracks))
         warnings.extend(_check_anchor_coverage(beat, tracks))
+        warnings.extend(_check_cue_offsets(beat))
+        warnings.extend(_check_footage_budget(beat, cfg))
     return warnings
 
 
-def _apply_anchor(clip: Clip, track: DialogueTrack, label: str) -> list[str]:
+def _apply_anchor(
+    clip: Clip, track: DialogueTrack, label: str, cfg: ValidateConfig
+) -> list[str]:
     """按 anchor 行的字幕时间校准 clip 起点（就地改 clip，clip 已是深拷贝）。
 
     偏差超过 ANCHOR_OVERWRITE_MAX_SECONDS 时**不改**，只留 warning —— 那个量级说明
@@ -225,7 +328,7 @@ def _apply_anchor(clip: Clip, track: DialogueTrack, label: str) -> list[str]:
     if anchor_start is None:
         return []
     drift = abs(anchor_start - clip.start)
-    if drift <= ANCHOR_TOLERANCE_SECONDS:
+    if drift <= cfg.anchor_tolerance_seconds:
         return []
     if drift > ANCHOR_OVERWRITE_MAX_SECONDS:
         return [
@@ -238,7 +341,7 @@ def _apply_anchor(clip: Clip, track: DialogueTrack, label: str) -> list[str]:
     clip.end = min(anchor_start + duration, track.duration)
     return [
         f"{label}：clip 起点 与 anchor 行时间 {anchor_start:.1f} 偏差超过 "
-        f"{ANCHOR_TOLERANCE_SECONDS:.0f} 秒，以字幕时间为准"
+        f"{cfg.anchor_tolerance_seconds:.0f} 秒，以字幕时间为准"
     ]
 
 
@@ -246,6 +349,8 @@ def repair_script(
     script: Script,
     tracks: dict[int, DialogueTrack],
     reports: dict[int, SignalReport],
+    *,
+    cfg: ValidateConfig = DEFAULT_VALIDATE,
 ) -> tuple[Script, list[str]]:
     """丢掉不可用的 clip、按字幕覆写偏差过大的时间戳、回填 is_silent_highlight。
 
@@ -256,9 +361,9 @@ def repair_script(
     原来是反的（先查、再覆写、只重查 end<=start），于是被 anchor 拽进片头曲或推出
     片长的 clip 会原样留到成片里。
     """
-    if len(script.beats) < MIN_BEATS:
+    if len(script.beats) < cfg.min_beats:
         raise ScriptValidationError(
-            f"剧本节点数 {len(script.beats)} 少于下限 {MIN_BEATS}，重试"
+            f"剧本节点数 {len(script.beats)} 少于下限 {cfg.min_beats}，重试"
         )
 
     repaired = script.model_copy(deep=True)
@@ -272,8 +377,8 @@ def repair_script(
                 warnings.append(f"{beat.label}：clip 引用了不存在的集数 {clip.episode}，丢弃")
                 continue
 
-            anchor_warnings = _apply_anchor(clip, track, beat.label)
-            reason = _reject_reason(clip, track)
+            anchor_warnings = _apply_anchor(clip, track, beat.label, cfg)
+            reason = _reject_reason(clip, track, cfg)
             if reason is not None:
                 warnings.extend(anchor_warnings)
                 warnings.append(f"{beat.label}：{reason}")
@@ -302,8 +407,10 @@ def validate_script(
     script: Script,
     tracks: dict[int, DialogueTrack],
     reports: dict[int, SignalReport],
+    *,
+    cfg: ValidateConfig = DEFAULT_VALIDATE,
 ) -> ValidationResult:
     """repair 一遍再 check 一遍。对外形状与历史一致，但**不再改动入参**。"""
-    repaired, warnings = repair_script(script, tracks, reports)
-    warnings.extend(check_script(repaired, tracks, reports))
+    repaired, warnings = repair_script(script, tracks, reports, cfg=cfg)
+    warnings.extend(check_script(repaired, tracks, reports, cfg=cfg))
     return ValidationResult(script=repaired, warnings=warnings)

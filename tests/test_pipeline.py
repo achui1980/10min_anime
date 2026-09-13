@@ -79,7 +79,10 @@ def fake_script_response(episode: int = 2):
                     LLMClip(
                         episode=episode,
                         start=300.0 + i * 100,
-                        end=305.0 + i * 100,
+                        # 360 字 ≈ 80 秒旁白，画面就给 80 秒。原来这里只给 5 秒，
+                        # 拉伸倍率 16 倍——validate 的 A3「画面/旁白预算」会报 warning，
+                        # 而这个 fixture 的 clip 长度本来就是随手写的无关变量。
+                        end=300.0 + i * 100 + 80.0,
                         visual="画面 ➔ 特写",
                     )
                 ],
