@@ -14,7 +14,12 @@ from tenmin.models import Beat, Script, VoiceChunk, VoiceTrack
 from tenmin.progress import NullProgressReporter, ProgressReporter
 from tenmin.render.chunks import plan_chunks
 from tenmin.render.ffmpeg import probe_duration
-from tenmin.script.budget import narration_chars, narration_seconds, speed_factor
+from tenmin.script.budget import narration_chars, narration_seconds
+
+# speed_factor 历史上住在本模块（叫 _speed_factor），现在唯一实现在 script/budget.py
+# ——预算估算与本模块的时长体检必须共用同一份 rate 解析。这里原样 re-export，是为了让
+# 「从 render.tts 拿 speed_factor」这个既有调用面继续成立。
+from tenmin.script.budget import speed_factor as speed_factor  # noqa: PLC0414
 
 TTS_MAX_ATTEMPTS = 3
 
