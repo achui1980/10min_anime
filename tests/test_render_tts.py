@@ -919,6 +919,25 @@ async def test_a_failure_stops_handing_out_new_chunks(tmp_path, sleeps):
     assert len(engine.seen) <= 2
 
 
+async def test_a_failing_chunk_keeps_the_original_error_in_the_chain(tmp_path, sleeps):
+    """解包 ExceptionGroup 时不能把叶子异常自己的 __cause__ 弄丢。
+
+    `raise leaf from group.__cause__` 看着对，但 TaskGroup 抛的组 `__cause__` 是 None，
+    于是等价于 `raise leaf from None` —— 它会把 synthesize_with_retry 好不容易挂上去的
+    那个 ConnectionResetError 从 __cause__ 里抹掉，traceback 里再也看不到真正的网络错误
+    （而 aiohttp 那些异常 stringify 常常是空串，这条链是唯一的线索）。
+    """
+    original = ConnectionResetError("断了")
+    engine = FailingTTSEngine(original)
+    with pytest.raises(TTSError) as exc:
+        await synthesize_track(
+            _wide_script(2), 2, tmp_path, engine, concurrency=2, max_attempts=1
+        )
+    assert exc.value.__cause__ is original
+    # ExceptionGroup 本身是噪音，不该再作为 context 印一遍。
+    assert exc.value.__suppress_context__
+
+
 @pytest.mark.parametrize("text", ["Q3 财报。", "第一句。", "ABC。", "２０２５。"])
 def test_normal_text_stays_pronounceable(text):
     assert tts_module._is_pronounceable(text)
