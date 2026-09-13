@@ -1593,3 +1593,76 @@ async def test_max_attempts_of_one_means_a_single_request(monkeypatch):
         await provider.complete("SYS", "USR", Toy)
     assert len([r for r in log if "url" in r]) == 1
     assert "连续 1 次" in str(exc.value)
+
+
+# --- OpenAI 兼容路径也要认「输出被截断」（N4）--------------------------------
+#
+# Gemini 那条路有 `_check_gemini_finish`，能把 `MAX_TOKENS` 翻译成「请调高
+# llm.max_output_tokens」。OpenAI 兼容那条路原来压根不看 `choices[0].finish_reason`，
+# 同一个失败只表现成「连续 N 次输出不符合 LLMScript」—— 而 `_payload` 现在会传
+# `max_tokens`，正好把这个失败模式变得更容易发生。
+#
+# 各厂商的字面量（查过文档，见 _TRUNCATED_FINISH_MARKERS 旁边的注释）：
+# OpenAI / MiniMax / DeepSeek 都是 "length"，Anthropic 兼容层是 "max_tokens"。
+
+
+@pytest.mark.parametrize(
+    "reason", ["length", "LENGTH", "max_tokens", "max_output_tokens", "MAX_TOKENS"]
+)
+@pytest.mark.asyncio
+async def test_openai_compatible_reports_a_truncated_output(monkeypatch, reason):
+    """截断必须报成「调高 max_output_tokens」，而不是「不合 schema」。"""
+    body = _sse(
+        _delta('{"value": '),
+        {"choices": [{"delta": {"content": ""}, "finish_reason": reason}]},
+    )
+    log = _mock_httpx(monkeypatch, [body])
+    provider = OpenAICompatibleProvider(
+        api_key="k", model="m", base_url="https://x.test/v1"
+    )
+    with pytest.raises(LLMFinishReasonError) as exc:
+        await provider.complete("SYS", "USR", Toy)
+    assert "max_output_tokens" in str(exc.value)
+    assert reason in str(exc.value)
+    # 截断不该触发 schema 修复重试：同一个 max_tokens 只会再截断一次。
+    assert len([r for r in log if "url" in r]) == 1
+
+
+@pytest.mark.parametrize(
+    "reason", ["stop", None, "tool_calls", "FINISH_REASON_UNSPECIFIED"]
+)
+@pytest.mark.asyncio
+async def test_openai_compatible_ignores_normal_finish_reasons(monkeypatch, reason):
+    """`stop` / `null` / 认不出的值都必须原样放过，绝不能把能用的输出打死。"""
+    body = _sse(
+        _delta('{"value": 1}'),
+        {"choices": [{"delta": {"content": ""}, "finish_reason": reason}]},
+    )
+    _mock_httpx(monkeypatch, [body])
+    provider = OpenAICompatibleProvider(
+        api_key="k", model="m", base_url="https://x.test/v1"
+    )
+    assert (await provider.complete("SYS", "USR", Toy)).value == 1
+
+
+@pytest.mark.asyncio
+async def test_truncation_is_reported_even_without_a_schema(monkeypatch):
+    """纯文本路径（schema=None）同样要认，它走的是同一个 _stream_once。"""
+    body = _sse(
+        _delta("半句话"),
+        {"choices": [{"delta": {"content": ""}, "finish_reason": "length"}]},
+    )
+    _mock_httpx(monkeypatch, [body])
+    provider = OpenAICompatibleProvider(
+        api_key="k", model="m", base_url="https://x.test/v1"
+    )
+    with pytest.raises(LLMFinishReasonError):
+        await provider.complete("SYS", "USR")
+
+
+@pytest.mark.asyncio
+async def test_truncation_error_is_in_the_pipeline_error_table(monkeypatch):
+    from tenmin.cli import PIPELINE_ERRORS
+
+    assert issubclass(LLMFinishReasonError, LLMError)
+    assert issubclass(LLMFinishReasonError, PIPELINE_ERRORS)

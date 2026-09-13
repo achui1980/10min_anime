@@ -206,12 +206,20 @@ class LLMBusinessError(LLMError):
 
 
 class LLMFinishReasonError(LLMError):
-    """Gemini 报了一个非 STOP 的 finish_reason（或 prompt 级别的 block_reason）。
+    """模型报了一个「没有可用输出」的 finish_reason（或 prompt 级别的 block_reason）。
 
-    原实现完全不看它，直接 `schema.model_validate_json(response.text)`；而 text 在
-    「被安全策略拦下」与「撞 max output tokens 被截断」两种情形下都是 None，用户拿到
-    的是一句 `TypeError`。这两种情形的处置还完全不同（改提示词 vs 调高
-    max_output_tokens），所以必须分开报。
+    **两条 provider 路径共用这一族**：
+
+    - Gemini（`_check_gemini_finish`）：原实现完全不看它，直接
+      `schema.model_validate_json(response.text)`；而 text 在「被安全策略拦下」与
+      「撞 max output tokens 被截断」两种情形下都是 None，用户拿到的是一句 `TypeError`。
+      这两种情形的处置还完全不同（改提示词 vs 调高 max_output_tokens），所以必须分开报。
+    - OpenAI 兼容（`_stream_once`）：原实现同样不看 `choices[0].finish_reason`，于是
+      「输出被截断」只表现成「连续 N 次输出不符合 LLMScript」—— 一个指向完全错误方向的
+      报错，而 `_payload` 现在会传 `max_tokens`，正好让这个失败模式更容易发生。
+
+    刻意**不**被 `_complete_with_schema_repair` 的 except 网住：同一个 max_tokens 只会
+    再截断一次，重试是纯浪费（Gemini 那条路的行为一直如此，这里保持一致）。
     """
 
 
@@ -336,6 +344,41 @@ def _event_delta(event: dict[str, Any]) -> str:
         return ""
     delta = choices[0].get("delta") or {}
     return delta.get("content") or ""
+
+
+# 「输出撞到 token 上限被截断」的 finish_reason 字面量。**用宽松包含匹配**，因为各厂商
+# 不统一（下面的依据都是查过文档/源码的，不是猜的）：
+#
+# - **OpenAI**：`"length"` —— "incomplete model output due to max_tokens parameter"。
+# - **MiniMax**：`"length"`。它的 OpenAI 兼容接口文档（platform.minimax.io/docs/
+#   api-reference/text-chat-openai）把流式 chunk 的 finish_reason 枚举写成
+#   `stop | length`，并注明 `length` = "reached `max_completion_tokens` limit"；
+#   原生 text-post 那份也是 `stop | length | tool_calls`。spring-ai 的
+#   `MiniMaxApi.ChatCompletionFinishReason` 同样是 STOP/LENGTH/CONTENT_FILTER/TOOL_CALLS。
+# - **DeepSeek**：`"length"`（api-docs.deepseek.com 的 create-chat-completion）。
+# - **Anthropic 兼容层 / Gemini 原生**：`"max_tokens"` / `"MAX_TOKENS"`。虽然本 provider
+#   目前不走那两条，但网关/代理转译时这两个值会原样漏出来，认它零成本。
+#
+# 匹配用「小写后 substring」而不是精确集合：新厂商大概率还是这几个词的变体
+# （`max_output_tokens` / `max_completion_tokens`），而误判的代价只是把一次**本来就
+# 不合 schema** 的输出报成截断 —— 提示的动作（调高上限）恰好也是对的。
+_TRUNCATED_FINISH_MARKERS = ("length", "max_token", "max_output", "max_completion")
+
+
+def _finish_reason(event: dict[str, Any]) -> str | None:
+    """一个 SSE 事件里的 `choices[0].finish_reason`；没有/为 null 时返回 None。"""
+    choices = event.get("choices") or []
+    if not choices:
+        return None
+    reason = choices[0].get("finish_reason")
+    return reason if isinstance(reason, str) and reason else None
+
+
+def _is_truncated_finish(reason: str | None) -> bool:
+    if reason is None:
+        return False
+    lowered = reason.lower()
+    return any(marker in lowered for marker in _TRUNCATED_FINISH_MARKERS)
 
 
 def _business_error(event: dict[str, Any]) -> tuple[Any, str] | None:
@@ -731,6 +774,7 @@ class OpenAICompatibleProvider:
         整体截止。
         """
         parts: list[str] = []
+        finish_reason: str | None = None
         tally.requests += 1
         try:
             async with asyncio.timeout(self._total_timeout_seconds):
@@ -765,6 +809,9 @@ class OpenAICompatibleProvider:
                             raise LLMBusinessError(code=code, message=message)
                         if isinstance(event.get("usage"), dict):
                             tally.usage = event["usage"]
+                        # 最后一个非空的赢：收尾 chunk 带 finish_reason 而 delta 为空，
+                        # 而个别实现会在**每个** chunk 上带一个 null。
+                        finish_reason = _finish_reason(event) or finish_reason
                         parts.append(_event_delta(event))
         except TimeoutError as exc:
             # asyncio.timeout 到点抛的是内置 TimeoutError（httpx 自己的超时是
@@ -773,6 +820,15 @@ class OpenAICompatibleProvider:
                 f"一次 LLM 请求超过了总时长上限 {self._total_timeout_seconds} 秒"
                 f"（{self._endpoint}）。确实需要更久的话调高 llm.total_timeout_seconds。"
             ) from exc
+        # 判在读完整条流之后：这样 `parts` 已经收全，报错里能带上「收到多少字符」。
+        if _is_truncated_finish(finish_reason):
+            raise LLMFinishReasonError(
+                f"模型的输出撞到了 token 上限，被截断了"
+                f"（finish_reason={finish_reason!r}，已收到 {len(''.join(parts))} 字符）。"
+                "一份完整剧本 JSON 很长，请在 project.yaml 里调高 llm.max_output_tokens"
+                "（没配过的话它就是服务端自己的默认上限，配一个更大的值），"
+                "或者把 target_seconds 调小让剧本本身变短。"
+            )
         return "".join(parts)
 
     async def _stream_with_retries(
