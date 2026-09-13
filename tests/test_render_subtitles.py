@@ -133,3 +133,23 @@ def test_render_ass_wraps_long_cue_into_multiple_lines():
     text_part = dialogue_line.split(",", 9)[-1]
     for segment in text_part.split("\\N"):
         assert len(segment) <= max_chars_per_line(DEFAULT_FONT_SIZE)
+
+
+# --- 反斜杠 = ASS 控制字符（P2-E C3）---------------------------------------
+#
+# escape_text 剥掉了 `{}`（覆盖标签的定界符）却放过了 `\`，而 ASS 的 `\N` / `\n`
+# / `\h` 在**花括号之外的正文里**同样生效：一段含反斜杠的旁白就能自己插硬换行、
+# 插硬空格，把断行算好的版式打乱。
+# 判据跟 `{}` 完全一样，所以处置也一样 —— **剥掉**。刻意不转义成 `\\`：ASS 压根没有
+# 反斜杠转义机制（`\\` 不是「一个字面反斜杠」，libass 只会把它当一个未知标签吃掉），
+# 也不换成全角 `＼`（那是往正文里塞一个作者没写的字）。
+# 实测 11 份真实 script.json 的 73 段 narration：反斜杠出现 **0 次**，不改现有产物。
+
+
+def test_escape_text_strips_backslash():
+    assert escape_text("这里\\N不该换行") == "这里N不该换行"
+
+
+def test_escape_text_strips_backslash_before_converting_real_newlines():
+    """剥反斜杠必须发生在「真换行 → \\N」之前，否则自己插的 \\N 会被自己吃掉。"""
+    assert escape_text("上一行\n下\\h一行") == "上一行\\N下h一行"

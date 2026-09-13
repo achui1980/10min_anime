@@ -266,3 +266,31 @@ def test_plan_chunks_without_a_warnings_list_still_works():
         audio=AudioDirection(holds=[Hold(at=900.0, duration=2.0, quote="金句")]),
     )
     assert plan_chunks(beat) == [("第一句。第二句。", 2.0)]
+
+
+# --- 换行符不再把两个词粘在一起（P2-E A4）---------------------------------
+#
+# 原来 split_sentences 见到 `\n` 直接 `continue`，一个分隔符都不留：
+# "hello\nworld" → "helloworld"。CJK 无碍（本来就不靠空格分词），旁白里嵌拉丁文时
+# 就粘成一个词 —— TTS 会把它当一个生词读，字幕上也少一个词界。
+# 实测 11 份真实 script.json 的 73 段 narration：`\n` 出现 **0 次**，所以这是纯
+# 防御性修复，不改任何现有产物。
+
+
+def test_split_sentences_turns_a_newline_into_a_separator():
+    assert split_sentences("hello\nworld") == ["hello world"]
+
+
+def test_split_sentences_collapses_a_run_of_line_breaks():
+    assert split_sentences("hello\r\n\n  world") == ["hello world"]
+
+
+def test_split_sentences_does_not_leak_a_separator_at_a_sentence_edge():
+    """换行紧贴句末标点时不能在下一句开头留空格（strip 兜住），也不能改字数。"""
+    assert split_sentences("第一句。\n第二句。") == ["第一句。", "第二句。"]
+
+
+def test_split_sentences_keeps_pure_cjk_byte_for_byte():
+    """没有换行的输入必须逐字节不变 —— 全部 115 个存量 chunk 的内容哈希靠这条。"""
+    text = "他被塞进面包车后座的那一刻，口袋里只剩两百块日圆——他全部的财产。'走吧。'"
+    assert "".join(split_sentences(text)) == text

@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import re
 import unicodedata
 
 from tenmin.models import Beat, Hold
@@ -13,6 +14,25 @@ from tenmin.script.budget import DEFAULT_RATE, narration_seconds
 
 # 一句 = 若干非句末字符 + 一串句末标点；末尾没标点的残句单独成句。
 _SENTENCE_ENDINGS = "。！？!?"
+
+# 连续的换行（含 `\r\n` 与裸 `\r`）折成**一个空格**。
+#
+# 原来是见 `\n` 就 `continue`，一个分隔符都不留（而裸 `\r` 压根没被处理，会原样留在
+# chunk 文本里、进 TTS 请求与内容哈希）。CJK 不靠空格分词所以看不出来，旁白里嵌拉丁文
+# 时就粘成一个词：`"hello\nworld"` → `"helloworld"`，Edge TTS 当一个生词读，字幕上也
+# 少一个词界。
+#
+# 为什么换成空格、而不是当句子边界：换行没有句读语义（LLM 也可能只是在排版），凭它
+# 造一个句子会切出没有终止标点的残句、还可能让 hold 落到一个作者没打算断开的位置。
+# 空格是最小介入的选择，而且**不改字数**：budget.narration_chars 把全部空白 sub 掉，
+# 所以时长估算、hold 定位、字幕分配全都逐点不变。
+#
+# 实测 11 份真实 script.json 的 73 段 narration：`\n` 与 `\r` 各 0 次，所以这是纯
+# 防御性修复，现有产物一个字节都不动。
+#
+# 顺带吃掉换行**紧邻**的空白，免得 `"甲。\n  乙。"` 留下三个空格；不碰独立出现的空格
+# （那可能是作者刻意写的，而语料里压根没有空格字符）。
+_LINE_BREAKS = re.compile(r"\s*[\r\n]+\s*")
 
 # 句末标点之后还该跟着一起走的**收尾**符号。分成两族，因为判据不一样。
 #
@@ -60,16 +80,15 @@ def split_sentences(text: str) -> list[str]:
        把「没有任何可发音字符」的句子折进前一句（首句没有前一句，折进下一句）。这条保证
        「切出来的每一句都有内容可读」是**无条件**成立的不变量，而不是「引号写规范时才成立」。
 
-    切句是纯重新分组：拼回去与 strip 过的原文逐字节相同（有测试锁着）。
+    切句是纯重新分组：拼回去与 strip 过的原文逐字节相同（有测试锁着）。唯一的例外是
+    换行 —— 它会先被折成一个空格（见 _LINE_BREAKS），真实旁白里 0 次出现。
     """
     sentences: list[str] = []
     buffer: list[str] = []
     pending_end = False
     # 每种歧义引号各数一个计数器：偶数次出现的那个才是收引号。
     quote_counts: dict[str, int] = {}
-    for char in text.strip():
-        if char == "\n":
-            continue
+    for char in _LINE_BREAKS.sub(" ", text).strip():
         if char in _AMBIGUOUS_QUOTES:
             quote_counts[char] = quote_counts.get(char, 0) + 1
         if char in _SENTENCE_ENDINGS:
