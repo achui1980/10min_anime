@@ -178,7 +178,7 @@ class EdgeTTSEngine:
                     f"{text!r}。确实需要更久的话调高 render.tts_chunk_timeout_seconds。"
                 ) from error
             # 阻塞的 subprocess，必须扔到线程里：直接 await 不了，直接调会把事件循环
-            # 整个卡住（P2-B 的 TTS 并发化就完全白做）。
+            # 整个卡住（synthesize_track 的并发就完全白做）。
             duration = await asyncio.to_thread(probe_duration, part_path, ffprobe=self.ffprobe)
             lower, upper = _duration_bounds(text, self.rate)
             if duration <= 0 or not (lower <= duration <= upper):
@@ -283,7 +283,7 @@ def _is_pronounceable(text: str) -> bool:
     之后切开，把闭合的 `'` 留成一个独立片段（`03_script/E05.script.json` 的
     beat-3-act2 与 beat-5-act4 都有）。一旦某个 hold 正好落在这种片段上，它就会自己成为
     一个 chunk，Edge TTS 抛 NoAudioReceived（communicate.py:567），重试耗尽后整次运行
-    中止 —— 一个引号搞掉一整集。切句本身的缺陷已经由 P2-E A1 在 chunks.py 修掉了；
+    中止 —— 一个引号搞掉一整集。切句本身的缺陷已经由 chunks.split_sentences 修掉了；
     本层这道闸留着当**防御纵深**：它保护的是「被跳过的 chunk 带的留白不能凭空消失」，
     而那条不变量的代价（此后整条时间轴前移）远大于多留几行代码。
     """
@@ -300,7 +300,7 @@ def _plan_pronounceable(
     整条时间轴前移，所以只能转移、不能丢。
 
     `rate` 只往下传给 plan_chunks 决定 hold 落在哪个句边界上，不影响切句本身。
-    `warnings` 也往下传：chunks.assign_holds 那边的两条坏 hold warning（P2-E A3）
+    `warnings` 也往下传：chunks.assign_holds 那边的两条坏 hold warning
     必须冒到这一层才看得见 —— voice 是第一个真正消费 hold.at 的阶段，也是人工改完
     03_script/*.json 之后第一个跑到的阶段（validate_script() 只在 script 阶段跑）。
     """

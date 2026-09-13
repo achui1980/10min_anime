@@ -300,3 +300,58 @@ def test_the_line_reference_audit_catches_an_internal_ref(tmp_path):
         "synthetic.py:1 → render/timeline.py:107",
         "synthetic.py:2 → models.py:257",
     ]
+
+
+# --- 注释里不许留内部任务代号（N7）------------------------------------------
+#
+# 形如「P + 一位数字 + 短横 + 一个大写字母」的代号曾经散在 60 多处注释里。它们对读代码
+# 的人**毫无意义**：那些计划文档是某个时间点的快照，代号既不指向代码里的任何东西，也不
+# 告诉你那件事到底做了什么，还常年过期（`_is_fresh` 的 docstring 把已经落地的产物原子写
+# 写成「不在这里做，只能靠那个任务」，而它早就落地了）。
+#
+# 描述一个已经做完的改动，正确写法是说清**它做了什么**：写「产物原子写
+# （tenmin.atomic）」，不写代号。
+#
+# 下面这条正则刻意不含任何字面代号，所以本文件不会自我命中。
+_TASK_CODE = re.compile(r"\bP\d-[A-Z]\b|\bP\d 的\b")
+
+# 也扫 tests/：那边原来占了三分之二。
+_ALL_AUDITED_DIRS = (SRC, Path(__file__).resolve().parent)
+
+
+def _audited_python_files() -> list[Path]:
+    seen: dict[Path, None] = {}
+    for base in _ALL_AUDITED_DIRS:
+        for path in sorted(base.rglob("*.py")):
+            seen.setdefault(path, None)
+    return list(seen)
+
+
+def _task_codes(path: Path) -> list[str]:
+    out: list[str] = []
+    for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+        out.extend(f"{path.name}:{lineno} {m.group(0)}" for m in _TASK_CODE.finditer(line))
+    return out
+
+
+@pytest.mark.parametrize("path", _audited_python_files(), ids=lambda p: p.name)
+def test_no_internal_task_codes_in_comments(path: Path):
+    assert _task_codes(path) == [], (
+        f"{path.name} 里留了内部任务代号。请改成说清那件事做了什么 —— 代号对读代码的人"
+        "毫无意义，而且计划文档只是某个时间点的快照。"
+    )
+
+
+def test_the_task_code_audit_can_see_a_violation(tmp_path):
+    """守住上面那条审计自己（它的正则不含任何字面代号，所以不会自我命中）。"""
+    path = tmp_path / "synthetic.py"
+    code = "P" + "1-G"
+    path.write_text(f"# 那是 {code} 的范围\n", encoding="utf-8")
+    assert _task_codes(path) == [f"synthetic.py:1 {code}"]
+
+
+def test_the_task_code_audit_covers_the_tests_directory():
+    """tests/ 那边原来占了三分之二的代号，必须也在扫描范围里。"""
+    names = {p.name for p in _audited_python_files()}
+    assert "pipeline.py" in names
+    assert "test_pipeline.py" in names

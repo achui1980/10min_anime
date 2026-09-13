@@ -244,7 +244,7 @@ def test_build_timeline_segments_are_contiguous_and_monotonic():
     assert timeline.segments[-1].timeline_end == pytest.approx(timeline.total_seconds)
 
 
-# --- 帧边界对齐（P2-A 第 6 项）---------------------------------------------
+# --- 帧边界对齐 -----------------------------------------------------------
 
 
 def test_align_to_frame_snaps_to_the_nearest_frame():
@@ -340,7 +340,7 @@ def test_build_timeline_drift_tolerance_comes_from_config():
     assert not any("相差超过" in w for w in loose)
 
 
-# --- 相邻 cue 共享精确边界，不插间隙（P2-E B3 的决定，锁住它）--------------
+# --- 相邻 cue 共享精确边界，不插间隙（刻意的决定，锁住它）-----------------
 #
 # 这不是一个 TDD 循环（没有改任何行为），是把 B3 的结论钉下来：实测 10 集已生成的
 # .ass 共 362 条 Dialogue，`end == start` 0 条、`end < start` 0 条、相邻重叠 0 条，

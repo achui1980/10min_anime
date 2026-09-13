@@ -2,8 +2,8 @@
 
 **为什么必须有这一层**：`pipeline._is_fresh` 只比 mtime。被 Ctrl-C 或 ffmpeg 中途
 失败留下的半截产物，mtime 恰好是最新的，于是下一次运行会把它判成「已是最新」整段
-跳过，一个截断的 `.m4a`/`.mp4`/`.json` 就这样一路进成片，全程零警告。P0-C 加的
-「0 字节判不新鲜」只挡得住「刚 open 就被打断」，挡不住「写了一半」。
+跳过，一个截断的 `.m4a`/`.mp4`/`.json` 就这样一路进成片，全程零警告。`_is_fresh` 里
+那条「0 字节判不新鲜」只挡得住「刚 open 就被打断」，挡不住「写了一半」。
 `os.replace` 是同文件系统内的原子操作，所以正式路径上永远只有完整内容。
 
 **为什么放在包根、而不是 render/ 或 pipeline.py 里**：`pipeline` 已经
@@ -12,8 +12,9 @@
 `render/{audio,video}`（包 ffmpeg 输出）两边都要用。跟 `tenmin/intervals.py`
 同样是一个「不 import 任何 tenmin 模块」的叶子层，谁都可以放心依赖。
 
-风格刻意跟 `render/tts.py` 的 P1-E 实现对齐（同一个 `.part` 记号、同样的
-「异常路径 unlink、成功路径 replace」结构），只是把它抽成了共用件。
+结构刻意跟 `render/tts.py` 的 `EdgeTTSEngine.synthesize` 对齐（同样的「异常路径
+unlink、成功路径 replace」），只是把它抽成了共用件。两边的 `.part` **命名**是两套，
+各自的理由见 `part_path`。
 """
 
 from __future__ import annotations

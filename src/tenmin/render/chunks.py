@@ -65,7 +65,7 @@ def is_pronounceable(text: str) -> bool:
 def split_sentences(text: str) -> list[str]:
     """按句末标点切句，标点与紧跟其后的收尾符号都跟着前一句。连续标点算同一句末。
 
-    「收尾符号也跟着走」是 P2-E A1 修的 bug。原来 `。` 之后一律断开，于是
+    「收尾符号也跟着走」修的是一个真实 bug。原来 `。` 之后一律断开，于是
     `…她应尽的义务。'` 里那个收引号自成一句 —— 它不含任何可发音字符，
     render/tts.py 得专门跳过它（否则 Edge TTS 抛 NoAudioReceived），而字幕那边
     直接多出一条 0.18 秒、正文只有一个 `'` 的 cue（生产实证：work/saijo E05 有两条）。
@@ -134,8 +134,8 @@ def sentence_offsets(sentences: list[str], *, rate: str = DEFAULT_RATE) -> list[
     """每句「结束时刻」的估算值（秒）。
 
     换算走 budget.narration_seconds，所以它跟 render.rate 是**同一份**语速：
-    P1-H 之后 script/budget.py 的预算与 render/tts.py 的合成结果时长体检都按 rate 缩放，
-    只有这里还写死 4.5 字/秒。后果不是「估算不准」而是**定位错**：assign_holds 把 hold
+    script/budget.py 的预算与 render/tts.py 的合成结果时长体检都按 rate 缩放，
+    而这里曾经写死 4.5 字/秒。后果不是「估算不准」而是**定位错**：assign_holds 把 hold
     贴到「偏移最近的句边界」，rate="+20%" 时真实的句边界比这里算的早 1/1.2，于是留白被
     插到了另一句后面。实测 10 集 52 个带 hold 的 beat：rate="+20%" 会让 29 个的落点变、
     "-20%" 会让 31 个变 —— 也就是说这个缺陷一旦用户动了 rate 就立刻显形。

@@ -455,7 +455,7 @@ def test_render_video_passes_configured_ffmpeg_binary(tmp_path, monkeypatch):
     assert seen["ffmpeg"] == "/opt/libass/bin/ffmpeg"
 
 
-# --- 产物原子写（P1-G 第 1 项）---------------------------------------------
+# --- 产物原子写 -------------------------------------------------------------
 
 
 def test_render_video_tells_ffmpeg_to_write_a_part_file(tmp_path, monkeypatch):
@@ -514,7 +514,7 @@ def test_render_video_keeps_the_previous_artifact_when_ffmpeg_fails(tmp_path, mo
     assert not part_path(out_path).exists()
 
 
-# --- filtergraph 转义的真 ffmpeg 回归锁（P1-I）-------------------------------
+# --- filtergraph 转义的真 ffmpeg 回归锁 -------------------------------------
 #
 # 上面那些断言只钉住「我们拼出了什么字符串」，钉不住「ffmpeg 认不认」。这一段真跑
 # ffmpeg，输入自己用 lavfi 造（不依赖 work/ 的素材），一次约 1 秒。

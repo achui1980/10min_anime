@@ -82,7 +82,7 @@ def fake_script_response(episode: int = 2):
                 label=labels[i],
                 role=roles[i],
                 # 360 字，但**带句读**：12 句 ×（29 字 + 「。」）。原来是光秃秃的
-                # "啊" * 360，那是一个 360 字的单句，字幕会折成 12 行 —— P2-E C2 的可读性
+                # "啊" * 360，那是一个 360 字的单句，字幕会折成 12 行 —— 字幕可读性
                 # 检查因此照实报 warning，而这个 fixture 想表达的是「一次健康的批处理」。
                 # 字数不变（时长预算、clip 长度、chunk 划分全部照旧），只是补上真实旁白
                 # 必然有的句号。
@@ -175,7 +175,7 @@ def test_is_fresh_false_on_zero_byte_output(tmp_path):
     """Ctrl-C 打断 ffmpeg 留下的空壳 .m4a/.mp4 不能被当成最新产物。
 
     这是纯 mtime 比较最伤的失效模式：半截产物的 mtime 恰恰是最新的，于是下一次
-    跑直接 stage_skip，坏产物一路进成片。真正的解法是产物原子写（P1-G），这里
+    跑直接 stage_skip，坏产物一路进成片。真正的解法是产物原子写（tenmin.atomic），这里
     只做最低成本的兜底。
     """
     src = _file(tmp_path / "in.txt")
@@ -539,7 +539,7 @@ async def test_run_pipeline_from_signals_keeps_dialogue(project):
 async def test_run_pipeline_reruns_every_stage_when_project_yaml_changes(project):
     """project.yaml 是每个阶段的隐式输入：改了阈值/glossary/render 必须让产物失效。
 
-    P1-B 把大量经验阈值搬进了 project.yaml，而 _is_fresh 的 inputs 里根本没有它，
+    大量经验阈值住在 project.yaml 里，而 _is_fresh 的 inputs 里曾经根本没有它，
     于是「改 credits.op_span_min 再重跑」会被全部 stage_skip，用户看到的产物跟
     改动前一模一样，且没有任何提示。
     """
@@ -1016,7 +1016,7 @@ async def test_run_pipeline_batch_mode_runs_full_pipeline_for_all_episodes(
     provider = FakeProvider([fake_script_response(episode=2), fake_script_response(episode=1)])
     # 80 秒 = 360 字 / 4.5 字每秒，也就是这份 fixture 的旁白**真实**会有的长度。原来写
     # 的 8.0 秒相当于每秒念 45 个字，物理上不可能；后果是每条字幕只显示 0.67 秒，
-    # P2-E C2 的可读性检查照实报了 72 条 warning，而这个 fixture 想表达的是「一次健康的
+    # 字幕可读性检查照实报了 72 条 warning，而这个 fixture 想表达的是「一次健康的
     # 批处理」。这里不该靠调阈值绕过去，该修的是假时长。
     tts_engine = FakeTTSEngine([80.0] * 20)
 
@@ -1713,7 +1713,7 @@ def _project_config(tmp_path: Path) -> ProjectConfig:
     return load_project(yaml_path)
 
 
-# --- 产物原子写（P1-G 第 1 项）---------------------------------------------
+# --- 产物原子写 -------------------------------------------------------------
 # _is_fresh 只比 mtime，所以每一个「会被当成输入或产物」的文件都必须原子落盘，
 # 否则半截文件的 mtime 恰好最新，下一轮直接跳过、坏产物一路进成片。
 
@@ -1946,7 +1946,7 @@ async def test_run_pipeline_writes_each_episodes_own_script(project, golden_srt_
 async def test_run_pipeline_keeps_earlier_deliverables_when_a_later_script_fails(
     project, golden_srt_path
 ):
-    """P0-C 的不变量：中途失败要留下**完整**交付物，而不是一堆半成品。
+    """批量模式的不变量：中途失败要留下**完整**交付物，而不是一堆半成品。
 
     并发预取不许破坏它 —— 按集纵向的循环顺序没变，所以第 3 集的 script 炸掉时前两集
     的 docgen 产物必须都在。

@@ -187,8 +187,8 @@ def init(slug: str, work_dir: Path = WORK_DIR_OPTION) -> None:
         raise typer.Exit(code=1)
 
     # 只建 srt/：register_episode 会把字幕拷进去（它自己也会 mkdir，这里预先建出来
-    # 是为了让「手动放字幕」的人一眼看到位置）。刻意不建 video/——P0-C 之后源片不再
-    # 被拷进 work/，project.yaml 只记它的绝对路径，一个空的 video/ 夹在
+    # 是为了让「手动放字幕」的人一眼看到位置）。刻意不建 video/——源片不会被拷进
+    # work/（见 pipeline.register_episode），project.yaml 只记它的绝对路径，一个空的 video/ 夹在
     # 01_dialogue/…07_render/ 中间只会让人以为源片该放那儿。
     (root / "srt").mkdir(parents=True, exist_ok=True)
     payload = build_project_template(slug)

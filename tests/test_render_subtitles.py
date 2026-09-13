@@ -92,7 +92,7 @@ def test_render_ass_without_cues_still_has_headers():
 
 def test_max_cells_per_line_for_default_font_size():
     # 1920 - 2*60 margins = 1800px 可用宽度；48 号字一格按 1.05×48/2 = 25.2px 估算
-    # → 71 格（P2-E C1 把口径从「字符数」换成「格数」，取整发生在更细的粒度上，
+    # → 71 格（口径从「字符数」换成「格数」之后，取整发生在更细的粒度上，
     # 所以是 71 而不是「35 个全角字 ×2」的 70）。
     assert max_cells_per_line(48) == 71
 
@@ -141,7 +141,7 @@ def test_render_ass_wraps_long_cue_into_multiple_lines():
         assert display_cells(segment) <= max_cells_per_line(DEFAULT_FONT_SIZE)
 
 
-# --- 反斜杠 = ASS 控制字符（P2-E C3）---------------------------------------
+# --- 反斜杠 = ASS 控制字符 -------------------------------------------------
 #
 # escape_text 剥掉了 `{}`（覆盖标签的定界符）却放过了 `\`，而 ASS 的 `\N` / `\n`
 # / `\h` 在**花括号之外的正文里**同样生效：一段含反斜杠的旁白就能自己插硬换行、
@@ -161,7 +161,7 @@ def test_escape_text_strips_backslash_before_converting_real_newlines():
     assert escape_text("上一行\n下\\h一行") == "上一行\\N下h一行"
 
 
-# --- 边距只能有一份真相（P2-E C4）------------------------------------------
+# --- 边距只能有一份真相 ----------------------------------------------------
 #
 # MARGIN_LR = 60 决定断行宽度，而 Style 行原来硬编码着第二份 `60,60,60`
 # （MarginL/MarginR/MarginV）决定 libass 实际留的边距。两份字面量分开写，改一份不改
@@ -187,7 +187,7 @@ def test_changing_margin_lr_moves_both_the_wrap_width_and_the_style_line(monkeyp
     assert module.max_cells_per_line(DEFAULT_FONT_SIZE) < before
 
 
-# --- 行宽按「格」量，不按字符数（P2-E C1）----------------------------------
+# --- 行宽按「格」量，不按字符数 --------------------------------------------
 #
 # 原来断行宽度用 len() 度量，把半角字符当成跟汉字一样宽，于是混了拉丁字母/数字的
 # 行被提前折断（保守，从不超宽，但白扔掉可用宽度）。
@@ -261,7 +261,7 @@ def test_render_ass_never_exceeds_the_usable_width():
     assert budget * DEFAULT_FONT_SIZE * 1.05 / 2 <= PLAY_RES_X - 2 * MARGIN_LR
 
 
-# --- 行首标点回收与回溯窗口的边界（P2-E C5）--------------------------------
+# --- 行首标点回收与回溯窗口的边界 ------------------------------------------
 #
 # 断行原来只从 max_cells 往回找到 60% 处，找不到标点就硬切。两个后果实测出来了
 # （10 集 139 次断行）：
@@ -310,7 +310,7 @@ def test_wrap_text_backtrack_window_still_excludes_its_lower_bound():
     assert wrap_text(text, 20).split("\n")[0] == "一二三四五，六七八九"
 
 
-# --- 可读性检查：行数上限与最短显示时长（P2-E C2）---------------------------
+# --- 可读性检查：行数上限与最短显示时长 ------------------------------------
 #
 # 每条 cue 原来既无行数上限也无最短显示时长。实测（10 集、修完 A1/C1/C5 之后的
 # 360 条 cue）：

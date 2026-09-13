@@ -136,7 +136,7 @@ def test_apply_glossary_cascades_through_replacement_values():
 
     这条（以及下面两条）不是「顺便测一下」，而是**否决 alternation 正则方案的依据**：
     `re.compile("A|B")` 一次扫描只会把 `"A"` 换成 `"B"` 就收工，给出 `"B"`。
-    P2-D 第 7 项要求「必须与按长度倒序逐个 str.replace 逐字节等价」，
+    要求是「必须与按长度倒序逐个 str.replace 逐字节等价」，
     alternation 做不到，所以这次只把每条 cue 重复做的 key 排序缓存下来，
     替换本身照旧走 str.replace。
     """

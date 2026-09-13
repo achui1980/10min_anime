@@ -1234,7 +1234,7 @@ def test_font_available_is_none_without_fc_list(monkeypatch):
     assert font_available("Lantinghei SC") is None
 
 
-# --- probe_frame_rate（P2-A 第 4 项）---
+# --- probe_frame_rate ---
 
 
 def test_probe_frame_rate_parses_a_rational(monkeypatch, tmp_path):

@@ -537,7 +537,7 @@ def test_mix_audio_passes_configured_ffmpeg_binary(tmp_path, monkeypatch):
     assert seen["ffmpeg"] == "/opt/libass/bin/ffmpeg"
 
 
-# --- 产物原子写（P1-G 第 1 项）---------------------------------------------
+# --- 产物原子写 -------------------------------------------------------------
 # mix_audio 原来直接 `-y` 写最终路径，被打断就留一个 mtime 最新的截断 m4a，
 # 而 pipeline._is_fresh 只比 mtime，于是下一轮把它当最新产物跳过、坏音频进成片。
 

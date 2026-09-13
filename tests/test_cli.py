@@ -241,7 +241,7 @@ def test_init_template_carries_render_defaults(tmp_path):
 
 
 def test_init_does_not_create_a_video_dir(work):
-    """P0-C 之后源片不再被拷进 work/，register_episode 只记它的绝对路径。
+    """源片不会被拷进 work/，register_episode 只记它的绝对路径。
 
     一个空的 work/<slug>/video/ 夹在 01_dialogue/…07_render/ 中间，读起来就是
     「源片放这里」，而 project.yaml 里明明指向别的盘，纯属自相矛盾的误导。
@@ -254,7 +254,7 @@ def test_init_does_not_create_a_video_dir(work):
 
 
 def test_init_tells_user_how_to_register_an_episode(work):
-    """原文案是「把字幕放进 …/srt、源视频放进 …/video」，后半句 P0-C 之后就是假的。"""
+    """原文案是「把字幕放进 …/srt、源视频放进 …/video」，而源片压根不进 work/。"""
     result = runner.invoke(app, ["init", "saijo", "--work-dir", str(work)])
     text = out(result)
     assert "tenmin run saijo --episode" in text

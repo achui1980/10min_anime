@@ -448,7 +448,7 @@ def test_run_ingest_and_signals_use_project_config(tmp_path):
     assert Paths(cfg.root).signals(1).is_file()
 
 
-# --- render 的编码参数真的被消费（P2-A 第 2 项）---
+# --- render 的编码参数真的被消费 ---
 #
 # 这五个字段（crf / preset / videotoolbox_bitrate / audio_codec / audio_bitrate）
 # 以前只被 video.py / audio.py 通过 DEFAULT_RENDER 的模块别名读，所以 project.yaml
@@ -845,7 +845,7 @@ async def test_run_voice_wires_ffprobe_path_into_the_reuse_path(tmp_path, monkey
 
 
 def test_run_timeline_surfaces_subtitle_legibility_warnings(tmp_path):
-    """字幕可读性检查（P2-E C2）要接到 timeline 阶段的 warnings 上。
+    """字幕可读性检查要接到 timeline 阶段的 warnings 上。
 
     检查住在 render/subtitles.py（它才知道字号与画布宽度），而拿得到 cfg 与 warnings
     的是 run_timeline —— render/timeline.py 压根不认识字体。

@@ -632,7 +632,7 @@ def test_prompt_char_budget_follows_the_tts_rate(cfg, track, report):
     assert str(int((240.0 - HOLD_RESERVE_SECONDS) * 4.5 * 1.2)) in text
 
 
-# --- P2-C-2：clip 上界的单位不能跟「正片秒数」冲突 ---
+# --- clip 上界的单位不能跟「正片秒数」冲突 ---
 
 
 def test_prompt_states_the_clip_upper_bound_in_seconds(cfg, track, report):
@@ -652,7 +652,7 @@ def test_prompt_still_carries_the_human_readable_duration(cfg, track, report):
     assert readable_seconds(track.duration) in build_user_prompt(cfg, track, report)
 
 
-# --- P2-C-1：静态段前置，范例留在末尾（prefix 缓存） ---
+# --- 静态段前置，范例留在末尾（prefix 缓存） ---
 
 _DYNAMIC_ZONE_HEADING = "## 本期素材"
 
@@ -727,7 +727,7 @@ def test_example_section_sits_after_all_of_the_episode_material(cfg, track, repo
 
 
 def test_hard_requirements_sit_next_to_the_output_format(cfg, track, report):
-    """P1-D/P1-H 的审查结论：5 条废稿条件排在末尾、而 3KB 范例又在它们之后，
+    """审查结论：5 条废稿条件排在末尾、而 3KB 范例又在它们之后，
     长上下文里位置最劣。重排后它们必须紧贴「输出格式」。"""
     text = build_user_prompt(cfg, track, report)
     between = text[_at(text, "### 硬性要求（违反任一条即为废稿）") : _at(text, "## 输出格式")]
@@ -744,7 +744,7 @@ def test_self_check_is_the_last_section_of_the_prompt(cfg, track, report):
         assert str(int(track.duration)) in tail, "clip 上界要在末尾复述一次"
 
 
-# --- P2-C-5：报错消息要指名道姓是哪份模板 ---
+# --- 报错消息要指名道姓是哪份模板 ---
 
 
 def test_prompt_errors_name_the_template_file(cfg, track, report, monkeypatch):

@@ -26,7 +26,7 @@ def test_split_sentences_ignores_blank_input():
     assert split_sentences("   \n  ") == []
 
 
-# --- 句末闭合符（P2-E A1）-------------------------------------------------
+# --- 句末闭合符 -----------------------------------------------------------
 #
 # 生产实证：work/saijo 的 E05 旁白用 ASCII `'` 当引号，`。` 之后的收引号被甩成了
 # 一个独立片段，最后变成两条整条内容就是 `'` 的字幕 cue（0.19s / 0.18s）。
@@ -120,9 +120,9 @@ def test_assign_holds_on_empty_sentences_returns_empty():
     assert assign_holds([], [Hold(at=1.0, duration=1.0, quote="金句")]) == {}
 
 
-# --- 句偏移跟着 render.rate 走（P2-E A2）-----------------------------------
+# --- 句偏移跟着 render.rate 走 ---------------------------------------------
 #
-# budget.narration_seconds 与 tts 的时长体检在 P1-H 之后都按 render.rate 缩放了，
+# budget.narration_seconds 与 tts 的时长体检都按 render.rate 缩放，
 # 只有这里还写死 4.5 字/秒。后果：rate != "+0%" 时 hold 被按到偏移不对的句边界上。
 
 
@@ -189,7 +189,7 @@ def test_plan_chunks_on_empty_narration_returns_empty():
     assert plan_chunks(beat) == []
 
 
-# --- 两种被静默掩盖的坏 hold（P2-E A3）-------------------------------------
+# --- 两种被静默掩盖的坏 hold -----------------------------------------------
 #
 # 原来 assign_holds 对两种坏输入一声不响：多个 hold 落到同一句边界时直接相加，
 # hold.at 超出这段旁白的总跨度时直接贴到最后一句。两者都不失同步，所以走
@@ -268,7 +268,7 @@ def test_plan_chunks_without_a_warnings_list_still_works():
     assert plan_chunks(beat) == [("第一句。第二句。", 2.0)]
 
 
-# --- 换行符不再把两个词粘在一起（P2-E A4）---------------------------------
+# --- 换行符不再把两个词粘在一起 -------------------------------------------
 #
 # 原来 split_sentences 见到 `\n` 直接 `continue`，一个分隔符都不留：
 # "hello\nworld" → "helloworld"。CJK 无碍（本来就不靠空格分词），旁白里嵌拉丁文时

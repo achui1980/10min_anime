@@ -465,7 +465,7 @@ async def test_edge_engine_gives_up_on_a_stalled_chunk(tmp_path, monkeypatch):
 
 async def test_edge_engine_probes_duration_off_the_event_loop(tmp_path, monkeypatch):
     """probe_duration 是阻塞 subprocess，直接在 async 里调会卡住事件循环，
-    P2-B 的 TTS 并发就白做了。"""
+    synthesize_track 的并发就白做了。"""
     _stub_edge_tts(monkeypatch)
     threads: list[int] = []
 
@@ -631,7 +631,7 @@ async def test_duplicate_text_in_one_run_reuses_without_probing(tmp_path, monkey
 def _quote_only_script(*, holds: list[Hold]) -> Script:
     """复刻实测事故的**原始输入**：work/saijo 的 E05 旁白用 `'…'` 当引号。
 
-    P2-E A1 之前，chunks.split_sentences 在 `。` 之后就断开，把收尾的 `'` 留成一个独立
+    修复之前，chunks.split_sentences 在 `。` 之后就断开，把收尾的 `'` 留成一个独立
     片段；hold 一旦落在它上面，它就自己成为一个 chunk，Edge TTS 抛 NoAudioReceived，
     重试三次后整次运行中止。A1 之后这个输入在**上游**就不会再切出孤立引号了
     （见 test_the_incident_input_no_longer_produces_a_lone_quote_chunk）。
@@ -652,7 +652,7 @@ def _quote_only_script(*, holds: list[Hold]) -> Script:
 
 
 def test_the_incident_input_no_longer_produces_a_lone_quote_chunk():
-    """P2-E A1 的回归测试：这条原来锁的是「事故输入真的会切出孤立 `'` chunk」。
+    """切句修复的回归测试：这条原来锁的是「事故输入真的会切出孤立 `'` chunk」。
 
     A1 把收尾符号吸收进前一句之后，同一个输入切出来的每个 chunk 都有内容可读，
     孤立引号从根上没有了 —— 所以这条从「证明症状存在」翻成「证明症状消失」。
@@ -742,7 +742,7 @@ async def test_progress_total_excludes_skipped_chunks(tmp_path, forced_plan):
     assert reporter.calls == [("substep", "voice", 1, 1, "第一句。第二句。")]
 
 
-# --- rate 一路传到切句（P2-E A2）-------------------------------------------
+# --- rate 一路传到切句 -----------------------------------------------------
 
 
 def _rate_sensitive_script() -> Script:
@@ -1080,7 +1080,7 @@ def test_build_tts_engine_wires_ffprobe_path():
 
 
 async def test_synthesize_track_surfaces_bad_hold_warnings(tmp_path):
-    """chunks.assign_holds 报的坏 hold 要一路冒到 voice 阶段的 warnings 里（P2-E A3）。
+    """chunks.assign_holds 报的坏 hold 要一路冒到 voice 阶段的 warnings 里。
 
     voice 是这条流水线上第一个真正**消费** hold.at 的阶段，也是人工改完
     03_script/*.json 之后第一个跑到的阶段（validate_script() 只在 script 阶段跑）。

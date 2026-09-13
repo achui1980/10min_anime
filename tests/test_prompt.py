@@ -25,8 +25,8 @@ def test_render_missing_variable_raises():
 
 
 def test_render_rejects_unused_kwargs():
-    """原来这里锁的是反的行为（「多传的变量被忽略」）。那正是 P2-C 第 4 项要修的 bug：
-    模板里的占位符名字敲错时，整段内容会静默丢失。见下面 P2-C-4 那一组测试。"""
+    """原来这里锁的是反的行为（「多传的变量被忽略」）。那正是要修的 bug：
+    模板里的占位符名字敲错时，整段内容会静默丢失。见下面「模板校验必须是双向的」那一组。"""
     from tenmin.script.prompt import PromptTemplateError
 
     with pytest.raises(PromptTemplateError):
@@ -92,7 +92,7 @@ def test_golden_example_asset_has_no_ocr_garbage():
     assert "浙谷339" not in text
 
 
-# --- P2-C-4：模板校验必须是双向的 ---
+# --- 模板校验必须是双向的 ---
 
 
 def test_render_rejects_a_variable_the_template_never_uses():
@@ -135,7 +135,7 @@ def test_template_errors_land_in_the_cli_error_funnel():
     assert issubclass(PromptTemplateError, KeyError)
 
 
-# --- P2-C-5：资源加载 ---
+# --- 资源加载 ---
 
 
 def test_load_prompt_is_cached():

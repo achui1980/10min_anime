@@ -401,7 +401,7 @@ class ProjectConfig(BaseModel):
         """project.yaml 自身的路径。
 
         两个用途：register_episode 要改写它；pipeline._is_fresh 把它当**每个阶段的
-        输入**（P1-B 之后全项目的经验阈值、glossary、render 参数都住在这个文件里，
+        输入**（全项目的经验阈值、glossary、render 参数都住在这个文件里，
         改了它却不让任何产物失效，等于旋钮全是哑的）。
 
         文件名写死 "project.yaml"：CLI 的 _project_file 只会去找这个名字，

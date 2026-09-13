@@ -179,13 +179,15 @@ def _is_fresh(outputs: list[Path], inputs: list[Path]) -> bool:
 
     语义与已知局限（改这个函数前先读完）：
 
-    1. **前提是「产物要么不存在、要么完整」**。判据只有 mtime，而被 Ctrl-C 打断的
-       ffmpeg / TTS 会留下一个 mtime 恰好最新的半截文件，纯 mtime 比较必然把它当成
-       最新产物直接跳过，坏产物一路进成片。正解是产物原子写（临时文件 + os.replace），
-       那是 P1-G 的范围，不在这里做。这里只加一条最低成本的兜底：**0 字节产物一律
-       视为不新鲜**。本流水线没有任何一个阶段会合法地产出空文件（json/md/txt/m4a/mp4
-       都有内容），所以这条规则不会误伤；它挡得住「刚 open 就被打断」这一类，挡不住
-       「写了一半」——后者只能靠 P1-G。
+    1. **前提是「产物要么不存在、要么完整」，而这个前提现在是被兜住的**。判据只有
+       mtime，而被 Ctrl-C 打断的 ffmpeg / TTS 曾经会留下一个 mtime 恰好最新的半截文件，
+       纯 mtime 比较必然把它当成最新产物直接跳过，坏产物一路进成片。**现在全部产物写入
+       都走 `tenmin.atomic`**（临时 `.part` + `os.replace`，正式路径上永远只有完整
+       内容；tests/test_source_hygiene.py 有一条审计守着「不许直接 write_text」），
+       所以「写了一半」这一类已经到不了这里。
+       这里另外还留着一条最低成本的兜底：**0 字节产物一律视为不新鲜**。本流水线没有
+       任何一个阶段会合法地产出空文件（json/md/txt/m4a/mp4 都有内容），所以这条规则
+       不会误伤；它挡的是「刚 open 就被打断」这一类，跟原子写是两层独立的保险。
     2. **inputs 必须包含 project.yaml**（调用点用 cfg.config_path 传进来）。所有阶段
        的行为都由它决定，漏了它就等于所有配置旋钮改了都不生效。
     3. **inputs 一个都不存在时返回 True（跳过）**，见下面的注释。
@@ -567,7 +569,7 @@ def run_timeline(
     timeline, warnings = build_timeline(
         script, track, source_duration, frame_rate=frame_rate, cfg=cfg.render
     )
-    # 可读性检查（P2-E C2）住在 render/subtitles.py —— 只有它知道字号与画布宽度算出来
+    # 可读性检查住在 render/subtitles.py 的 check_cue_legibility —— 只有它知道字号与画布宽度算出来
     # 的行数。接在这里而不是 build_timeline 里：render/timeline.py 压根不认识字体，而
     # 这个函数手上同时有 cfg.render 与 warnings。
     warnings.extend(
@@ -740,7 +742,7 @@ async def run_pipeline(
     都会对 cfg.episodes 里注册的每一集分别跑一遍。传了具体集数时是单集模式：
     只处理这一集（ingest/signals 仍然是全局阶段，一直处理所有已注册的集）。
 
-    **script 阶段的多集并发**（`llm.script_concurrency`）：编排保持 P0-C 的「按集纵向」，
+    **script 阶段的多集并发**（`llm.script_concurrency`）：编排保持「按集纵向」，
     只给 script 加一个**有界预取窗口** —— 走到第 i 集时确保前 `i + concurrency` 集的
     script task 都已经起了，然后 await 第 i 集那个。取舍见 `_launch_scripts` 的注释。
     """
@@ -833,8 +835,8 @@ async def run_pipeline(
 
         为什么是「有界预取」而不是「把 script 整个抽成横向阶段」：
 
-        P0-C 刻意把批量模式从「按阶段横向」改成「按集纵向」，理由是**中途失败要留下
-        完整交付物、而不是一堆半成品**。把 script 抽成横向的并发阶段（选项 a）会直接
+        批量模式刻意是「按集纵向」而不是「按阶段横向」，理由是**中途失败要留下
+        完整交付物、而不是一堆半成品**。把 script 抽成横向的并发阶段会直接
         推翻它：全部集的 script 跑完之前一集成片都不会有，而 script 恰好是最容易失败、
         也最慢的那一个阶段（实测单次调用 561 秒）—— 十集批量跑到第九集炸掉，用户手上
         是 8 份 script.json 和 0 个 mp4。
