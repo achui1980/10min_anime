@@ -191,9 +191,14 @@ def test_tts_error_is_a_pipeline_error():
 
 
 async def test_synthesize_track_passes_max_attempts_through(tmp_path, sleeps):
+    """concurrency=1 是刻意钉住的：FlakyTTSEngine 的 attempts 是**全局**计数，默认并发
+    度下另外两个 chunk 也会各自贡献一次尝试，断言就不再是在测 max_attempts 转发了。
+    并发下的同一条性质由 test_a_failure_stops_handing_out_new_chunks 覆盖。"""
     engine = FlakyTTSEngine(fail_times=1)
     with pytest.raises(TTSError):
-        await synthesize_track(sample_script(), 2, tmp_path, engine, max_attempts=1)
+        await synthesize_track(
+            sample_script(), 2, tmp_path, engine, max_attempts=1, concurrency=1
+        )
     assert engine.attempts == 1
 
 
@@ -735,14 +740,25 @@ def _wide_durations(count: int) -> dict[str, float]:
     return {f"第{i}句。": 1.0 + i for i in range(count)}
 
 
-async def test_synthesize_track_is_serial_by_default(tmp_path):
-    """默认 concurrency=1：任何时刻只有一个 chunk 在合成（零行为变更的底线）。"""
+async def test_synthesize_track_is_serial_at_concurrency_one(tmp_path):
+    """concurrency=1：任何时刻只有一个 chunk 在合成，且合成顺序 = 计划顺序
+    （零行为变更的底线）。"""
     engine = _ConcurrencySpyEngine(
         _wide_durations(6), {f"第{i}句。": 0.01 for i in range(6)}
     )
-    await synthesize_track(_wide_script(6), 2, tmp_path, engine)
+    await synthesize_track(_wide_script(6), 2, tmp_path, engine, concurrency=1)
     assert engine.peak == 1
     assert engine.started == [f"第{i}句。" for i in range(6)]
+
+
+async def test_synthesize_track_default_concurrency_follows_render_config(tmp_path):
+    """不传 concurrency 时用 RenderConfig 的默认值，别在这里写第二份字面量。"""
+    count = RenderConfig().tts_concurrency + 4
+    engine = _ConcurrencySpyEngine(
+        _wide_durations(count), {f"第{i}句。": 0.02 for i in range(count)}
+    )
+    await synthesize_track(_wide_script(count), 2, tmp_path, engine)
+    assert engine.peak == RenderConfig().tts_concurrency
 
 
 async def test_synthesize_track_honours_the_concurrency_limit(tmp_path):

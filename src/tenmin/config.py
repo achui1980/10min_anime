@@ -286,8 +286,35 @@ class RenderConfig(BaseModel):
     outro_font_name: str = "Lantinghei SC"
     # 抄 render/tts.py 的 TTS_MAX_ATTEMPTS。
     tts_max_attempts: int = Field(default=3, ge=1)
-    # 新旋钮。默认 1 = 保持当前的串行合成行为，并发化是后续任务的事。
-    tts_concurrency: int = Field(default=1, ge=1)
+    # 同时在飞的 chunk 数。**4 是实测选出来的**，见 render/tts.py 的 synthesize_track。
+    #
+    # 标定素材：work/saijo 10 集的 beat 合成一份 115 个 chunk 的 script（等价于「一次
+    # 批量跑 10 集」对 Edge TTS 的冲击 —— voice 阶段按集串行，在飞数永远不超过这个值），
+    # 每轮往一个全新空目录里真合成，避开内容哈希缓存：
+    #
+    # | 并发度 | 墙钟   | 相对串行 | 重试 |
+    # |--------|--------|----------|------|
+    # | 1      | 297.3s | 1.0×     | 0    |
+    # | 4      |  81.9s | 3.6×     | 0    |
+    # | 8      |  36.2s | 8.2×     | 0    |
+    # | 12     |  33.1s | 9.0×     | 0    |
+    # | 24     |  12.8s | 23.2×    | 0    |
+    #
+    # 一直到 24 都没观察到任何限流（唯一一次失败是并发 4 那轮的 NoAudioReceived，
+    # Edge TTS 的随机抽风，跟并发无关，退避重试一次就过了）。既然如此为什么不取更大：
+    # - **收益的膝点在 4–8**：1→4 省 215 秒（占全部可省时间的 76%），4→8 只再省 46 秒，
+    #   8→24 只再省 23 秒。voice 阶段本来就不是最长的那一段（script 一次 LLM 调用实测
+    #   561 秒），把它从 5 分钟压到 1.4 分钟已经拿到了这条路上几乎全部的价值。
+    # - **Edge TTS 是免费公共服务**，而且走的是没有公开契约的接口。24 路突发是那种
+    #   「每个用户都这么干就会被封掉」的用法，而上面那张表只代表一个网络、一个时间窗，
+    #   微软的限流策略没有文档、可能按区域/时段变。
+    # - **失败代价不对称**：真撞上限流时兜底只有 TTS_MAX_ATTEMPTS=3 次、1/2 秒的退避，
+    #   而一个 chunk 彻底失败会中止整次运行。
+    #
+    # 产物与并发度无关（已用真实素材逐字节验证：voice.json、chunk 文件名的内容哈希、
+    # 每个 mp3 的 md5，在并发 1 与并发 4 下与改动前的实现完全一致），所以这个默认值
+    # 只影响速度，不影响成片。
+    tts_concurrency: int = Field(default=4, ge=1)
     # 新旋钮。edge-tts 走公司代理时需要；None = 不设代理。
     tts_proxy: str | None = None
     # edge_tts.Communicate 的 connect_timeout / receive_timeout（默认值就抄它的

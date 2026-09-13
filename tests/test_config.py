@@ -435,7 +435,7 @@ def test_render_config_new_defaults():
     assert cfg.subtitle_font_name == "Lantinghei SC"
     assert cfg.outro_font_name == "Lantinghei SC"
     assert cfg.tts_max_attempts == 3
-    assert cfg.tts_concurrency == 1
+    assert cfg.tts_concurrency == 4
     assert cfg.tts_proxy is None
     assert cfg.drift_tolerance == pytest.approx(0.5)
     assert cfg.ffmpeg_path == "ffmpeg"
