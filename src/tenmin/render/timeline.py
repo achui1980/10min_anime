@@ -77,7 +77,33 @@ def chunks_by_beat(track: VoiceTrack) -> dict[str, list[VoiceChunk]]:
 def build_timeline(
     script: Script, track: VoiceTrack, source_duration: float
 ) -> tuple[Timeline, list[str]]:
-    """按 beat 逐段重算画面时长，产出成片时间轴。"""
+    """按 beat 逐段重算画面时长，产出成片时间轴。
+
+    **一个 beat 只要有 chunk，就必须至少产出一段画面**，否则抛 ValueError。理由：
+    音频游标（字幕与旁白落点的唯一驱动）在 clip 检查**之前**就推进了 —— 它必须
+    这么推，因为旁白已经合成出来了、占着这段时间。所以一个「有旁白、没画面」的
+    beat 会让音频保住时间而画面没有输出，**此后每一段画面都相对旁白整体前移**，
+    全片失同步。这不是「尾部少一点画面」，是从那个 beat 起内容全部对错。
+
+    为什么是硬失败而不是本项目惯用的「降级 + warning」：
+
+    - 触发条件本身就是「源片跟剧本对不上」，不是「稿子写得不够好」。实测（真实
+      saijo E02 的 script.json + voice.json）把 source_duration 从 1509.97 压到
+      900 秒，climax 与 outro 两个 beat 的全部 clip 都落在片长之外，画面比旁白
+      少 71.4 秒 —— 真因是「配的 video 不是这一集/被截断了」，唯一有用的动作是
+      去修 project.yaml 或换源片，而不是接受一份错位的成片。
+    - 降级出来的东西没有价值：填黑场能救回同步，但那个 beat 的旁白就对着黑屏讲，
+      而且**同一个原因**还会让相邻 beat 的 clip 被「钳到片尾」，内容照样错。
+    - script/validate.py 对**同一个条件**（「某个节点的 clip 全灭」）已经是硬失败
+      （见那边 `if not kept` 的长注释）。那道闸按 DialogueTrack.duration（字幕末尾）
+      判，这里按**视频**片长判，两者对不上时就漏到这一层 —— 语义上是同一道闸的
+      下半段，行为该一致。
+    - 代价很小：timeline 是纯计算，贵的 LLM 与 TTS 产物都已经落盘，改完
+      project.yaml 跑 `--from timeline` 就继续。
+
+    仍然降级的是**同一个 beat 里丢掉部分 clip**（剩下的还撑得住这段时长）与
+    「beat 压根没有 chunk」（音频与画面同时跳过，不会失同步）—— 那两条都不失同步。
+    """
     grouped = chunks_by_beat(track)
     segments: list[TimelineSegment] = []
     subtitles: list[SubtitleCue] = []
@@ -99,12 +125,11 @@ def build_timeline(
             audio_cursor += chunk.duration + chunk.hold_after
 
         audio_seconds = beat_audio_seconds(chunks)
-        clip_seconds = beat_clip_seconds(beat)
-        if clip_seconds <= 0:
-            warnings.append(f"beat {beat.id} 没有可用的 clip，该段将没有画面")
-            continue
-
-        ratio = scale_ratio(audio_seconds, clip_seconds)
+        # clip 总时长为 0（clips 为空、或每条都是零长）时 ratio 是 0，于是下面每条
+        # clip 都会缩放成零长被丢掉，最后由 beat 级的那道闸统一报错 —— 刻意不在这里
+        # 提前 continue，免得同一个失同步条件有两条出口、两套消息。
+        ratio = scale_ratio(audio_seconds, beat_clip_seconds(beat))
+        emitted = 0
         for clip in beat.clips:
             if clip.start >= source_duration:
                 warnings.append(
@@ -135,6 +160,18 @@ def build_timeline(
                 )
             )
             picture_cursor += length
+            emitted += 1
+
+        if emitted == 0:
+            raise ValueError(
+                f"beat {beat.id} 有 {audio_seconds:.1f}s 旁白却一段画面都没有"
+                f"（clips 为空，或每一条都落在源片长 {source_duration:.1f}s 之外／"
+                f"缩放后成了零长）。这会让这个节点之后的画面全部相对旁白前移、"
+                f"整片失同步，所以这里直接拦掉。\n"
+                f"先看上面那几条 clip 的 warning：源片是不是配错集数／被截断了？"
+                f"（project.yaml 的 episodes[].video）"
+                f"要么改 03_script/ 里这个节点的 clip 时间戳，再跑 --from timeline。"
+            )
 
     if abs(picture_cursor - audio_cursor) > DRIFT_TOLERANCE:
         warnings.append(

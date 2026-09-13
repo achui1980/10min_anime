@@ -170,20 +170,35 @@ def test_build_timeline_warns_on_beat_without_chunks():
     assert any("没有配音 chunk" in w for w in warnings)
 
 
-def test_build_timeline_warns_on_beat_without_clips():
+def test_build_timeline_rejects_beat_without_clips():
+    """有 chunk 却一个 clip 都没有 = 音频占了时间、画面没有输出 → 此后全片失同步。
+
+    原来这里只报一条 warning 就继续：音频游标已经推进（字幕也照样产出），而画面
+    游标没动，于是**后面每一段画面都相对旁白整体前移**。硬失败才是对的，理由见
+    build_timeline 的 docstring。
+    """
     script = one_beat_script([])
-    timeline, warnings = build_timeline(script, two_chunk_track(), source_duration=1400.0)
-    assert timeline.segments == []
-    # 音频照旧推进，字幕仍然产出
-    assert len(timeline.subtitles) == 2
-    assert timeline.total_seconds == pytest.approx(20.0)
-    assert any("没有可用的 clip" in w for w in warnings)
+    with pytest.raises(ValueError) as exc:
+        build_timeline(script, two_chunk_track(), source_duration=1400.0)
+    assert "b1" in str(exc.value)
+    assert "20.0" in str(exc.value)
 
 
-def test_build_timeline_drops_clip_starting_past_source_end():
+def test_build_timeline_rejects_beat_whose_clips_all_fall_outside_the_source():
+    """clip 被逐条丢弃到一个不剩，跟「压根没写 clip」是同一种失同步。"""
     script = one_beat_script([Clip(episode=2, start=200.0, end=240.0)])
+    with pytest.raises(ValueError) as exc:
+        build_timeline(script, two_chunk_track(), source_duration=150.0)
+    assert "b1" in str(exc.value)
+
+
+def test_build_timeline_keeps_going_when_the_beat_still_has_one_clip():
+    """降级的边界：同一个 beat 里丢掉一条、留下一条时照旧只报 warning。"""
+    script = one_beat_script(
+        [Clip(episode=2, start=200.0, end=240.0), Clip(episode=2, start=10.0, end=50.0)]
+    )
     timeline, warnings = build_timeline(script, two_chunk_track(), source_duration=150.0)
-    assert timeline.segments == []
+    assert len(timeline.segments) == 1
     assert any("超出源片长" in w for w in warnings)
 
 
