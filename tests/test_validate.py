@@ -16,9 +16,7 @@ from tenmin.script.budget import beat_seconds
 from tenmin.script.validate import (
     ANCHOR_OUTSIDE_MAX_RATIO,
     ANCHOR_OVERWRITE_MAX_SECONDS,
-    ANCHOR_TOLERANCE_SECONDS,
     CREDITS_OVERLAP_MAX_RATIO,
-    MIN_CLIP_SECONDS,
     AnchorIndex,
     ScriptValidationError,
     check_script,
@@ -69,7 +67,7 @@ def clip(start, end, anchors=(), silent=False):
 
 
 def make_script(clips_per_beat, *, pad=True):
-    """pad=True 时补齐到 MIN_BEATS 个节点，避免触发节点数下限检查。
+    """pad=True 时补齐到 min_beats 个节点，避免触发节点数下限检查。
     填充 clip 落在 300s 附近，刻意避开测试里用到的 OP(153-225) / ED(1348+) 区间。"""
     rows = list(clips_per_beat)
     if pad:
@@ -108,8 +106,9 @@ def test_valid_script_passes_unchanged():
     assert len(result.script.beats[0].clips) == 1
 
 
-def test_anchor_tolerance_constant():
-    assert ANCHOR_TOLERANCE_SECONDS == pytest.approx(5.0)
+def test_anchor_tolerance_default():
+    """对着权威来源（config）断言，不再经过 validate 那个没人读的模块级别名。"""
+    assert DEFAULT_VALIDATE.anchor_tolerance_seconds == pytest.approx(5.0)
 
 
 def test_clip_past_episode_end_is_dropped():
@@ -211,7 +210,7 @@ def test_silent_highlight_recomputed_false_when_llm_lied():
 
 
 def test_silent_highlight_needs_one_second_overlap():
-    # 与间隙只重叠 0.633 秒。clip 本身给足 3 秒，避免撞上 MIN_CLIP_SECONDS。
+    # 与间隙只重叠 0.633 秒。clip 本身给足 3 秒，避免撞上 min_clip_seconds。
     s = make_script([[clip(1326.0, 1329.0, silent=False)]])
     result = run(s, report=make_report(gaps=[(1328.367, 1348.18)]))
     assert result.script.beats[0].clips[0].is_silent_highlight is False
@@ -556,12 +555,12 @@ def test_flash_frame_clip_is_dropped():
 
 
 def test_clip_at_exactly_the_minimum_is_kept():
-    s = make_script([[clip(50.0, 50.0 + MIN_CLIP_SECONDS)]])
+    s = make_script([[clip(50.0, 50.0 + DEFAULT_VALIDATE.min_clip_seconds)]])
     assert len(run(s).script.beats[0].clips) == 1
 
 
-def test_min_clip_seconds_constant():
-    assert MIN_CLIP_SECONDS == pytest.approx(1.5)
+def test_min_clip_seconds_default():
+    assert DEFAULT_VALIDATE.min_clip_seconds == pytest.approx(1.5)
 
 
 # --- A1：时间轴单调性 ---

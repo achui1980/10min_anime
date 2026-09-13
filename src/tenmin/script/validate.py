@@ -28,11 +28,13 @@ from tenmin.models import Beat, Clip, DialogueLine, DialogueTrack, Script, Signa
 from tenmin.render.timeline import beat_clip_seconds
 from tenmin.script.budget import DEFAULT_RATE, beat_seconds
 
-# 阈值的权威定义在 tenmin.config.ValidateConfig；下面三个只是 DEFAULT_VALIDATE 的
-# 模块级别名，给老调用点、文档与测试用（全项目一律这个惯例，见 config.py 的模块 docstring）。
-ANCHOR_TOLERANCE_SECONDS = DEFAULT_VALIDATE.anchor_tolerance_seconds
-MIN_BEATS = DEFAULT_VALIDATE.min_beats
-MIN_CLIP_SECONDS = DEFAULT_VALIDATE.min_clip_seconds
+# 这里**刻意没有** anchor_tolerance_seconds / min_beats / min_clip_seconds 的模块级
+# 别名。config.py 的模块 docstring 把别名的用途写成「给老调用点、文档与测试用」，而这
+# 三个（加 min_beats 共四个）在 src/ 里一个读取点都没有 —— 本模块的函数全部走 `cfg.xxx`，
+# 别名只被三条「别名 == config 默认值」的同义反复测试引用。留着它们的唯一效果是给同一个
+# 值造第二个名字、并让人误以为存在一个模块级旋钮。要断言默认值请直接对着权威来源写
+# （`DEFAULT_VALIDATE.min_clip_seconds`），本文件的 timeline_regression / stretch 两组
+# 测试本来就是这个写法。
 
 SILENT_OVERLAP_SECONDS = 1.0
 
@@ -402,7 +404,7 @@ def _check_structure(script: Script, cfg: ValidateConfig) -> list[str]:
     """B1：提示词写明的节点结构约定（single_episode.md 的「节点结构」与
     「每个节点的 clips」两节）。
 
-    原来这里只有 `MIN_BEATS` 一条下限（低于它直接判错重试），上限与结构一概不查。
+    原来这里只有 `cfg.min_beats` 一条下限（低于它直接判错重试），上限与结构一概不查。
 
     全部只给 warning，一条都不判错：这些是「写得合不合规格」的创作约定，违反了照样
     能出片，不值得烧掉一次几百秒的 LLM 调用。实测 13 份真实 script.json（10 集 saijo

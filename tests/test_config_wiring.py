@@ -66,8 +66,18 @@ _AUDIT_SKIP_FILES = frozenset({"config.py"})
 #   DEFAULT_RENDER.ffmpeg_path                 → 接收者是那个默认实例
 _CONFIG_RECEIVERS = frozenset({"cfg", "render", "llm", "DEFAULT_RENDER", "DEFAULT_LLM"})
 
-# 派生模块级别名的那两个默认实例。
-_DEFAULT_INSTANCES = {"DEFAULT_RENDER": "render", "DEFAULT_LLM": "llm"}
+# 派生模块级别名的那几个默认实例。RenderConfig / LLMConfig 之外的也扫：
+# `test_config_aliases_are_only_default_parameter_values` 那条规则（别名只许当默认参数
+# 值用）跟字段属于哪个子块无关，而 validate / signals 那两个模块历史上正是「别名一个
+# 读取点都没有」的地方。
+_DEFAULT_INSTANCES = {
+    "DEFAULT_RENDER": "render",
+    "DEFAULT_LLM": "llm",
+    "DEFAULT_VALIDATE": "validate_script",
+    "DEFAULT_SIGNALS": "signals",
+    "DEFAULT_INGEST": "ingest",
+    "DEFAULT_CREDITS": "credits",
+}
 
 # 「已知不消费」白名单：{(子块, 字段名): 理由}。
 #

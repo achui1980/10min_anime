@@ -11,8 +11,9 @@ from tenmin.config import DEFAULT_SIGNALS, SignalsConfig
 from tenmin.intervals import spoken_lines
 from tenmin.models import DialogueLine, DialogueTrack, Signal
 
-# 阈值的权威定义在 tenmin.config.SignalsConfig；这个别名只为老调用点/文档保留。
-LOW_DENSITY_RATIO = DEFAULT_SIGNALS.low_density_ratio
+# 这里**刻意没有** low_density_ratio 的模块级别名：本模块全部走 `cfg.low_density_ratio`，
+# 那个别名在 src/ 里一个读取点都没有（只被一条「别名 == 默认值」的同义反复测试引用）。
+# 要断言默认值请直接写 `DEFAULT_SIGNALS.low_density_ratio`。
 
 # 「桶字数差分的标准差算作 0」的判据。见 find_density_shifts 里的注释。
 _STDEV_EPS = 1e-9

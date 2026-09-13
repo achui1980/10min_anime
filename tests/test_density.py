@@ -2,10 +2,10 @@ import re
 
 import pytest
 
+from tenmin.config import DEFAULT_SIGNALS
 from tenmin.models import DialogueLine, DialogueTrack
 from tenmin.signals import density as density_module
 from tenmin.signals.density import (
-    LOW_DENSITY_RATIO,
     char_rate,
     find_density_shifts,
     find_density_signals,
@@ -74,8 +74,9 @@ def test_find_low_density_requires_min_duration():
     assert find_low_density(track(lines, 5.5)) == []
 
 
-def test_low_density_ratio_constant():
-    assert LOW_DENSITY_RATIO == pytest.approx(0.4)
+def test_low_density_ratio_default():
+    """对着权威来源（config）断言，不再经过 density 那个没人读的模块级别名。"""
+    assert DEFAULT_SIGNALS.low_density_ratio == pytest.approx(0.4)
 
 
 def _bucket_track(bucket_chars: list[int]) -> DialogueTrack:
