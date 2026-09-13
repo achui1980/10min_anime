@@ -113,6 +113,11 @@ def build_user_prompt(
         episode_number=track.episode,
         target_seconds=f"{cfg.target_seconds:.0f}",
         duration_readable=readable_seconds(track.duration),
+        # 纯秒数，给 clip 时间戳的合法上界用。**向下取整**：validate.py 判的是
+        # `clip.end > track.duration` 就丢弃，四舍五入到 1417 会让模型以为 1416.6–1417
+        # 这段合法，写出来的 clip 直接被丢。duration_readable 只用在「本期素材」那一行，
+        # 给人看；原来它也被填进 clip 上界那句话里，跟同一句的「正片秒数」单位冲突。
+        duration_seconds=int(track.duration),
         speech_rate=f"{SPEECH_RATE_CPS:g}",
         tolerance=f"{cfg.llm.budget_tolerance:.0%}",
         hold_reserve=f"{HOLD_RESERVE_SECONDS:.0f}",

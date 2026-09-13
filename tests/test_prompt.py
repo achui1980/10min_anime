@@ -46,6 +46,7 @@ def test_single_episode_prompt_declares_all_placeholders():
         "episode_number",
         "target_seconds",
         "duration_readable",
+        "duration_seconds",
         "glossary_block",
         "highlight_block",
         "dialogue_block",

@@ -4,7 +4,7 @@
 
 - 番剧：{{show}}
 - 集数：第 {{episode_number}} 集
-- 正片时长：{{duration_readable}}
+- 正片时长：{{duration_readable}}（= {{duration_seconds}} 秒）
 - 目标旁白时长：{{target_seconds}} 秒（语速按 {{speech_rate}} 字/秒估算，正负 {{tolerance}} 以内都算达标）
 
 ## 术语表（专有名词必须按这个写法）
@@ -40,7 +40,7 @@
 
 - 2–5 个 `clip`。
 - **每个节点至少有一个 clip 落在上面高能点清单的 `gap` 区间里。**
-- `clip.start` / `clip.end` 是正片秒数，必须落在 `0` 到 `{{duration_readable}}` 之内，且不要落在片头曲/片尾曲区间。
+- `clip.start` / `clip.end` 是正片秒数，必须落在 `0` 到 `{{duration_seconds}}` 秒之内，且不要落在片头曲/片尾曲区间。
 - 一个节点的多个 clip 可以来自全集任意时间点——允许把 00:01 的画面和 00:18 的画面拼在同一段旁白下。
 - `clip.visual` 写这个片段的画面特征，给剪辑的人看，用 `A ➔ B ➔ C` 描述镜头推进（例：`伊月被扑倒 ➔ 大小姐居高临下 ➔ 特写手腕`）。不要写「主角说话」这种没信息量的描述。
 - `clip.anchor_lines` 填这个片段对应的对白轨行号；如果该片段落在无台词间隙里，填紧邻前后的行号。

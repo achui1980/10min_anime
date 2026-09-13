@@ -630,3 +630,23 @@ def test_prompt_char_budget_follows_the_tts_rate(cfg, track, report):
     cfg.render.rate = "+20%"
     text = build_user_prompt(cfg, track, report)
     assert str(int((240.0 - HOLD_RESERVE_SECONDS) * 4.5 * 1.2)) in text
+
+
+# --- P2-C-2：clip 上界的单位不能跟「正片秒数」冲突 ---
+
+
+def test_prompt_states_the_clip_upper_bound_in_seconds(cfg, track, report):
+    """`clip.start/end 是正片秒数，必须落在 0 到 X 之内` 里的 X 原来填的是
+    duration_readable（"23 分 36 秒"），跟同一句话里的「秒数」单位冲突，逼模型自己
+    换算——正是 validate.py 那条「clip 越界丢弃」在兜的坑。现在填纯秒数。"""
+    text = build_user_prompt(cfg, track, report)
+    bound = str(int(track.duration))  # 向下取整：validate 判的是 clip.end > track.duration
+    assert f"`0` 到 `{bound}` 秒" in text
+
+
+def test_prompt_still_carries_the_human_readable_duration(cfg, track, report):
+    """秒数是给模型算时间戳用的，人类可读串在「本期素材」里该留着——它是唯一一处
+    让人（读 prompt 排查问题的人）一眼看出这集有多长的地方。"""
+    from tenmin.timecode import readable_seconds
+
+    assert readable_seconds(track.duration) in build_user_prompt(cfg, track, report)
