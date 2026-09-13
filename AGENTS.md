@@ -45,6 +45,8 @@ cat /path/to/zscaler_ca_bundle.pem >> .venv/lib/python3.14/site-packages/certifi
 
 - `src/tenmin/config.py`：`ProjectConfig` 与它的 6 个子 config（`.ingest` / `.credits` / `.signals` / `.validate_script` / `.render` / `.llm`）、`EpisodeConfig`，`Settings`（`BaseSettings`，读 `.env`，`env_prefix="TENMIN_"`）。**全项目所有「经验阈值」的唯一权威来源**；分家的判据是「这部番想要什么」的创作旋钮进 config，「物理上不可能／数据坏了」的合法性边界留在各模块的模块级常量里。各阶段模块只保留 `DEFAULT_XXX.field` 的模块级别名。
 - `src/tenmin/pipeline.py`：`Paths` 类（每阶段产物路径，全部按集号 `E{episode:02d}` 前缀），`STAGES` 列表，`run_pipeline()` 顶层编排（支持单集/批量两种模式，靠 `episode: int | None` 区分），`register_episode()`（`--episode --srt --video` 注册新集）。
+
+  批量模式的编排是**按集纵向**（P0-C 定的：中途失败要留下完整交付物，而不是一堆半成品）。script 阶段的多集并发（`llm.script_concurrency`，默认 1）是在这个纵向循环上加一个**有界预取窗口** —— 走到第 i 集时确保前 `i + concurrency` 集的 script task 都起了，然后 await 第 i 集那个。**刻意不把 script 抽成横向并发阶段**：那会直接推翻上面那条不变量（全部集的 script 跑完之前一集成片都不会有，而 script 恰好是最慢也最容易失败的阶段）。默认 1 的三条依据见 `config.LLMConfig.script_concurrency` 的注释（最硬的一条：默认 provider 是 gemini，而它那条路上没有我们自己的传输层退避）。失败收摊走 `_drain_script_tasks`，`try/finally` 包住整个纵向循环。
 - `src/tenmin/cli.py`：Typer CLI（`tenmin init` / `tenmin run` / `tenmin inspect`）。`tenmin run` 支持三种用法：
   - `--episode N --srt <path> --video <path>`：注册新集并跑。
   - `--episode N`（不带 srt/video）：重跑已注册的某一集。
@@ -62,7 +64,8 @@ cat /path/to/zscaler_ca_bundle.pem >> .venv/lib/python3.14/site-packages/certifi
   2. **原子落盘 + 时长体检**（`EdgeTTSEngine.synthesize`）：`edge_tts.Communicate.save()` 是流式写，中断留截断 mp3。所以一律先落 `.part`、`probe_duration` 体检通过才 `os.replace`。体检区间见 `_duration_bounds` 的 docstring（标定自 115 个真实 chunk）。
   3. **退避重试**（`synthesize_with_retry`）：模块级 `_sleep` / `_rand` 供测试 monkeypatch，参数与命名跟 llm.py 一套。`TypeError` / `ValueError` 判为不可重试（edge-tts 的参数校验）。**新增退避路径不要改成裸 `asyncio.sleep`**，否则测试会真睡。
   4. **输入健壮性**（`_plan_pronounceable`）：不含任何字母/数字的 chunk（切句留下的孤立 `'`）直接跳过，它带的 hold 折进前一个 chunk。
-  5. `probe_duration` 是阻塞 subprocess，一律走 `asyncio.to_thread`（P2-B 的 TTS 并发要靠它）。
+  5. `probe_duration` 是阻塞 subprocess，一律走 `asyncio.to_thread`。
+  6. **并发合成**（`synthesize_track`，`render.tts_concurrency` 默认 4）：**固定 N 个 worker 抢一个共享游标**，刻意不是「每个 chunk 一个 task + Semaphore 限流」—— 后者在 concurrency=1 下也会把 N 个 task 全建出来，首个 chunk 失败时它们已经排在同一轮事件循环里、照样各发一次请求。四条不变量都有测试锁住：结果顺序 = 计划顺序（写预分配槽位，绝不 append，因为 `VoiceTrack.chunks` 的顺序决定 audio.py 的 adelay 偏移与字幕顺序）；同文本只合成一次（`digest_locks` 按内容哈希串起来，顺带关掉 `known_durations` 的竞态）；失败之后不再发新活；concurrency=1 与串行逐字节等价。TaskGroup 的 ExceptionGroup 必须解包成叶子异常（`_first_leaf`），否则 `cli.PIPELINE_ERRORS` 认不出 `TTSError`。默认值 4 的标定数据见 `config.RenderConfig.tts_concurrency` 的注释。
 
 - `src/tenmin/script/single.py`：单集 LLM 调用编排（`generate_script()`），拼 prompt（模板 + few-shot 示例 + schema + 对白/信号数据）。轮次结构：首稿 → 最多 `llm.validation_retries` 次语义校验重试 → 最多 `llm.budget_rewrite_rounds` 轮时长返工。**返工轮跟首轮的 prompt 不一样**：摘掉 few-shot 范例（模型已经证明它会这个格式，而范例自己带着「不要学它的内容」的警告），但**必须**重发对白轨与高能点清单（占整份 prompt 的 84%，而重试要修的语义错只能对着对白原文才判得出来），另外把上一版的 `LLMScript` JSON 交回去让它做局部编辑 —— 不交回去的话 `budget.rewrite_instruction` 里那句「不要改动 clip 时间戳」是模型物理上做不到的要求。
 - `src/tenmin/script/validate.py`：LLM 输出的唯一拦网。**分成两半，改之前先分清自己在动哪一半**：`check_script()` 是纯读（只返回 warning，一个字节都不改），`repair_script()` 是显式修复（先 `model_copy(deep=True)` 再改，返回**新** Script）。`validate_script()` 是两者的组合。拆开的动因是 single.py 的返工轮要「两版择优」，而原来 validate 就地改写并把同一个对象塞回结果，上一版根本没被保留下来。降级语义（丢弃单条 clip、保留其余、附一条 warning）是生产上的重要健壮性，别改成整篇作废。
