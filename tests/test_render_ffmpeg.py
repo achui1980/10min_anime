@@ -17,6 +17,7 @@ from tenmin.render.ffmpeg import (
     parse_names,
     preflight,
     probe_duration,
+    probe_frame_rate,
     progress_seconds,
     run,
     run_with_progress,
@@ -1141,3 +1142,89 @@ def test_font_available_is_none_without_fc_list(monkeypatch):
     """检查不了就返回 None，让调用方明确说「跳过了」而不是谎报可用。"""
     monkeypatch.setattr("tenmin.render.ffmpeg.shutil.which", lambda _n: None)
     assert font_available("Lantinghei SC") is None
+
+
+# --- probe_frame_rate（P2-A 第 4 项）---
+
+
+def test_probe_frame_rate_parses_a_rational(monkeypatch, tmp_path):
+    """r_frame_rate 是有理数字符串（`24000/1001`），不是小数。"""
+    media = tmp_path / "a.mkv"
+    media.write_bytes(b"fake")
+    seen: dict[str, list[str]] = {}
+
+    def fake_run(args, **kwargs):
+        seen["args"] = list(args)
+        return FakeCompleted(stdout="24000/1001\n")
+
+    monkeypatch.setattr("tenmin.render.ffmpeg.subprocess.run", fake_run)
+    assert probe_frame_rate(media) == pytest.approx(23.976023976)
+    assert seen["args"][0] == "ffprobe"
+    assert "-nostdin" not in seen["args"]
+    assert seen["args"][seen["args"].index("-select_streams") + 1] == "v:0"
+    assert "r_frame_rate" in " ".join(seen["args"])
+
+
+def test_probe_frame_rate_accepts_a_plain_number(monkeypatch, tmp_path):
+    """有些容器给的是整数（`25`），别为了「必须有斜杠」把它判成坏数据。"""
+    media = tmp_path / "a.mkv"
+    media.write_bytes(b"fake")
+    monkeypatch.setattr(
+        "tenmin.render.ffmpeg.subprocess.run",
+        lambda args, **kwargs: FakeCompleted(stdout="25\n"),
+    )
+    assert probe_frame_rate(media) == pytest.approx(25.0)
+
+
+def test_probe_frame_rate_uses_configured_ffprobe_path(monkeypatch, tmp_path):
+    media = tmp_path / "a.mkv"
+    media.write_bytes(b"fake")
+    seen: dict[str, list[str]] = {}
+
+    def fake_run(args, **kwargs):
+        seen["args"] = list(args)
+        return FakeCompleted(stdout="24/1\n")
+
+    monkeypatch.setattr("tenmin.render.ffmpeg.subprocess.run", fake_run)
+    probe_frame_rate(media, ffprobe="/opt/x/ffprobe")
+    assert seen["args"][0] == "/opt/x/ffprobe"
+
+
+def test_probe_frame_rate_reports_a_missing_file_as_such(tmp_path):
+    """跟 probe_duration 同一套：文件不在就说文件不在，别送用户去查 ffprobe。"""
+    with pytest.raises(FileNotFoundError) as exc:
+        probe_frame_rate(tmp_path / "nope.mkv")
+    assert "nope.mkv" in str(exc.value)
+
+
+@pytest.mark.parametrize("bad", ["0/0", "N/A", "", "-24/1", "24/0"])
+def test_probe_frame_rate_rejects_unusable_values(monkeypatch, tmp_path, bad):
+    """`0/0` 是 ffprobe 对「没有帧率」的常规回答（实测：附图流就是它）。
+
+    拿 0 去算帧边界会静默把每一段都对齐到 0 秒，所以这里必须响亮失败。
+    """
+    media = tmp_path / "a.mkv"
+    media.write_bytes(b"fake")
+    monkeypatch.setattr(
+        "tenmin.render.ffmpeg.subprocess.run",
+        lambda args, **kwargs: FakeCompleted(stdout=f"{bad}\n"),
+    )
+    with pytest.raises(FFmpegError) as exc:
+        probe_frame_rate(media)
+    assert "a.mkv" in str(exc.value)
+
+
+def test_probe_frame_rate_has_a_timeout(monkeypatch, tmp_path):
+    media = tmp_path / "a.mkv"
+    media.write_bytes(b"fake")
+    seen: dict[str, object] = {}
+
+    def fake_run(args, **kwargs):
+        seen["timeout"] = kwargs.get("timeout")
+        raise subprocess.TimeoutExpired(args, kwargs.get("timeout") or 0)
+
+    monkeypatch.setattr("tenmin.render.ffmpeg.subprocess.run", fake_run)
+    with pytest.raises(FFmpegError) as exc:
+        probe_frame_rate(media)
+    assert isinstance(seen["timeout"], (int, float))
+    assert "超时" in str(exc.value)

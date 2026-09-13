@@ -519,6 +519,7 @@ async def test_run_pipeline_reruns_render_stages_when_project_yaml_changes(
     _write_script(paths.script(2), render_script())
     _prepare_video(project)
     monkeypatch.setattr("tenmin.pipeline.probe_duration", lambda path, **_: 1400.0)
+    monkeypatch.setattr("tenmin.pipeline.probe_frame_rate", lambda path, **_: 25.0)
     monkeypatch.setattr("tenmin.pipeline.preflight", lambda video, encoder, **_: 1400.0)
     # voice 重跑时 synthesize_track 会复用上一轮落盘的 chunk 并用真 ffprobe 量时长，
     # 而 FakeTTSEngine 写的是假 mp3 字节。
@@ -770,11 +771,18 @@ def test_run_timeline_probes_source_when_duration_missing(project, monkeypatch):
         calls.append(Path(path))
         return 1400.0
 
+    def fake_frame_rate(path, **_):
+        calls.append(Path(path))
+        return 25.0
+
     monkeypatch.setattr("tenmin.pipeline.probe_duration", fake_probe)
+    monkeypatch.setattr("tenmin.pipeline.probe_frame_rate", fake_frame_rate)
 
     timeline, warnings = run_timeline(project, episode=2)
 
-    assert calls == [video]
+    # 片长与帧率是同一次源片探测的两半，都必须落在**同一个**文件上
+    assert calls == [video, video]
+    assert timeline.frame_rate == pytest.approx(25.0)
     assert warnings == []
     assert timeline.total_seconds == pytest.approx(30.0)
 
@@ -888,6 +896,7 @@ async def test_run_pipeline_from_voice_runs_render_stages(project, monkeypatch):
     _write_script(paths.script(2), render_script())
     _prepare_video(project)
     monkeypatch.setattr("tenmin.pipeline.probe_duration", lambda path, **_: 1400.0)
+    monkeypatch.setattr("tenmin.pipeline.probe_frame_rate", lambda path, **_: 25.0)
     monkeypatch.setattr("tenmin.pipeline.preflight", lambda video, encoder, **_: 1400.0)
     monkeypatch.setattr("tenmin.render.audio.run_with_progress", _touch_output)
     monkeypatch.setattr("tenmin.render.video.run_with_progress", _touch_output_with_progress)
@@ -923,6 +932,7 @@ async def test_run_pipeline_batch_mode_runs_full_pipeline_for_all_episodes(
         episode_cfg.video = Path(video_name)
 
     monkeypatch.setattr("tenmin.pipeline.probe_duration", lambda path, **_: 1400.0)
+    monkeypatch.setattr("tenmin.pipeline.probe_frame_rate", lambda path, **_: 25.0)
     monkeypatch.setattr("tenmin.pipeline.preflight", lambda video, encoder, **_: 1400.0)
     monkeypatch.setattr("tenmin.render.audio.run_with_progress", _touch_output)
     monkeypatch.setattr("tenmin.render.video.run_with_progress", _touch_output_with_progress)
@@ -1250,6 +1260,7 @@ async def test_run_pipeline_reports_episode_start_exactly_once_per_episode(
         episode_cfg.video = Path(video_name)
 
     monkeypatch.setattr("tenmin.pipeline.probe_duration", lambda path, **_: 1400.0)
+    monkeypatch.setattr("tenmin.pipeline.probe_frame_rate", lambda path, **_: 25.0)
     monkeypatch.setattr("tenmin.pipeline.preflight", lambda video, encoder, **_: 1400.0)
     monkeypatch.setattr("tenmin.render.audio.run_with_progress", _touch_output)
     monkeypatch.setattr("tenmin.render.video.run_with_progress", _touch_output_with_progress)
@@ -1336,6 +1347,7 @@ async def test_run_pipeline_preflights_all_episodes_before_any_tts(
             return await super().synthesize(text, out_path)
 
     monkeypatch.setattr("tenmin.pipeline.probe_duration", lambda path, **_: 1400.0)
+    monkeypatch.setattr("tenmin.pipeline.probe_frame_rate", lambda path, **_: 25.0)
     monkeypatch.setattr(
         "tenmin.pipeline.preflight",
         lambda video, encoder, **_: (events.append(f"preflight:{Path(video).name}"), 1400.0)[1],
@@ -1397,12 +1409,17 @@ def test_run_timeline_uses_configured_ffprobe_path(project, monkeypatch):
     seen: dict[str, str] = {}
 
     def fake_probe(path, *, ffprobe="ffprobe"):
-        seen["ffprobe"] = ffprobe
+        seen["duration"] = ffprobe
         return 1400.0
 
+    def fake_frame_rate(path, *, ffprobe="ffprobe"):
+        seen["frame_rate"] = ffprobe
+        return 25.0
+
     monkeypatch.setattr("tenmin.pipeline.probe_duration", fake_probe)
+    monkeypatch.setattr("tenmin.pipeline.probe_frame_rate", fake_frame_rate)
     run_timeline(project, episode=2)
-    assert seen["ffprobe"] == "/opt/x/ffprobe"
+    assert seen == {"duration": "/opt/x/ffprobe", "frame_rate": "/opt/x/ffprobe"}
 
 
 def test_run_audio_uses_configured_ffmpeg_path(project, monkeypatch):

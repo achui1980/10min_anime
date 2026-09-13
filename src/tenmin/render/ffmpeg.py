@@ -162,6 +162,52 @@ def run(args: list[str], *, ffmpeg: str = FFMPEG, timeout: float | None = None) 
     return completed.stderr
 
 
+def _probe_field(
+    path: Path,
+    entries: str,
+    what: str,
+    *,
+    ffprobe: str,
+    stream: str | None = None,
+) -> str:
+    """跑一次 ffprobe 读一个字段，返回 stdout（已 strip）。失败一律 FFmpegError。
+
+    从 probe_duration 里抽出来的公共壳子：两处的失败处理、超时、以及那条「刻意不加
+    -nostdin」的约束必须一模一样，各写一份迟早会漂。`what` 只进错误消息。
+    """
+    path = Path(path)
+    if not path.is_file():
+        raise FileNotFoundError(f"找不到媒体文件 {path}（读不了{what}）")
+    args = [ffprobe, "-v", "error"]
+    if stream is not None:
+        args += ["-select_streams", stream]
+    args += ["-show_entries", entries, "-of", "csv=p=0", str(path)]
+    # 刻意**不**加 -nostdin：ffprobe 不认这个选项。实测 ffprobe 9.0.1 会直接报
+    # `Failed to set value '-v' for option 'nostdin': Option not found` 并退出 1。
+    # 它这边只能靠 stdin=DEVNULL 防抢 TTY。
+    try:
+        completed = subprocess.run(
+            args,
+            capture_output=True,
+            text=True,
+            errors="replace",
+            stdin=subprocess.DEVNULL,
+            timeout=PROBE_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise FFmpegError(
+            f"ffprobe 读 {path} 的{what}超时（超过 {PROBE_TIMEOUT_SECONDS} 秒）：\n"
+            f"{shlex.join(args)}\n\n"
+            f"源片是不是在一个很慢/已经掉线的盘上？\n{tail(_decode(error.stderr))}"
+        ) from error
+    if completed.returncode != 0:
+        raise FFmpegError(
+            f"ffprobe 读不出 {path} 的{what}，退出码 {completed.returncode}：\n"
+            f"{tail(completed.stderr)}"
+        )
+    return completed.stdout.strip()
+
+
 def probe_duration(path: Path, *, ffprobe: str = FFPROBE) -> float:
     """用 ffprobe 读时长（秒）。读不出、或读出来不是个正数，一律抛错。
 
@@ -179,54 +225,54 @@ def probe_duration(path: Path, *, ffprobe: str = FFPROBE) -> float:
     - 时长 <= 0 → FFmpegError。截断/空的容器会给出一个**看起来正常**的数字，timeline
       拿它去算偏移一路不报错，只会静默出一个时间轴全错的成片。
     """
-    path = Path(path)
-    if not path.is_file():
-        raise FileNotFoundError(f"找不到媒体文件 {path}（读不了时长）")
-    args = [
-        ffprobe,
-        "-v",
-        "error",
-        "-show_entries",
-        "format=duration",
-        "-of",
-        "csv=p=0",
-        str(path),
-    ]
-    # 刻意**不**加 -nostdin：ffprobe 不认这个选项。实测 ffprobe 9.0.1 会直接报
-    # `Failed to set value '-v' for option 'nostdin': Option not found` 并退出 1。
-    # 它这边只能靠 stdin=DEVNULL 防抢 TTY。
+    raw = _probe_field(path, "format=duration", "时长", ffprobe=ffprobe)
     try:
-        completed = subprocess.run(
-            args,
-            capture_output=True,
-            text=True,
-            errors="replace",
-            stdin=subprocess.DEVNULL,
-            timeout=PROBE_TIMEOUT_SECONDS,
-        )
-    except subprocess.TimeoutExpired as error:
-        raise FFmpegError(
-            f"ffprobe 读 {path} 的时长超时（超过 {PROBE_TIMEOUT_SECONDS} 秒）：\n"
-            f"{shlex.join(args)}\n\n"
-            f"源片是不是在一个很慢/已经掉线的盘上？\n{tail(_decode(error.stderr))}"
-        ) from error
-    if completed.returncode != 0:
-        raise FFmpegError(
-            f"ffprobe 读不出 {path} 的时长，退出码 {completed.returncode}：\n"
-            f"{tail(completed.stderr)}"
-        )
-    try:
-        duration = float(completed.stdout.strip())
+        duration = float(raw)
     except ValueError as error:
-        raise FFmpegError(
-            f"ffprobe 读不出 {path} 的时长，输出是 {completed.stdout.strip()!r}"
-        ) from error
+        raise FFmpegError(f"ffprobe 读不出 {path} 的时长，输出是 {raw!r}") from error
     if duration <= 0:
         raise FFmpegError(
             f"ffprobe 报 {path} 的时长是 {duration} 秒，这不可能是个能用的媒体文件"
             "（截断的下载？0 字节壳子？）。它会静默毒化整条时间轴，所以这里直接拦掉。"
         )
     return duration
+
+
+def probe_frame_rate(path: Path, *, ffprobe: str = FFPROBE) -> float:
+    """第一条视频轨的帧率（fps）。读不出、或读出来不是个正数，一律抛错。
+
+    取 **r_frame_rate** 而不是 avg_frame_rate：前者是容器声明的「基准帧率」
+    （实测真实源片 `24000/1001`），后者是「解出来的帧数 / 时长」的事后平均，
+    在 VFR 或有丢帧的文件上是个不整齐的数（实测同一个文件 `1678552091/70009610`）。
+    我们要的是「帧边界落在哪」，那是 r_frame_rate 的语义。
+
+    值是**有理数字符串**，必须按分数解析：`float("24000/1001")` 直接 ValueError，
+    而写成 `24000/1001 = 23.976…` 的十进制近似再去算帧号，长片尾部会累积到差一帧。
+
+    `-select_streams v:0` 是必须的：真实源片里常有第二条「视频」轨（附图/封面，
+    实测 work/saijo 的 mp4 就带一条 mjpeg 1200x800），它的 r_frame_rate 是
+    `90000/1`。不选流的话 ffprobe 会把两条都打出来，取到哪一条纯看运气。
+
+    `0/0` → 抛错：那是 ffprobe 对「这条流没有帧率」的常规回答（附图流就是它）。
+    帧率 0 会让 render/timeline.py 的帧对齐把每一段都算成 0 秒，是典型的静默毒化。
+    """
+    raw = _probe_field(
+        path, "stream=r_frame_rate", "帧率", ffprobe=ffprobe, stream="v:0"
+    )
+    numerator, _, denominator = raw.partition("/")
+    try:
+        rate = float(numerator) / float(denominator) if denominator else float(numerator)
+    except (ValueError, ZeroDivisionError) as error:
+        raise FFmpegError(
+            f"ffprobe 读不出 {path} 的帧率，输出是 {raw!r}"
+            "（`0/0` = 这条流没有帧率声明）"
+        ) from error
+    if rate <= 0:
+        raise FFmpegError(
+            f"ffprobe 报 {path} 的帧率是 {raw!r}（{rate}），这不可能是条能用的视频轨。"
+            "帧率会被用来把 timeline 的每一段对齐到帧边界，0 会让每段都变成零长。"
+        )
+    return rate
 
 
 # maxsize 从 1 提到 8：key 是可执行文件路径，而 preflight 在批量模式下每集都调。

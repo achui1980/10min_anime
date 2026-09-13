@@ -393,3 +393,12 @@ class Timeline(_StageModel):
     subtitles: list[SubtitleCue] = Field(default_factory=list)
     narration_offsets: list[float] = Field(default_factory=list)
     total_seconds: float = 0.0
+    # 源片帧率（fps）。**None = 上游没探到**（只有 SRT 没有视频的降级路径，或者调用方
+    # 自己注入了 source_duration 却没给帧率），不是「帧率是 0」。
+    #
+    # 为什么记在产物里而不是让 render 阶段自己再探一次：segments 的 source_start/
+    # source_end 就是**按这个帧率**对齐到帧边界的（见 render/timeline.py），而
+    # render/video.py 的片尾黑卡要跟正片同帧率。两处用同一个数字才谈得上「对齐」；
+    # 各自探一次的话，中途换了源片就会静默错位，而这个字段让 timeline.json 自证
+    # 它是按哪个帧率算的。存量 timeline.json 没有这个键 → None → 退回老行为。
+    frame_rate: float | None = None

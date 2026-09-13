@@ -15,7 +15,12 @@ from tenmin.ingest.normalize import build_track
 from tenmin.models import DialogueTrack, Script, SignalReport, Timeline, VoiceTrack
 from tenmin.progress import NullProgressReporter, ProgressReporter
 from tenmin.render.audio import mix_audio
-from tenmin.render.ffmpeg import FFmpegError, preflight, probe_duration
+from tenmin.render.ffmpeg import (
+    FFmpegError,
+    preflight,
+    probe_duration,
+    probe_frame_rate,
+)
 from tenmin.render.subtitles import render_ass
 from tenmin.render.timeline import build_timeline
 from tenmin.render.tts import TTSEngine, synthesize_track
@@ -502,17 +507,34 @@ async def run_voice(
 
 
 def run_timeline(
-    cfg: ProjectConfig, episode: int, *, source_duration: float | None = None
+    cfg: ProjectConfig,
+    episode: int,
+    *,
+    source_duration: float | None = None,
+    frame_rate: float | None = None,
 ) -> tuple[Timeline, list[str]]:
+    """重算时间轴并落盘 timeline.json + ASS 字幕。
+
+    source_duration 与 frame_rate 是**同一次源片探测的两半**，所以它们共享一个开关：
+    传了 source_duration 就说明「调用方自己在管源片探测」（run_pipeline 复用刚跑过的
+    preflight 结果、只有 SRT 没有视频的降级路径、单测手上只有一个空壳文件），那时不再
+    去碰 video_path —— 那条路上压根没有可探的视频。
+
+    frame_rate 是 None 的后果是段边界不做帧对齐（见 render/timeline.py），成片退回
+    「ffmpeg 自己按帧取整」的老行为：能出片，只是首尾各差不到一帧。
+    """
     paths = Paths(cfg.root)
     episode_cfg = _find_episode(cfg, episode)
     script = _load_script(cfg, episode)
     track = _load_voice(cfg, episode)
     if source_duration is None:
-        source_duration = probe_duration(
-            cfg.video_path(episode_cfg), ffprobe=cfg.render.ffprobe_path
-        )
-    timeline, warnings = build_timeline(script, track, source_duration)
+        video = cfg.video_path(episode_cfg)
+        source_duration = probe_duration(video, ffprobe=cfg.render.ffprobe_path)
+        if frame_rate is None:
+            frame_rate = probe_frame_rate(video, ffprobe=cfg.render.ffprobe_path)
+    timeline, warnings = build_timeline(
+        script, track, source_duration, frame_rate=frame_rate
+    )
     _write_json(paths.timeline(episode), timeline.model_dump_json(indent=2))
     _write_text(
         paths.subtitles(episode),
@@ -576,6 +598,10 @@ def run_render(
         preset=cfg.render.preset,
         tune=cfg.render.tune,
         videotoolbox_bitrate=cfg.render.videotoolbox_bitrate,
+        # 片尾黑卡要跟正片同帧率，否则成片是 VFR（见 render/video.py 那段注释）。
+        # 帧率取 timeline 产物里记的那个 —— segments 的边界就是按它对齐的，
+        # 这里再探一次只会引入「万一中途换了源片」的错位空间。
+        frame_rate=timeline.frame_rate,
         fade_out_seconds=cfg.render.fade_out_seconds,
         outro_seconds=cfg.render.outro_card_seconds,
         outro_title=f"{cfg.show} · EP{episode:02d}",

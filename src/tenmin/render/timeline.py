@@ -75,7 +75,11 @@ def chunks_by_beat(track: VoiceTrack) -> dict[str, list[VoiceChunk]]:
 
 
 def build_timeline(
-    script: Script, track: VoiceTrack, source_duration: float
+    script: Script,
+    track: VoiceTrack,
+    source_duration: float,
+    *,
+    frame_rate: float | None = None,
 ) -> tuple[Timeline, list[str]]:
     """按 beat 逐段重算画面时长，产出成片时间轴。
 
@@ -185,5 +189,6 @@ def build_timeline(
         subtitles=subtitles,
         narration_offsets=offsets,
         total_seconds=audio_cursor,
+        frame_rate=frame_rate,
     )
     return timeline, warnings

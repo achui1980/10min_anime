@@ -7,6 +7,7 @@ from tenmin.render.video import (
     build_render_args,
     escape_filter_arg,
     escape_filter_path,
+    frame_rate_arg,
     quality_args,
     render_video,
 )
@@ -292,13 +293,40 @@ def test_build_render_args_appends_outro_card(tmp_path):
         outro_seconds=3.0,
         outro_title="才女的侍从 · EP02",
         outro_message="解说结束，谢谢观看",
+        frame_rate=23.976023976023978,
     )
     graph = args[args.index("-filter_complex") + 1]
-    assert "color=c=black:s=1920x1080:d=3.000[cardbg]" in graph
+    assert (
+        "color=c=black:s=1920x1080:r=24000/1001:d=3.000,setsar=1,format=yuv420p[cardbg]"
+        in graph
+    )
     assert "drawtext=font='Lantinghei SC':text='才女的侍从 · EP02'" in graph
     assert "drawtext=font='Lantinghei SC':text='解说结束，谢谢观看'" in graph
     assert graph.endswith("[vfaded][card]concat=n=2:v=1:a=0[vfinal]")
     assert args[args.index("-map") + 1] == "[vfinal]"
+
+
+def test_outro_card_runs_at_the_source_frame_rate(tmp_path):
+    """卡片不带 `r=` 时 color 源默认 25fps，跟 23.976 的正片 concat 出来是 VFR。
+
+    实测（真实 E02 成片）修前 `avg_frame_rate=869000000/36223751`（23.990）而
+    `r_frame_rate=24000/1001`（23.976）—— 总时长对得上，帧率是编出来的。
+    """
+    args = build(tmp_path, outro_seconds=3.0, frame_rate=25.0)
+    graph = args[args.index("-filter_complex") + 1]
+    assert "r=25:" in graph
+
+
+def test_outro_card_omits_the_rate_when_the_frame_rate_is_unknown(tmp_path):
+    """帧率是 None 时退回老行为（不写 r=），而不是猜一个数写上去。
+
+    生产路径上 pipeline.run_render 一定探到了帧率（源片不存在的话渲染本来就跑不了），
+    所以这条分支只服务于「库调用方/单测手上没有真源片」。
+    """
+    args = build(tmp_path, outro_seconds=3.0)
+    graph = args[args.index("-filter_complex") + 1]
+    assert "color=c=black:s=1920x1080:d=3.000,setsar=1,format=yuv420p[cardbg]" in graph
+    assert ":r=" not in graph
 
 
 def test_render_video_runs_ffmpeg_and_returns_path(tmp_path, monkeypatch):
@@ -589,3 +617,10 @@ def test_real_ffmpeg_accepts_outro_text_with_special_characters(tmp_path, title)
     )
     assert out.is_file()
     assert out.stat().st_size > 0
+
+
+def test_frame_rate_arg_restores_the_exact_rational():
+    """十进制近似会让成片仍然不是严格 CFR，见 frame_rate_arg 的 docstring。"""
+    assert frame_rate_arg(23.976023976023978) == "24000/1001"
+    assert frame_rate_arg(29.97002997002997) == "30000/1001"
+    assert frame_rate_arg(25.0) == "25"

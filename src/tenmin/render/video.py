@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+from fractions import Fraction
 from pathlib import Path
 
 from tenmin.atomic import atomic_path
@@ -120,6 +121,24 @@ def quality_args(
     return args
 
 
+def frame_rate_arg(frame_rate: float) -> str:
+    """帧率写成 ffmpeg 认的**有理数**（`24000/1001`），不是十进制近似。
+
+    十进制不够用：`r=23.976024` 只是 24000/1001 的六位近似，color 源按它生成的
+    时间戳会跟正片那条 24000/1001 的网格慢慢错开，成片仍然不是严格 CFR。真实 E02
+    实测 —— 写 `r=23.976024` 修后 `avg_frame_rate=193000000/8049707`
+    （23.9760279）与 `r_frame_rate=24000/1001`（23.9760240）**还是不相等**，
+    差 4e-6 fps；写成 `r=24000/1001` 之后两者逐位相同。
+
+    limit_denominator 是把 float 还原成那个有理数的正规做法：ffprobe 给的
+    `24000/1001` 转成 float 再转回来会精确命中（实测 23.976/24/25/29.97/59.94/
+    12.5 六个常见帧率全部 `float(Fraction) == 原值`），因为分母都远小于 1e6，
+    连分数收敛到它就停。这样 probe_frame_rate 的返回值可以老老实实是 float
+    （帧对齐的算术要它），有理数只在拼 filtergraph 这一处还原。
+    """
+    return str(Fraction(frame_rate).limit_denominator(1_000_000))
+
+
 def build_render_args(
     *,
     video: Path,
@@ -134,6 +153,7 @@ def build_render_args(
     preset: str = PRESET,
     tune: str = TUNE,
     videotoolbox_bitrate: str = VIDEOTOOLBOX_BITRATE,
+    frame_rate: float | None = None,
     fade_out_seconds: float = 0.0,
     outro_seconds: float = 0.0,
     outro_title: str = "",
@@ -176,7 +196,19 @@ def build_render_args(
         # 所以一律走 escape_filter_arg —— 它已经含外层单引号，别再自己补一对。
         # `%` 不靠转义：drawtext 默认按 strftime 展开 `%`，靠末尾的 expansion=none
         # 关掉（实测 `%Y-%m-%d` 与 textfile= 的基准真值像素逐字节相同）。
-        parts.append(f"color=c=black:s={width}x{height}:d={outro_seconds:.3f}[cardbg]")
+        #
+        # `r=` / `setsar=1` / `format=` 三件都是为了跟正片那一路**逐项对齐**：
+        # - r=：color 源不给帧率时默认 **25fps**。跟 23.976 的正片 concat，容器时长
+        #   仍然是对的（实测 2s+3s → 5.002s），但成片变成 VFR：真实 E02 修前
+        #   `avg_frame_rate=869000000/36223751`（23.990）≠ `r_frame_rate=24000/1001`。
+        #   帧率从源片探（见 pipeline.run_render），不写死 23.976。
+        # - setsar/format：正片那一路显式写了这两个，两路在 concat 处相遇时格式必须
+        #   一致，否则又回到「靠 ffmpeg 现场协商」—— 而协商结果跟图的形状有关。
+        rate = "" if frame_rate is None else f"r={frame_rate_arg(frame_rate)}:"
+        parts.append(
+            f"color=c=black:s={width}x{height}:{rate}d={outro_seconds:.3f},"
+            f"setsar=1,format={PIX_FMT}[cardbg]"
+        )
         font = escape_filter_arg(OUTRO_FONT_NAME)
         title = escape_filter_arg(outro_title)
         message = escape_filter_arg(outro_message)
@@ -243,6 +275,7 @@ def render_video(
     preset: str = PRESET,
     tune: str = TUNE,
     videotoolbox_bitrate: str = VIDEOTOOLBOX_BITRATE,
+    frame_rate: float | None = None,
     fade_out_seconds: float = 0.0,
     outro_seconds: float = 0.0,
     outro_title: str = "",
@@ -275,6 +308,7 @@ def render_video(
             preset=preset,
             tune=tune,
             videotoolbox_bitrate=videotoolbox_bitrate,
+            frame_rate=frame_rate,
             fade_out_seconds=fade_out_seconds,
             outro_seconds=outro_seconds,
             outro_title=outro_title,

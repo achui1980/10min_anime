@@ -378,6 +378,31 @@ def test_run_render_wires_the_encoder_knobs(tmp_path, monkeypatch):
     assert seen["videotoolbox_bitrate"] == "7000k"
 
 
+def test_run_render_takes_the_frame_rate_from_the_timeline_artifact(tmp_path, monkeypatch):
+    """片尾卡的帧率来自 timeline.json 记的那个，不是 render 阶段自己再探一次。
+
+    段边界就是按那个帧率对齐的，两处必须是同一个数字。
+    """
+    seen: dict[str, object] = {}
+    monkeypatch.setattr("tenmin.pipeline.render_video", _capturing_render_video(seen))
+    cfg = _minimal_project(tmp_path)
+    _write_timeline_and_inputs(cfg, frame_rate=23.976023976023978)
+    run_render(cfg, episode=1)
+    assert seen["frame_rate"] == pytest.approx(23.976023976023978)
+
+
+def test_run_timeline_records_the_probed_frame_rate(tmp_path, monkeypatch):
+    """帧率必须进产物：render 阶段与帧对齐都读它。"""
+    monkeypatch.setattr("tenmin.pipeline.probe_duration", lambda path, **_: 100.0)
+    monkeypatch.setattr("tenmin.pipeline.probe_frame_rate", lambda path, **_: 23.976)
+    cfg = _minimal_project(tmp_path)
+    _write_voice_and_script(cfg)
+    timeline, _ = run_timeline(cfg, episode=1)
+    assert timeline.frame_rate == pytest.approx(23.976)
+    reloaded = Paths(cfg.root).timeline(1).read_text(encoding="utf-8")
+    assert '"frame_rate": 23.976' in reloaded
+
+
 def test_run_audio_wires_the_audio_knobs(tmp_path, monkeypatch):
     seen: dict[str, object] = {}
 
@@ -435,12 +460,13 @@ def _capturing_render_video(seen: dict[str, object]):
     return fake_render_video
 
 
-def _write_timeline_and_inputs(cfg: ProjectConfig) -> None:
+def _write_timeline_and_inputs(cfg: ProjectConfig, frame_rate: float | None = None) -> None:
     """run_audio / run_render 需要的上游产物（内容不重要，它们的消费者被替掉了）。"""
     from tenmin.models import VoiceChunk, VoiceTrack
 
     paths = Paths(cfg.root)
     timeline = _stub_timeline(offsets=[0.0])
+    timeline.frame_rate = frame_rate
     timeline.episode = 1
     paths.timeline(1).parent.mkdir(parents=True, exist_ok=True)
     paths.timeline(1).write_text(timeline.model_dump_json(), encoding="utf-8")
