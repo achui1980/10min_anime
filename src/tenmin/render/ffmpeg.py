@@ -130,10 +130,18 @@ def run(args: list[str], *, ffmpeg: str = FFMPEG, timeout: float | None = None) 
     UTF-8 解码遇到这种输入必炸——所以这里用 errors="replace"，脏字节换成 U+FFFD，
     不让一段无关的元数据把整条渲染流水线搞挂。
 
-    timeout 默认 None = 不设上限，这是**刻意的**：这个函数在生产里的调用方是
-    mix_audio，一次几分钟的真实编码，设上限只会在慢机器上误杀一次已经跑了一半的活。
-    长跑任务的中止交给用户 Ctrl-C（现在会正确杀掉子进程）。只有 preflight 里那些
-    「本该毫秒级返回」的探测才传具体值进来。
+    **本函数目前没有生产调用方**：出片路径上的两次真实编码（audio.mix_audio、
+    video 的剪辑拼接）都走 run_with_progress，preflight 里那些探测各自直接
+    subprocess.run。刻意留着而不删，是因为它是这一层「安全地 shell out 到 ffmpeg」的
+    单次调用形态，身上那三条保护每一条都是踩过坑才加的（`-nostdin` + stdin=DEVNULL
+    防抢 TTY 挂死、errors="replace" 防非 UTF-8 容器元数据、失败时截 stderr 末尾），
+    而这三条各自都有回归测试挂在这个函数上。删掉它等于把那些测试搬到
+    run_with_progress —— 那是另一个函数、另一套失败面（要 total_seconds 与进度管道），
+    属于重构而不是清理。
+
+    timeout 默认 None = 不设上限，这是**刻意的**：这个函数是给「一次几分钟的真实编码」
+    准备的形态，设上限只会在慢机器上误杀一次已经跑了一半的活。长跑任务的中止交给用户
+    Ctrl-C（现在会正确杀掉子进程）。「本该毫秒级返回」的探测才该传具体值进来。
     """
     argv = [ffmpeg, "-nostdin", *args]
     try:
