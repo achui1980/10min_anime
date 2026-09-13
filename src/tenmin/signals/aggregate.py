@@ -14,6 +14,7 @@ from tenmin.models import (
 from tenmin.signals.density import (
     char_rate,
     find_density_signals,
+    line_rates,
     median_char_rate,
 )
 from tenmin.signals.gaps import find_silent_gaps
@@ -149,10 +150,13 @@ def build_report(
     track: DialogueTrack, *, cfg: SignalsConfig = DEFAULT_SIGNALS
 ) -> SignalReport:
     gaps = find_silent_gaps(track, cfg=cfg)
-    signals = [*gaps, *find_density_signals(track, cfg=cfg)]
+    # 字数与语速只扫一遍，median 与两个 detector 共用这一份快照。见 density.line_rates。
+    rates = line_rates(track)
+    median = median_char_rate(track, rates=rates)
+    signals = [*gaps, *find_density_signals(track, cfg=cfg, rates=rates, median=median)]
     return SignalReport(
         episode=track.episode,
         silent_gaps=gaps,
-        median_char_rate=median_char_rate(track),
+        median_char_rate=median,
         highlights=aggregate(signals, track, cfg=cfg),
     )

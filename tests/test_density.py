@@ -1,3 +1,5 @@
+import re
+
 import pytest
 
 from tenmin.models import DialogueLine, DialogueTrack
@@ -8,6 +10,7 @@ from tenmin.signals.density import (
     find_density_shifts,
     find_density_signals,
     find_low_density,
+    line_rates,
     median_char_rate,
 )
 
@@ -225,6 +228,111 @@ def test_find_density_shifts_partially_masked_bucket_is_dropped():
     )
     for signal in find_density_shifts(t):
         assert signal.end <= 90.0 or signal.start >= 180.0
+
+
+# --- 单遍扫描缓存（line_rates） ---
+
+
+def test_line_rates_carries_line_chars_and_rate():
+    lines = [
+        dline(1, 0.0, 2.0, "你 好 呀 吗"),  # 去掉空白 4 字 / 2s = 2.0
+        dline(2, 4.0, 5.0, "制作委员会", kind="credits"),  # 不算说话
+    ]
+    rates = line_rates(track(lines, 5.0))
+    assert [r.line.idx for r in rates] == [1]
+    assert rates[0].chars == 4
+    assert rates[0].rate == pytest.approx(2.0)
+
+
+def test_line_rates_is_ordered_by_start_like_spoken_lines():
+    lines = [dline(1, 9.0, 10.0, "后"), dline(2, 1.0, 2.0, "先")]
+    assert [r.line.idx for r in line_rates(track(lines, 12.0))] == [2, 1]
+
+
+def test_line_rates_rate_matches_char_rate_exactly():
+    """缓存的 rate 必须跟公开的 char_rate 逐比特相同，否则 detail 里的 density: 会漂。"""
+    lines = [dline(i + 1, i * 3.0, i * 3.0 + 2.567, "啊" * (i + 1)) for i in range(6)]
+    for r in line_rates(track(lines, 20.0)):
+        assert r.rate == char_rate(r.line)
+
+
+def test_char_counting_ignores_every_unicode_whitespace():
+    """`_chars` 从 `_WHITESPACE.sub` 换成 `str.isspace()`，两者必须逐字符同义。
+
+    实测 Python 3.12 下 `re` 的 `\\s`（str 模式，未开 re.ASCII）与 `str.isspace()`
+    在**全部** 1114112 个码位上判断一致，所以这次替换是恒等变换而不是近似。
+    这条测试只把几个容易踩的非 ASCII 空白钉住，防止以后有人给 `\\s` 加上 re.ASCII
+    或把 isspace 换成 `ch == " "`。
+    """
+    whitespace = " \t\n\r\f\v\u3000\xa0\u2028\u2029\u205f\u1680\u2009\x85\x1c"
+    text = whitespace.join("一二三四五六七八九十")
+    assert len(re.compile(r"\s+").sub("", text)) == 10
+    assert sum(1 for ch in text if not ch.isspace()) == 10
+    line = dline(1, 0.0, 2.0, text)
+    assert line_rates(track([line], 2.0))[0].chars == 10
+
+
+def test_median_char_rate_accepts_precomputed_rates():
+    lines = [dline(1, 0.0, 1.0, "一二三四"), dline(2, 2.0, 3.0, "一二三四五六")]
+    t = track(lines, 5.0)
+    rates = line_rates(t)
+    assert median_char_rate(t, rates=rates) == median_char_rate(t)
+
+
+def test_find_low_density_accepts_precomputed_median_and_rates():
+    lines = [
+        dline(1, 0.0, 1.0, "一二三四五"),
+        dline(2, 2.0, 3.0, "一二三四五"),
+        dline(3, 4.0, 5.0, "一二三四五"),
+        dline(4, 6.0, 9.0, "啊"),
+    ]
+    t = track(lines, 9.0)
+    rates = line_rates(t)
+    passed = find_low_density(t, rates=rates, median=median_char_rate(t, rates=rates))
+    assert passed == find_low_density(t)
+
+
+def test_find_low_density_honours_the_median_it_is_given():
+    """传进来的 median 必须真的被用上，而不是被内部重算的那份悄悄覆盖。"""
+    lines = [dline(i + 1, i * 3.0, i * 3.0 + 2.5, "一二三四五") for i in range(4)]
+    t = track(lines, 12.0)
+    # 真实 median 是 2.0 字/秒，阈值 0.8，没有行低于它。
+    assert find_low_density(t) == []
+    # 硬塞一个高得离谱的 median，阈值升到 40，全部 4 行都该发信号。
+    assert len(find_low_density(t, median=100.0)) == 4
+
+
+def test_find_density_shifts_accepts_precomputed_rates():
+    t = _bucket_track([30, 30, 30, 30, 120, 30, 30, 30])
+    assert find_density_shifts(t, rates=line_rates(t)) == find_density_shifts(t)
+
+
+def test_build_report_scans_the_dialogue_text_only_once(monkeypatch):
+    """整条 build_report 里 density 只能把说话行扫一遍、每行只数一次字。
+
+    修复前 `median_char_rate` 一遍、`find_low_density` 内部再调一次 `median_char_rate`
+    又一遍、它自己逐行 `char_rate` 第三遍、`find_density_shifts` 第四遍 ——
+    每一遍还对每行分配一个新字符串。这里直接数 density 自己的两个原语被调了几次，
+    这样不管调用方是 import 了哪个模块的名字都盖得住。
+    """
+    from tenmin.signals import aggregate as aggregate_module
+
+    scans: list[object] = []
+    counted: list[str] = []
+    real_spoken = density_module.spoken_lines
+    real_chars = density_module._chars
+    monkeypatch.setattr(
+        density_module,
+        "spoken_lines",
+        lambda lines: (scans.append(lines), real_spoken(lines))[1],
+    )
+    monkeypatch.setattr(
+        density_module, "_chars", lambda text: (counted.append(text), real_chars(text))[1]
+    )
+    t = _bucket_track([30, 30, 30, 30, 120, 30, 30, 30])
+    aggregate_module.build_report(t)
+    assert len(scans) == 1
+    assert len(counted) == len(t.lines)
 
 
 # --- 黄金样本 ---
