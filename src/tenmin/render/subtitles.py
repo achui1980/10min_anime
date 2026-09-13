@@ -67,6 +67,9 @@ _BREAK_AFTER = "，、。！？；：—…”』」）,.!?;:"
 # 「优先在标点后断行」。实测 10 集 139 次断行：只有 12 次（8.6%）在这个窗口里找不到
 # 标点、退化成硬切。
 _BREAK_SEARCH_MIN_RATIO = 0.6
+# 行首标点最多能往上一行挤多少格（见 _hang_leading_punctuation）。
+# 4 格 = 2 个全角标点，标定自语料：10 集里出现过的行首标点串最长就是 `——`。
+_HANG_MAX_CELLS = 4
 
 
 def format_ass_time(seconds: float) -> str:
@@ -150,15 +153,40 @@ def _wrap_single_line(line: str, max_cells: int) -> list[str]:
         limit = _cells_prefix_length(remaining, max_cells)
         window_start = max(1, int(limit * _BREAK_SEARCH_MIN_RATIO))
         break_at = limit
+        # 下界**不含** window_start 本身。看起来像差一错，实测是刻意保留的：把它改成
+        # 含下界能把硬切从 11 次降到 8 次，代价是多出一条 3 行的 cue（8 → 9）与多一个
+        # 物理行（498 → 499）—— 3 行字幕挡掉的画面比「切在词中间」难看得多，这笔换不值。
         for i in range(limit, window_start, -1):
             if remaining[i - 1] in _BREAK_AFTER:
                 break_at = i
                 break
+        break_at = _hang_leading_punctuation(remaining, break_at)
         pieces.append(remaining[:break_at])
         remaining = remaining[break_at:]
     if remaining:
         pieces.append(remaining)
     return pieces
+
+
+def _hang_leading_punctuation(text: str, break_at: int) -> int:
+    """下一行开头是标点时把它挤回上一行（CJK 排版的「追い込み」），返回新的断点。
+
+    「句读不可置于行首」是 CJK 禁则里最基本的一条，而原来的断行会违反它：实测 10 集
+    139 次断行里 5 行以标点开头，其中 4 行**整行只有一个 `。`**
+    （`…工作内容是当一个高中女生的贴身侍从` ⏎ `。`）。
+
+    代价是这一行会超出 max_cells 最多 _HANG_MAX_CELLS 格。为什么这是安全的：
+    predicted 宽度模型本身比 libass 实测宽 15%（见 CJK_CHAR_WIDTH_RATIO），实测满行
+    1552px 离可用宽度 1800px 还有 248px，而 2 个全角标点只占 94.6px。
+    """
+    hung = 0
+    while break_at < len(text) and text[break_at] in _BREAK_AFTER:
+        width = display_cells(text[break_at])
+        if hung + width > _HANG_MAX_CELLS:
+            break
+        hung += width
+        break_at += 1
+    return break_at
 
 
 def _cells_prefix_length(text: str, max_cells: int) -> int:

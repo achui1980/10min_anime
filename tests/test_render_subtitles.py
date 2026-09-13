@@ -256,3 +256,52 @@ def test_render_ass_never_exceeds_the_usable_width():
         assert display_cells(segment) <= budget
     # 预算换算回像素也必须落在可用宽度里
     assert budget * DEFAULT_FONT_SIZE * 1.05 / 2 <= PLAY_RES_X - 2 * MARGIN_LR
+
+
+# --- 行首标点回收与回溯窗口的边界（P2-E C5）--------------------------------
+#
+# 断行原来只从 max_cells 往回找到 60% 处，找不到标点就硬切。两个后果实测出来了
+# （10 集 139 次断行）：
+#
+# 1. **行首标点**：5 行以标点开头，其中 4 行**整行只有一个 `。`** ——
+#    `…工作内容是当一个高中女生的贴身侍从` ⏎ `。` 这种。CJK 排版的禁则里
+#    「句读不可置于行首」是最基本的一条，而这里的成本是把它挤进上一行（追い込み）。
+# 刻意**不**处理的两件事（都有实测依据，见 _wrap_single_line / 本次报告）：
+#
+# - 硬切切在 CJK 词中间（`完` ⏎ `全不是一个人`）。判准需要分词器 = 新依赖。
+# - 把回溯窗口的下界改成**含** window_start 本身。它能把硬切从 11 次降到 8 次，
+#   代价是多一条 3 行的 cue（8 → 9）与多一个物理行（498 → 499）—— 3 行字幕挡掉的
+#   画面比切在词中间难看得多，这笔换不值。
+# - 切在拉丁词内部或数字与单位之间：实测 10 集 139 次断行 **0 次**发生（语料 97.6%
+#   是全角字符，非 W/F 的字符只有 9 个、其中 5 个各出现 1 次）。没有可修的东西。
+
+
+def test_wrap_text_pulls_a_leading_punctuation_back_to_the_previous_line():
+    """下一行开头是标点时把它挤回上一行，宁可超一格也不让 `。` 独占行首。"""
+    text = "一二三四五六七八九十。后面还有内容"
+    # 20 格 = 10 个全角字：硬切正好落在 `。` 之前
+    assert wrap_text(text, 20).split("\n")[0] == "一二三四五六七八九十。"
+
+
+def test_wrap_text_pulls_a_whole_dash_pair_back():
+    """`——` 是两个字符，只挤一个会在下一行开头留一个孤立的 `—`。"""
+    text = "一二三四五六七八九十——后面还有内容"
+    assert wrap_text(text, 20).split("\n")[0] == "一二三四五六七八九十——"
+
+
+def test_wrap_text_does_not_hang_more_than_the_measured_headroom():
+    """挂出去的格数有上限：语料里最长的行首标点串是 `——`（2 个字符 / 4 格）。"""
+    text = "一二三四五六七八九十。。。。。后面还有内容"
+    first = wrap_text(text, 20).split("\n")[0]
+    assert first == "一二三四五六七八九十。。"
+
+
+def test_wrap_text_backtrack_window_still_excludes_its_lower_bound():
+    """回溯窗口的下界仍然是开区间 —— 这是实测选择，不是漏掉的差一错。
+
+    改成闭区间能少 3 次硬切，但会多出一条 3 行的 cue，得不偿失（数据见上面的注释）。
+    """
+    # 20 格 = 10 个全角字，60% → window_start = 6；标点正好在第 6 个字符之后，
+    # 落在窗口之外，所以照旧硬切在第 10 个字符处。
+    text = "一二三四五，六七八九十一二三四五"
+    assert wrap_text(text, 20).split("\n")[0] == "一二三四五，六七八九"
