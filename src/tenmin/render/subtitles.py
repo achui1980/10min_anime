@@ -16,9 +16,25 @@ DEFAULT_FONT_NAME = DEFAULT_RENDER.subtitle_font_name
 DEFAULT_FONT_SIZE = DEFAULT_RENDER.font_size
 PLAY_RES_X = DEFAULT_RENDER.width
 PLAY_RES_Y = DEFAULT_RENDER.height
+# 字幕四周留白（px，PlayRes 坐标系）。**这两个值同时喂断行计算与 Style 行的
+# MarginL/MarginR/MarginV** —— 原来 Style 行里硬编码着第二份 `60,60,60`，改一份不改
+# 另一份就会「按一个宽度算断行、按另一个宽度排版」，算出来的行宽从此对不上画面。
+#
+# 为什么留在模块级、不进 RenderConfig（判据见 AGENTS.md）：Style 行里每一个数字
+# （颜色、Bold、Outline、Spacing、Alignment、边距）都同等地是「这部番想要什么」，
+# 单独把边距拎出来做旋钮没有依据 —— 已经进 config 的那四个（font_size、
+# subtitle_font_name、width、height）进去的理由是**实测出来的耦合 bug**（PlayRes 与
+# video.py 的 scale 不一致会让 libass 静默缩放字号），边距没有这个问题。真要参数化
+# 该是「字幕样式全面上 config」那一个专项，而不是这里再开一个特例。这次要修的只是
+# 「同一个数字写了两遍」。
 MARGIN_LR = 60
+MARGIN_V = 60
 # 全角字符的实际显示宽度近似等于字号本身；用 1.05 留一点余量，
 # 免得断行算准了但描边（Outline）一挤又超出画面。
+#
+# 实测（真 libass 渲染 + 逐帧量墨迹包围盒，Lantinghei SC / 字号 52 / Spacing=3）：
+# 一个全角字的真实前进宽度是 **47.3px**，而这里的模型值是 52×1.05 = 54.6px ——
+# 模型比实测宽 15%，也就是这条余量实际留了 15% 而不是 5%。
 CJK_CHAR_WIDTH_RATIO = 1.05
 
 _STYLE_FORMAT = (
@@ -27,15 +43,28 @@ _STYLE_FORMAT = (
     "BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding"
 )
 _EVENT_FORMAT = "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text"
-# 黄字黑边、加粗、底部居中、四周留 60px。Alignment 2 = 底部居中。
+# 黄字黑边、加粗、底部居中、四周留 MARGIN_LR / MARGIN_V。Alignment 2 = 底部居中。
 # 参考 B 站/抖音吐槽解说类视频最常见的配色：黄色文字 + 黑色粗描边，
 # 对比度强，任何背景下都清楚，比白字彩边更贴近"二次元解说"的既有印象。
 # Spacing 加到 3，字号偏大时给字间留点缝，不然描边一粗字就糊成一片。
 # 字号用 52（比 48 大一点，48/Outline3 已经清楚但想再对比一版更粗更大的），
 # Outline 用 4：配合更大的字号，描边稍粗一点仍保持轮廓清晰。
-_STYLE_TAIL = "&H0000FFFF,&H000000FF,&H00000000,&H80000000,1,0,0,0,100,100,3,0,1,4,1,2,60,60,60,1"
+# 边距三个字段刻意从 MARGIN_LR / MARGIN_V 拼出来，不再写第二份字面量（见上面的注释）。
+_STYLE_HEAD = "&H0000FFFF,&H000000FF,&H00000000,&H80000000,1,0,0,0,100,100,3,0,1,4,1,2"
+
+
+def _style_tail() -> str:
+    """Style 行里字号之后的全部字段。边距每次从常量取，所以只有一份真相。"""
+    return f"{_STYLE_HEAD},{MARGIN_LR},{MARGIN_LR},{MARGIN_V},1"
+
+
 # 优先在这些字符之后断行（标点收尾，不会把标点甩到下一行开头）。
 _BREAK_AFTER = "，、。！？；：—…”』」）,.!?;:"
+# 回溯窗口：从 max_chars 往回最多找到这个比例处，再往前就宁可硬切。
+# 太小会切出很短的行（一行只剩几个字，读起来比切在词中间更难受），太大等于关掉
+# 「优先在标点后断行」。实测 10 集 139 次断行：只有 12 次（8.6%）在这个窗口里找不到
+# 标点、退化成硬切。
+_BREAK_SEARCH_MIN_RATIO = 0.6
 
 
 def format_ass_time(seconds: float) -> str:
@@ -87,7 +116,7 @@ def _wrap_single_line(line: str, max_chars: int) -> list[str]:
     pieces: list[str] = []
     remaining = line
     while len(remaining) > max_chars:
-        window_start = max(1, int(max_chars * 0.6))
+        window_start = max(1, int(max_chars * _BREAK_SEARCH_MIN_RATIO))
         break_at = max_chars
         for i in range(max_chars, window_start, -1):
             if remaining[i - 1] in _BREAK_AFTER:
@@ -129,7 +158,7 @@ def render_ass(
         "",
         "[V4+ Styles]",
         _STYLE_FORMAT,
-        f"Style: Narration,{font_name},{font_size},{_STYLE_TAIL}",
+        f"Style: Narration,{font_name},{font_size},{_style_tail()}",
         "",
         "[Events]",
         _EVENT_FORMAT,

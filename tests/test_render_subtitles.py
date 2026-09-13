@@ -153,3 +153,29 @@ def test_escape_text_strips_backslash():
 def test_escape_text_strips_backslash_before_converting_real_newlines():
     """剥反斜杠必须发生在「真换行 → \\N」之前，否则自己插的 \\N 会被自己吃掉。"""
     assert escape_text("上一行\n下\\h一行") == "上一行\\N下h一行"
+
+
+# --- 边距只能有一份真相（P2-E C4）------------------------------------------
+#
+# MARGIN_LR = 60 决定断行宽度，而 Style 行原来硬编码着第二份 `60,60,60`
+# （MarginL/MarginR/MarginV）决定 libass 实际留的边距。两份字面量分开写，改一份不改
+# 另一份就会「按 60px 算断行、按别的值排版」——算出来的行宽从此对不上画面。
+
+
+def test_style_line_margins_come_from_the_module_constants():
+    from tenmin.render.subtitles import MARGIN_LR, MARGIN_V
+
+    style = next(line for line in render_ass([]).splitlines() if line.startswith("Style:"))
+    fields = style.split(",")
+    assert fields[-4:-1] == [str(MARGIN_LR), str(MARGIN_LR), str(MARGIN_V)]
+
+
+def test_changing_margin_lr_moves_both_the_wrap_width_and_the_style_line(monkeypatch):
+    """改一个常量，断行宽度与 Style 行必须一起动。"""
+    from tenmin.render import subtitles as module
+
+    before = module.max_chars_per_line(DEFAULT_FONT_SIZE)
+    monkeypatch.setattr(module, "MARGIN_LR", 300)
+    style = next(line for line in module.render_ass([]).splitlines() if line.startswith("Style:"))
+    assert style.split(",")[-4:-2] == ["300", "300"]
+    assert module.max_chars_per_line(DEFAULT_FONT_SIZE) < before
