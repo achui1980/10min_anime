@@ -14,6 +14,8 @@ validate 就地改写并把同一个对象塞回 ValidationResult，上一版根
 
 from __future__ import annotations
 
+import unicodedata
+
 from pydantic import BaseModel
 
 from tenmin.config import DEFAULT_VALIDATE, ValidateConfig
@@ -57,6 +59,15 @@ ANCHOR_OVERWRITE_MAX_SECONDS = 60.0
 # 边界语义：**达到**就丢（>=），不是严格超过。恰好一半是片头曲画面的 clip 没有保留价值。
 # 跟 ANCHOR_OUTSIDE_MAX_RATIO 一样是「过半」这个定义，不是可调偏好，所以留在模块级。
 CREDITS_OVERLAP_MAX_RATIO = 0.5
+
+# 「某行是金句的一大半」这条反向包含的长度闸：行的归一化长度既要 >= 4 个字符、
+# 又要 >= 金句长度的 60%。两条都是「一个字的行不能命中任何金句」这个必要条件的
+# 两种表达（短金句靠绝对下限兜、长金句靠比例兜），不是可调偏好，所以留在模块级。
+QUOTE_FRAGMENT_MIN_CHARS = 4
+QUOTE_FRAGMENT_MIN_RATIO = 0.6
+
+# 提示词 single_episode.md:36 要求末节点 label 以这个前缀开头。
+OUTRO_LABEL_PREFIX = "收尾："
 # 「落在窗**外**的 anchor 行占比」的上限。名字里的 OUTSIDE 是刻意的：它原来叫
 # ANCHOR_COVERAGE_MIN_RATIO（「覆盖率下限」），而代码里比的是 outside/total，
 # 语义正好反过来 —— 读代码的人会以为 0.5 是「至少一半要被覆盖」。
@@ -130,17 +141,47 @@ def _anchor_time(track: DialogueTrack, anchor_lines: list[int]) -> float | None:
     return min(starts)
 
 
+def _normalize_quote(text: str) -> str:
+    """只留字母与数字（含 CJK 汉字与假名）。标点、空白、符号一律丢掉。
+
+    判据用 unicodedata 的大类 L*/N*，与 render/tts.py 的 _is_pronounceable 同源：
+    「读得出声的字符」正好也是「反查台词时该比对的字符」。
+    """
+    return "".join(ch for ch in text if unicodedata.category(ch)[0] in "LN")
+
+
 def _quote_matches(
     tracks: dict[int, DialogueTrack], episodes: list[int], quote: str
 ) -> list[DialogueLine]:
-    """按整行完全相等反查金句出处。找不到是合法情况（跨 cue 拼接／双轨半句）。"""
-    target = quote.strip()
+    """归一化（去标点/空白）后反查金句出处。找不到仍是合法情况（跨 cue 拼接／双轨半句）。
+
+    原来是**整行完全相等**，标点差一个就找不到，而 `if not matches: continue` 让找不到
+    的 hold 静默跳过整个检查。实测 61 个真实 hold 的定位率：
+
+    - 整行完全相等（原实现）：41/61 = 67.2%
+    - 归一化后整行相等：43/61 = 70.5%
+    - 归一化后「金句是某行的子串」：44/61 = 72.1%
+    - 再加上「某行是金句的一大半」（下面的反向包含）：46/61 = 75.4%
+
+    反向包含必须带长度闸（QUOTE_FRAGMENT_MIN_*）：LLM 常把相邻两条字幕缝成一句金句，
+    要认出这种情况就得允许「行 ⊂ 金句」，但不加闸的话「嗯」这种一个字的行会命中任何
+    金句，把检查稀释成噪声（实测放开闸门后定位率虚高到 83.6%，单个 hold 最多命中 15 行）。
+    """
+    target = _normalize_quote(quote)
+    if not target:
+        return []
+    minimum = max(QUOTE_FRAGMENT_MIN_CHARS, QUOTE_FRAGMENT_MIN_RATIO * len(target))
     found: list[DialogueLine] = []
     for episode in episodes:
         track = tracks.get(episode)
         if track is None:
             continue
-        found.extend(ln for ln in track.lines if ln.text.strip() == target)
+        for ln in track.lines:
+            line = _normalize_quote(ln.text)
+            if not line:
+                continue
+            if target in line or (len(line) >= minimum and line in target):
+                found.append(ln)
     return found
 
 
@@ -294,6 +335,61 @@ def _check_footage_budget(beat: Beat, cfg: ValidateConfig) -> list[str]:
     return []
 
 
+def _check_structure(script: Script, cfg: ValidateConfig) -> list[str]:
+    """B1：提示词写明的节点结构约定（single_episode.md:34/36/37）。
+
+    原来这里只有 `MIN_BEATS` 一条下限（低于它直接判错重试），上限与结构一概不查。
+
+    全部只给 warning，一条都不判错：这些是「写得合不合规格」的创作约定，违反了照样
+    能出片，不值得烧掉一次几百秒的 LLM 调用。实测 13 份真实 script.json（10 集 saijo
+    + akujo2 + 两份已提交样本）**全部满足**这四条：首节点 role=hook、末节点 role=outro
+    且 label 以「收尾：」开头、6–7 个节点、恰好 1 个 climax。所以它们报出来一定是真的
+    不合规格，不是判据太严。
+    """
+    beats = script.beats
+    if not beats:
+        return []
+    warnings: list[str] = []
+    if beats[0].role != "hook":
+        warnings.append(
+            f"首节点 {beats[0].label!r} 的 role 是 {beats[0].role!r}，"
+            f"提示词要求固定 hook（用最抓人的画面开场）"
+        )
+    if beats[-1].role != "outro":
+        warnings.append(
+            f"末节点 {beats[-1].label!r} 的 role 是 {beats[-1].role!r}，提示词要求 outro"
+        )
+    elif not beats[-1].label.startswith(OUTRO_LABEL_PREFIX):
+        warnings.append(
+            f"末节点 label {beats[-1].label!r} 没有以「{OUTRO_LABEL_PREFIX}」开头"
+        )
+    if len(beats) > cfg.max_beats:
+        warnings.append(
+            f"节点数 {len(beats)} 超过上限 {cfg.max_beats}（提示词要求 5–8 个），"
+            f"每个节点分到的时长会被摊薄"
+        )
+    climaxes = [beat.label for beat in beats if beat.role == "climax"]
+    if len(climaxes) > 1:
+        warnings.append(
+            f"有 {len(climaxes)} 个 climax 节点（{'、'.join(climaxes)}），"
+            f"提示词要求最多 1 个"
+        )
+    return warnings
+
+
+def _check_narration(beat: Beat) -> list[str]:
+    """B2：narration 不该是空的。
+
+    内部 `Beat.narration` 刻意**不**加非空约束（人手清空某段旁白、只要画面不要解说是
+    合法编辑，见 models.py:257 与 render/tts.py 的 warning 降级），但 validate 层该说
+    一声——LLM 那条路已经被 `LLMBeat.narration: NonBlankStr` 堵死，所以这条 warning
+    只可能来自人工编辑。实测 85 个真实 beat 里 0 个空旁白。
+    """
+    if beat.narration.strip():
+        return []
+    return [f"{beat.label}：旁白为空，这一段不会有配音（只有画面）"]
+
+
 def check_script(
     script: Script,
     tracks: dict[int, DialogueTrack],
@@ -307,8 +403,10 @@ def check_script(
     调用方（single.py）拿同一组素材调两个函数，签名对齐比少一个参数更值。
     """
     warnings: list[str] = []
+    warnings.extend(_check_structure(script, cfg))
     warnings.extend(_check_timeline_order(script, cfg))
     for beat in script.beats:
+        warnings.extend(_check_narration(beat))
         warnings.extend(_check_hold_quotes(beat, tracks))
         warnings.extend(_check_anchor_coverage(beat, tracks))
         warnings.extend(_check_cue_offsets(beat))
@@ -368,6 +466,9 @@ def repair_script(
 
     repaired = script.model_copy(deep=True)
     warnings: list[str] = []
+    # 已经为「这一集缺 SignalReport」报过警的集号。按集去重而不是按 clip：一集
+    # 二十来个 clip 会刷出二十条一模一样的 warning，反而把别的信息挤掉。
+    reported_missing: set[int] = set()
 
     for beat in repaired.beats:
         kept: list[Clip] = []
@@ -386,6 +487,17 @@ def repair_script(
             warnings.extend(anchor_warnings)
 
             report = reports.get(clip.episode)
+            if report is None and clip.episode not in reported_missing:
+                # 原来这里是 `gaps = report.silent_gaps if report else []`：缺 report
+                # 就静默退化成「本集没有静音间隙」，is_silent_highlight 全 False、
+                # 一点痕迹都不留。而 single.py 只往 reports 里放**本集**一份，
+                # 跨集 clip 必然走进这个分支，静音标记就这么静默丢了。
+                reported_missing.add(clip.episode)
+                warnings.append(
+                    f"缺第 {clip.episode} 集的静音间隙信号（02_signals），"
+                    f"这一集的 clip 一律不会被标成静音高光；"
+                    f"跨集引用请先把那一集也跑过 signals 阶段"
+                )
             gaps = report.silent_gaps if report else []
             clip.is_silent_highlight = any(
                 _overlap(clip.start, clip.end, gap.start, gap.end)

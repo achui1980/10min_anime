@@ -76,11 +76,15 @@ def make_script(clips_per_beat, *, pad=True):
             rows.append([clip(300.0 + 10 * len(rows), 305.0 + 10 * len(rows))])
     beats = []
     for i, clips in enumerate(rows):
+        # 末节点做成 outro + 「收尾：」label：B1 的结构校验要求首 hook、末 outro，
+        # 不然每一条「warnings == []」的断言都会被结构 warning 污染。原来这里
+        # 全是 hook/act，最后一个是 act。
+        last = i == len(rows) - 1
         beats.append(
             Beat(
                 id=f"b{i + 1}",
-                label=f"节点{i + 1}",
-                role="hook" if i == 0 else "act",
+                label=(f"收尾：节点{i + 1}" if last else f"节点{i + 1}"),
+                role=("hook" if i == 0 else "outro" if last else "act"),
                 narration="旁白" * 20,
                 clips=list(clips),
             )
@@ -603,3 +607,130 @@ def test_beat_within_the_measured_stretch_range_does_not_warn():
 def test_stretch_bounds_constants():
     assert DEFAULT_VALIDATE.stretch_max == pytest.approx(4.0)
     assert DEFAULT_VALIDATE.stretch_min == pytest.approx(0.125)
+
+
+# --- B1：节点结构约定（提示词 single_episode.md:34,36,37）---
+
+
+def structure_script(roles, labels=None):
+    beats = []
+    for i, role in enumerate(roles):
+        beats.append(
+            Beat(
+                id=f"s{i + 1}",
+                label=(labels[i] if labels else f"阶段{i + 1}"),
+                role=role,
+                narration="旁白" * 20,
+                clips=[clip(300.0 + i * 10, 305.0 + i * 10)],
+            )
+        )
+    return Script(show="才女的侍从", episodes=[2], beats=beats)
+
+
+def test_first_beat_must_be_hook():
+    s = structure_script(["act", "act", "outro"])
+    hits = [w for w in run(s).warnings if "首节点" in w]
+    assert len(hits) == 1, run(s).warnings
+
+
+def test_last_beat_must_be_outro():
+    s = structure_script(["hook", "act", "act"])
+    hits = [w for w in run(s).warnings if "role 是" in w and "末节点" in w]
+    assert len(hits) == 1, run(s).warnings
+
+
+def test_last_beat_label_must_start_with_the_outro_prefix():
+    s = structure_script(["hook", "act", "outro"], labels=["Hook 开场", "阶段一", "大结局"])
+    hits = [w for w in run(s).warnings if "收尾：" in w]
+    assert len(hits) == 1, run(s).warnings
+
+
+def test_too_many_beats_warns_but_does_not_raise():
+    s = structure_script(["hook"] + ["act"] * 8 + ["outro"])
+    hits = [w for w in run(s).warnings if "节点数" in w]
+    assert len(hits) == 1, run(s).warnings
+
+
+def test_more_than_one_climax_warns():
+    s = structure_script(["hook", "climax", "climax", "outro"])
+    hits = [w for w in run(s).warnings if "climax" in w]
+    assert len(hits) == 1, run(s).warnings
+
+
+def test_the_shape_real_products_use_warns_about_nothing():
+    """实测 13 份真实 script.json 的 role 序列全是
+    hook + act* + 一个 climax + outro、6–7 个节点、末节点 label 以「收尾：」开头。
+    这个形状必须一条 warning 都不报。"""
+    s = structure_script(
+        ["hook", "act", "act", "act", "climax", "act", "outro"],
+        labels=["Hook 开场", "阶段一", "阶段二", "阶段三", "阶段四", "阶段五", "收尾：完"],
+    )
+    assert run(s).warnings == []
+
+
+# --- B2：narration 非空 ---
+
+
+def test_empty_narration_warns():
+    """内部 Beat.narration 刻意保持宽松（人手清空是合法编辑），但 validate 该说一声。"""
+    s = make_script([[clip(10.0, 15.0)]])
+    s.beats[0].narration = "   "
+    hits = [w for w in run(s).warnings if "旁白为空" in w]
+    assert len(hits) == 1, run(s).warnings
+
+
+# --- B8：缺 SignalReport 时不再静默当成「无静音间隙」 ---
+
+
+def test_missing_signal_report_warns_instead_of_silently_clearing_the_flag():
+    """reports.get(...) 为 None 时原来静默退化成「本集没有静音间隙」，
+    is_silent_highlight 全 False，一点痕迹都不留。而 single.py 只放一集的 report，
+    跨集 clip 会静默丢失静音标记。"""
+    s = make_script([[clip(10.0, 15.0)]])
+    result = validate_script(s, tracks={2: make_track()}, reports={})
+    hits = [w for w in result.warnings if "静音间隙信号" in w]
+    assert len(hits) == 1, result.warnings
+    assert result.script.beats[0].clips[0].is_silent_highlight is False
+
+
+def test_missing_signal_report_warns_once_per_episode_not_per_clip():
+    s = make_script([[clip(10.0, 15.0), clip(20.0, 25.0), clip(30.0, 35.0)]])
+    result = validate_script(s, tracks={2: make_track()}, reports={})
+    assert len([w for w in result.warnings if "静音间隙信号" in w]) == 1
+
+
+# --- B9：留白金句反查改成归一化匹配 ---
+
+
+def test_quote_is_matched_after_dropping_punctuation():
+    """原来用整行完全相等反查，标点差一个就找不到，于是 `if not matches: continue`
+    让大量 hold 静默跳过检查。实测 61 个真实 hold 的定位率只有 67.2%。"""
+    track = make_track(lines=[dline(17, 41.1, 43.0, "原来，您对我的认知只有这种程度……")])
+    s = with_holds(make_script([[clip(0.6, 20.0)]]), [hold("原来您对我的认知只有这种程度")])
+    result = run(s, track=track)
+    assert len(result.warnings) == 1, result.warnings
+    assert "留白金句" in result.warnings[0]
+
+
+def test_quote_that_is_a_fragment_of_a_longer_line_is_matched():
+    track = make_track(lines=[dline(17, 41.1, 43.0, "所以我说了，原来您对我的认知只有这种程度")])
+    s = with_holds(make_script([[clip(0.6, 20.0)]]), [hold("原来您对我的认知只有这种程度")])
+    assert len(run(s, track=track).warnings) == 1
+
+
+def test_quote_stitched_from_two_cues_matches_the_longer_half():
+    """LLM 常把相邻两条字幕缝成一句金句。要求「行是金句的一大半」才算命中。"""
+    track = make_track(
+        lines=[dline(17, 41.1, 43.0, "伊月肯听我的话"), dline(18, 43.0, 45.5, "只是因为那是他的工作吗")]
+    )
+    s = with_holds(
+        make_script([[clip(0.6, 20.0)]]), [hold("伊月肯听我的话 只是因为那是他的工作吗")]
+    )
+    assert len(run(s, track=track).warnings) == 1
+
+
+def test_a_one_character_line_does_not_match_every_quote():
+    """反向包含必须带长度闸，否则「嗯」这种行会命中任何金句，把检查稀释成噪声。"""
+    track = make_track(lines=[dline(17, 41.1, 43.0, "嗯")])
+    s = with_holds(make_script([[clip(0.6, 20.0)]]), [hold("原来您对我的认知只有这种程度")])
+    assert run(s, track=track).warnings == []
