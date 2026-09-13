@@ -56,12 +56,12 @@ cat /path/to/zscaler_ca_bundle.pem >> .venv/lib/python3.14/site-packages/certifi
   健壮性分成三层，改这个文件前先分清自己在动哪一层：
   1. **传输层**（`_stream_with_retries`）：429/5xx 与连接类异常走指数退避 + 抖动 + `Retry-After`，次数由 `transport_max_attempts` 管。其余 4xx 与非限流的业务错误码立即失败。
   2. **schema 修复层**（`_complete_with_schema_repair`，provider 无关，两个 provider 共用）：校验失败就把「schema + 报错 + 截断后的坏输出」回灌重试，次数由 `max_attempts` 管。**纠错轮刻意不重发首轮那份 ~35k 字符的正文。**
-  3. **异常族**：全部继承 `LLMError`（`RuntimeError` 子类，已进 `cli.py` 的 `PIPELINE_ERRORS`）。`LLMHTTPError` 把响应体摘要拼进消息，`LLMBusinessError` 管 HTTP 200 + `base_resp.status_code != 0`，`LLMSchemaError.raw_output` 带着最后一次的原始模型输出（由 `pipeline.run_script` 落到 `03_script/E{NN}.raw.txt`）。
+  3. **异常族**：全部继承 `LLMError`（`RuntimeError` 子类，已进 `cli.py` 的 `PIPELINE_ERRORS`）。`LLMHTTPError` 把响应体摘要拼进消息，`LLMBusinessError` 管 HTTP 200 + `base_resp.status_code != 0`，`LLMSchemaError.raw_output` 带着最后一次的原始模型输出（由 `pipeline.run_script` 落到 `03_script/E{NN}.raw.txt`），`LLMFinishReasonError` 管「没有可用输出」的 finish_reason —— **两条 provider 路径共用它**（Gemini 的 `_check_gemini_finish` 与 OpenAI 兼容的 `_stream_once` 里那次截断判定），而且它刻意不被 schema 修复层网住：同一个 max_tokens 只会再截断一次。
   退避的 `_sleep` / `_rand` 是模块级函数，测试 monkeypatch 掉它们，所以**新增退避路径时不要改成直接 `asyncio.sleep`**，否则测试会真睡。
 - `src/tenmin/render/`：`subtitles.py`（ASS 字幕生成，含手动 CJK 换行，因为 libass 不会按 CJK 字符边界自动换行）、`timeline.py`（时间轴重算 + 按句拆分字幕 cue）、`audio.py`（原声 ducking + 混音 + 淡出 + 结尾静音）、`video.py`（剪辑拼接烧字幕 + 淡出 + 结尾卡片）、`ffmpeg.py`（subprocess 封装，所有调用都用 `text=True, errors="replace"`，因为老番源文件的容器元数据经常不是合法 UTF-8）。
 - `src/tenmin/render/tts.py`：TTS 层，结构上刻意跟 `script/llm.py` 对齐。改它之前先分清自己在动哪一层：
   1. **缓存身份**：chunk 文件名是 `chunk_{序号:03d}.{hash8}.mp3`，哈希 = sha256(`engine.fingerprint` + `\x00` + text)，`fingerprint` 含 voice 与 rate。**序号只为人工试听时可读，身份全靠哈希** —— 复用先按确切名字找，找不到就在同目录里按哈希 glob（chunk 数量一变序号全平移，但内容没变的不该重合成）。改这里会让 `work/` 下的存量 chunk 全部失效。
-  2. **原子落盘 + 时长体检**（`EdgeTTSEngine.synthesize`）：`edge_tts.Communicate.save()` 是流式写，中断留截断 mp3。所以一律先落 `.part`、`probe_duration` 体检通过才 `os.replace`。体检区间见 `_duration_bounds` 的 docstring（标定自 115 个真实 chunk）。
+  2. **原子落盘 + 时长体检**（`EdgeTTSEngine.synthesize`）：`edge_tts.Communicate.save()` 是流式写，中断留截断 mp3。所以一律走 `tenmin.atomic` 的 `atomic_path`（全仓一套 `.part` 命名，`.part` 插在扩展名**之前**：`chunk_001.abc.part.mp3`）、`probe_duration` 体检通过才 `os.replace`。那个命名不会被 `_find_cached_chunk` 的 `chunk_*.{digest}.mp3` glob 命中（实测）。体检区间见 `_duration_bounds` 的 docstring（标定自 115 个真实 chunk）。
   3. **退避重试**（`synthesize_with_retry`）：模块级 `_sleep` / `_rand` 供测试 monkeypatch，参数与命名跟 llm.py 一套。`TypeError` / `ValueError` 判为不可重试（edge-tts 的参数校验）。**新增退避路径不要改成裸 `asyncio.sleep`**，否则测试会真睡。
   4. **输入健壮性**（`_plan_pronounceable`）：不含任何字母/数字的 chunk（切句留下的孤立 `'`）直接跳过，它带的 hold 折进前一个 chunk。
   5. `probe_duration` 是阻塞 subprocess，一律走 `asyncio.to_thread`。
@@ -70,8 +70,8 @@ cat /path/to/zscaler_ca_bundle.pem >> .venv/lib/python3.14/site-packages/certifi
 - `src/tenmin/script/single.py`：单集 LLM 调用编排（`generate_script()`），拼 prompt（模板 + few-shot 示例 + schema + 对白/信号数据）。轮次结构：首稿 → 最多 `llm.validation_retries` 次语义校验重试 → 最多 `llm.budget_rewrite_rounds` 轮时长返工。**返工轮跟首轮的 prompt 不一样**：摘掉 few-shot 范例（模型已经证明它会这个格式，而范例自己带着「不要学它的内容」的警告），但**必须**重发对白轨与高能点清单（占整份 prompt 的 84%，而重试要修的语义错只能对着对白原文才判得出来），另外把上一版的 `LLMScript` JSON 交回去让它做局部编辑 —— 不交回去的话 `budget.rewrite_instruction` 里那句「不要改动 clip 时间戳」是模型物理上做不到的要求。
 - `src/tenmin/script/prompts/single_episode.md` 的**段落顺序是按 prefix 缓存实测标定的，别凭直觉重排**。顺序：完全静态的「素材格式说明 / 交付要求 / 输出格式」→ 本集素材（本期素材 / 术语表 / 高能点清单 / 对白轨）→ few-shot 范例 → 输出前自检。关键点是**范例必须留在全部素材之后**：返工轮除了摘掉范例什么都没动，所以范例排最后时返工轮的 prompt 就是首轮的一个**严格前缀**（实测 saijo 31.7k 字符可缓存）。「把静态段连范例一起前置」这个看起来更对的做法实测是 4 倍回退（一次 10 集批处理的可缓存字符占比 42.9% → 9.9%）：真正被反复发的前缀是「同集首轮↔返工轮共享的整份素材」，不是「跨集共享的那 2.5k 静态段」，而后者在默认模型（`gemini-3.6-flash`，implicit caching 门槛 4096 token）上大概率还够不到门槛。摘除范例的机制是「整节都注进 `{{example_block}}`」，不是字符串切割 —— 空值必须**逐字节**不留痕，多两个空行就足以让分叉点之后的缓存全部失效。
 - `src/tenmin/script/prompt.py`：`{{name}}` 占位符渲染，**双向校验**（模板要的没传 → 报错；传了模板没用到 → 也报错，因为那是占位符名字敲错，会让整段内容静默丢失）。两个方向共用 `PromptTemplateError(KeyError, ValueError)`：KeyError 保历史语义，ValueError 让它落进 `cli.PIPELINE_ERRORS`。模板名是 `render_prompt` 的**位置参数**（占位符可能恰好叫 `template_name`）。`load_prompt` 带 `functools.cache`，改模板内容的测试用 `cache_clear()`。
-- `src/tenmin/script/validate.py`：LLM 输出的唯一拦网。**分成两半，改之前先分清自己在动哪一半**：`check_script()` 是纯读（只返回 warning，一个字节都不改），`repair_script()` 是显式修复（先 `model_copy(deep=True)` 再改，返回**新** Script）。`validate_script()` 是两者的组合。拆开的动因是 single.py 的返工轮要「两版择优」，而原来 validate 就地改写并把同一个对象塞回结果，上一版根本没被保留下来。降级语义（丢弃单条 clip、保留其余、附一条 warning）是生产上的重要健壮性，别改成整篇作废。
-- `src/tenmin/script/budget.py`：时长预算，全是纯函数。`SPEECH_RATE_CPS = 4.5` 是全项目唯一一份（render/tts.py 的时长体检、render/chunks.py 的句偏移、docgen/table.py 的估算列都从这里取），`speed_factor(rate)` 也住在这里、tts.py 反过来 import 它。字数换算成秒数的唯一入口是 `narration_seconds(text, rate=...)`；读全片估算的唯一入口是 `total_estimate()`（优先读存好的 `est_total_seconds`，缺了才重算）。`narration_chars` 对中文标点**全额计费是刻意的**，用 115 个真实 chunk 测过：打折只会让「实测/估算」的分布更散（docstring 里有完整数据）。
+- `src/tenmin/script/validate.py`：LLM 输出的唯一拦网。**分成两半，改之前先分清自己在动哪一半**：`check_script()` 是纯读（只返回 warning，一个字节都不改），`repair_script()` 是显式修复（先 `model_copy(deep=True)` 再改，返回**新** Script）。`validate_script()` 是两者的组合。三个入口都收 `rate`（= `render.rate`）：两条按秒数判的检查（hold/sfx 落点上界、画面/旁白拉伸倍率）必须跟 voice 阶段同口径，不传就会在非默认语速下分叉。拆开的动因是 single.py 的返工轮要「两版择优」，而原来 validate 就地改写并把同一个对象塞回结果，上一版根本没被保留下来。降级语义（丢弃单条 clip、保留其余、附一条 warning）是生产上的重要健壮性，别改成整篇作废。
+- `src/tenmin/script/budget.py`：时长预算，全是纯函数。`SPEECH_RATE_CPS = 4.5` 是全项目唯一一份（render/tts.py 的时长体检、render/chunks.py 的句偏移、docgen/table.py 的估算列都从这里取），`speed_factor(rate)` 也住在这里、tts.py 反过来 import 它。字数换算成秒数的唯一入口是 `narration_seconds(text, rate=...)`，**反向**（秒→字）的唯一入口是 `narration_chars_for_seconds(seconds, rate=...)`；「旁白 + 留白」的跨度只有一份实现 `narration_span_seconds`（`beat_seconds` 是它的 Beat 包装，`render/chunks.py` 的 `assign_holds` 直接调散件版）；读全片估算的唯一入口是 `total_estimate()`（优先读存好的 `est_total_seconds`，缺了才重算）。`narration_chars` 对中文标点**全额计费是刻意的**，用 115 个真实 chunk 测过：打折只会让「实测/估算」的分布更散（docstring 里有完整数据）。
 
 ## 测试
 
@@ -79,7 +79,7 @@ cat /path/to/zscaler_ca_bundle.pem >> .venv/lib/python3.14/site-packages/certifi
 uv run pytest tests/ -q          # 全量跑，默认跳过需要真实 API key / 素材的标记测试
 ```
 
-`tests/` 目录：`test_config.py`、`test_llm.py`、`test_pipeline.py`、`test_cli.py`、`test_render_*.py` 等，共 28 个文件。pytest markers：
+`tests/` 目录：`test_config.py`、`test_llm.py`、`test_pipeline.py`、`test_cli.py`、`test_render_*.py` 等，共 40 个文件（含 conftest.py / fakes.py / __init__.py）。pytest markers：
 
 - `llm`：需要真实 LLM API key（默认跳过），跑法：`TENMIN_GEMINI_API_KEY=xxx uv run pytest -m llm`。
 - `generalize`：需要额外的番剧 SRT fixture。
