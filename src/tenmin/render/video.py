@@ -64,11 +64,6 @@ def escape_filter_path(path: Path) -> str:
     return escape_filter_arg(str(path))
 
 
-def escape_drawtext(text: str) -> str:
-    """drawtext 的 text 参数整体用单引号包住，反斜杠与单引号需要转义。"""
-    return text.replace("\\", "\\\\").replace("'", "\\'")
-
-
 def quality_args(encoder: str) -> list[str]:
     """videotoolbox 不认 -crf/-preset，只能给码率。"""
     if encoder.endswith("videotoolbox"):
@@ -114,16 +109,23 @@ def build_render_args(
         final_label = "[vfaded]"
     if outro_seconds > 0:
         # 结尾黑卡：番剧名+集数在上，感谢语在下，样式跟正片字幕保持一致（黄字黑边）。
+        #
+        # font / text 三个值全部来自 config（outro_title 由 cfg.show 拼出、
+        # outro_message 是 render.outro_message、字体名是 render.outro_font_name），
+        # 所以一律走 escape_filter_arg —— 它已经含外层单引号，别再自己补一对。
+        # `%` 不靠转义：drawtext 默认按 strftime 展开 `%`，靠末尾的 expansion=none
+        # 关掉（实测 `%Y-%m-%d` 与 textfile= 的基准真值像素逐字节相同）。
         parts.append(f"color=c=black:s={width}x{height}:d={outro_seconds:.3f}[cardbg]")
-        title = escape_drawtext(outro_title)
-        message = escape_drawtext(outro_message)
+        font = escape_filter_arg(OUTRO_FONT_NAME)
+        title = escape_filter_arg(outro_title)
+        message = escape_filter_arg(outro_message)
         parts.append(
-            f"[cardbg]drawtext=font='{OUTRO_FONT_NAME}':text='{title}':fontcolor=yellow:"
+            f"[cardbg]drawtext=font={font}:text={title}:fontcolor=yellow:"
             "bordercolor=black:borderw=4:fontsize=64:x=(w-text_w)/2:y=(h-text_h)/2-60:"
             "expansion=none[card1]"
         )
         parts.append(
-            f"[card1]drawtext=font='{OUTRO_FONT_NAME}':text='{message}':fontcolor=yellow:"
+            f"[card1]drawtext=font={font}:text={message}:fontcolor=yellow:"
             "bordercolor=black:borderw=4:fontsize=44:x=(w-text_w)/2:y=(h-text_h)/2+40:"
             "expansion=none[card]"
         )

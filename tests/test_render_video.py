@@ -5,7 +5,7 @@ import pytest
 from tenmin.models import Timeline, TimelineSegment
 from tenmin.render.video import (
     build_render_args,
-    escape_drawtext,
+    escape_filter_arg,
     escape_filter_path,
     quality_args,
     render_video,
@@ -168,9 +168,50 @@ def test_build_render_args_rejects_empty_timeline(tmp_path):
     assert "segment" in str(exc.value)
 
 
-def test_escape_drawtext_escapes_backslash_and_quote():
-    raw = "it's\\path"
-    assert escape_drawtext(raw) == "it\\'s\\\\path"
+def test_escape_filter_arg_handles_drawtext_text_too(tmp_path):
+    """drawtext 的 text 跟文件路径过的是同两层，转义规则完全一样，共用一个函数。
+
+    drawtext 独有的 `%` strftime 展开不靠转义解决 —— 由 expansion=none 关掉（实测
+    `%Y-%m-%d` 渲染出来跟 textfile= 的基准真值像素逐字节相同）。
+    """
+    assert escape_filter_arg("it's\\path") == "'it\\'\\''s\\\\path'"
+    assert escape_filter_arg("a:b") == "'a\\:b'"
+    assert escape_filter_arg("100%") == "'100%'"
+
+
+def test_build_render_args_keeps_expansion_none_so_percent_is_literal(tmp_path):
+    """没有 expansion=none 的话 drawtext 会把 % 当 strftime 展开，`100%` 就变了。"""
+    args = build(tmp_path, outro_seconds=3.0, outro_title="100%", outro_message="50%")
+    graph = args[args.index("-filter_complex") + 1]
+    assert graph.count("expansion=none") == 2
+
+
+def test_build_render_args_escapes_quotes_and_colons_in_outro_text(tmp_path):
+    """片尾卡的文案来自 config（outro_title 由 cfg.show 拼出），带撇号的剧名很常见。
+
+    走的是跟字幕路径同一套两层转义 —— 实测（ffmpeg 9.0.1）不转义时 ' 会让 drawtext
+    的 Eval 报 `Invalid chars '[o]' at the end of expression`，: 会让层 1 就地报
+    `Error parsing a filter description`。
+    """
+    args = build(
+        tmp_path,
+        outro_seconds=3.0,
+        outro_title="It's 9:00",
+        outro_message="a\\b",
+    )
+    graph = args[args.index("-filter_complex") + 1]
+    assert "text='It\\'\\''s 9\\:00'" in graph
+    assert "text='a\\\\b'" in graph
+
+
+def test_build_render_args_escapes_the_outro_font_name(tmp_path, monkeypatch):
+    """font= 跟 text= 在同一个 AVOption 串里，字体名也来自 config，同样要转义。"""
+    from tenmin.render import video as video_module
+
+    monkeypatch.setattr(video_module, "OUTRO_FONT_NAME", "It's:Font")
+    args = build(tmp_path, outro_seconds=3.0, outro_title="x", outro_message="y")
+    graph = args[args.index("-filter_complex") + 1]
+    assert "font='It\\'\\''s\\:Font'" in graph
 
 
 def test_build_render_args_without_fade_or_outro_keeps_vout_label(tmp_path):
@@ -446,6 +487,51 @@ def test_real_ffmpeg_accepts_ass_paths_with_special_characters(tmp_path, dirname
         ass=ass,
         out_path=tmp_path / "out" / "E02.mp4",
         encoder="libx264",
+    )
+    assert out.is_file()
+    assert out.stat().st_size > 0
+
+
+@pytest.mark.render
+@pytest.mark.parametrize(
+    "title",
+    [
+        "\u624d\u5973\u7684\u4f8d\u4ece \u00b7 EP02",  # 现状：正常文案
+        "It's ok",
+        "9:00",
+        "a\\b",
+        "100%",  # expansion=none 关掉了 strftime 展开
+        "%Y-%m-%d",
+        "a,b",
+        "a=b",
+        "[x];y",
+        "O'B:x\\y%z,w=v",  # 全都来一遍
+    ],
+)
+def test_real_ffmpeg_accepts_outro_text_with_special_characters(tmp_path, title):
+    """片尾卡文案带特殊字符时，真 ffmpeg 必须能解析并渲染。"""
+    from tenmin.render.ffmpeg import has_filter
+    from tenmin.render.video import render_video
+
+    if not has_filter("subtitles"):
+        pytest.skip("ffmpeg 没编 libass，跑不了 subtitles 滤镜")
+    if not has_filter("drawtext"):
+        pytest.skip("ffmpeg 没编 drawtext 滤镜，画不了片尾黑卡")
+
+    video, audio = _lavfi_inputs(tmp_path)
+    ass = tmp_path / "E02.ass"
+    ass.write_text(MINIMAL_ASS, encoding="utf-8")
+
+    out = render_video(
+        video=video,
+        timeline=_one_second_timeline(),
+        audio=audio,
+        ass=ass,
+        out_path=tmp_path / "out" / "E02.mp4",
+        encoder="libx264",
+        outro_seconds=0.5,
+        outro_title=title,
+        outro_message=title,
     )
     assert out.is_file()
     assert out.stat().st_size > 0
