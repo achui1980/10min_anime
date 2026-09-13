@@ -656,6 +656,40 @@ async def test_run_voice_wires_tts_concurrency(tmp_path):
     assert engine.peak == 3
 
 
+async def test_run_voice_wires_ffprobe_path_into_the_reuse_path(tmp_path, monkeypatch):
+    """render.ffprobe_path 必须也到达**复用** chunk 那条路上的时长体检。
+
+    engine 那条路（EdgeTTSEngine.synthesize 的体检）早就接线了，复用那条路一直用的是
+    模块默认 "ffprobe"。这个半接线的失败模式最难查：只配了 ffprobe_path 的用户第一次
+    跑（全新合成）好的，第二次跑（chunk 全命中缓存）才炸。
+    """
+    from tenmin.render import tts as tts_module
+
+    from .fakes import FakeTTSEngine
+
+    cfg = _minimal_project(tmp_path)
+    cfg.render.ffprobe_path = "/opt/x/ffprobe"
+    _write_voice_and_script(cfg)
+    Paths(cfg.root).voice(1).unlink()
+
+    # 先跑一轮把 chunk 落到盘上（FakeTTSEngine 自己报时长，不碰 ffprobe）。
+    await run_voice(cfg, FakeTTSEngine([2.0] * 8), episode=1)
+    # voice.json 拿掉，复用路径就没有现成时长可用，只能去 probe。
+    Paths(cfg.root).voice(1).unlink()
+
+    seen: list[str] = []
+
+    def spy(path, *, ffprobe="ffprobe"):
+        seen.append(ffprobe)
+        return 2.0
+
+    monkeypatch.setattr(tts_module, "probe_duration", spy)
+    await run_voice(cfg, FakeTTSEngine([]), episode=1)
+
+    assert seen, "复用路径压根没去 probe，这个测试没测到东西"
+    assert set(seen) == {"/opt/x/ffprobe"}
+
+
 def test_run_timeline_surfaces_subtitle_legibility_warnings(tmp_path):
     """字幕可读性检查（P2-E C2）要接到 timeline 阶段的 warnings 上。
 

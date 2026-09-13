@@ -502,6 +502,7 @@ async def run_voice(
         previous=previous,
         concurrency=cfg.render.tts_concurrency,
         rate=cfg.render.rate,
+        ffprobe=cfg.render.ffprobe_path,
     )
     if previous_warning is not None:
         warnings.insert(0, previous_warning)

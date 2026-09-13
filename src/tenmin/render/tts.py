@@ -12,7 +12,7 @@ from tenmin.config import DEFAULT_RENDER, RenderConfig
 from tenmin.models import Beat, Script, VoiceChunk, VoiceTrack
 from tenmin.progress import NullProgressReporter, ProgressReporter
 from tenmin.render.chunks import is_pronounceable, plan_chunks
-from tenmin.render.ffmpeg import probe_duration
+from tenmin.render.ffmpeg import FFPROBE, probe_duration
 from tenmin.script.budget import DEFAULT_RATE, narration_chars, narration_seconds
 
 # speed_factor 历史上住在本模块（叫 _speed_factor），现在唯一实现在 script/budget.py
@@ -372,12 +372,21 @@ async def synthesize_track(
     previous: VoiceTrack | None = None,
     concurrency: int = DEFAULT_RENDER.tts_concurrency,
     rate: str = DEFAULT_RATE,
+    ffprobe: str = FFPROBE,
 ) -> tuple[VoiceTrack, list[str]]:
     """合成整集旁白。chunk 独立落盘，重跑只补内容变了的那几个。
 
     `previous` 是上一轮的 voice.json。复用时优先取里面记下的时长，省掉每个 chunk 一次
     ffprobe 子进程 —— 文件名里的哈希已经保证内容与音色都对得上，那份时长就是同一段音频
     体检过的真实时长。
+
+    `ffprobe` 是**复用**路径上那次时长体检要用的可执行文件（`render.ffprobe_path`）。
+    刻意做成本函数的参数、而不是从 `engine` 上取：`TTSEngine` 协议就是「fingerprint +
+    synthesize」两件事，ffprobe 不属于「一台 TTS 引擎是什么」——自己就能报时长的引擎
+    压根用不到它，而 `getattr(engine, "ffprobe", FFPROBE)` 这种写法是在协议之外做鸭子
+    类型，凡是没恰好带这个属性的引擎都会静默退回坏掉的默认值，等于把要修的 bug 重造
+    一遍。复用路径体检的是**磁盘上已有**的文件（可能还是上一次运行落的），那是调用方的
+    环境，跟 `voice_dir` 同一类，也跟 `rate`／`concurrency` 同一个形状。
 
     `concurrency` 是同时在飞的 chunk 数（`render.tts_concurrency`）。每个 chunk 的耗时
     几乎全是网络往返，所以并发几乎线性提速：115 个真实 chunk 串行 297.3 秒、并发 4
@@ -440,7 +449,9 @@ async def synthesize_track(
                 filename = cached.name
                 duration = known_durations.get(filename)
                 if duration is None:
-                    duration = await asyncio.to_thread(probe_duration, cached)
+                    duration = await asyncio.to_thread(
+                        probe_duration, cached, ffprobe=ffprobe
+                    )
             else:
                 duration = await synthesize_with_retry(
                     engine, text, out_path, label=label, max_attempts=max_attempts

@@ -238,7 +238,9 @@ async def test_synthesize_track_reuses_existing_chunk(tmp_path, monkeypatch):
     「chunk 文件按位置序号命名、复用只看文件存在」这个 bug，所以必须改成先真跑一轮。
     """
     await synthesize_track(sample_script(), 2, tmp_path, FakeTTSEngine([3.0, 4.0, 5.0]))
-    monkeypatch.setattr("tenmin.render.tts.probe_duration", lambda path: 9.0)
+    # `**_`：真的 probe_duration 是 `(path, *, ffprobe=...)`，复用路径现在会把
+    # render.ffprobe_path 传进来。断言一个字没改。
+    monkeypatch.setattr("tenmin.render.tts.probe_duration", lambda path, **_: 9.0)
 
     engine = FakeTTSEngine([])
     track, _ = await synthesize_track(sample_script(), 2, tmp_path, engine)
@@ -560,6 +562,28 @@ async def test_reuse_probes_when_the_duration_is_not_recorded(tmp_path, monkeypa
     track, _ = await synthesize_track(sample_script(), 2, tmp_path, FakeTTSEngine([]))
     assert len(probed) == 3
     assert [c.duration for c in track.chunks] == [9.0, 9.0, 9.0]
+
+
+async def test_reuse_path_uses_the_configured_ffprobe(tmp_path, monkeypatch):
+    """复用 chunk 时的时长体检也必须走 render.ffprobe_path。
+
+    engine 那一侧早就接线了（test_edge_engine_uses_configured_ffprobe），复用这一侧
+    一直漏着模块默认的 "ffprobe"。后果对「PATH 上没有 ffprobe、只配了
+    render.ffprobe_path」的用户是最难查的一种：第一次跑（全新合成）好的，第二次跑
+    （chunk 全命中缓存）才炸。
+    """
+    await synthesize_track(sample_script(), 2, tmp_path, FakeTTSEngine([3.0, 4.0, 5.0]))
+    seen: list[str] = []
+
+    def spy(path, *, ffprobe="ffprobe"):
+        seen.append(ffprobe)
+        return 9.0
+
+    monkeypatch.setattr("tenmin.render.tts.probe_duration", spy)
+    await synthesize_track(
+        sample_script(), 2, tmp_path, FakeTTSEngine([]), ffprobe="/opt/x/ffprobe"
+    )
+    assert seen == ["/opt/x/ffprobe"] * 3
 
 
 async def test_recorded_duration_is_only_trusted_for_the_matching_file(tmp_path, monkeypatch):
