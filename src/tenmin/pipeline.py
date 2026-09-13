@@ -499,6 +499,7 @@ async def run_voice(
         reporter=reporter,
         max_attempts=cfg.render.tts_max_attempts,
         previous=previous,
+        concurrency=cfg.render.tts_concurrency,
     )
     if previous_warning is not None:
         warnings.insert(0, previous_warning)

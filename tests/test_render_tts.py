@@ -685,6 +685,224 @@ async def test_progress_total_excludes_skipped_chunks(tmp_path):
     assert reporter.calls == [("substep", "voice", 1, 1, "第一句。第二句。")]
 
 
+# --- 并发合成（tts_concurrency）---
+
+
+class _ConcurrencySpyEngine:
+    """按文本查表返回时长的假引擎，同时记录并发峰值与真实的合成顺序。
+
+    刻意不复用 FakeTTSEngine：它按调用顺序 pop 时长，而并发下调用顺序本来就不确定，
+    「哪个 chunk 拿到哪个时长」会变成一个随机数。这里按文本查表，结果与顺序无关。
+    """
+
+    fingerprint = "fake|voice|+0%"
+
+    def __init__(self, durations: dict[str, float], delays: dict[str, float] | None = None):
+        self.durations = durations
+        self.delays = delays or {}
+        self.in_flight = 0
+        self.peak = 0
+        self.started: list[str] = []
+        self.finished: list[str] = []
+
+    async def synthesize(self, text: str, out_path: Path) -> float:
+        self.in_flight += 1
+        self.peak = max(self.peak, self.in_flight)
+        self.started.append(text)
+        try:
+            await asyncio.sleep(self.delays.get(text, 0.0))
+        finally:
+            self.in_flight -= 1
+        self.finished.append(text)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_bytes(b"fake mp3")
+        return self.durations[text]
+
+
+def _wide_script(count: int) -> Script:
+    """count 个 beat，每个正好一句，用来把并发度撑开。"""
+    return Script(
+        show="剧名",
+        episodes=[2],
+        beats=[
+            Beat(id=f"b{i}", label="A", role="hook", narration=f"第{i}句。")
+            for i in range(count)
+        ],
+    )
+
+
+def _wide_durations(count: int) -> dict[str, float]:
+    return {f"第{i}句。": 1.0 + i for i in range(count)}
+
+
+async def test_synthesize_track_is_serial_by_default(tmp_path):
+    """默认 concurrency=1：任何时刻只有一个 chunk 在合成（零行为变更的底线）。"""
+    engine = _ConcurrencySpyEngine(
+        _wide_durations(6), {f"第{i}句。": 0.01 for i in range(6)}
+    )
+    await synthesize_track(_wide_script(6), 2, tmp_path, engine)
+    assert engine.peak == 1
+    assert engine.started == [f"第{i}句。" for i in range(6)]
+
+
+async def test_synthesize_track_honours_the_concurrency_limit(tmp_path):
+    engine = _ConcurrencySpyEngine(
+        _wide_durations(9), {f"第{i}句。": 0.02 for i in range(9)}
+    )
+    await synthesize_track(_wide_script(9), 2, tmp_path, engine, concurrency=3)
+    assert engine.peak == 3
+
+
+async def test_synthesize_track_actually_overlaps_the_network_waits(tmp_path):
+    """并发的全部意义：墙钟时间接近 max 而不是 sum。
+
+    每个 chunk 睡 0.05 秒，8 个串行至少 0.4 秒；并发 8 应该 ~0.05 秒。
+    """
+    engine = _ConcurrencySpyEngine(
+        _wide_durations(8), {f"第{i}句。": 0.05 for i in range(8)}
+    )
+    started = asyncio.get_running_loop().time()
+    await synthesize_track(_wide_script(8), 2, tmp_path, engine, concurrency=8)
+    elapsed = asyncio.get_running_loop().time() - started
+    assert elapsed < 0.2
+
+
+async def test_synthesize_track_keeps_chunk_order_under_concurrency(tmp_path):
+    """chunks 的顺序决定 render/audio.py 的 adelay 偏移与字幕顺序，绝不能跟着完成顺序走。
+
+    延迟刻意反着排（最后一句最快），所以完成顺序必然是倒序。
+    """
+    count = 5
+    delays = {f"第{i}句。": 0.01 * (count - i) for i in range(count)}
+    engine = _ConcurrencySpyEngine(_wide_durations(count), delays)
+    track, _ = await synthesize_track(
+        _wide_script(count), 2, tmp_path, engine, concurrency=count
+    )
+    assert engine.finished == [f"第{i}句。" for i in reversed(range(count))]
+    assert [c.text for c in track.chunks] == [f"第{i}句。" for i in range(count)]
+    assert [c.beat_id for c in track.chunks] == [f"b{i}" for i in range(count)]
+    assert [c.duration for c in track.chunks] == [1.0 + i for i in range(count)]
+    assert [c.path.split(".")[0] for c in track.chunks] == [
+        f"chunk_{i + 1:03d}" for i in range(count)
+    ]
+
+
+async def test_substep_is_a_completion_counter_under_concurrency(tmp_path):
+    """原来报的是循环下标，并发下它会乱序。改成完成计数器后 current 必须严格 1..N 递增，
+    label 是刚刚完成的那一句。"""
+    count = 5
+    delays = {f"第{i}句。": 0.01 * (count - i) for i in range(count)}
+    engine = _ConcurrencySpyEngine(_wide_durations(count), delays)
+    reporter = FakeReporter()
+    await synthesize_track(
+        _wide_script(count), 2, tmp_path, engine, concurrency=count, reporter=reporter
+    )
+    substeps = [c for c in reporter.calls if c[0] == "substep"]
+    assert [c[2] for c in substeps] == [1, 2, 3, 4, 5]
+    assert all(c[3] == count for c in substeps)
+    # 完成顺序是倒序，所以 label 也必须是倒序 —— 它描述的是「刚完成的那一句」。
+    assert [c[4] for c in substeps] == [f"第{i}句。" for i in reversed(range(count))]
+
+
+async def test_duplicate_text_is_synthesized_once_even_under_concurrency(tmp_path, monkeypatch):
+    """并发下两个同文本 chunk 会同时错过缓存 → 各自去 Edge TTS 合成一遍。
+
+    序号不同所以 `.part` 其实不会互撞（用户报告里猜的那个失败模式不成立），但
+    voice.json 会指向两个内容相同的文件，而串行下它们指向同一个 —— 一次白花的网络
+    往返 + 与串行不一致的产物。
+    """
+    script = Script(
+        show="剧名",
+        episodes=[2],
+        beats=[
+            Beat(id="b1", label="A", role="hook", narration="一模一样的一句。"),
+            Beat(id="b2", label="B", role="outro", narration="一模一样的一句。"),
+        ],
+    )
+
+    def boom(path, **_):
+        raise AssertionError("这一轮刚合成过它，时长在内存里，不该 spawn ffprobe")
+
+    monkeypatch.setattr("tenmin.render.tts.probe_duration", boom)
+    engine = _ConcurrencySpyEngine(
+        {"一模一样的一句。": 6.0}, {"一模一样的一句。": 0.02}
+    )
+    track, _ = await synthesize_track(script, 2, tmp_path, engine, concurrency=4)
+
+    assert engine.started == ["一模一样的一句。"]
+    assert [c.duration for c in track.chunks] == [6.0, 6.0]
+    assert track.chunks[0].path == track.chunks[1].path
+
+
+async def test_a_failing_chunk_raises_tts_error_not_an_exception_group(tmp_path, sleeps):
+    """TaskGroup 把异常包成 ExceptionGroup，而 cli.PIPELINE_ERRORS 认的是 TTSError 本身
+    —— 不解包的话用户拿到的是一整页 traceback。"""
+    engine = FailingTTSEngine(ConnectionResetError("断了"))
+    with pytest.raises(TTSError) as exc:
+        await synthesize_track(_wide_script(4), 2, tmp_path, engine, concurrency=4)
+    assert not isinstance(exc.value, BaseExceptionGroup)
+    assert "ConnectionResetError" in str(exc.value)
+
+
+async def test_a_failing_chunk_keeps_the_chunks_that_already_landed(tmp_path, sleeps):
+    """一个 chunk 彻底失败时 TaskGroup 会取消其余 task。已经原子落盘的要留着（下次靠
+    哈希复用），被取消的 task 留下的 `.part` 要清掉。"""
+
+    class _OneBadApple:
+        fingerprint = "fake|voice|+0%"
+
+        async def synthesize(self, text: str, out_path: Path) -> float:
+            if text == "第2句。":
+                raise ConnectionResetError("断了")
+            if text == "第3句。":
+                # 慢到必然还在飞的时候就被取消，模拟「留下 .part 的那个 task」。
+                out_path.with_name(out_path.name + ".part").write_bytes(b"partial")
+                try:
+                    await asyncio.sleep(10)
+                except BaseException:
+                    out_path.with_name(out_path.name + ".part").unlink(missing_ok=True)
+                    raise
+            out_path.write_bytes(b"fake mp3")
+            return 2.0
+
+    with pytest.raises(TTSError):
+        await synthesize_track(
+            _wide_script(4), 2, tmp_path, _OneBadApple(), concurrency=4, max_attempts=1
+        )
+    assert list(tmp_path.glob("*.part")) == []
+    assert (tmp_path / tts_module.chunk_filename(1, "第0句。", "fake|voice|+0%")).is_file()
+
+
+async def test_a_failure_stops_handing_out_new_chunks(tmp_path, sleeps):
+    """并发实现如果是「每个 chunk 一个 task + Semaphore 限流」，N 个 task 会在同一轮
+    事件循环里全被建出来，首个 chunk 失败时它们照样各发一次 Edge TTS 请求。
+
+    worker 池 + 共享游标才有「游标推不动就没有新活」这个性质：8 个 chunk、并发 2、
+    第一个就失败 —— 最多只该有 2 个 chunk 被碰过（那两个已经在飞的）。
+    """
+
+    class _FirstOneFails:
+        fingerprint = "fake|voice|+0%"
+
+        def __init__(self):
+            self.seen: list[str] = []
+
+        async def synthesize(self, text: str, out_path: Path) -> float:
+            self.seen.append(text)
+            if text == "第0句。":
+                raise ConnectionResetError("断了")
+            await asyncio.sleep(0.02)
+            out_path.write_bytes(b"fake mp3")
+            return 2.0
+
+    engine = _FirstOneFails()
+    with pytest.raises(TTSError):
+        await synthesize_track(
+            _wide_script(8), 2, tmp_path, engine, concurrency=2, max_attempts=1
+        )
+    assert len(engine.seen) <= 2
+
+
 @pytest.mark.parametrize("text", ["Q3 财报。", "第一句。", "ABC。", "２０２５。"])
 def test_normal_text_stays_pronounceable(text):
     assert tts_module._is_pronounceable(text)

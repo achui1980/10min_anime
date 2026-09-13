@@ -339,6 +339,21 @@ def _plan_pronounceable(
     return staged
 
 
+def _first_leaf(error: BaseException) -> BaseException:
+    """从 TaskGroup 的 (Base)ExceptionGroup 里挖出第一个真正的叶子异常。
+
+    TaskGroup 把子 task 的异常一律包成 ExceptionGroup，而 `cli.PIPELINE_ERRORS` 认的是
+    TTSError **本身** —— 不解包的话「一个 chunk 的 Edge TTS 连不上」会从一行人话退化成
+    一整页 traceback。取第一个叶子而不是整组：TaskGroup 在首个失败时就取消其余 task，
+    所以组里通常只有一个非取消异常；真同时炸了两个也只需要报一个（都是同一次运行的
+    同一类故障），多报只会淹掉重点。
+    """
+    if isinstance(error, BaseExceptionGroup):
+        for child in error.exceptions:
+            return _first_leaf(child)
+    return error
+
+
 async def synthesize_track(
     script: Script,
     episode: int,
@@ -349,12 +364,35 @@ async def synthesize_track(
     reporter: ProgressReporter | None = None,
     max_attempts: int = TTS_MAX_ATTEMPTS,
     previous: VoiceTrack | None = None,
+    concurrency: int = DEFAULT_RENDER.tts_concurrency,
 ) -> tuple[VoiceTrack, list[str]]:
     """合成整集旁白。chunk 独立落盘，重跑只补内容变了的那几个。
 
     `previous` 是上一轮的 voice.json。复用时优先取里面记下的时长，省掉每个 chunk 一次
     ffprobe 子进程 —— 文件名里的哈希已经保证内容与音色都对得上，那份时长就是同一段音频
     体检过的真实时长。
+
+    `concurrency` 是同时在飞的 chunk 数（`render.tts_concurrency`）。实测每个 chunk
+    的耗时几乎全是网络往返（E01 11 个 chunk 41.8 秒、E05 13 个 chunk 71.1 秒，chunk
+    之间的间隔 2.0–12.5 秒），所以并发几乎线性提速。四条不变量：
+
+    1. **结果顺序 = 计划顺序**，跟完成顺序无关。`VoiceTrack.chunks` 的顺序决定
+       render/audio.py 的 adelay 偏移与 timeline 的字幕顺序，所以结果按下标写进预分配
+       的槽位，绝不 append。
+    2. **同文本只合成一次**。`digest_locks` 按内容哈希给同文本的 chunk 上锁，第二个
+       进临界区时 `_find_cached_chunk` 已经能 glob 到第一个落好的文件，于是走复用路径
+       —— 跟串行下的行为逐字节一致。顺带把 `known_durations` 的竞态也一起关掉：这个
+       dict 的每个 key 只会被「同一个哈希」的 chunk 读写，而它们全被那把锁串起来了。
+       （用户报告里猜的「两个 `.part` 互相覆盖」其实不成立：文件名带序号，两个同文本
+       chunk 的序号必然不同，`.part` 路径也就不同。真正的代价是一次白花的网络往返 +
+       voice.json 指向两个内容相同的文件。）
+    3. **失败之后不再开新活**。并发用的是「固定 N 个 worker 抢一个共享游标」，**不是**
+       「给每个 chunk 建一个 task 再用 Semaphore 限流」。后者在 concurrency=1 下也会
+       把 N 个 task 全建出来，首个 chunk 失败时它们已经排在同一轮事件循环里、照样会
+       各发一次 Edge TTS 请求（实测：`max_attempts=1` 下第一个 chunk 就失败，engine
+       仍被调了 3 次）。worker 池里游标推不动就没有新活，行为跟串行的 `for` 循环一致。
+    4. **concurrency=1 与改动前逐字节等价**：一个 worker 按游标顺序取活，就是原来那个
+       for 循环。
     """
     reporter = reporter or NullProgressReporter()
     voice_dir = Path(voice_dir)
@@ -365,18 +403,30 @@ async def synthesize_track(
     warnings: list[str] = []
     planned_by_beat = _plan_pronounceable(script, warnings)
 
-    total_chunks = sum(len(planned) for _, planned in planned_by_beat)
+    # 展平成带全局序号的作业清单。序号在这里就定下来，跟后面谁先跑完无关。
+    jobs: list[tuple[Beat, int, str, float]] = [
+        (beat, index, text, hold_after)
+        for beat, planned in planned_by_beat
+        for index, (text, hold_after) in enumerate(planned, start=1)
+    ]
+    total_chunks = len(jobs)
 
-    chunks: list[VoiceChunk] = []
-    serial = 0
-    for beat, planned in planned_by_beat:
-        for index, (text, hold_after) in enumerate(planned, start=1):
-            serial += 1
-            reporter.substep("voice", serial, total_chunks, text[:20])
-            digest = content_hash(text, engine.fingerprint)
-            filename = chunk_filename(serial, text, engine.fingerprint)
-            out_path = voice_dir / filename
-            label = f"beat {beat.id} 的第 {index} 个 chunk"
+    results: list[VoiceChunk | None] = [None] * total_chunks
+    digest_locks: dict[str, asyncio.Lock] = {}
+    cursor = 0
+    done = 0
+
+    async def synthesize_one(position: int) -> None:
+        nonlocal done
+        beat, index, text, hold_after = jobs[position]
+        digest = content_hash(text, engine.fingerprint)
+        filename = chunk_filename(position + 1, text, engine.fingerprint)
+        out_path = voice_dir / filename
+        label = f"beat {beat.id} 的第 {index} 个 chunk"
+        # setdefault 而不是 defaultdict：这里是纯同步代码（asyncio.Lock() 的构造不 await），
+        # 所以两个 worker 之间不可能插进来各建一把锁。
+        lock = digest_locks.setdefault(digest, asyncio.Lock())
+        async with lock:
             cached = _find_cached_chunk(voice_dir, filename, digest) if reuse else None
             if cached is not None:
                 filename = cached.name
@@ -388,17 +438,40 @@ async def synthesize_track(
                     engine, text, out_path, label=label, max_attempts=max_attempts
                 )
             # 同一段文字在剧本里出现两次时，第二个 chunk 会命中第一个的文件；记下来
-            # 就连那一次 ffprobe 也省了。
+            # 就连那一次 ffprobe 也省了。锁内写、锁内读，所以并发下也没有竞态。
             known_durations[filename] = duration
-            chunks.append(
-                VoiceChunk(
-                    beat_id=beat.id,
-                    index=index,
-                    text=text,
-                    path=filename,
-                    duration=duration,
-                    hold_after=hold_after,
-                )
-            )
+        results[position] = VoiceChunk(
+            beat_id=beat.id,
+            index=index,
+            text=text,
+            path=filename,
+            duration=duration,
+            hold_after=hold_after,
+        )
+        # 完成计数器，不是循环下标 —— 并发下下标会乱序。label 是「刚刚完成的那一句」。
+        done += 1
+        reporter.substep("voice", done, total_chunks, text[:20])
+
+    async def worker() -> None:
+        nonlocal cursor
+        while True:
+            if cursor >= total_chunks:
+                return
+            # 取号与自增之间没有 await，所以两个 worker 不可能拿到同一个号。
+            position = cursor
+            cursor += 1
+            await synthesize_one(position)
+
+    if jobs:
+        try:
+            async with asyncio.TaskGroup() as group:
+                for _ in range(min(max(1, concurrency), total_chunks)):
+                    group.create_task(worker())
+        except BaseExceptionGroup as error:
+            raise _first_leaf(error) from error.__cause__
+
+    # 全部 chunk 都成功时 results 里不可能还有 None（每个 position 恰好被写一次），
+    # 但类型上它是 VoiceChunk | None，所以这里显式过滤给类型检查器看。
+    chunks = [chunk for chunk in results if chunk is not None]
     total = sum(chunk.duration + chunk.hold_after for chunk in chunks)
     return VoiceTrack(episode=episode, chunks=chunks, total_seconds=total), warnings

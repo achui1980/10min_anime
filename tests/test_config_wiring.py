@@ -602,3 +602,55 @@ async def test_run_voice_wires_tts_max_attempts(tmp_path, monkeypatch):
     with pytest.raises(tts_module.TTSError):
         await run_voice(cfg, engine, episode=1)
     assert engine.attempts == 2
+
+
+async def test_run_voice_wires_tts_concurrency(tmp_path):
+    """render.tts_concurrency 必须真的到达 synthesize_track 的 worker 池。
+
+    原来它是个哑字段：定义了、测了 default，但 pipeline 压根不读它。
+    """
+    import asyncio
+    from pathlib import Path
+
+    from tenmin.models import Beat, Clip, Script
+
+    class _PeakEngine:
+        fingerprint = "fake|voice|+0%"
+
+        def __init__(self):
+            self.in_flight = 0
+            self.peak = 0
+
+        async def synthesize(self, text: str, out_path: Path) -> float:
+            self.in_flight += 1
+            self.peak = max(self.peak, self.in_flight)
+            await asyncio.sleep(0.02)
+            self.in_flight -= 1
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            out_path.write_bytes(b"fake mp3")
+            return 2.0
+
+    cfg = _minimal_project(tmp_path)
+    cfg.render.tts_concurrency = 3
+    # 一个 beat 只会切出一个 chunk（plan_chunks 只在 hold 处断开），所以要 6 个 beat。
+    script = Script(
+        show="剧名",
+        episodes=[1],
+        beats=[
+            Beat(
+                id=f"b{i}",
+                label="开场",
+                role="hook",
+                narration=f"第{i}句话在这里。",
+                clips=[Clip(episode=1, start=float(i), end=float(i) + 10.0)],
+            )
+            for i in range(6)
+        ],
+    )
+    paths = Paths(cfg.root)
+    paths.script(1).parent.mkdir(parents=True, exist_ok=True)
+    paths.script(1).write_text(script.model_dump_json(), encoding="utf-8")
+
+    engine = _PeakEngine()
+    await run_voice(cfg, engine, episode=1)
+    assert engine.peak == 3

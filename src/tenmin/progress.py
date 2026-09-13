@@ -22,7 +22,13 @@ class ProgressReporter(Protocol):
         ...
 
     def substep(self, stage: str, current: int, total: int, label: str) -> None:
-        """阶段内部的细粒度进度。目前只有 voice（按句）和 render（按 ffmpeg 百分比）会调用。"""
+        """阶段内部的细粒度进度。目前只有 voice、script 和 render 会调用。
+
+        `current` 的口径是**已完成数**，不是「正在做第几个」：voice 阶段可以并发合成
+        （`render.tts_concurrency`），循环下标在并发下会乱序。相应地 `label` 描述的是
+        **刚刚完成**的那个单位（voice 是刚合成好的那一句），而不是即将开始的那个。
+        render 传的是 ffmpeg 的整数百分比（total=100，label 空串）。
+        """
         ...
 
     def episode_start(self, number: int, index: int, total: int) -> None:
