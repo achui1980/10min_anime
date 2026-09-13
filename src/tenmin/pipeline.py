@@ -622,6 +622,10 @@ def run_render(
         outro_seconds=cfg.render.outro_card_seconds,
         outro_title=f"{cfg.show} · EP{episode:02d}",
         outro_message=cfg.render.outro_message,
+        # 必须跟上面 preflight 递给 font_names 的是**同一个值**：preflight 查的字体
+        # 与 drawtext 用的字体分叉过一次（前者读 config、后者读模块级默认值），
+        # 结果是「查了一个用不到的字体、用了一个没查过的字体」。
+        outro_font_name=cfg.render.outro_font_name,
         reporter=reporter,
         ffmpeg=cfg.render.ffmpeg_path,
     )

@@ -314,9 +314,11 @@ class RenderConfig(BaseModel):
     # 见 render/audio.py 里那段听感验证。想留 headroom 的项目可以调到 0.891（-1dB）。
     limiter_ceiling: float = Field(default=1.0, gt=0, le=1)
 
-    # --- 以下"只定义不消费"，等各自的 render 专项任务接线 ---
-    # 片尾黑卡 drawtext 用的字体。跟 subtitle_font_name 是两个独立旋钮：
-    # 字幕字体换了不代表片尾卡也要换（卡片是纯 ASCII+中文标题，选择面更宽）。
+    # --- 已接线：片尾黑卡、TTS 与外部二进制 ---
+    # 片尾黑卡 drawtext 用的字体（走 pipeline.run_render → render/video.py 的
+    # build_render_args(outro_font_name=...)，同一个值也递给 preflight 去 fc-list
+    # 查）。跟 subtitle_font_name 是两个独立旋钮：字幕字体换了不代表片尾卡也要换
+    # （卡片是纯 ASCII+中文标题，选择面更宽）。
     outro_font_name: str = "Lantinghei SC"
     # 抄 render/tts.py 的 TTS_MAX_ATTEMPTS。
     tts_max_attempts: int = Field(default=3, ge=1)

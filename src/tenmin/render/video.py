@@ -158,6 +158,7 @@ def build_render_args(
     outro_seconds: float = 0.0,
     outro_title: str = "",
     outro_message: str = "",
+    outro_font_name: str = OUTRO_FONT_NAME,
 ) -> list[str]:
     """拼出渲染用的 ffmpeg 参数列表（不含 ffmpeg 本身）。
 
@@ -192,7 +193,8 @@ def build_render_args(
         # 结尾黑卡：番剧名+集数在上，感谢语在下，样式跟正片字幕保持一致（黄字黑边）。
         #
         # font / text 三个值全部来自 config（outro_title 由 cfg.show 拼出、
-        # outro_message 是 render.outro_message、字体名是 render.outro_font_name），
+        # outro_message 是 render.outro_message、字体名是本函数的 outro_font_name
+        # 参数，由 pipeline.run_render 从 render.outro_font_name 递进来），
         # 所以一律走 escape_filter_arg —— 它已经含外层单引号，别再自己补一对。
         # `%` 不靠转义：drawtext 默认按 strftime 展开 `%`，靠末尾的 expansion=none
         # 关掉（实测 `%Y-%m-%d` 与 textfile= 的基准真值像素逐字节相同）。
@@ -209,7 +211,7 @@ def build_render_args(
             f"color=c=black:s={width}x{height}:{rate}d={outro_seconds:.3f},"
             f"setsar=1,format={PIX_FMT}[cardbg]"
         )
-        font = escape_filter_arg(OUTRO_FONT_NAME)
+        font = escape_filter_arg(outro_font_name)
         title = escape_filter_arg(outro_title)
         message = escape_filter_arg(outro_message)
         parts.append(
@@ -291,6 +293,7 @@ def render_video(
     outro_seconds: float = 0.0,
     outro_title: str = "",
     outro_message: str = "",
+    outro_font_name: str = OUTRO_FONT_NAME,
     reporter: ProgressReporter | None = None,
     ffmpeg: str = DEFAULT_RENDER.ffmpeg_path,
 ) -> Path:
@@ -323,6 +326,7 @@ def render_video(
             outro_seconds=outro_seconds,
             outro_title=outro_title,
             outro_message=outro_message,
+            outro_font_name=outro_font_name,
         )
         run_with_progress(
             args,

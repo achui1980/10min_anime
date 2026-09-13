@@ -1,17 +1,25 @@
 """证明 config 层的阈值真的被下游消费了，不只是"定义了个字段"。
 
-只有真正接线的字段才在这里测：ingest / credits / signals 全量，
-render 里的 width / height / subtitle_font_name（"两份真相"修正）。
-其余 RenderConfig / LLMConfig 新字段是留给后续任务接的，这里只测 default。
+逐字段的接线测试（ingest / credits / signals / render / llm）在下半部分；
+文件开头那两条是**自动化审计**，扫 src/ 的 AST，不用逐个字段手写：
+
+- `test_every_render_and_llm_field_is_read_off_a_config_object`：字段至少有一处
+  真的从 config 对象上读出来（挡「定义了个字段就忘了」）。
+- `test_config_aliases_are_only_default_parameter_values`：模块级别名只许当默认
+  参数值用（挡「半接线」—— 函数体里直接读别名，那个位置的 config 覆盖永远失效）。
 """
 
 from __future__ import annotations
+
+import ast
+from pathlib import Path
 
 import pytest
 
 from tenmin.config import (
     CreditsConfig,
     IngestConfig,
+    LLMConfig,
     ProjectConfig,
     RenderConfig,
     SignalsConfig,
@@ -43,6 +51,153 @@ SRT_TWO_HALVES = """1
 00:00:01,100 --> 00:00:02,000
 后半句
 """
+
+# --- 自动化接线审计（挡「定义了个字段但没接线」这一整类复发）---
+
+SRC = Path(__file__).resolve().parent.parent / "src" / "tenmin"
+
+# 权威定义住在 config.py，所以它自己不算消费点。
+_AUDIT_SKIP_FILES = frozenset({"config.py"})
+
+# 「这是一个 config 对象」的接收者名字。覆盖三种真实形态：
+#   cfg.render.width / cfg.llm.max_attempts   → 接收者末段是 render / llm
+#   llm.validation_retries（llm = cfg.llm）    → 接收者是 llm
+#   cfg.voice（cfg: RenderConfig，build_tts_engine）→ 接收者是 cfg
+#   DEFAULT_RENDER.ffmpeg_path                 → 接收者是那个默认实例
+_CONFIG_RECEIVERS = frozenset({"cfg", "render", "llm", "DEFAULT_RENDER", "DEFAULT_LLM"})
+
+# 派生模块级别名的那两个默认实例。
+_DEFAULT_INSTANCES = {"DEFAULT_RENDER": "render", "DEFAULT_LLM": "llm"}
+
+# 「已知不消费」白名单：{(子块, 字段名): 理由}。
+#
+# **目前是空的，这是刻意的** —— RenderConfig 与 LLMConfig 现在每一个字段都有真实
+# 消费点。往里加东西时必须写清理由（比如「纯诊断字段，只挂在 provider 上供人读」），
+# 而且理由要能回答一句话：为什么这个字段存在却不该有任何代码读它。
+_KNOWN_UNCONSUMED: dict[tuple[str, str], str] = {}
+
+
+def _audit_files() -> list[Path]:
+    return sorted(p for p in SRC.rglob("*.py") if p.name not in _AUDIT_SKIP_FILES)
+
+
+def _receiver_tail(node: ast.expr) -> str | None:
+    """`cfg.render` → "render"、`DEFAULT_RENDER` → "DEFAULT_RENDER"，别的返回 None。"""
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        return node.attr
+    return None
+
+
+def _alias_definitions(tree: ast.AST) -> dict[str, tuple[str, str, int]]:
+    """模块级 `NAME = DEFAULT_RENDER.field` → {别名: (子块, 字段, 行号)}。"""
+    out: dict[str, tuple[str, str, int]] = {}
+    for node in getattr(tree, "body", []):
+        if not isinstance(node, ast.Assign) or not isinstance(node.value, ast.Attribute):
+            continue
+        base = node.value.value
+        if not isinstance(base, ast.Name) or base.id not in _DEFAULT_INSTANCES:
+            continue
+        for target in node.targets:
+            if isinstance(target, ast.Name):
+                out[target.id] = (
+                    _DEFAULT_INSTANCES[base.id],
+                    node.value.attr,
+                    node.lineno,
+                )
+    return out
+
+
+def _default_value_nodes(tree: ast.AST) -> set[int]:
+    """所有落在「默认参数值」位置的表达式节点 id（含它们的子节点）。"""
+    marked: set[int] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+            continue
+        for default in [*node.args.defaults, *node.args.kw_defaults]:
+            if default is None:
+                continue
+            for inner in ast.walk(default):
+                marked.add(id(inner))
+    return marked
+
+
+def test_audit_sees_the_real_sources():
+    """守住上面两条审计自己：SRC 写错时它们会假绿。"""
+    names = {p.name for p in _audit_files()}
+    assert "pipeline.py" in names
+    assert "config.py" not in names
+    assert len(names) > 10
+
+
+def test_every_render_and_llm_field_is_read_off_a_config_object():
+    """RenderConfig / LLMConfig 的每个字段都得有一处「从 config 对象上读」的代码。
+
+    只算真正的读取：config.py 自己不算（那是定义），模块级别名的**定义式**
+    （`WIDTH = DEFAULT_RENDER.width`）也不算 —— 它只是给默认参数值起了个名字，
+    不代表 project.yaml 里配的值到得了任何地方。
+    """
+    wanted = {
+        ("render", name) for name in RenderConfig.model_fields
+    } | {("llm", name) for name in LLMConfig.model_fields}
+    seen: set[tuple[str, str]] = set()
+    for path in _audit_files():
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        alias_lines = {line for _, _, line in _alias_definitions(tree).values()}
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Attribute):
+                continue
+            if node.lineno in alias_lines:
+                continue
+            tail = _receiver_tail(node.value)
+            if tail is None or tail not in _CONFIG_RECEIVERS:
+                continue
+            block = {"render": "render", "DEFAULT_RENDER": "render"}.get(tail)
+            if block is None:
+                block = {"llm": "llm", "DEFAULT_LLM": "llm"}.get(tail)
+            if block is None:  # 裸 cfg：两个子块都算它一份
+                seen.add(("render", node.attr))
+                seen.add(("llm", node.attr))
+                continue
+            seen.add((block, node.attr))
+    missing = sorted(wanted - seen - set(_KNOWN_UNCONSUMED))
+    assert missing == [], (
+        f"这些 config 字段在 src/tenmin/ 里没有任何读取点（=哑字段）：{missing}"
+    )
+
+
+def test_config_aliases_are_only_default_parameter_values():
+    """模块级别名（`X = DEFAULT_RENDER.field`）只许出现在**默认参数值**位置。
+
+    这条是「半接线」的通用探测器，也是它存在的唯一理由。`WIDTH`/`CRF` 那一族的
+    正确形状是「别名当默认值 + 真值由 pipeline 按参数传进来」，函数**体**里直接读
+    别名就意味着那个位置永远只能拿到 config 的默认值 —— project.yaml 里的覆盖静默
+    失效，而且失效得毫无痕迹（渲染照样成功，只是字体/码率不是你配的那个）。
+
+    历史事故：`render/video.py` 的片尾卡 drawtext 直接读 `OUTRO_FONT_NAME`，而
+    `build_render_args` 压根没有 `outro_font_name` 参数；同时 pipeline 把配置值递给
+    了 preflight 去查字体 —— 于是「查的字体」和「用的字体」是两个不同的值。
+    """
+    offenders: list[str] = []
+    for path in _audit_files():
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        aliases = _alias_definitions(tree)
+        if not aliases:
+            continue
+        allowed = _default_value_nodes(tree)
+        alias_lines = {line for _, _, line in aliases.values()}
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Name) or node.id not in aliases:
+                continue
+            if node.lineno in alias_lines or id(node) in allowed:
+                continue
+            block, field, _ = aliases[node.id]
+            offenders.append(f"{path.name}:{node.lineno} {node.id}（={block}.{field}）")
+    assert offenders == [], (
+        "这些模块级 config 别名被用在了默认参数值之外的位置，"
+        f"那个取值点上 project.yaml 的覆盖是静默失效的：{offenders}"
+    )
 
 
 def dline(idx: int, start: float, end: float, text: str = "喂", kind: str = "dialogue"):
@@ -610,7 +765,6 @@ async def test_run_voice_wires_tts_concurrency(tmp_path):
     原来它是个哑字段：定义了、测了 default，但 pipeline 压根不读它。
     """
     import asyncio
-    from pathlib import Path
 
     from tenmin.models import Beat, Clip, Script
 

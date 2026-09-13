@@ -2,6 +2,7 @@ from pathlib import Path
 
 import pytest
 
+from tenmin.config import RenderConfig
 from tenmin.models import Timeline, TimelineSegment
 from tenmin.render.video import (
     build_render_args,
@@ -259,14 +260,57 @@ def test_build_render_args_escapes_quotes_and_colons_in_outro_text(tmp_path):
     assert "text='a\\\\b'" in graph
 
 
-def test_build_render_args_escapes_the_outro_font_name(tmp_path, monkeypatch):
-    """font= 跟 text= 在同一个 AVOption 串里，字体名也来自 config，同样要转义。"""
-    from tenmin.render import video as video_module
+def test_build_render_args_escapes_the_outro_font_name(tmp_path):
+    """font= 跟 text= 在同一个 AVOption 串里，字体名也来自 config，同样要转义。
 
-    monkeypatch.setattr(video_module, "OUTRO_FONT_NAME", "It's:Font")
-    args = build(tmp_path, outro_seconds=3.0, outro_title="x", outro_message="y")
+    原来这条测试是 `monkeypatch.setattr(video_module, "OUTRO_FONT_NAME", ...)` —— 那时
+    `build_render_args` 压根没有 `outro_font_name` 参数，只能去改模块级别名（也就是断言
+    实现细节）。现在按参数传，断言的是行为。
+    """
+    args = build(
+        tmp_path,
+        outro_seconds=3.0,
+        outro_title="x",
+        outro_message="y",
+        outro_font_name="It's:Font",
+    )
     graph = args[args.index("-filter_complex") + 1]
     assert "font='It\\'\\''s\\:Font'" in graph
+
+
+def test_build_render_args_outro_font_name_defaults_to_the_config_default(tmp_path):
+    args = build(tmp_path, outro_seconds=3.0, outro_title="x", outro_message="y")
+    graph = args[args.index("-filter_complex") + 1]
+    assert f"font='{RenderConfig().outro_font_name}'" in graph
+
+
+def test_render_video_passes_the_outro_font_name_through(tmp_path, monkeypatch):
+    """render_video 也得有这个参数，否则 pipeline 递进来的值到不了 filtergraph。"""
+    from tenmin.render import video as video_module
+
+    seen: dict[str, object] = {}
+
+    def fake_run(args, **_):
+        seen["graph"] = args[args.index("-filter_complex") + 1]
+        # atomic_path 要求块结束时临时文件还在，所以假 run 也得把它造出来。
+        Path(args[-1]).write_bytes(b"x")
+        return ""
+
+    monkeypatch.setattr(video_module, "run_with_progress", fake_run)
+    out = tmp_path / "07_render" / "E02.mp4"
+    render_video(
+        video=tmp_path / "source.mkv",
+        timeline=make_timeline(),
+        audio=tmp_path / "a.m4a",
+        ass=tmp_path / "s.ass",
+        out_path=out,
+        encoder="libx264",
+        outro_seconds=3.0,
+        outro_title="t",
+        outro_message="m",
+        outro_font_name="MyCustomFont",
+    )
+    assert "font='MyCustomFont'" in seen["graph"]
 
 
 def test_build_render_args_without_fade_or_outro_keeps_vout_label(tmp_path):

@@ -1555,6 +1555,55 @@ def test_preflight_gets_both_configured_font_names(project, monkeypatch):
     assert set(seen["fonts"]) == {"Lantinghei SC", "Hiragino Sans"}
 
 
+def test_run_render_wires_the_outro_font_name_into_drawtext(project, monkeypatch):
+    """preflight 查的那个字体名，必须**就是** drawtext 真正用上的那个。
+
+    历史 bug：pipeline 把 `cfg.render.outro_font_name` 递给 preflight 去 fc-list 查，
+    而 render/video.py 的 drawtext 读的是模块级 `OUTRO_FONT_NAME`（= config 默认值）。
+    于是配了自定义字体的用户会收到一条**假 warning**（查一个永远不会被用到的字体），
+    而真正会被烧进片尾卡的那个字体反倒没人查过。
+    """
+    from tenmin.config import RenderConfig
+    from tenmin.render.video import build_render_args
+
+    paths = Paths(project.root)
+    _write_script(paths.script(2), render_script())
+    asyncio.run(run_voice(project, FakeTTSEngine([8.0, 10.0, 10.0]), episode=2))
+    run_timeline(project, episode=2, source_duration=1400.0)
+    _prepare_video(project)
+    paths.mixed_audio(2).parent.mkdir(parents=True, exist_ok=True)
+    paths.mixed_audio(2).write_bytes(b"\x00")
+    project.render.outro_font_name = "Hiragino Sans"
+    project.render.outro_card_seconds = 3.0
+
+    seen: dict[str, object] = {}
+
+    def fake_render_video(**kwargs):
+        seen.update(kwargs)
+        return kwargs["out_path"]
+
+    monkeypatch.setattr("tenmin.pipeline.render_video", fake_render_video)
+    run_render(project, episode=2)
+    assert seen["outro_font_name"] == "Hiragino Sans"
+
+    # 再往下一层：这个值真的进了 filtergraph（不是被 render_video 吃掉了）。
+    graph_args = build_render_args(
+        video=Path("in.mkv"),
+        timeline=seen["timeline"],
+        audio=Path("a.m4a"),
+        ass=Path("s.ass"),
+        out_path=Path("out.mp4"),
+        encoder="libx264",
+        outro_seconds=3.0,
+        outro_title="t",
+        outro_message="m",
+        outro_font_name=seen["outro_font_name"],
+    )
+    graph = graph_args[graph_args.index("-filter_complex") + 1]
+    assert "font='Hiragino Sans'" in graph
+    assert RenderConfig().outro_font_name not in graph
+
+
 def test_preflight_skips_the_outro_font_when_there_is_no_outro_card(project, monkeypatch):
     seen: dict[str, object] = {}
 
