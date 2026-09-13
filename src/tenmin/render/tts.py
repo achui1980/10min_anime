@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import random
-import re
 import unicodedata
 from pathlib import Path
 from typing import Protocol, runtime_checkable
@@ -15,7 +14,7 @@ from tenmin.models import Beat, Script, VoiceChunk, VoiceTrack
 from tenmin.progress import NullProgressReporter, ProgressReporter
 from tenmin.render.chunks import plan_chunks
 from tenmin.render.ffmpeg import probe_duration
-from tenmin.script.budget import SPEECH_RATE_CPS, narration_chars
+from tenmin.script.budget import narration_chars, narration_seconds, speed_factor
 
 TTS_MAX_ATTEMPTS = 3
 
@@ -80,24 +79,15 @@ class TTSEngine(Protocol):
         ...
 
 
-_RATE_PERCENT = re.compile(r"^([+-]\d+)%$")
-
-
-def _speed_factor(rate: str) -> float:
-    """把 edge-tts 的 rate 字符串换算成语速倍率。认不出就当 1.0（体检退化成最宽的 band）。
-
-    edge-tts 自己会校验 `^[+-]\\d+%$`（data_classes.py 的 validate_string_param），
-    所以这里认不出的形态在 Communicate 构造期就已经炸了，兜底只是不让体检自己抛。
-    """
-    match = _RATE_PERCENT.match(rate.strip())
-    if match is None:
-        return 1.0
-    return max(0.1, 1.0 + int(match.group(1)) / 100.0)
-
-
 def _expected_seconds(text: str, rate: str) -> float:
-    """这段文本「应该」有多长。分母是 script/budget.py 那个 4.5 字/秒。"""
-    return narration_chars(text) / SPEECH_RATE_CPS / _speed_factor(rate)
+    """这段文本「应该」有多长。**跟时长预算共用同一个估算器**。
+
+    原来这里有一份自己的 rate 解析（`_speed_factor`）与自己的 chars/CPS/factor 算式，
+    而 script/budget.py 那边压根不看 rate —— 两份实现随时会分叉。现在两边都走
+    budget.narration_seconds，`speed_factor` 也只有那一份（本模块 re-export 它，
+    老调用点与测试照旧能从 render.tts 拿到）。
+    """
+    return narration_seconds(text, rate=rate)
 
 
 def _duration_bounds(text: str, rate: str) -> tuple[float, float]:

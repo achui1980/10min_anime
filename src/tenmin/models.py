@@ -270,7 +270,13 @@ class Script(_StageModel):
     show: str
     mode: Literal["single_episode", "season"] = "single_episode"
     episodes: list[int] = Field(default_factory=list)
-    target_seconds: float = 240.0
+    # gt=0：预算这一整套机制全靠它做分母。原来无约束，而 budget.budget_deviation 对
+    # `<= 0` 返回 0.0（也就是「达标」），于是一个配错的目标时长被静默当成完美达标。
+    # 用 gt 而不是全项目那套 ge + AfterValidator：Script 不进 LLM 的 response_schema，
+    # 不受 google.genai types.Schema 不认 exclusiveMinimum 的限制（ProjectConfig
+    # .target_seconds 也是直接用 gt=0）。实测 work/ 下 11 份真实 script.json 与
+    # tests/ 下 2 份样本的 target_seconds 全是 240.0，不会误伤存量。
+    target_seconds: float = Field(default=240.0, gt=0)
     est_total_seconds: float = 0.0
     beats: list[Beat] = Field(default_factory=list)
 
