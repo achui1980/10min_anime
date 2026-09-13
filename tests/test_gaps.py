@@ -190,3 +190,54 @@ def test_golden_gaps_never_overlap_op_or_ed(golden_track):
             if block is None:
                 continue
             assert gap.end <= block[0] + 1e-6 or gap.start >= block[1] - 1e-6, gap
+
+
+# --- 被 OP/ED 切开的碎片只保留紧邻自己的 anchor ---
+
+
+def test_unsplit_gap_keeps_both_neighbouring_anchors():
+    lines = [dline(7, 10.0, 12.0), dline(9, 30.0, 32.0)]
+    (gap,) = find_silent_gaps(track(lines, duration=32.0))
+    assert gap.anchor_lines == [7, 9]
+
+
+def test_trailing_gap_has_only_the_left_anchor():
+    lines = [dline(7, 10.0, 12.0)]
+    (gap,) = find_silent_gaps(track(lines, duration=40.0))
+    assert gap.anchor_lines == [7]
+
+
+def test_split_gap_fragments_do_not_share_each_others_anchors():
+    """抄 saijo/E08 的真实形状：一条 66.6s 的间隙被 ED 切成两片。
+
+    原实现给**两片**都挂上 `[before, after]`。于是左片（1327.8-1348.2）带着一个
+    位于 1394.4s 的 anchor —— 隔着整段 ED、离自己右界 46 秒。validate 的
+    「clip 时间窗必须装得下自己的 anchor_lines」会收到自相矛盾的输入，而喂给 LLM 的
+    高能点也在说「这段无台词画面对应的是那句台词」，其实那句在片尾之后。
+
+    正确的判据是几何的：`before` 结束于 gap.start，只有起点没被切掉的碎片才紧邻它；
+    `after` 起始于 gap.end，只有终点没被切掉的碎片才紧邻它。
+    """
+    lines = [dline(380, 1320.0, 1327.825), dline(384, 1394.393, 1400.0)]
+    gaps = find_silent_gaps(
+        track(lines, duration=1400.0, ed=(1348.221, 1383.672))
+    )
+    assert [(round(g.start, 3), round(g.end, 3), g.anchor_lines) for g in gaps] == [
+        (1327.825, 1348.221, [380]),
+        (1383.672, 1394.393, [384]),
+    ]
+
+
+def test_fragment_touching_neither_neighbour_has_no_anchor():
+    """两端都被切掉的碎片一条紧邻的说话行都没有，anchor_lines 就该是空的。
+
+    实测 11 集里有 4 条这样的信号，全是「ED 之后到片长」那一小段（3 秒级）。
+    空 anchor 是诚实的（「这是一段纯画面」）；挂一个几十秒外的行是主动误导。
+    `density_shift` 的 anchor_lines 本来也恒为空，下游早就吃得下这种情况。
+    """
+    lines = [dline(7, 10.0, 12.0)]
+    gaps = find_silent_gaps(track(lines, duration=100.0, ed=(20.0, 90.0)))
+    assert [(round(g.start, 1), round(g.end, 1), g.anchor_lines) for g in gaps] == [
+        (12.0, 20.0, [7]),
+        (90.0, 100.0, []),
+    ]
