@@ -8,9 +8,10 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Iterable
 
 from tenmin.config import DEFAULT_LLM, DEFAULT_RENDER
-from tenmin.models import Beat, Script
+from tenmin.models import Beat, Hold, Script
 from tenmin.script.prompt import load_prompt, render_prompt
 
 # 中文旁白的基准语速（字/秒），对应 rate="+0%"。
@@ -81,13 +82,45 @@ def narration_seconds(text: str, *, rate: str = DEFAULT_RATE) -> float:
     return narration_chars(text) / SPEECH_RATE_CPS / speed_factor(rate)
 
 
+def narration_chars_for_seconds(seconds: float, *, rate: str = DEFAULT_RATE) -> int:
+    """秒数换算成旁白字数。`narration_seconds` 的**反向唯一入口**。
+
+    正向（字→秒）早就收敛到 narration_seconds 了，反向（秒→字）却有三份内联拷贝：
+    script/single.py 的首轮字数额度、本模块的 budget_chars 与 rewrite_instruction 的
+    delta_chars，全都手写 `* SPEECH_RATE_CPS * speed_factor(rate)`。而模块 docstring 与
+    AGENTS.md 都写着「字数换算成秒数的唯一入口是 narration_seconds」—— 那句话只覆盖了
+    一个方向。
+
+    刻意**不**在这里钳负数：`int()` 向零截断的行为是三个调用点原本就有的，钳不钳是
+    调用点的语义（budget_chars 要钳，因为「留白吃满预算」时负额度没有意义；
+    delta_chars 拿到的 delta 是绝对值，压根不会负）。放进来会静默改掉 single.py 那条
+    在 target_seconds < HOLD_RESERVE_SECONDS 时的行为。
+    """
+    return int(seconds * SPEECH_RATE_CPS * speed_factor(rate))
+
+
 def hold_seconds(beat: Beat) -> float:
     """本节点全部留白的总秒数。真静音，跟语速无关，永远不被 speed_factor 缩放。"""
     return sum(hold.duration for hold in beat.audio.holds)
 
 
+def narration_span_seconds(
+    narration: str, holds: Iterable[Hold], *, rate: str = DEFAULT_RATE
+) -> float:
+    """「这段旁白 + 这些留白」在成片里的总跨度（秒）。
+
+    `beat_seconds` 的散件版，供只拿得到「句子列表 + hold 列表」的调用方用
+    （render/chunks.py 的 assign_holds）。那边原来是
+    `offsets[-1] + sum(hold.duration for hold in holds)` —— 一份等价的第三实现，注释
+    自己声明「与 script/validate.py 的 beat_seconds 同口径」。**那正是 M2 那个
+    「validate 不传 rate」的不一致能溜进来的结构原因**：两份实现，一份跟着 rate 走、
+    一份不跟。
+    """
+    return narration_seconds(narration, rate=rate) + sum(h.duration for h in holds)
+
+
 def beat_seconds(beat: Beat, *, rate: str = DEFAULT_RATE) -> float:
-    return narration_seconds(beat.narration, rate=rate) + hold_seconds(beat)
+    return narration_span_seconds(beat.narration, beat.audio.holds, rate=rate)
 
 
 def script_seconds(script: Script, *, rate: str = DEFAULT_RATE) -> float:
@@ -163,7 +196,7 @@ def budget_chars(script: Script, *, rate: str = DEFAULT_RATE) -> int:
     rewrite_instruction 会另给一条「留白已占满预算」的兜底文案。
     """
     speakable = script.target_seconds - script_hold_seconds(script)
-    return max(0, int(speakable * SPEECH_RATE_CPS * speed_factor(rate)))
+    return max(0, narration_chars_for_seconds(speakable, rate=rate))
 
 
 def rewrite_instruction(
@@ -213,7 +246,7 @@ def rewrite_instruction(
         tolerance=f"{tolerance:.0%}",
         verb=verb,
         delta=f"{delta:.0f}",
-        delta_chars=int(delta * SPEECH_RATE_CPS * speed_factor(rate)),
+        delta_chars=narration_chars_for_seconds(delta, rate=rate),
         budget_chars=chars_budget,
         hold_seconds=f"{holds:.1f}",
         beat_rows=rows,

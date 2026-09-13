@@ -9,7 +9,9 @@ from tenmin.script.budget import (
     budget_chars,
     budget_deviation,
     narration_chars,
+    narration_chars_for_seconds,
     narration_seconds,
+    narration_span_seconds,
     needs_rewrite,
     rewrite_instruction,
     script_seconds,
@@ -256,3 +258,70 @@ def test_rewrite_instruction_admits_when_expanding_is_impossible():
     text = rewrite_instruction(s)
     assert "扩写" in text
     assert "不能" in text and "减少或缩短留白" in text
+
+
+# --- 秒→字的反向换算只有一份实现（N2）--------------------------------------
+
+
+@pytest.mark.parametrize("rate", ["+0%", "+20%", "-30%"])
+@pytest.mark.parametrize("seconds", [0.0, 1.0, 15.0, 225.0, 240.0])
+def test_narration_chars_for_seconds_is_the_inverse_of_narration_seconds(seconds, rate):
+    """两个方向必须是同一条换算线上的两半。
+
+    正向（字→秒）早就收敛到 narration_seconds，反向（秒→字）却有过三份内联拷贝
+    （script/single.py 的首轮字数额度、budget_chars、rewrite_instruction 的
+    delta_chars），全都手写 `* SPEECH_RATE_CPS * speed_factor(rate)`。
+    """
+    chars = narration_chars_for_seconds(seconds, rate=rate)
+    assert chars == int(seconds * SPEECH_RATE_CPS * speed_factor(rate))
+    # 换回去误差不超过一个字（int 向零截断）
+    assert narration_seconds("字" * chars, rate=rate) <= seconds + 1e-9
+
+
+def test_budget_chars_goes_through_the_single_entry_point():
+    s = script([beat("b1", 100)], target=240.0)
+    assert budget_chars(s) == narration_chars_for_seconds(240.0)
+
+
+def test_narration_chars_for_seconds_does_not_clamp_negatives():
+    """钳负数是**调用点**的语义（budget_chars 要钳），不该藏进换算里。
+
+    藏进来会静默改掉 script/single.py 在 target_seconds < HOLD_RESERVE_SECONDS 时的行为。
+    """
+    assert narration_chars_for_seconds(-10.0) < 0
+
+
+# --- beat_seconds 与 chunks 的跨度只有一份实现（N2）--------------------------
+
+
+@pytest.mark.parametrize("rate", ["+0%", "+20%", "-20%"])
+def test_beat_seconds_is_narration_span_seconds(rate):
+    b = beat("b1", 60, holds=[(1.0, 2.0), (5.0, 3.0)])
+    assert beat_seconds(b, rate=rate) == narration_span_seconds(
+        b.narration, b.audio.holds, rate=rate
+    )
+
+
+@pytest.mark.parametrize("rate", ["+0%", "+20%", "-20%"])
+def test_assign_holds_span_is_the_same_number_as_beat_seconds(rate):
+    """render/chunks.py 的 assign_holds 原来有一份等价的第三实现
+    （`offsets[-1] + sum(hold.duration ...)`），注释自己声明「同口径」。
+
+    那正是 M2 那个「validate 不传 rate」的不一致能溜进来的结构原因。判据做成
+    「恰好在 beat_seconds 上不报、多一点就报」——也就是两边用的是**同一个数**。
+    """
+    from tenmin.render.chunks import assign_holds, split_sentences
+
+    b = beat("b1", 60, holds=[(1.0, 2.0)])
+    span = beat_seconds(b, rate=rate)
+    sentences = split_sentences(b.narration)
+
+    def warns(at: float) -> bool:
+        holds = [Hold(at=at, duration=2.0, quote="金句")]
+        out: list[str] = []
+        assign_holds(sentences, holds, rate=rate, warnings=out)
+        return any("超出本节点跨度" in w for w in out)
+
+    # b 自带的 hold 是 2.0 秒，warns() 里那个也是 2.0 秒，所以跨度相同。
+    assert warns(span) is False
+    assert warns(span + 0.5) is True

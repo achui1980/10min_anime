@@ -20,9 +20,9 @@ from tenmin.script.budget import (
     SPEECH_RATE_CPS,
     apply_estimates,
     budget_deviation,
+    narration_chars_for_seconds,
     needs_rewrite,
     rewrite_instruction,
-    speed_factor,
 )
 from tenmin.script.llm import LLMProvider
 from tenmin.script.prompt import load_prompt, render_prompt
@@ -161,10 +161,8 @@ def build_user_prompt(
         speech_rate=f"{SPEECH_RATE_CPS:g}",
         tolerance=f"{cfg.llm.budget_tolerance:.0%}",
         hold_reserve=f"{HOLD_RESERVE_SECONDS:.0f}",
-        narration_char_budget=int(
-            (cfg.target_seconds - HOLD_RESERVE_SECONDS)
-            * SPEECH_RATE_CPS
-            * speed_factor(cfg.render.rate)
+        narration_char_budget=narration_chars_for_seconds(
+            cfg.target_seconds - HOLD_RESERVE_SECONDS, rate=cfg.render.rate
         ),
         glossary_block=build_glossary_block(cfg.glossary),
         highlight_block=build_highlight_block(report),

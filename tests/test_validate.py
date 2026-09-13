@@ -676,6 +676,28 @@ def test_stretch_bounds_constants():
     assert DEFAULT_VALIDATE.stretch_min == pytest.approx(0.125)
 
 
+def test_footage_budget_uses_the_render_layer_clip_sum(monkeypatch):
+    """A3 的分母必须走 render/timeline.py 的 beat_clip_seconds。
+
+    那个文件的 docstring 写着「ratio 的分母只能有一处算法」，而 validate 这边原来有
+    一份内联的 `sum(clip.duration for clip in beat.clips)` —— 两份实现，谁改都不会
+    惊动另一份，而它们算的是同一个 ratio 的同一个分母。
+    """
+    from tenmin.script import validate as validate_module
+
+    seen: list[str] = []
+    real = validate_module.beat_clip_seconds
+
+    def spy(beat):
+        seen.append(beat.id)
+        return real(beat)
+
+    monkeypatch.setattr(validate_module, "beat_clip_seconds", spy)
+    s = make_script([[clip(10.0, 25.0)]])
+    check_script(s, {2: make_track()}, {2: make_report()})
+    assert seen == [b.id for b in s.beats]
+
+
 # --- render.rate 必须一路穿到 validate（M2）-------------------------------
 #
 # validate 的两处 `beat_seconds(beat)` 原来不传 rate，落到 budget.DEFAULT_RATE
@@ -687,25 +709,36 @@ def test_stretch_bounds_constants():
 
 @pytest.mark.parametrize("rate", ["+20%", "-20%", "+50%"])
 def test_cue_offset_span_matches_the_voice_stage_span(rate):
-    """validate 判 hold.at 的上界，必须跟 voice 阶段真正用的那个上界是同一个数。"""
-    from tenmin.render.chunks import sentence_offsets, split_sentences
+    """validate 判 hold.at 的上界，必须跟 voice 阶段真正用的那个上界是同一个数。
 
-    s = make_script([[clip(10.0, 30.0)]])
-    beat = s.beats[0]
-    beat.audio.holds = [Hold(at=0.5, duration=2.0, quote="金句")]
+    判据刻意做成「两边报不报是同一个布尔值」，而不是「validate 在某个算出来的数字上
+    不报」：后者会把 voice 阶段的实现细节抄一遍进测试，而这条不变量本身就是
+    「两个阶段不许分叉」。
+    """
+    from tenmin.render.chunks import assign_holds, split_sentences
 
-    sentences = split_sentences(beat.narration)
-    voice_span = sentence_offsets(sentences, rate=rate)[-1] + 2.0
+    seen: list[bool] = []
+    for offset in (-3.0, -0.001, 0.0, 5.0):
+        s = make_script([[clip(10.0, 30.0)]])
+        beat = s.beats[0]
+        sentences = split_sentences(beat.narration)
+        # 跨度 = 旁白 + 本节点全部留白，所以要把下面那个 hold 的 2.0 秒算进来。
+        span = beat_seconds(beat, rate=rate) + 2.0
+        beat.audio.holds = [Hold(at=max(0.0, span + offset), duration=2.0, quote="金句")]
 
-    # 恰好落在 voice 阶段那个上界上 → 两边都不该报。
-    beat.audio.holds = [Hold(at=voice_span, duration=2.0, quote="金句")]
-    warnings = check_script(s, {2: make_track()}, {2: make_report()}, rate=rate)
-    assert [w for w in warnings if "留白落点" in w] == [], warnings
+        voice_warnings: list[str] = []
+        assign_holds(sentences, beat.audio.holds, rate=rate, warnings=voice_warnings)
+        voice_hit = any("超出本节点跨度" in w for w in voice_warnings)
 
-    # 明显越过它 → 必须报。
-    beat.audio.holds = [Hold(at=voice_span + 5.0, duration=2.0, quote="金句")]
-    warnings = check_script(s, {2: make_track()}, {2: make_report()}, rate=rate)
-    assert len([w for w in warnings if "留白落点" in w]) == 1, warnings
+        script_warnings = check_script(
+            s, {2: make_track()}, {2: make_report()}, rate=rate
+        )
+        script_hit = any("留白落点" in w for w in script_warnings)
+
+        assert voice_hit == script_hit, (offset, voice_warnings, script_warnings)
+        seen.append(voice_hit)
+    # 两种结论都必须出现过，否则这个测试什么都没证明（比如两边恒不报也会绿）。
+    assert set(seen) == {True, False}, seen
 
 
 def test_footage_budget_span_follows_the_configured_rate():

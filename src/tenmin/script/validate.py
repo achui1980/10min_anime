@@ -21,6 +21,11 @@ from pydantic import BaseModel
 
 from tenmin.config import DEFAULT_VALIDATE, ValidateConfig
 from tenmin.models import Beat, Clip, DialogueLine, DialogueTrack, Script, SignalReport
+
+# import 方向说明：script/ → render/ 这个方向本来就有（render/timeline.py 反过来
+# import script/budget.py），而 render/timeline.py 只依赖 render/chunks.py 与
+# script/budget.py，两者都不认识本模块，所以不成环。
+from tenmin.render.timeline import beat_clip_seconds
 from tenmin.script.budget import DEFAULT_RATE, beat_seconds
 
 # 阈值的权威定义在 tenmin.config.ValidateConfig；下面三个只是 DEFAULT_VALIDATE 的
@@ -368,8 +373,12 @@ def _check_footage_budget(beat: Beat, cfg: ValidateConfig, rate: str) -> list[st
 
     `rate` 的必要性同 `_check_cue_offsets`：分子是旁白秒数，语速一变整条阈值前提就被
     乘上 1/speed_factor(rate)。
+
+    画面秒数走 `render/timeline.py 的 beat_clip_seconds`，也就是那边算 ratio 分母时用的
+    **同一份实现** —— 那个文件的 docstring 写着「ratio 的分母只能有一处算法」，而这里
+    原来有一份内联的 `sum(clip.duration for clip in beat.clips)`。
     """
-    footage = sum(clip.duration for clip in beat.clips)
+    footage = beat_clip_seconds(beat)
     span = beat_seconds(beat, rate=rate)
     if footage <= 0 or span <= 0:
         return []

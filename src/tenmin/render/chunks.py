@@ -10,7 +10,7 @@ import re
 import unicodedata
 
 from tenmin.models import Beat, Hold
-from tenmin.script.budget import DEFAULT_RATE, narration_seconds
+from tenmin.script.budget import DEFAULT_RATE, narration_seconds, narration_span_seconds
 
 # 一句 = 若干非句末字符 + 一串句末标点；末尾没标点的残句单独成句。
 _SENTENCE_ENDINGS = "。！？!?"
@@ -167,11 +167,17 @@ def assign_holds(
        但其中一个 hold 想停的位置被吞了。实测 11 份真实 script.json 的 58 个带 hold
        的 beat、61 个 hold：**0 次发生**，所以这条在健康数据上完全不出声。
     2. **hold.at 超出本节点总跨度**：那时「最近的边界」永远是最后一句，等于把留白
-       无声地搬到了段尾。上界取 `旁白估算秒数 + 本节点全部留白秒数`，跟
-       script/validate.py 的 `_check_cue_offsets` 用的 `beat_seconds` 是同一个口径，
+       无声地搬到了段尾。上界走 `budget.narration_span_seconds`，也就是
+       `script/validate.py` 的 `beat_seconds` **同一份实现**（后者就是它的 Beat 包装），
        所以「把留白放在这段旁白的最后」这种正常创作不触发：实测 61 个真实 hold 一条
        都不报（唯一越过**纯旁白**总长的是 work/saijo E09 的 climax，at=27.0 vs
        26.89 秒，差 0.11 秒，正落在这个宽度里）。
+
+       原来这里是 `offsets[-1] + sum(hold.duration for hold in holds)` —— 一份等价的
+       第三实现，注释自己声明「同口径」。那正是 M2 那个「validate 不传 rate」的不一致
+       能溜进来的结构原因：两份实现，一份跟着 rate 走、一份不跟，而没有任何东西迫使
+       它们一起变。现在只有一份。
+
        这条不是 validate.py 那道闸的重复：`validate_script()` **只在 script 阶段跑**
        （唯一调用点是 script/single.py），人手改完 `03_script/*.json` 直接
        `--from voice` 时没有任何人再查一遍 at，一个 at=300 照旧一路静默到成片。
@@ -179,8 +185,11 @@ def assign_holds(
     if not sentences:
         return {}
     offsets = sentence_offsets(sentences, rate=rate)
-    # 与 script/validate.py 的 beat_seconds 同口径：旁白 + 本节点全部留白。
-    span = offsets[-1] + sum(hold.duration for hold in holds)
+    # 与 script/validate.py 的 beat_seconds 同一份实现：旁白 + 本节点全部留白。
+    # 传 `"".join(sentences)` 而不是 offsets[-1]：切句是纯重新分组（拼回去与 strip 过的
+    # 原文逐字节相同，见 split_sentences），而 narration_chars 会把全部空白 sub 掉，
+    # 所以字数与原 narration 完全一致 —— 但走同一个函数就不会再分叉。
+    span = narration_span_seconds("".join(sentences), holds, rate=rate)
     assigned: dict[int, float] = {}
     for hold in holds:
         if warnings is not None and hold.at > span:
