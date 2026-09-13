@@ -23,7 +23,8 @@ STRENGTH_MAX = 5
 # Hold.duration 的硬上界（秒）。这是「物理合法性」边界，不是「写得好不好」的判断：
 # 实测 work/ 下 11 份 + tests/ 下 1 份真实 script.json 共 69 个 hold，duration 全部落在
 # 2.0–4.0 秒（直方图 2.0×7 / 2.5×19 / 3.0×34 / 3.5×4 / 4.0×5），prompt
-# (script/prompts/single_episode.md:60) 要求的也是「一般 2–4 秒」。这里取 15 秒 ≈ 实测
+# （script/prompts/single_episode.md 的「留白（holds）」一节）要求的也是「一般 2–4 秒」。
+# 这里取 15 秒 ≈ 实测
 # 上界的 3.75 倍，只拦「模型把 3 写成 30」这类既往成片里插一整段死寂（render/chunks.py
 # 把它变成真静音）、又让时长预算彻底失真（script/budget.py 直接把它计入总时长）的离谱值，
 # 正常创作空间一律放过。
@@ -60,8 +61,9 @@ PositiveSeconds = Annotated[float, Field(ge=0), AfterValidator(_reject_non_posit
 def _reject_duplicate_beat_ids(beats: Sequence[Beat] | Sequence[LLMBeat]) -> None:
     """beat.id 是渲染阶段的连接键，重复了会静默串台，必须直接判错。
 
-    render/timeline.py:73 把配音 chunk 按 chunk.beat_id 收进一个 dict，再在 :90 用
-    grouped.get(beat.id) 取回 —— 两个同 id 的 beat 会各自拿到两段的**全部** chunk，
+    render/timeline.py 的 chunks_by_beat 把配音 chunk 按 chunk.beat_id 收进一个 dict，
+    build_timeline 再 grouped.get(beat.id) 取回 —— 两个同 id 的 beat 会各自拿到两段的
+    **全部** chunk，
     第二段静默复读第一段的音频。下游没有任何办法察觉或恢复，而重复 id 也不可能是有意的
     人工编辑，所以这里不做降级。
     """
@@ -223,10 +225,11 @@ class Clip(_StageModel):
     """一段要截取的原片。visual 是「建议画面特征」列，v5 会当视觉检索 query。
 
     刻意**不**给 start/end 加 ge=0 或 end > start 的硬约束：坏 clip 的拦网在
-    script/validate.py:132-142，那里是「丢弃这一条、保留其余、附一条 warning」的优雅降级。
-    而 script/single.py:92 的 to_script() 是直接拿 LLM 的原始数字构造本模型的，跑在
-    validate_script() 之前；一旦这里抛 ValidationError，single.py:135 只 catch
-    ScriptValidationError，异常会直接逃出去把整次运行打死 —— 18 个 clip 里坏 1 个就全盘报废。
+    script/validate.py 的 _reject_reason，那里是「丢弃这一条、保留其余、附一条 warning」
+    的优雅降级。而 script/single.py 的 to_script() 是直接拿 LLM 的原始数字构造本模型的，
+    跑在 validate_script() 之前；一旦这里抛 ValidationError，single.generate_script 的
+    重试循环只 catch ScriptValidationError，异常会直接逃出去把整次运行打死 ——
+    18 个 clip 里坏 1 个就全盘报废。
     """
 
     episode: int
@@ -270,7 +273,8 @@ class Beat(_StageModel):
     """对照表的一行。clips 是列表，支持跨时间点拼接（对照表里用「接」连起来）。
 
     narration 刻意**不**加非空约束（与 LLMBeat 相反）：人手改 script.json 时清空某段旁白
-    是合法编辑（只要画面不要解说），render/tts.py:75 会给出 warning 并跳过配音。
+    是合法编辑（只要画面不要解说），render/tts.py 的 _plan_pronounceable 会给出 warning
+    并跳过配音。
     """
 
     id: NonBlankStr

@@ -214,7 +214,7 @@ class ValidateConfig(BaseModel):
     边界）。它们四个都不是「换一部番会想改」的东西。
     """
 
-    # --- 节点结构。提示词 single_episode.md:37 要求 5–8 个节点 ---
+    # --- 节点结构。提示词 single_episode.md 的「节点结构」一节要求 5–8 个节点 ---
     # 下限沿用历史值 3（低于它直接判错重试），刻意比提示词的 5 松：3 个节点的剧本
     # 虽然不合规格，但结构完整、能出片，不该烧掉一次几百秒的 LLM 调用。
     min_beats: int = Field(default=3, ge=1)

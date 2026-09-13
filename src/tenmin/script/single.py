@@ -243,8 +243,9 @@ def to_script(llm_script: LLMScript, cfg: ProjectConfig, episode: int) -> Script
     LLM 也该填的字段时会**静默丢失**（不报错、不传值，默认值一路漂到成片）。
 
     刻意**不**做「全字段对拷」：`LLM*` 镜像模型不含 est_seconds / est_total_seconds /
-    is_silent_highlight（models.py:284 的注释说明这是设计意图，那三个由 budget.py 与
-    validate.py 计算），所以这里只搬 LLMBeat / LLMClip **自己声明过**的字段，其余留默认值。
+    is_silent_highlight（models.py 里 `--- 以下三个模型只用于喂 LLM 的 response_schema ---`
+    那段注释说明这是设计意图，那三个由 budget.py 与 validate.py 计算），所以这里只搬
+    LLMBeat / LLMClip **自己声明过**的字段，其余留默认值。
     """
     beats = []
     for llm_beat in llm_script.beats:

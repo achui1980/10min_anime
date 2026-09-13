@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import ast
+import re
 from pathlib import Path
 
 import pytest
@@ -237,3 +238,65 @@ def test_the_atomic_audit_lets_the_atomic_helper_through(tmp_path):
         encoding="utf-8",
     )
     assert _non_atomic_writes(path) == []
+
+
+# --- 注释里不许写 `模块.py:行号` 这种交叉引用（N1）--------------------------
+#
+# 审查时逐条核过 13 处这种引用，**正确率 0/13** —— 它们全部在后续重构里漂掉了，
+# 而且漂得毫无痕迹（读注释的人会跳到一段完全无关的代码，然后怀疑自己）。行号是
+# 这个仓库里最容易过期的东西：一次 63 个 commit 的优化就能把整份文件推走几十行。
+#
+# 正确写法是**符号名引用**：`render/timeline.py 的 chunks_by_beat`、
+# `single_episode.md 的「硬性要求」一节`。它们跟着重命名一起被 grep 到，不跟着行号漂。
+_LINE_REFERENCE = re.compile(r"[\w/]+\.(?:py|md):\d+")
+
+
+def _internal_file_names() -> set[str]:
+    """src/tenmin/ 底下所有 .py 与 .md 的**文件名**（含 prompts/*.md）。"""
+    return {p.name for p in SRC.rglob("*") if p.suffix in {".py", ".md"}}
+
+
+def _line_references(path: Path) -> list[str]:
+    """本文件里指向**本项目自己**某个文件某一行的引用。
+
+    白名单是结构性的、不用手维护：只有「文件名在 src/tenmin/ 底下真的存在」才算违规。
+    edge-tts 那几处（`communicate.py:616`、`data_classes.py:38`）形态一样，但那两个
+    文件不属于本项目 —— 引用**第三方库**的行号是合理的（它是钉在某个版本上的证据，
+    而我们不重构它），所以自动放过。
+    """
+    internal = _internal_file_names()
+    text = path.read_text(encoding="utf-8")
+    out: list[str] = []
+    for lineno, line in enumerate(text.splitlines(), start=1):
+        for match in _LINE_REFERENCE.finditer(line):
+            name = match.group(0).rsplit("/", 1)[-1].split(":")[0]
+            if name in internal:
+                out.append(f"{path.name}:{lineno} → {match.group(0)}")
+    return out
+
+
+@pytest.mark.parametrize("path", _source_files(), ids=lambda p: p.name)
+def test_no_line_number_cross_references(path: Path):
+    assert _line_references(path) == [], (
+        f"{path.name} 里有指向本项目文件某一行的引用。行号一定会漂 —— "
+        "请改成符号名引用（`render/timeline.py 的 chunks_by_beat`）。"
+    )
+
+
+def test_the_line_reference_audit_lets_third_party_refs_through(tmp_path):
+    """守住上面那条白名单：edge-tts 的 `communicate.py:616` 必须被放过。"""
+    path = tmp_path / "synthetic.py"
+    path.write_text("# 见 communicate.py:616 与 data_classes.py:38\n", encoding="utf-8")
+    assert _line_references(path) == []
+
+
+def test_the_line_reference_audit_catches_an_internal_ref(tmp_path):
+    """而指向本项目的必须被抓到，两种写法（带目录/不带目录）都算。"""
+    path = tmp_path / "synthetic.py"
+    path.write_text(
+        "# 见 render/timeline.py:107\n# 也见 models.py:257\n", encoding="utf-8"
+    )
+    assert _line_references(path) == [
+        "synthetic.py:1 → render/timeline.py:107",
+        "synthetic.py:2 → models.py:257",
+    ]

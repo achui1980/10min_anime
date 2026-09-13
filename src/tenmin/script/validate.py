@@ -67,7 +67,7 @@ CREDITS_OVERLAP_MAX_RATIO = 0.5
 QUOTE_FRAGMENT_MIN_CHARS = 4
 QUOTE_FRAGMENT_MIN_RATIO = 0.6
 
-# 提示词 single_episode.md:36 要求末节点 label 以这个前缀开头。
+# 提示词 single_episode.md 的「节点结构」一节要求末节点 label 以这个前缀开头。
 OUTRO_LABEL_PREFIX = "收尾："
 # 「落在窗**外**的 anchor 行占比」的上限。名字里的 OUTSIDE 是刻意的：它原来叫
 # ANCHOR_COVERAGE_MIN_RATIO（「覆盖率下限」），而代码里比的是 outside/total，
@@ -281,8 +281,9 @@ def _check_anchor_coverage(beat: Beat, indexes: dict[int, AnchorIndex]) -> list[
 def _check_timeline_order(script: Script, cfg: ValidateConfig) -> list[str]:
     """A1：节点的画面起点应该跟正片时间轴同向前进。
 
-    提示词（script/prompts/single_episode.md:74）把「事件顺序必须与时间戳一致」列为
-    废稿条件，但原来代码里**没有任何跨 beat 的时序检查**——beat 3 的 clip 全在 60 秒、
+    提示词（script/prompts/single_episode.md 的「硬性要求」一节）把「事件顺序必须与
+    时间戳一致」列为废稿条件，但原来代码里**没有任何跨 beat 的时序检查**——beat 3 的
+    clip 全在 60 秒、
     beat 4 全在 20 秒也照样通过。
 
     口径与豁免（都是实测定下来的，别凭感觉改）：
@@ -356,10 +357,10 @@ def _check_cue_offsets(beat: Beat, rate: str) -> list[str]:
 def _check_footage_budget(beat: Beat, cfg: ValidateConfig, rate: str) -> list[str]:
     """A3：本节点的画面总时长与旁白时长得在同一个量级。
 
-    render/timeline.py:107 按 `ratio = 旁白秒数 / 画面秒数` 缩放本节点每一个 clip
-    （`source_end = clip.start + clip.duration * ratio`）。ratio 远大于 1 时每段都要
-    往后多吃几倍源片，吃到超出片长就被钳到片尾（timeline.py:116 那条 warning 就是
-    这个），成片画面与旁白错位；ratio 远小于 1 时每段的尾巴被大幅截掉。
+    render/timeline.py 的 build_timeline 按 `ratio = 旁白秒数 / 画面秒数` 缩放本节点
+    每一个 clip（`source_end = clip.start + clip.duration * ratio`）。ratio 远大于 1 时
+    每段都要往后多吃几倍源片，吃到超出片长就被钳到片尾（那边「已钳到片尾」那条 warning
+    就是这个），成片画面与旁白错位；ratio 远小于 1 时每段的尾巴被大幅截掉。
 
     在 script 阶段就能提前拦住，不用等到 timeline。阈值来自实测：85 个真实 beat 的
     拉伸倍率落在 **0.193–2.526**（画面/旁白比值 0.396–5.176，中位 1.319），
@@ -389,7 +390,8 @@ def _check_footage_budget(beat: Beat, cfg: ValidateConfig, rate: str) -> list[st
 
 
 def _check_structure(script: Script, cfg: ValidateConfig) -> list[str]:
-    """B1：提示词写明的节点结构约定（single_episode.md:34/36/37）。
+    """B1：提示词写明的节点结构约定（single_episode.md 的「节点结构」与
+    「每个节点的 clips」两节）。
 
     原来这里只有 `MIN_BEATS` 一条下限（低于它直接判错重试），上限与结构一概不查。
 
@@ -434,7 +436,7 @@ def _check_narration(beat: Beat) -> list[str]:
     """B2：narration 不该是空的。
 
     内部 `Beat.narration` 刻意**不**加非空约束（人手清空某段旁白、只要画面不要解说是
-    合法编辑，见 models.py:257 与 render/tts.py 的 warning 降级），但 validate 层该说
+    合法编辑，见 models.Beat.narration 与 render/tts.py 的 warning 降级），但 validate 层该说
     一声——LLM 那条路已经被 `LLMBeat.narration: NonBlankStr` 堵死，所以这条 warning
     只可能来自人工编辑。实测 85 个真实 beat 里 0 个空旁白。
     """
