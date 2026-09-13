@@ -85,6 +85,32 @@ def build_mix_args(
     parts.append(f"[ducked]{voice_label}amix=inputs=2:normalize=0[mix]")
 
     final_label = "[mix]"
+    # --- 输出长度：唯一真相是 timeline.total_seconds（+ 片尾卡片） ---
+    #
+    # 为什么必须显式钉：amix 默认 duration=longest，所以不钉的话输出长度是
+    # max(画面音频, 末条配音结束) —— 一个由「哪条输入最长」决定的副产物。render 阶段
+    # 用 `-c:a copy -map 1:a` 把这条音轨原样挂进 mp4，而 mp4 的容器时长取两条流的
+    # 较大值，于是音频长出一点就静默产出一个更长的 mp4（尾部画面冻结）。
+    #
+    # 为什么真相是 total_seconds 而不是「画面总长」：total_seconds 就是
+    # render/timeline.py 的 audio_cursor，本阶段的 afade 起点（total - fade）和
+    # render/video.py 的 fade 起点、进度条总长全部已经以它为准。画面总长
+    # （sum(segment 时长)）在 build_timeline 里按构造与它相等，只有 clip 被钳到
+    # 片尾/丢弃时才会**变短**，而那条路已经各自报了 warning；让音频跟着一份出过问题
+    # 的画面长度走，等于把两个可疑数字绑在一起。
+    #
+    # 为什么是 apad + atrim 而不是 -t / -shortest：
+    # - `-shortest` 钉的是「最短那条输入」，也就是随便某个几秒的旁白 chunk，方向全错。
+    # - `-t` 只能截断，补不了「混音比声明时长短」的那一半（画面被钳到片尾时就会短）。
+    #   而且片尾静音是在图里 concat 上去的，`-t` 作用在它之后，还得再算一遍总长。
+    # apad 负责补齐、atrim 负责截断，两个方向都封死，且落在 afade 之前 —— 淡出的起点
+    # 是 timeline 坐标，长度得先对上，淡出才落在该落的地方。
+    if timeline.total_seconds > 0:
+        parts.append(
+            f"{final_label}apad=whole_dur={timeline.total_seconds:.3f},"
+            f"atrim=end={timeline.total_seconds:.3f}[mixlen]"
+        )
+        final_label = "[mixlen]"
     if fade_out_seconds > 0:
         fade_start = max(timeline.total_seconds - fade_out_seconds, 0.0)
         parts.append(
@@ -94,7 +120,18 @@ def build_mix_args(
     if outro_seconds > 0:
         # 片尾卡片没有声音，垫一段静音跟视频那边的黑卡对齐。
         parts.append(f"anullsrc=r=48000:cl=stereo:d={outro_seconds:.3f}[silence]")
-        parts.append(f"{final_label}[silence]concat=n=2:v=0:a=1[mixfinal]")
+        # concat 之后必须按样本数重建 pts。concat 拼音频时给第二段的偏移是按第一段
+        # 「实测到的结束时刻」算的，两段之间会留下一个亚帧级的洞，mp4 muxer 拿这串
+        # pts 写 moov 时**随机**少算一截：真实素材实测（work/saijo E02，同一条 argv
+        # 连跑 6 遍）容器 duration 在 217.404000 与 214.424229 之间乱跳，偏差正好是
+        # 片尾静音那 3 秒。两种结果的 AAC 帧数都是 10192、解码出的样本逐字节相同，
+        # 也就是说样本一个没丢，只是 moov 里那个数字写错了 —— 而 render 阶段
+        # `-c:a copy` 会把这条音轨连同它的时长声明一起搬进 mp4。
+        # asetpts=N/SR/TB 用「已消费样本数 / 采样率」重算每帧的 pts，输出必然连续
+        # 单调；实测加上之后 6/6 都是 217.404000，且样本逐字节不变（只动时间戳）。
+        parts.append(
+            f"{final_label}[silence]concat=n=2:v=0:a=1,asetpts=N/SR/TB[mixfinal]"
+        )
         final_label = "[mixfinal]"
 
     args = ["-y", "-i", str(video)]

@@ -82,7 +82,8 @@ EXPECTED_GRAPH = (
     "[2:a]adelay=delays=10000:all=1[n1];"
     "[3:a]adelay=delays=20000:all=1[n2];"
     "[n0][n1][n2]amix=inputs=3:normalize=0[voice];"
-    "[ducked][voice]amix=inputs=2:normalize=0[mix]"
+    "[ducked][voice]amix=inputs=2:normalize=0[mix];"
+    "[mix]apad=whole_dur=30.000,atrim=end=30.000[mixlen]"
 )
 
 
@@ -136,7 +137,7 @@ def test_build_mix_args_filter_graph_matches_expected(tmp_path):
 def test_build_mix_args_maps_mix_and_encodes_aac(tmp_path):
     args = build(tmp_path)
     out = tmp_path / "06_audio" / "E02.mixed.m4a"
-    assert args[-7:] == ["-map", "[mix]", "-c:a", "aac", "-b:a", "192k", str(out)]
+    assert args[-7:] == ["-map", "[mixlen]", "-c:a", "aac", "-b:a", "192k", str(out)]
 
 
 def test_build_mix_args_single_chunk_skips_voice_amix(tmp_path):
@@ -149,7 +150,7 @@ def test_build_mix_args_single_chunk_skips_voice_amix(tmp_path):
     args = build(tmp_path, timeline=timeline, track=track)
     graph = args[args.index("-filter_complex") + 1]
     assert "amix=inputs=1" not in graph
-    assert graph.endswith("[ducked][n0]amix=inputs=2:normalize=0[mix]")
+    assert "[ducked][n0]amix=inputs=2:normalize=0[mix]" in graph
 
 
 def test_build_mix_args_rejects_empty_timeline(tmp_path):
@@ -175,18 +176,18 @@ def test_build_mix_args_rejects_offset_count_mismatch(tmp_path):
         build(tmp_path, timeline=timeline)
 
 
-def test_build_mix_args_without_fade_or_outro_keeps_mix_label(tmp_path):
-    """没要求淡出/片尾时，-map 仍然是 [mix]，行为与老版本完全一致。"""
+def test_build_mix_args_maps_the_length_pinned_label_without_fade_or_outro(tmp_path):
+    """不淡出、不加片尾时也必须钉长度 —— 输出长度不该由「哪条输入最长」决定。"""
     args = build(tmp_path)
-    assert args[args.index("-map") + 1] == "[mix]"
+    assert args[args.index("-map") + 1] == "[mixlen]"
 
 
 def test_build_mix_args_applies_fade_out_before_mix_ends(tmp_path):
     args = build(tmp_path, fade_out_seconds=5.0)
     graph = args[args.index("-filter_complex") + 1]
     assert graph.endswith(
-        "[ducked][voice]amix=inputs=2:normalize=0[mix];"
-        "[mix]afade=t=out:st=25.000:d=5.000[mixfaded]"
+        "[mix]apad=whole_dur=30.000,atrim=end=30.000[mixlen];"
+        "[mixlen]afade=t=out:st=25.000:d=5.000[mixfaded]"
     )
     assert args[args.index("-map") + 1] == "[mixfaded]"
 
@@ -195,22 +196,73 @@ def test_build_mix_args_appends_silence_for_outro_card(tmp_path):
     args = build(tmp_path, fade_out_seconds=5.0, outro_seconds=3.0)
     graph = args[args.index("-filter_complex") + 1]
     assert graph.endswith(
-        "[mix]afade=t=out:st=25.000:d=5.000[mixfaded];"
+        "[mixlen]afade=t=out:st=25.000:d=5.000[mixfaded];"
         "anullsrc=r=48000:cl=stereo:d=3.000[silence];"
-        "[mixfaded][silence]concat=n=2:v=0:a=1[mixfinal]"
+        "[mixfaded][silence]concat=n=2:v=0:a=1,asetpts=N/SR/TB[mixfinal]"
     )
     assert args[args.index("-map") + 1] == "[mixfinal]"
+
+
+def test_build_mix_args_regenerates_pts_after_the_outro_concat(tmp_path):
+    """concat 出来的 pts 有洞，mp4 muxer 会据此随机写出一个偏短的容器时长。
+
+    真实素材实测（work/saijo E02，同一条 argv 跑 6 遍）：容器 duration 在
+    217.404000 与 214.424229 之间乱跳，而两者的 AAC 帧数都是 10192、解码出的
+    样本逐字节相同 —— 也就是说样本没丢，是 moov 里那个数字写错了。按样本数重建
+    pts（asetpts=N/SR/TB）之后 6/6 都是 217.404000。
+    """
+    args = build(tmp_path, outro_seconds=3.0)
+    graph = args[args.index("-filter_complex") + 1]
+    assert graph.endswith("concat=n=2:v=0:a=1,asetpts=N/SR/TB[mixfinal]")
 
 
 def test_build_mix_args_outro_without_fade_concats_mix_directly(tmp_path):
     args = build(tmp_path, outro_seconds=3.0)
     graph = args[args.index("-filter_complex") + 1]
     assert graph.endswith(
-        "[ducked][voice]amix=inputs=2:normalize=0[mix];"
+        "[mix]apad=whole_dur=30.000,atrim=end=30.000[mixlen];"
         "anullsrc=r=48000:cl=stereo:d=3.000[silence];"
-        "[mix][silence]concat=n=2:v=0:a=1[mixfinal]"
+        "[mixlen][silence]concat=n=2:v=0:a=1,asetpts=N/SR/TB[mixfinal]"
     )
     assert args[args.index("-map") + 1] == "[mixfinal]"
+
+
+# --- 输出长度受控（第 2 项）-------------------------------------------------
+# 原来 build_mix_args 既没有 -t 也没有 apad，输出长度是 amix（默认 duration=longest）
+# 算出来的 max(画面音频, 末条配音结束)，而不是 timeline 声明的长度。render 阶段
+# `-c:a copy -map 1:a` 之后，mp4 的容器时长会被音频反过来决定。
+
+
+def test_build_mix_args_pins_length_to_timeline_total(tmp_path):
+    args = build(tmp_path)
+    graph = args[args.index("-filter_complex") + 1]
+    assert "[mix]apad=whole_dur=30.000,atrim=end=30.000[mixlen]" in graph
+    assert args[args.index("-map") + 1] == "[mixlen]"
+
+
+def test_build_mix_args_pins_length_before_fade_and_outro(tmp_path):
+    """长度必须先钉死，再淡出、再接片尾静音：淡出的起点是 timeline 坐标，
+    钉长度放在淡出之后的话，混音短了一截时淡出会落在不存在的样本上。"""
+    args = build(tmp_path, fade_out_seconds=5.0, outro_seconds=3.0)
+    graph = args[args.index("-filter_complex") + 1]
+    assert graph.endswith(
+        "[mix]apad=whole_dur=30.000,atrim=end=30.000[mixlen];"
+        "[mixlen]afade=t=out:st=25.000:d=5.000[mixfaded];"
+        "anullsrc=r=48000:cl=stereo:d=3.000[silence];"
+        "[mixfaded][silence]concat=n=2:v=0:a=1,asetpts=N/SR/TB[mixfinal]"
+    )
+    assert args[args.index("-map") + 1] == "[mixfinal]"
+
+
+def test_build_mix_args_skips_length_pin_when_total_seconds_is_zero(tmp_path):
+    """total_seconds 为 0 时钉长度只会产出一个空音轨，宁可退回不钉。"""
+    timeline = make_timeline()
+    timeline.total_seconds = 0.0
+    args = build(tmp_path, timeline=timeline)
+    graph = args[args.index("-filter_complex") + 1]
+    assert "apad" not in graph
+    assert "atrim=end=0.000" not in graph
+    assert args[args.index("-map") + 1] == "[mix]"
 
 
 def test_mix_audio_runs_ffmpeg_and_returns_path(tmp_path, monkeypatch):
