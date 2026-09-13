@@ -4,6 +4,7 @@ import sys
 import threading
 import types
 from pathlib import Path
+from typing import ClassVar
 
 import pytest
 
@@ -287,7 +288,9 @@ async def test_synthesize_track_reports_substep_progress(tmp_path):
 class _StubCommunicate:
     """假的 edge_tts.Communicate。绝不联网，只记录构造参数并按脚本行为落盘。"""
 
-    calls: list[dict] = []
+    # ClassVar 是刻意的：这份 log 就是要全实例共用（测试直接断言 _StubCommunicate.calls），
+    # 每个 fixture 里手动清空。标上 ClassVar 只是把这个既有意图写明白。
+    calls: ClassVar[list[dict]] = []
 
     def __init__(
         self,

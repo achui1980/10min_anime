@@ -1,3 +1,5 @@
+from itertools import pairwise
+
 import pytest
 
 from tenmin.models import AudioDirection, Beat, Clip, Hold, Script, VoiceChunk, VoiceTrack
@@ -352,7 +354,7 @@ def test_sentence_cues_hand_off_at_exactly_the_same_instant():
     )
     cues = sentence_cues(chunk, 100.0)
     assert len(cues) == 3
-    for before, after in zip(cues, cues[1:], strict=False):
+    for before, after in pairwise(cues):
         assert after.start == before.end
     assert cues[0].start == 100.0
     assert cues[-1].end == pytest.approx(109.0)

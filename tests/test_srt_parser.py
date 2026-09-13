@@ -1,3 +1,5 @@
+from itertools import pairwise
+
 import pytest
 
 from tenmin.ingest.srt_parser import (
@@ -169,7 +171,7 @@ def test_golden_sample_shape(golden_srt_path):
     assert 7.0 <= cues[0].start < 8.0
     assert cues[-1].end == pytest.approx(1416.622, abs=0.001)
     assert all(c.end >= c.start for c in cues)
-    assert all(b.start >= a.start for a, b in zip(cues, cues[1:], strict=False))
+    assert all(b.start >= a.start for a, b in pairwise(cues))
 
 
 def test_golden_sample_known_anchors(golden_srt_path):

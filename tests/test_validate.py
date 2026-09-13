@@ -479,7 +479,7 @@ def test_anchor_overwrite_reruns_the_op_window_check():
     track = make_track(op=(153.486, 224.681), lines=[dline(42, 160.0, 164.0)])
     s = make_script([[clip(10.0, 15.0), clip(210.0, 220.0, anchors=[42])]])
     result = run(s, track=track)
-    kept = [c for c in result.script.beats[0].clips]
+    kept = list(result.script.beats[0].clips)
     assert len(kept) == 1, [(c.start, c.end) for c in kept]
     assert kept[0].start == pytest.approx(10.0)
     assert any("片头" in w for w in result.warnings), result.warnings

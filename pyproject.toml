@@ -46,5 +46,93 @@ markers = [
 line-length = 100
 target-version = "py312"
 
+# 刻意**不**配 [tool.ruff.format]、也不跑 `ruff format`。三条依据（都实测过）：
+#   1. ruff 0.16 会格式化 Markdown 里的 python 代码块，`ruff format .` 会重写
+#      docs/superpowers/ 下的历史 spec/plan —— 那些是「某个时间点的设计快照」，按约定
+#      不许动（diff 最大的 15 个文件里有 5 个是它们）。要防住得再加一份 exclude 配置。
+#   2. 波及面 55/92 个文件、3785 行 diff，没法逐行审查，而本仓对「每处改动都说得清是
+#      等价变换」是有要求的。
+#   3. 改动方向跟本仓的行文习惯相反：它会把手工折好的多行签名/表达式**拉回**单行，
+#      还会把刻意「一行一条 SRT cue」拆开的隐式字符串拼接并成一行。
+# 补一句诚实的话：在临时副本上跑过 `ruff format` + 全量 pytest，1397 passed、E501 也
+# 是 0 —— 所以这不是「不安全」，纯粹是当下收益抵不上代价。**只加配置不跑 formatter
+# 等于没加**（配置会谎称本仓已格式化），所以两样都不做。
+
 [tool.ruff.lint]
-select = ["E", "F", "I", "UP", "B"]
+# PERF（Perflint）刻意不开，见文件末尾的说明。
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF", "PTH", "C4"]
+
+ignore = [
+    # --- RUF001/002/003：易混淆 Unicode 字符 -------------------------------------
+    # 6353 条命中，全是中文标点的误报（本仓注释、docstring、测试数据、面向用户的
+    # 文案全是中文，全角逗号/引号/破折号本来就是正文的一部分，不是「看起来像 ASCII
+    # 的冒牌货」）。这三条规则的前提是「代码是英文的」，在这里不成立。
+    "RUF001",
+    "RUF002",
+    "RUF003",
+    # --- RUF046：int(round(x)) 里的 int() 多余 ------------------------------------
+    # 3 处命中全是同一个刻意的写法：render/audio.py 的 adelay 毫秒、
+    # render/subtitles.py 的 ASS 厘秒、timecode.py 的毫秒。int() 在这里是**类型保证**
+    # 而不是冗余：这几个值紧接着要进 `:02d`/`:03d` 格式串和 ffmpeg 命令行参数，而
+    # round() 的返回类型跟入参类型有关（Decimal 进 Decimal 出）。ruff 自己也把这条的
+    # 修复标成 unsafe。
+    "RUF046",
+    # --- RUF100：noqa 指向未启用的规则 --------------------------------------------
+    # 3 处命中（render/tts.py 的 PLC0414、tts.py 与 test_render_ffmpeg.py 的 BLE001）
+    # 都不是「代码改好了 noqa 变陈旧」，而是「我们没开那个规则集」。那几条 noqa 后面
+    # 带着一句为什么（`原样 re-export` / `网络层什么都可能抛`），是有用的意图记录。
+    # RUF100 分不出这两种情况，只有 noqa 集合跟启用集合对齐时它才划得来。
+    "RUF100",
+    # --- SIM103：直接 return 条件 --------------------------------------------------
+    # 2 处命中都是一串「否决条款阶梯」的最后一级：ingest/clean.py 的 is_suspect（5 级
+    # `if 命中: return True`）、ingest/normalize.py 的 _can_merge（6 级
+    # `if 不合格: return False`）。折叠最后一级会破坏阶梯的形状，_can_merge 那处还会
+    # 把比较**反向**（`> max` 变成 `<= max`），读起来跟它上面 6 个兄弟条款反着，
+    # 以后加第 7 条否决条款时是实实在在的出错源。
+    "SIM103",
+    # --- SIM105：用 contextlib.suppress ------------------------------------------
+    # 2 处命中（render/ffmpeg.py 的 _drain、tests/test_cli.py 的 out）都已经在
+    # docstring 或行内注释里写清了「为什么这里要静默吞掉」。换成 suppress 行为一模一样，
+    # 但会把理由从异常元组旁边挪走；_drain 那处还带着 `# pragma: no cover`，挪到 with
+    # 行上会连同被覆盖的正常路径一起排除掉。
+    "SIM105",
+    # --- SIM108：改用三元表达式 ---------------------------------------------------
+    # 唯一一处命中（cli.py 的 printed_numbers）改完是「三元表达式的 else 分支里套一个
+    # 列表推导」。两个分支各占一行的 if/else 更好读，而本仓大量分支是带注释的，
+    # 三元式没地方放注释。
+    "SIM108",
+    # --- SIM300：Yoda 条件 --------------------------------------------------------
+    # 9 处命中全是误报。ruff 把全大写的名字当字面量，于是
+    # `assert SPEECH_RATE_CPS == pytest.approx(4.5)` 被判成「常量在左」——可这正是
+    # 「被测对象在左、期望值在右」的正确顺序。按它建议改成
+    # `pytest.approx(4.5) == SPEECH_RATE_CPS` 只会更差。
+    "SIM300",
+    # --- PTH201：不要给 Path 显式传当前目录 ---------------------------------------
+    # 唯一一处命中是 config.py 的 `PrivateAttr(default=Path("."))`。`Path(".")` 自带
+    # 说明性，`Path()` 看着像漏写了参数。这条规则在这里是拿隐式换显式。
+    "PTH201",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# SIM117（合并嵌套 with）：3 处命中全在 test_atomic.py，形如
+#   with pytest.raises(RuntimeError):
+#       with atomic_path(target) as tmp:
+# pytest.raises 是断言脚手架、不是资源。这几个测试存在的意义恰恰是盯 atomic_path
+# 自己的 __exit__ 在异常路径上的清理行为，把两者塞进同一个 with 会看不出在验哪个
+# __exit__。合并本身是等价的，只是读起来更糊。
+#
+# RUF015（别为了取第一个元素而先建整个列表）：5 处命中全在测试里、被取的列表只有
+# 一两个元素，所以它的性能理由为零；而代价是真的：`next(生成器)` 在找不到时抛
+# StopIteration，其中 4 处在 `async def` 测试里 —— 实测会被转成
+# `RuntimeError: coroutine raised StopIteration`，比现在的
+# `IndexError: list index out of range` 难查得多。src 里这条规则仍然有意义，所以
+# 只在 tests 下关。
+"tests/**" = ["SIM117", "RUF015"]
+
+# --- 为什么不开 PERF（Perflint）------------------------------------------------
+# 5 处命中全是 PERF401，全在冷路径上（docgen/table.py 渲染文档、
+# script/validate.py 校验，每集各跑一次、循环几十次），性能收益是零；代价是真的：
+# 其中 table.py:113 与 validate.py:345 要把多行中文 f-string 塞进生成器表达式，
+# 而 validate.py 那两处是两个连续循环往同一个 warnings 列表里 append，ruff 建议的
+# 「列表推导」形态压根用不上。往后它还会持续冲着本仓的主流写法开火 ——
+# 「在循环里建列表、每个分支带一句注释解释为什么这步不能合并」。

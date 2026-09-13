@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import statistics
 from collections.abc import Sequence
+from itertools import pairwise
 from typing import NamedTuple
 
 from tenmin.config import DEFAULT_SIGNALS, SignalsConfig
@@ -173,9 +174,7 @@ def find_density_shifts(
             buckets[index] += chars
 
     # (差分值, 差分归属的桶下标)。只在同一存活段内做差分，不跨屏蔽空洞。
-    diffs = [
-        (buckets[b] - buckets[a], b) for run in runs for a, b in zip(run, run[1:], strict=False)
-    ]
+    diffs = [(buckets[b] - buckets[a], b) for run in runs for a, b in pairwise(run)]
     # 屏蔽区可能把桶切得很碎，所以这条守卫是真的会命中的（不像满桶数 >= 3 那条）。
     if len(diffs) < 2:
         return []
