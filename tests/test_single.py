@@ -742,3 +742,18 @@ def test_self_check_is_the_last_section_of_the_prompt(cfg, track, report):
         assert "\n## " not in tail[1:], "自检必须是最后一节"
         assert "JSON schema" in tail
         assert str(int(track.duration)) in tail, "clip 上界要在末尾复述一次"
+
+
+# --- P2-C-5：报错消息要指名道姓是哪份模板 ---
+
+
+def test_prompt_errors_name_the_template_file(cfg, track, report, monkeypatch):
+    """render_prompt 只认得到「一个 str 模板」，模板名得由调用点告诉它 —— 不告诉的话
+    报错消息里是 `<inline>`，排查的人不知道该去改哪份 md。"""
+    from tenmin.script.prompt import PromptTemplateError
+
+    monkeypatch.setattr("tenmin.script.single.load_prompt", lambda name: "{{typo_here}}")
+    with pytest.raises(PromptTemplateError) as exc:
+        build_user_prompt(cfg, track, report)
+    assert "single_episode.md" in str(exc.value)
+    assert "typo_here" in str(exc.value)

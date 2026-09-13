@@ -32,6 +32,8 @@ from tenmin.timecode import format_timestamp, readable_seconds
 # 提示词一律住在 prompts/*.md（全项目策略），这句原来硬编码在代码里。
 SYSTEM_PROMPT = load_prompt("system.md").strip()
 
+_TEMPLATE = "single_episode.md"  # 同时当 render_prompt 的模板名（只进报错消息）
+
 # few-shot 范例那一节的标题与引子。**整节（含标题）都是注进 {{example_block}} 的**，
 # 模板里不写它 —— 返工轮要摘掉范例，原来那种 `template.split("## 参考范例")[0]` 的字符串
 # 切割只在「范例恰好是模板最后一节」时才成立，而现在它后面还跟着「输出前自检」。
@@ -145,7 +147,8 @@ def build_user_prompt(
     `## 参考范例` 小节标题一起）。取舍依据见 _followup_prompt 的 docstring。
     """
     return render_prompt(
-        load_prompt("single_episode.md"),
+        load_prompt(_TEMPLATE),
+        _TEMPLATE,
         show=cfg.show,
         episode_number=track.episode,
         target_seconds=f"{cfg.target_seconds:.0f}",

@@ -29,6 +29,8 @@ DEFAULT_TOLERANCE = DEFAULT_LLM.budget_tolerance
 # （没有 cfg 可拿的单测、一次性脚本）的行为跟历史逐点一致。
 DEFAULT_RATE = DEFAULT_RENDER.rate
 
+_REWRITE_TEMPLATE = "rewrite.md"  # 同时当 render_prompt 的模板名（只进报错消息）
+
 _WHITESPACE = re.compile(r"\s+")
 _RATE_PERCENT = re.compile(r"^([+-]\d+)%$")
 
@@ -203,7 +205,8 @@ def rewrite_instruction(
         else ""
     )
     return render_prompt(
-        load_prompt("rewrite.md"),
+        load_prompt(_REWRITE_TEMPLATE),
+        _REWRITE_TEMPLATE,
         actual=f"{actual:.1f}",
         target=f"{target:.0f}",
         deviation=f"{deviation:+.1%}",

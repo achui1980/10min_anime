@@ -24,8 +24,13 @@ def test_render_missing_variable_raises():
     assert "name" in str(exc.value)
 
 
-def test_render_ignores_unused_kwargs():
-    assert render_prompt("固定文本", unused="x") == "固定文本"
+def test_render_rejects_unused_kwargs():
+    """原来这里锁的是反的行为（「多传的变量被忽略」）。那正是 P2-C 第 4 项要修的 bug：
+    模板里的占位符名字敲错时，整段内容会静默丢失。见下面 P2-C-4 那一组测试。"""
+    from tenmin.script.prompt import PromptTemplateError
+
+    with pytest.raises(PromptTemplateError):
+        render_prompt("固定文本", unused="x")
 
 
 def test_load_prompt_reads_file():
@@ -85,3 +90,70 @@ def test_golden_example_asset_has_no_ocr_garbage():
     text = (PROMPTS_DIR / "examples" / "saijo_e02.md").read_text(encoding="utf-8")
     assert "80-08" not in text
     assert "浙谷339" not in text
+
+
+# --- P2-C-4：模板校验必须是双向的 ---
+
+
+def test_render_rejects_a_variable_the_template_never_uses():
+    """md 里把 {{dialogue_block}} 写错成 {{dialog_block}} 时，传进来的 dialogue_block
+    原来被**静默忽略**：模型收到一份没有字幕轨的 prompt，照样凭空编时间戳生成，要到
+    validate 层才可能发现。打字错没有任何合法用途，所以报错而不是 warning。"""
+    from tenmin.script.prompt import PromptTemplateError
+
+    with pytest.raises(PromptTemplateError) as exc:
+        render_prompt("只用了 {{dialog_block}}", "fake.md", dialogue_block="正文", dialog_block="x")
+    assert "dialogue_block" in str(exc.value)
+    assert "fake.md" in str(exc.value)
+
+
+def test_render_unused_variable_error_lists_the_placeholders_it_did_find():
+    from tenmin.script.prompt import PromptTemplateError
+
+    with pytest.raises(PromptTemplateError) as exc:
+        render_prompt("{{a}}", "fake.md", a="1", b="2")
+    assert "{{a}}" in str(exc.value)
+
+
+def test_render_missing_variable_error_names_the_template_and_the_candidates():
+    """原来只 `raise KeyError(name)`：光一个变量名，既不知道是哪份模板，也不知道
+    调用点到底传了什么。"""
+    with pytest.raises(KeyError) as exc:
+        render_prompt("你好 {{name}}", "greeting.md", nome="x")
+    message = str(exc.value)
+    assert "name" in message
+    assert "greeting.md" in message
+    assert "nome" in message
+
+
+def test_template_errors_land_in_the_cli_error_funnel():
+    """模板与调用点对不上是打字错，但用户该看到一行红字而不是 traceback。
+    KeyError 不在 cli.PIPELINE_ERRORS 里，ValueError 在。"""
+    from tenmin.script.prompt import PromptTemplateError
+
+    assert issubclass(PromptTemplateError, ValueError)
+    assert issubclass(PromptTemplateError, KeyError)
+
+
+# --- P2-C-5：资源加载 ---
+
+
+def test_load_prompt_is_cached():
+    """范例是 3KB 的常驻资产，每次拼 prompt 都读一遍盘没有意义。"""
+    load_prompt.cache_clear()
+    first = load_prompt("single_episode.md")
+    second = load_prompt("single_episode.md")
+    assert first is second
+    assert load_prompt.cache_info().hits >= 1
+
+
+def test_load_prompt_cache_can_be_cleared():
+    """加了缓存就必须留一个清缓存的口子，否则想改模板内容的测试没法写。"""
+    load_prompt("single_episode.md")
+    load_prompt.cache_clear()
+    assert load_prompt.cache_info().currsize == 0
+
+
+def test_load_prompt_refuses_to_escape_the_prompts_dir():
+    with pytest.raises(ValueError, match="prompts"):
+        load_prompt("../single.py")
