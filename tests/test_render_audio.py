@@ -1,3 +1,4 @@
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -83,7 +84,8 @@ EXPECTED_GRAPH = (
     "[3:a]adelay=delays=20000:all=1[n2];"
     "[n0][n1][n2]amix=inputs=3:normalize=0[voice];"
     "[ducked][voice]amix=inputs=2:normalize=0[mix];"
-    "[mix]apad=whole_dur=30.000,atrim=end=30.000[mixlen]"
+    "[mix]apad=whole_dur=30.000,atrim=end=30.000[mixlen];"
+    "[mixlen]alimiter=limit=1:level=false:latency=true[limited]"
 )
 
 
@@ -137,7 +139,7 @@ def test_build_mix_args_filter_graph_matches_expected(tmp_path):
 def test_build_mix_args_maps_mix_and_encodes_aac(tmp_path):
     args = build(tmp_path)
     out = tmp_path / "06_audio" / "E02.mixed.m4a"
-    assert args[-7:] == ["-map", "[mixlen]", "-c:a", "aac", "-b:a", "192k", str(out)]
+    assert args[-7:] == ["-map", "[limited]", "-c:a", "aac", "-b:a", "192k", str(out)]
 
 
 def test_build_mix_args_single_chunk_skips_voice_amix(tmp_path):
@@ -176,31 +178,30 @@ def test_build_mix_args_rejects_offset_count_mismatch(tmp_path):
         build(tmp_path, timeline=timeline)
 
 
-def test_build_mix_args_maps_the_length_pinned_label_without_fade_or_outro(tmp_path):
+def test_build_mix_args_pins_length_even_without_fade_or_outro(tmp_path):
     """不淡出、不加片尾时也必须钉长度 —— 输出长度不该由「哪条输入最长」决定。"""
     args = build(tmp_path)
-    assert args[args.index("-map") + 1] == "[mixlen]"
+    graph = args[args.index("-filter_complex") + 1]
+    assert "[mix]apad=whole_dur=30.000,atrim=end=30.000[mixlen]" in graph
 
 
 def test_build_mix_args_applies_fade_out_before_mix_ends(tmp_path):
     args = build(tmp_path, fade_out_seconds=5.0)
     graph = args[args.index("-filter_complex") + 1]
-    assert graph.endswith(
+    assert (
         "[mix]apad=whole_dur=30.000,atrim=end=30.000[mixlen];"
         "[mixlen]afade=t=out:st=25.000:d=5.000[mixfaded]"
-    )
-    assert args[args.index("-map") + 1] == "[mixfaded]"
+    ) in graph
 
 
 def test_build_mix_args_appends_silence_for_outro_card(tmp_path):
     args = build(tmp_path, fade_out_seconds=5.0, outro_seconds=3.0)
     graph = args[args.index("-filter_complex") + 1]
-    assert graph.endswith(
+    assert (
         "[mixlen]afade=t=out:st=25.000:d=5.000[mixfaded];"
         "anullsrc=r=48000:cl=stereo:d=3.000[silence];"
         "[mixfaded][silence]concat=n=2:v=0:a=1,asetpts=N/SR/TB[mixfinal]"
-    )
-    assert args[args.index("-map") + 1] == "[mixfinal]"
+    ) in graph
 
 
 def test_build_mix_args_regenerates_pts_after_the_outro_concat(tmp_path):
@@ -213,18 +214,17 @@ def test_build_mix_args_regenerates_pts_after_the_outro_concat(tmp_path):
     """
     args = build(tmp_path, outro_seconds=3.0)
     graph = args[args.index("-filter_complex") + 1]
-    assert graph.endswith("concat=n=2:v=0:a=1,asetpts=N/SR/TB[mixfinal]")
+    assert "concat=n=2:v=0:a=1,asetpts=N/SR/TB[mixfinal]" in graph
 
 
 def test_build_mix_args_outro_without_fade_concats_mix_directly(tmp_path):
     args = build(tmp_path, outro_seconds=3.0)
     graph = args[args.index("-filter_complex") + 1]
-    assert graph.endswith(
+    assert (
         "[mix]apad=whole_dur=30.000,atrim=end=30.000[mixlen];"
         "anullsrc=r=48000:cl=stereo:d=3.000[silence];"
         "[mixlen][silence]concat=n=2:v=0:a=1,asetpts=N/SR/TB[mixfinal]"
-    )
-    assert args[args.index("-map") + 1] == "[mixfinal]"
+    ) in graph
 
 
 # --- 输出长度受控（第 2 项）-------------------------------------------------
@@ -237,7 +237,6 @@ def test_build_mix_args_pins_length_to_timeline_total(tmp_path):
     args = build(tmp_path)
     graph = args[args.index("-filter_complex") + 1]
     assert "[mix]apad=whole_dur=30.000,atrim=end=30.000[mixlen]" in graph
-    assert args[args.index("-map") + 1] == "[mixlen]"
 
 
 def test_build_mix_args_pins_length_before_fade_and_outro(tmp_path):
@@ -245,13 +244,12 @@ def test_build_mix_args_pins_length_before_fade_and_outro(tmp_path):
     钉长度放在淡出之后的话，混音短了一截时淡出会落在不存在的样本上。"""
     args = build(tmp_path, fade_out_seconds=5.0, outro_seconds=3.0)
     graph = args[args.index("-filter_complex") + 1]
-    assert graph.endswith(
+    assert (
         "[mix]apad=whole_dur=30.000,atrim=end=30.000[mixlen];"
         "[mixlen]afade=t=out:st=25.000:d=5.000[mixfaded];"
         "anullsrc=r=48000:cl=stereo:d=3.000[silence];"
         "[mixfaded][silence]concat=n=2:v=0:a=1,asetpts=N/SR/TB[mixfinal]"
-    )
-    assert args[args.index("-map") + 1] == "[mixfinal]"
+    ) in graph
 
 
 def test_build_mix_args_skips_length_pin_when_total_seconds_is_zero(tmp_path):
@@ -262,7 +260,88 @@ def test_build_mix_args_skips_length_pin_when_total_seconds_is_zero(tmp_path):
     graph = args[args.index("-filter_complex") + 1]
     assert "apad" not in graph
     assert "atrim=end=0.000" not in graph
-    assert args[args.index("-map") + 1] == "[mix]"
+    assert args[args.index("-map") + 1] == "[limited]"
+
+
+# --- 限幅（第 3 项）---------------------------------------------------------
+# ducked 原声（-12dB）+ 满量程旁白在响场景相加可能冲过满刻度，而 amix
+# normalize=0 不做任何归一化。真实素材实测最响的一集（work/saijo E06）编码前峰值
+# -0.90 dBFS —— 没削波，但只剩 0.9dB 余量。
+
+
+def test_build_mix_args_limits_the_final_signal(tmp_path):
+    args = build(tmp_path)
+    graph = args[args.index("-filter_complex") + 1]
+    assert graph.endswith("[mixlen]alimiter=limit=1:level=false:latency=true[limited]")
+    assert args[args.index("-map") + 1] == "[limited]"
+
+
+def test_build_mix_args_limits_after_every_absolute_time_filter(tmp_path):
+    """限幅必须排在 atrim / afade / concat **之后**。
+
+    latency=true 补偿前瞻延迟的做法是把输出 pts 往前挪一个 attack 窗，而那三个
+    滤镜全部按绝对 timeline 时刻工作。真实素材实测把它插在 apad/atrim 之前，
+    `atrim=end=214.404` 会少留 239 个样本（≈5ms@48kHz，正好一个 attack 窗）。
+    """
+    args = build(tmp_path, fade_out_seconds=5.0, outro_seconds=3.0)
+    graph = args[args.index("-filter_complex") + 1]
+    assert graph.endswith("[mixfinal]alimiter=limit=1:level=false:latency=true[limited]")
+    for earlier in ("apad=", "atrim=end=30.000", "afade=", "concat=n=2:v=0:a=1"):
+        assert graph.index(earlier) < graph.index("alimiter"), earlier
+
+
+@pytest.mark.render
+def test_alimiter_options_are_transparent_below_the_ceiling():
+    """limit=1:level=false:latency=true 对没超标的信号必须逐字节不变。
+
+    三个参数缺一不可：level 默认 true，latency 默认 false（不补偿前瞻延迟，
+    整条轨会平移几毫秒）。任何一个用默认值都会改听感，而用户对成片听感有既定期待。
+    """
+    plain = _lavfi_pcm("sine=f=440:d=2:r=48000,volume=0.5")
+    limited = _lavfi_pcm(
+        "sine=f=440:d=2:r=48000,volume=0.5,alimiter=limit=1:level=false:latency=true"
+    )
+    assert limited == plain
+
+
+@pytest.mark.render
+def test_alimiter_actually_caps_a_clipping_signal():
+    """真超标时限幅必须把峰值压到 0 dBFS，否则这一层等于没加。"""
+    assert _lavfi_peak_db("sine=f=440:d=2:r=48000,volume=24") > 1.0
+    peak = _lavfi_peak_db(
+        "sine=f=440:d=2:r=48000,volume=24,alimiter=limit=1:level=false:latency=true"
+    )
+    assert peak == pytest.approx(0.0, abs=0.01)
+
+
+def _lavfi_pcm(graph: str) -> bytes:
+    """跑一条 lavfi 滤镜链，取回 f32le 原始样本。"""
+    completed = subprocess.run(
+        ["ffmpeg", "-nostdin", "-v", "error", "-f", "lavfi", "-i", graph,
+         "-f", "f32le", "-ac", "1", "-ar", "48000", "-"],
+        capture_output=True,
+        check=True,
+    )
+    return completed.stdout
+
+
+def _lavfi_peak_db(graph: str) -> float:
+    completed = subprocess.run(
+        ["ffmpeg", "-nostdin", "-hide_banner", "-f", "lavfi", "-i", graph,
+         "-af", "astats=measure_perchannel=Peak_level:measure_overall=Peak_level",
+         "-f", "null", "-"],
+        capture_output=True,
+        text=True,
+        errors="replace",
+        check=True,
+    )
+    peaks = [
+        float(line.rsplit(":", 1)[1])
+        for line in completed.stderr.splitlines()
+        if "Peak level dB:" in line
+    ]
+    assert peaks, completed.stderr
+    return peaks[-1]
 
 
 def test_mix_audio_runs_ffmpeg_and_returns_path(tmp_path, monkeypatch):

@@ -134,6 +134,34 @@ def build_mix_args(
         )
         final_label = "[mixfinal]"
 
+    # --- 限幅：把最终信号封在 0 dBFS 以内 ---
+    #
+    # amix normalize=0 是刻意的（要的就是「原声压低 + 旁白满量程」这个既定听感），
+    # 代价是它完全不管相加会不会冲过满刻度。真实素材实测编码前峰值：E01 -4.70、
+    # E02 -1.95、E03 -4.26、E06 -0.90、E09 -1.52 dBFS —— 一次都没削波，但最响那集
+    # 只剩 0.9dB 余量，换个混响更凶的番、或者把 duck_db 调浅一点就会过线。所以这一层
+    # 是**防御性**的，不是在修一个已经发生的 bug。
+    #
+    # 三个参数缺一不可，任何一个用默认值都会改听感：
+    # - limit=1：天花板就是满刻度。峰值没到 1.0 的信号一点增益衰减都不会挨。
+    # - level=false：alimiter 的 level 默认 **true**，会把输出自动归一化到 0dB，
+    #   等于凭空给整条轨加一次响度变化。
+    # - latency=true：alimiter 内部有前瞻缓冲，默认**不**补偿，整条轨会平移一个
+    #   attack 窗（默认 5ms）。
+    #
+    # 为什么必须放在最末尾、在 atrim/afade/concat **之后**：latency=true 补偿延迟的
+    # 做法是把输出 pts 往前挪一个前瞻窗，而上面那些滤镜全部按**绝对 timeline 时刻**
+    # 工作。实测把它插在 apad/atrim 之前，`atrim=end=214.404` 会少留 239 个样本
+    # （≈5ms@48kHz，正好是那个 attack 窗）—— 一个静默的截尾。放在最末尾还顺带符合
+    # 「天花板作用在真正出去的那份信号上」这个常规做法。
+    #
+    # 听感验证（work/saijo E02 + E06，跑完整条 mix graph 出 f32le 原始样本比哈希）：
+    # 未削波的素材加上这一层之后样本**逐字节不变**；少 level=false 或少 latency=true
+    # 都会变。tests/test_render_audio.py 里有两个 render 标记的用例把这三个参数的
+    # 「透明」与「真的限得住」都钉住了。
+    parts.append(f"{final_label}alimiter=limit=1:level=false:latency=true[limited]")
+    final_label = "[limited]"
+
     args = ["-y", "-i", str(video)]
     for path in chunk_paths:
         args.extend(["-i", path])
