@@ -1,6 +1,11 @@
 import pytest
 
-from tenmin.ingest.normalize import build_track, merge_continuations
+from tenmin.config import CreditsConfig
+from tenmin.ingest.normalize import (
+    build_track,
+    credit_range_source,
+    merge_continuations,
+)
 from tenmin.models import DialogueLine
 
 
@@ -410,3 +415,119 @@ def test_golden_track_shape(golden_track):
     assert 400 <= len(golden_track.lines) <= 420
     dialogue = [ln for ln in golden_track.lines if ln.kind in ("dialogue", "monologue")]
     assert len(dialogue) >= 350
+
+
+# --- OP/ED 区间的三级回退 --------------------------------------------------
+
+
+def _tc(seconds):
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    return f"{int(h):02d}:{int(m):02d}:{int(s):02d},{int(round(s % 1 * 1000)):03d}"
+
+
+def _write_srt(path, cues):
+    """cues: [(start, end, text)]"""
+    blocks = [
+        f"{i}\n{_tc(start)} --> {_tc(end)}\n{text}\n"
+        for i, (start, end, text) in enumerate(cues, start=1)
+    ]
+    path.write_text("\n".join(blocks), encoding="utf-8")
+    return path
+
+
+# 片头 31.1s 的 `此花同学 早安` 是 saijo/E01 的真台词：6 个 CJK 字、两段齐整，
+# 盲窗（0-300）下会被 is_credits 规则 4（纯人名罗列）误杀。
+# 355.0s 的 `副监督 野吕纯恵` 是 saijo2/E01 的真 staff 行：盲窗下 >300 漏成台词。
+_MIXED_CUES = [
+    (31.1, 37.5, "此花同学 早安"),
+    (300.5, 303.0, "正片对白一句"),
+    (355.0, 358.0, "副监督 野吕纯恵"),
+    (700.0, 703.0, "正片中段对白"),
+]
+
+
+def _kind_at(track, start):
+    return next(ln.kind for ln in track.lines if ln.start == pytest.approx(start))
+
+
+def test_build_track_prefers_episode_range_over_project_default(tmp_path):
+    srt = _write_srt(tmp_path / "e.srt", _MIXED_CUES)
+    track = build_track(
+        srt,
+        episode=1,
+        duration=1430.0,
+        op_range=(181.0, 260.0),
+        credits=CreditsConfig(default_op_range=(300.0, 390.0)),
+    )
+    assert track.op_range == (181.0, 260.0)
+
+
+def test_build_track_uses_project_default_when_episode_range_missing(tmp_path):
+    srt = _write_srt(tmp_path / "e.srt", _MIXED_CUES)
+    track = build_track(
+        srt,
+        episode=1,
+        duration=1430.0,
+        credits=CreditsConfig(
+            default_op_range=(300.0, 390.0), default_ed_range=(1290.0, None)
+        ),
+    )
+    assert track.op_range == (300.0, 390.0)
+    # null 终点解析成这一集的真实片长
+    assert track.ed_range == (1290.0, 1430.0)
+
+
+def test_build_track_falls_back_to_inference_when_nothing_filled(tmp_path):
+    """两级手填都空时走 find_credit_ranges。这是三个现有 project 的形态。"""
+    srt = _write_srt(
+        tmp_path / "e.srt",
+        [
+            (60.0, 63.0, "© 某制作委员会"),
+            (90.0, 93.0, "© 作画监督 某人"),
+            (105.0, 108.0, "© 某某某"),
+            (700.0, 703.0, "正片中段对白"),
+        ],
+    )
+    track = build_track(srt, episode=1, duration=1430.0)
+    assert track.op_range == (60.0, 108.0)
+
+
+def test_build_track_manual_op_range_drives_the_credit_window(tmp_path):
+    """手填区间同时修两个方向：接住窗外的 staff 行、放过窗内的真台词。
+
+    盲窗是 [0,300] ∪ [尾-80,尾]，于是 31.1s 的真台词落在窗内被人名正则误杀、
+    355.0s 的 staff 行落在窗外漏成台词。手填 OP=[281,368] 之后两者同时纠正。
+    """
+    srt = _write_srt(tmp_path / "e.srt", _MIXED_CUES)
+
+    blind = build_track(srt, episode=1, duration=1430.0)
+    assert _kind_at(blind, 31.1) == "credits"  # 误杀
+    assert _kind_at(blind, 355.0) == "dialogue"  # 漏判
+
+    manual = build_track(srt, episode=1, duration=1430.0, op_range=(281.0, 368.0))
+    assert _kind_at(manual, 31.1) == "dialogue"  # 救回
+    assert _kind_at(manual, 355.0) == "credits"  # 接住
+    assert _kind_at(manual, 700.0) == "dialogue"  # 中段不受影响
+
+
+def test_build_track_without_manual_ranges_is_unchanged(tmp_path):
+    """没填任何区间时逐行 kind 必须与改动前一致（产物逐字节不变的单元级版本）。"""
+    srt = _write_srt(tmp_path / "e.srt", _MIXED_CUES)
+    track = build_track(srt, episode=1, duration=1430.0)
+    assert [ln.kind for ln in track.lines] == [
+        "credits",
+        "dialogue",
+        "dialogue",
+        "dialogue",
+    ]
+
+
+def test_credit_range_source_reports_which_level_won():
+    """来源标注必须与 _resolve_manual_range 同源，否则显示与行为会静默分叉。"""
+    assert credit_range_source((181.0, 260.0), (300.0, 390.0), 1430.0) == "episode"
+    assert credit_range_source(None, (300.0, 390.0), 1430.0) == "project"
+    assert credit_range_source(None, None, 1430.0) == "inferred"
+    # 项目级默认写了但在这一集上解析不出合法区间（duration 早于起点）→ 实际走推断，
+    # 显示也必须说推断，不能因为「字段填了」就报 project。
+    assert credit_range_source(None, (1290.0, None), 100.0) == "inferred"

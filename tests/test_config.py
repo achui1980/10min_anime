@@ -487,3 +487,66 @@ def test_default_llm_is_a_plain_llm_config():
     from tenmin.config import DEFAULT_LLM
 
     assert DEFAULT_LLM == LLMConfig()
+
+
+# --- 项目级手填的 OP/ED 默认区间 -------------------------------------------
+
+
+def test_credits_default_ranges_default_to_none():
+    """不填时必须是 None —— 那是「走系统默认的启发式推断」这一级的入口。"""
+    cfg = CreditsConfig()
+    assert cfg.default_op_range is None
+    assert cfg.default_ed_range is None
+
+
+def test_credits_default_ed_range_allows_open_end():
+    """ED 终点允许 null，表示「到片尾」。
+
+    片长逐集不同（saijo 实测 1316-1510 秒），而 ED 起点是稳定结构，
+    所以项目级默认必须能只钉起点。
+    """
+    cfg = CreditsConfig(default_ed_range=(1290.0, None))
+    assert cfg.default_ed_range == (1290.0, None)
+
+
+def test_credits_default_op_range_requires_both_ends():
+    """OP 终点不许 null。
+
+    OP 的终点不是片尾，写成 null 会让 OP 区间吞掉整集 —— signals 会把全片
+    当 credits 扣掉、in_credit_window 会对全片开放激进规则。这个脚枪要在
+    加载期就挡住，而不是等看成片才发现。
+    """
+    with pytest.raises(ValidationError):
+        CreditsConfig(default_op_range=(300.0, None))
+
+
+@pytest.mark.parametrize("field", ["default_op_range", "default_ed_range"])
+def test_credits_default_ranges_reject_inverted(field):
+    with pytest.raises(ValidationError):
+        CreditsConfig(**{field: (390.0, 300.0)})
+
+
+@pytest.mark.parametrize("field", ["default_op_range", "default_ed_range"])
+def test_credits_default_ranges_reject_negative(field):
+    with pytest.raises(ValidationError):
+        CreditsConfig(**{field: (-1.0, 300.0)})
+
+
+def test_credits_default_ranges_load_from_yaml(tmp_path):
+    path = tmp_path / "project.yaml"
+    path.write_text(
+        """
+show: 某番
+slug: demo
+credits:
+  default_op_range: [300, 390]
+  default_ed_range: [1290, null]
+episodes:
+  - number: 1
+    srt: srt/E01.srt
+""".strip(),
+        encoding="utf-8",
+    )
+    cfg = load_project(path)
+    assert cfg.credits.default_op_range == (300.0, 390.0)
+    assert cfg.credits.default_ed_range == (1290.0, None)

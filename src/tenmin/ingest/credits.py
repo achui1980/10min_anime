@@ -204,19 +204,44 @@ def credit_window_bounds(
 
 
 def in_credit_window(
-    start: float, duration: float, *, cfg: CreditsConfig = DEFAULT_CREDITS
+    start: float,
+    duration: float,
+    *,
+    cfg: CreditsConfig = DEFAULT_CREDITS,
+    op: tuple[float, float] | None = None,
+    ed: tuple[float, float] | None = None,
 ) -> bool:
-    """片头 0-300s 或片尾最后 80s。给 is_credits 的规则 2b/4/5 开门。
+    """给 is_credits 的规则 2b/4/5 开门的时间窗。
 
-    这里用的是 credit_head_window / ed_keyword_window_seconds 两个独立旋钮，
-    跟聚簇用的 op_search_* / ed_cluster_tail_seconds 不共享数值：片尾窗口刻意比
-    ed_cluster_tail_seconds 窄，理由见 CreditsConfig 里的注释。
+    两种模式，`op` / `ed` 任一非 None 就走第一种：
 
-    两个窗的实际大小由 credit_window_max_ratio 兜底收缩，保证并集永远覆盖不满整条
-    时间轴 —— 否则短 track（以及 duration=0 的空字幕）上每一行都会拿到
-    in_credit_window=True，本文件头部记录的「演出来」被「演出」命中那类事故就会从
-    「只在片头片尾发生」升级成「全片发生」。
+    1. **手填区间模式**：窗就是 op 与 ed 这两段（各留 cfg.manual_window_margin 秒
+       余量），盲窗完全不参与。只填了一半时另一半是关闭的，**不**回退到盲窗 ——
+       否则语义会变成「手填窗与盲窗的并集」，比两者单独用都糟（saijo/E01 就是
+       这个形态：这集真的没有 OP，只有 ED 可填，此时片头不该再对激进规则开门）。
+       这条路不依赖 duration：区间是绝对时间。
+
+    2. **盲窗模式**（两个区间都没有）：片头 0-300s 或片尾最后 80s，与本函数
+       历史行为逐点等价。用的是 credit_head_window / ed_keyword_window_seconds
+       两个独立旋钮，跟聚簇用的 op_search_* / ed_cluster_tail_seconds 不共享
+       数值：片尾窗口刻意比 ed_cluster_tail_seconds 窄，理由见 CreditsConfig。
+
+       两个窗的实际大小由 credit_window_max_ratio 兜底收缩，保证并集永远覆盖不满
+       整条时间轴 —— 否则短 track（以及 duration=0 的空字幕）上每一行都会拿到
+       in_credit_window=True，本文件头部记录的「演出来」被「演出」命中那类事故就会
+       从「只在片头片尾发生」升级成「全片发生」。
+
+    手填模式**刻意不**受 credit_window_max_ratio 约束：那条约束是给盲窗兜底用的，
+    而手填区间的覆盖范围是用户的显式声明，静默把它收缩成跟声明不一样的东西比
+    覆盖过宽更难查。区间覆盖过宽这件事该由 ingest 的告警去说，不是在这里悄悄改。
     """
+    if op is not None or ed is not None:
+        margin = cfg.manual_window_margin
+        return any(
+            window[0] - margin <= start <= window[1] + margin
+            for window in (op, ed)
+            if window is not None
+        )
     if duration <= 0:
         # 片长未知（空字幕 / 解析失败）。宁可漏判 credits，也不能把激进规则对全片放开。
         return False

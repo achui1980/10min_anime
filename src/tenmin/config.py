@@ -34,6 +34,26 @@ def _validate_credit_range(value: tuple[float, float] | None) -> tuple[float, fl
     return value
 
 
+def _validate_open_credit_range(
+    value: tuple[float, float | None] | None,
+) -> tuple[float, float | None] | None:
+    """终点允许 None（= 到片尾）的区间校验。
+
+    只给项目级的 ED 默认值用：片长逐集不同（实测 1315.94-1510.0 秒），而 ED 起点
+    是稳定结构，所以必须能只钉起点。OP 刻意**不**享受这条 —— OP 的终点不是片尾，
+    写成 None 会让 OP 区间吞掉整集（signals 把全片当 credits 扣掉、
+    in_credit_window 对全片放开激进规则），那个脚枪要在加载期就挡住。
+    """
+    if value is None:
+        return None
+    start, end = value
+    if start < 0:
+        raise ValueError(f"区间 {value} 不能含负数，时间轴从 0 秒开始")
+    if end is None:
+        return value
+    return _validate_credit_range((start, end))
+
+
 class EpisodeConfig(BaseModel):
     number: int
     srt: Path
@@ -184,6 +204,47 @@ class CreditsConfig(BaseModel):
     # is_credits 规则 5：拉丁字母占比门槛与生效所需的最小非空白长度。
     latin_ratio_threshold: float = Field(default=0.6, ge=0, le=1)
     latin_min_len: int = Field(default=6, gt=0)
+
+    # --- 手填的 OP/ED 区间（项目级默认） ---
+    # 区间解析是三级回退：EpisodeConfig.op_range/ed_range（逐集手填）→ 这里的两个
+    # default_*（项目级手填，整季形态一致时只填一处）→ find_credit_ranges 的启发式推断。
+    #
+    # 这两个字段不只是「省掉逐集抄一遍」：拿到确定的区间之后，in_credit_window 就不再
+    # 用 credit_head_window / ed_keyword_window_seconds 那对盲窗，而是直接用区间本身。
+    # 实测（13 份真实产物）两个方向同时变好 —— 接住 3 条落在盲窗外的 staff 行
+    # （saijo2/E01 的 355.0 `副监督`、358.5 `监督`、365.2 `制作`，OP 起点 281s 跑出
+    # 300s 盲窗），并救回 5 条落在盲窗内被规则 4/5 误杀的真台词（saijo/E01 的
+    # 31.1 `此花同学 早安`、51.9、185.2，saijo/E07 的 37.9 `欢迎回来 伊月`，
+    # saijo/E08 的 35.9 `美丽 辛苦妳了`）。
+    #
+    # 代价也很明确：填错会在**你填的区间内**误杀（实测给 saijo/E01 乱填
+    # ed=[1290,1420] 会误杀 1294.5s 的 `那种口吻 我不喜欢`）。这个范围比盲窗小得多，
+    # 而且是显式的 —— 区间是你写下的，不是猜出来的。
+    #
+    # credit_window_max_ratio 刻意**不**约束手填区间：那条约束是给盲窗兜底用的
+    # （防止短 track 上两个标称窗覆盖满整条时间轴），而手填区间的覆盖范围是用户的
+    # 显式声明，不该被静默收缩成跟声明不一样的东西。
+    default_op_range: tuple[float, float] | None = None
+    # 终点可以写 null，表示「到片尾」——片长逐集不同，而 ED 起点是稳定结构。
+    default_ed_range: tuple[float, float | None] | None = None
+    # 手填区间两侧各留这么多秒余量。staff 名单常常比肉眼判断的「OP 结束」再多跑
+    # 几秒，而手填值是按秒估的；实测 saijo2/E01 的 staff 行落在 [281,368] 内，
+    # 5 秒余量足够吸收「按整秒估」带来的偏差，又不至于把真台词卷进来。
+    manual_window_margin: float = Field(default=5.0, ge=0)
+
+    @field_validator("default_op_range")
+    @classmethod
+    def _check_default_op(
+        cls, value: tuple[float, float] | None
+    ) -> tuple[float, float] | None:
+        return _validate_credit_range(value)
+
+    @field_validator("default_ed_range")
+    @classmethod
+    def _check_default_ed(
+        cls, value: tuple[float, float | None] | None
+    ) -> tuple[float, float | None] | None:
+        return _validate_open_credit_range(value)
 
 
 class SignalsConfig(BaseModel):

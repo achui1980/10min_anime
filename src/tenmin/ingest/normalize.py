@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
+from typing import Literal
 
 from tenmin.config import DEFAULT_CREDITS, DEFAULT_INGEST, CreditsConfig, IngestConfig
 from tenmin.ingest.clean import (
@@ -108,6 +109,52 @@ def merge_continuations(
     return out
 
 
+def _resolve_manual_range(
+    episode_range: tuple[float, float] | None,
+    project_default: tuple[float, float | None] | None,
+    duration: float,
+) -> tuple[float, float] | None:
+    """OP/ED 区间三级回退的前两级：逐集手填 → 项目级手填。
+
+    都没填就返回 None，交给第三级（find_credit_ranges 的启发式推断）。
+
+    项目级默认的终点允许是 None（= 到片尾），在这里解析成**这一集**的真实片长 ——
+    片长逐集不同（实测 1315.94-1510.0 秒），所以这个解析只能发生在知道 duration
+    的地方，不能在 config 加载期就定下来。
+
+    解析结果不合法时（duration 未知或早于区间起点，例如空字幕轨上写了
+    `default_ed_range: [1290, null]`）返回 None 而不是一个起点晚于终点的区间：
+    写反的区间在下游一路不报错，intervals.subtract 会把它当空集静默忽略。
+    """
+    if episode_range is not None:
+        return episode_range
+    if project_default is None:
+        return None
+    start, end = project_default
+    resolved_end = duration if end is None else end
+    if resolved_end <= start:
+        return None
+    return (start, resolved_end)
+
+
+def credit_range_source(
+    episode_range: tuple[float, float] | None,
+    project_default: tuple[float, float | None] | None,
+    duration: float,
+) -> Literal["episode", "project", "inferred"]:
+    """三级回退里实际生效的是哪一级。给 `tenmin inspect` 的显示用。
+
+    刻意复用 `_resolve_manual_range` 而不是自己再判一遍「字段填了没」：项目级默认
+    可能填了却在这一集上解析不出合法区间（例如空字幕轨上的 `[1290, null]`），
+    那时实际走的是推断，显示也必须说推断。两处各写一遍判据就会静默分叉。
+    """
+    if episode_range is not None:
+        return "episode"
+    if _resolve_manual_range(None, project_default, duration) is not None:
+        return "project"
+    return "inferred"
+
+
 def build_track(
     srt_path: Path,
     *,
@@ -148,11 +195,19 @@ def build_track(
     cues = sorted(parsed.cues, key=lambda cue: (cue.start, cue.end))
     if duration is None:
         duration = max((cue.end for cue in cues), default=0.0)
+    # 区间必须在逐 cue 分类**之前**定下来：手填区间直接当 in_credit_window 的窗，
+    # 而窗决定 is_credits 的规则 2b/4/5 是否开火、也就决定 kind=="credits"。
+    # 手填那条路没有鸡生蛋问题（区间不需要先分类就知道）；只有落到第三级的推断
+    # 才需要「先分类、再从 credits 行反推区间」的老顺序。
+    manual_op = _resolve_manual_range(op_range, credits.default_op_range, duration)
+    manual_ed = _resolve_manual_range(ed_range, credits.default_ed_range, duration)
     lines: list[DialogueLine] = []
 
     for cue in cues:
         cleaned = clean_text(cue.text, convert=convert_traditional, glossary=glossary)
-        window = in_credit_window(cue.start, duration, cfg=credits)
+        window = in_credit_window(
+            cue.start, duration, cfg=credits, op=manual_op, ed=manual_ed
+        )
         for position, segment in enumerate(split_dual_track(cleaned)):
             speaker, body = extract_prefix(segment)
             # 被夹成零时长的坏 cue 一律算可疑行：DialogueLine.suspect 本来就是为这类
@@ -189,8 +244,8 @@ def build_track(
         episode=episode,
         source="srt",
         duration=duration,
-        op_range=op_range or inferred_op,
-        ed_range=ed_range or inferred_ed,
+        op_range=manual_op or inferred_op,
+        ed_range=manual_ed or inferred_ed,
         lines=lines,
         skipped_blocks=parsed.skipped_blocks,
         clamped_cues=parsed.clamped_cues,

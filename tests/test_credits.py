@@ -272,3 +272,77 @@ def test_title_overlap_cache_keeps_different_show_titles_apart():
 def test_title_overlap_empty_title_never_matches():
     assert is_credits("《随便什么》", show_title="") is False
     assert is_credits("《随便什么》", show_title="　 ") is False
+
+
+# --- 手填 OP/ED 区间驱动 in_credit_window ---------------------------------
+
+
+def test_in_credit_window_uses_manual_ranges_when_given():
+    """手填区间存在时，窗就是那两段，盲窗完全不参与。
+
+    这是 saijo2/E01 的真实形态：OP staff 从 281s 跑到 367s，整段落在盲窗
+    （0-300）之外，三条 `副监督`/`监督`/`制作` 行因此漏成台词喂给 LLM。
+    """
+    duration = 1429.9
+    op = (281.0, 368.0)
+    ed = (1354.5, 1429.9)
+    # OP 里的 staff 行：盲窗下是 False（>300），手填窗下是 True
+    assert in_credit_window(355.0, duration) is False
+    assert in_credit_window(355.0, duration, op=op, ed=ed) is True
+    # 片头的真台词：盲窗下是 True（<=300，会被人名正则误杀），手填窗下是 False
+    assert in_credit_window(31.1, duration) is True
+    assert in_credit_window(31.1, duration, op=op, ed=ed) is False
+    # ED 里的 staff 行两种窗都认
+    assert in_credit_window(1400.0, duration, op=op, ed=ed) is True
+    # 正片中段两种窗都不认
+    assert in_credit_window(700.0, duration, op=op, ed=ed) is False
+
+
+def test_in_credit_window_falls_back_to_blind_window_without_manual_ranges():
+    """两个区间都没有时必须与改动前逐点等价。
+
+    三个现有 project 的 project.yaml 一个区间字段都没填，全部走这条路，
+    所以这条不变量直接决定 01_dialogue/ 产物是否逐字节不变。
+    """
+    duration = 1315.94
+    for start in (0.0, 299.9, 300.1, 700.0, duration - 80.1, duration - 79.9):
+        assert in_credit_window(start, duration, op=None, ed=None) is in_credit_window(
+            start, duration
+        )
+
+
+def test_in_credit_window_accepts_a_single_manual_range():
+    """只填了一半时，另一半不回退到盲窗 —— 否则语义会变成「两套窗的并集」。
+
+    saijo/E01 就是这个形态：这集真的没有 OP（0-300s 对白连续无断），
+    只有 ED 可填。此时片头不该再对激进规则开门。
+    """
+    duration = 1420.1
+    assert in_credit_window(31.1, duration, ed=(1290.0, 1420.1)) is False
+    assert in_credit_window(1300.0, duration, ed=(1290.0, 1420.1)) is True
+    # 反过来：只填 OP 时片尾窗关闭
+    assert in_credit_window(1400.0, duration, op=(60.0, 150.0)) is False
+    assert in_credit_window(100.0, duration, op=(60.0, 150.0)) is True
+
+
+def test_in_credit_window_manual_range_has_a_margin():
+    """手填区间两侧各留 manual_window_margin 秒余量。
+
+    staff 名单常常比肉眼判断的「OP 结束」再多跑几秒，而手填值是按秒估的。
+    """
+    duration = 1430.0
+    op = (281.0, 368.0)
+    assert in_credit_window(372.0, duration, op=op) is True  # 368 + 4 < 余量 5
+    assert in_credit_window(374.0, duration, op=op) is False  # 368 + 6 > 余量 5
+    assert in_credit_window(277.0, duration, op=op) is True  # 281 - 4
+    assert in_credit_window(275.0, duration, op=op) is False  # 281 - 6
+
+
+def test_in_credit_window_manual_range_ignores_unknown_duration():
+    """duration=0 时手填区间仍然可用 —— 它不依赖片长。
+
+    盲窗那条路必须靠 duration 算预算，所以 duration<=0 时一律关闭；
+    手填区间是绝对时间，跟片长无关。
+    """
+    assert in_credit_window(100.0, 0.0) is False
+    assert in_credit_window(100.0, 0.0, op=(60.0, 150.0)) is True

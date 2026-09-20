@@ -12,6 +12,7 @@ import yaml
 
 from tenmin import atomic
 from tenmin.config import ProjectConfig, Settings, load_project
+from tenmin.ingest.normalize import credit_range_source
 from tenmin.models import DialogueTrack, SignalReport
 from tenmin.pipeline import (
     STAGES,
@@ -320,6 +321,16 @@ def run(
             typer.echo(f"成品视频：{video_path}")
 
 
+# OP/ED 区间三级回退里实际生效的那一级，给 inspect 显示用。标注的是「这个值
+# 从哪来」：自动推断那一级不可靠（实测 13 集里 2 集 op=None、2 集 ed=None），
+# 而手填那两级还会同时驱动 in_credit_window，两者的后果完全不同。
+_RANGE_SOURCE_LABEL = {
+    "episode": "逐集手填",
+    "project": "项目默认",
+    "inferred": "自动推断",
+}
+
+
 @app.command()
 def inspect(
     slug: str,
@@ -348,8 +359,13 @@ def inspect(
 
     typer.echo(f"对白轨 E{episode:02d}：{len(track.lines)} 行，时长 {track.duration:.3f}s")
     typer.echo("  分类：" + "、".join(f"{k}={v}" for k, v in sorted(counts.items())))
-    typer.echo(f"  片头曲：{track.op_range}")
-    typer.echo(f"  片尾曲：{track.ed_range}")
+    ep_cfg = next((ep for ep in cfg.episodes if ep.number == episode), None)
+    for label, value, filled, default in (
+        ("片头曲", track.op_range, ep_cfg and ep_cfg.op_range, cfg.credits.default_op_range),
+        ("片尾曲", track.ed_range, ep_cfg and ep_cfg.ed_range, cfg.credits.default_ed_range),
+    ):
+        source = credit_range_source(filled or None, default, track.duration)
+        typer.echo(f"  {label}：{value}（{_RANGE_SOURCE_LABEL[source]}）")
     if track.skipped_blocks or track.clamped_cues:
         typer.secho(
             f"  解析期坏数据：跳过 {track.skipped_blocks} 个无时间戳块、"
