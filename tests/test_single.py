@@ -18,6 +18,7 @@ from tenmin.models import (
 )
 from tenmin.script.single import (
     SYSTEM_PROMPT,
+    build_credits_block,
     build_dialogue_block,
     build_glossary_block,
     build_highlight_block,
@@ -150,8 +151,18 @@ def test_dialogue_block_marks_suspect_lines(track):
     assert "?" in line
 
 
-def test_dialogue_block_uses_readable_timestamps(track):
-    assert "00:00:07.120" in build_dialogue_block(track)
+def test_dialogue_block_gives_plain_seconds(track):
+    """模板要求 `clip.start` / `clip.end` 填**秒数**，而这份清单原来给的是
+    `00:00:07.120`。模型每写一个 clip 都得做一次 60 进制换算，错一次的量级是 60 或 600
+    秒 —— 超过 validate 的 ANCHOR_OVERWRITE_MAX_SECONDS(60)，于是不纠正只 warning，
+    接着大概率被当成越界 clip 丢掉。顺带：秒数比时间码短一半，408 行省约 4.9k 字符。"""
+    line = next(ln for ln in build_dialogue_block(track).splitlines() if "你是谁" in ln)
+    assert line.startswith("1 | 7.1 - 11.5 |")
+
+
+def test_dialogue_block_does_not_leak_clock_timestamps(track):
+    """两套单位共存比单给一套更糟：模型会分不清该抄哪个。"""
+    assert "00:00:07.120" not in build_dialogue_block(track)
 
 
 def test_dialogue_block_fills_missing_speaker(track):
@@ -163,7 +174,37 @@ def test_highlight_block_lists_strength_and_triggers(report):
     text = build_highlight_block(report)
     assert "gap:19.8s" in text
     assert "强度 4" in text
-    assert "00:22:08.367" in text
+    assert "1328.4 - 1348.2" in text
+
+
+def test_highlight_block_does_not_leak_clock_timestamps(report):
+    assert "00:22:08.367" not in build_highlight_block(report)
+
+
+def test_highlight_block_prints_precomputed_anchor_lines(report):
+    """`Highlight.anchor_lines` 是 signals/gaps.py 的 _piece_anchors 已经算好的
+    「紧邻这段间隙前后的对白行号」，但原来一个字都不印，模板 :35 却让模型自己去 400 行
+    对白轨里找同一份东西。不印是纯粹的信息浪费，而模型找错的后果是 clip 被 anchor 校正
+    搬到别处（validate.py 的 R2）。"""
+    assert "锚点行 1" in build_highlight_block(report)
+
+
+def test_highlight_block_omits_the_anchor_column_when_there_are_none(report):
+    """两头都被 OP/ED 裁掉的间隙拿不到锚点行（_piece_anchors 要求端点浮点相等）。
+    那种情况下印一个空列只是噪声。"""
+    bare = SignalReport(
+        episode=2,
+        highlights=[
+            Highlight(
+                start=10.0,
+                end=20.0,
+                strength=2,
+                triggers=["gap:10.0s"],
+                summary="无台词演出段 10.0s",
+            )
+        ],
+    )
+    assert "锚点行" not in build_highlight_block(bare)
 
 
 def test_highlight_block_empty_report_says_none():
@@ -177,6 +218,94 @@ def test_glossary_block_formats_pairs():
 
 def test_glossary_block_empty_says_none():
     assert "无" in build_glossary_block({})
+
+
+# --- credits block ---
+#
+# 模板两次要求「不要落在片头曲/片尾曲区间」（clips 小节与自检第 6 条），而
+# validate.py 的执行方式是静默丢 clip：与 OP/ED 重叠达 CREDITS_OVERLAP_MAX_RATIO
+# (0.5) 就整条扔掉，丢光一个节点的 clip 还会抛 ScriptValidationError、烧掉一整轮
+# 重试。track 里本来就有 op_range / ed_range，不给模型等于让它盲猜。
+
+
+def test_credits_block_prints_both_ranges_in_seconds(track):
+    text = build_credits_block(track)
+    assert "153.5 - 224.7" in text
+    assert "1348.2 - 1416.6" in text
+
+
+def test_credits_block_uses_the_same_unit_as_clip_timestamps(track):
+    """必须是纯秒数：模型要照着它判断自己写的 clip.start 落没落进禁区。"""
+    assert "00:02:33" not in build_credits_block(track)
+
+
+def test_credits_block_marks_a_missing_range_instead_of_dropping_it(track):
+    """
+    只推断出一段时，缺的那段要显式说「未识别」。
+
+    静默省略会让模型把「没提片尾曲」读成「本集没有片尾曲」，从而放心去切最后
+    90 秒——那恰好是丢 clip 最集中的区域。
+    """
+    only_op = track.model_copy(update={"ed_range": None})
+    text = build_credits_block(only_op)
+    assert "153.5 - 224.7" in text
+    assert "未识别" in text
+
+
+def test_credits_block_falls_back_when_nothing_was_inferred(track):
+    """
+    两段都没推出来时给一句可执行的回避指引。
+
+    这条分支是常态而非边缘：credits.py 的 OP 推断与静音兜底共用 [30, 300] 的搜索
+    窗，OP 起点早于 30 秒的番、或把 OP 歌词打成字幕的番，两条路都推不出来。
+    """
+    blind = track.model_copy(update={"op_range": None, "ed_range": None})
+    text = build_credits_block(blind)
+    assert "未识别" in text
+    assert "153.5" not in text
+
+
+def test_prompt_injects_the_credit_ranges(cfg, track, report):
+    assert "1348.2 - 1416.6" in build_user_prompt(cfg, track, report)
+
+
+# --- schema 字段与 prompt 的一致性 ---
+#
+# 这三条锁的是「模板描述的形状」必须等于「LLMScript 真实的形状」。不一致的代价不是
+# 质量下降而是硬失败：_StageModel 是 extra="forbid"，字面照着模板写就是
+# ValidationError，在 gemini 之外的 provider 上还会白烧一轮 schema 修复。
+
+
+def test_prompt_does_not_describe_a_nested_audio_object(cfg, track, report):
+    """
+    LLMBeat 是平的：original_audio / holds / sfx 直接挂在节点上（models.py:334-336）。
+
+    模板原先写 `audio.original_audio` / `audio.sfx`，而 LLMBeat 上并没有 `audio`
+    这个字段，且 extra="forbid" —— 模型照着写就是 ValidationError。嵌套的
+    `hold.at` / `sfx.cue` 是对的（Hold / SfxCue 确实是对象），不要连它们一起改。
+    """
+    prompt = build_user_prompt(cfg, track, report)
+    assert "audio.original_audio" not in prompt
+    assert "audio.sfx" not in prompt
+    assert "`original_audio`" in prompt
+    assert "`sfx`" in prompt
+
+
+def test_prompt_tells_the_model_that_every_beat_needs_an_id(cfg, track, report):
+    """
+    LLMBeat.id 是必填的 NonBlankStr，且重复 id 会被 model_validator 直接拒掉
+    （models.py:329,342-345）——那是硬失败，不是 warning。模板此前一个字没提。
+    """
+    assert "`id`" in build_user_prompt(cfg, track, report)
+
+
+def test_prompt_tells_the_model_what_clip_episode_should_be(cfg, track, report):
+    """
+    LLMClip.episode 是必填的（models.py:321），填错则 validate 静默丢掉该 clip
+    （R1），丢光一个节点就抛 ScriptValidationError。模板此前只有「集数：第 N 集」
+    这一行素材，没说过它要被抄进每个 clip。
+    """
+    assert "`clip.episode`" in build_user_prompt(cfg, track, report)
 
 
 # --- to_script ---

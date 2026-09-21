@@ -27,7 +27,7 @@ from tenmin.script.budget import (
 from tenmin.script.llm import LLMProvider
 from tenmin.script.prompt import load_prompt, render_prompt
 from tenmin.script.validate import ScriptValidationError, validate_script
-from tenmin.timecode import format_timestamp, readable_seconds
+from tenmin.timecode import readable_seconds
 
 # 提示词一律住在 prompts/*.md（全项目策略），这句原来硬编码在代码里。
 SYSTEM_PROMPT = load_prompt("system.md").strip()
@@ -98,7 +98,7 @@ def build_dialogue_block(track: DialogueTrack) -> str:
         extra = ",".join(str(m) for m in line.merged_from if m != line.idx)
         number = f"{line.idx}(+{extra})" if extra else str(line.idx)
         rows.append(
-            f"{number} | {format_timestamp(line.start)} - {format_timestamp(line.end)}"
+            f"{number} | {line.start:.1f} - {line.end:.1f}"
             f" | {line.speaker or '-'} | {line.kind}{mark} | {line.text}"
         )
     return "\n".join(rows)
@@ -110,9 +110,16 @@ def build_highlight_block(report: SignalReport) -> str:
     rows = []
     for highlight in report.highlights:
         triggers = "、".join(highlight.triggers) or "-"
+        # anchor_lines 是 signals/gaps.py 的 _piece_anchors 已经算好的「紧邻这段间隙前后
+        # 的对白行号」。原来一个字都不印，而提示词又让模型自己去几百行对白轨里找同一份
+        # 东西 —— 找错的后果是 clip 被 validate 的 anchor 校正搬到别处。
+        # 两头都被 OP/ED 裁掉的间隙拿不到锚点行（_piece_anchors 要求端点浮点相等），
+        # 那种情况下整列省掉，别留一个空列当噪声。
+        anchors = ",".join(str(idx) for idx in highlight.anchor_lines)
+        anchor_col = f" | 锚点行 {anchors}" if anchors else ""
         rows.append(
-            f"- {format_timestamp(highlight.start)} - {format_timestamp(highlight.end)}"
-            f" | 强度 {highlight.strength} | {triggers} | {highlight.summary}"
+            f"- {highlight.start:.1f} - {highlight.end:.1f}"
+            f" | 强度 {highlight.strength} | {triggers}{anchor_col} | {highlight.summary}"
         )
     return "\n".join(rows)
 
@@ -121,6 +128,27 @@ def build_glossary_block(glossary: dict[str, str]) -> str:
     if not glossary:
         return "（无术语表）"
     return "\n".join(f"- {key} → {value}" for key, value in glossary.items())
+
+
+def build_credits_block(track: DialogueTrack) -> str:
+    """片头曲/片尾曲区间，秒数，跟 clip 时间戳同一个单位。
+
+    提示词里两处（clips 那节与输出前自检）都要求「避开片头曲/片尾曲」，而这份区间
+    原来一个字都没进过 prompt —— 模型只能靠对白轨里一段没有解释的行号断层去猜。
+    猜错的代价是静默的：validate 的 R7 对与 OP/ED 重叠 ≥50% 的 clip 直接丢弃，
+    一个节点的 clip 全丢光就抛 ScriptValidationError、烧掉一整轮重试。
+
+    区间缺失时刻意仍然印一行「未识别」而不是整条省掉：ingest 的三级回退里
+    OP 推断与静音兜底共用 [30,300] 搜索窗，片头从 0 秒开始的番两条路都摸不到，
+    这种时候得让模型知道「没有数据」而不是让它以为这一集没有片头曲。
+    """
+    lines = []
+    for label, span in (("片头曲", track.op_range), ("片尾曲", track.ed_range)):
+        if span is None:
+            lines.append(f"- {label}：未识别（本集没能定出区间，按常规位置自行回避）")
+        else:
+            lines.append(f"- {label}：{span[0]:.1f} - {span[1]:.1f} 秒")
+    return "\n".join(lines)
 
 
 def build_example_section(*, with_example: bool) -> str:
@@ -165,6 +193,7 @@ def build_user_prompt(
             cfg.target_seconds - HOLD_RESERVE_SECONDS, rate=cfg.render.rate
         ),
         glossary_block=build_glossary_block(cfg.glossary),
+        credits_block=build_credits_block(track),
         highlight_block=build_highlight_block(report),
         dialogue_block=build_dialogue_block(track),
         example_block=build_example_section(with_example=with_example),
