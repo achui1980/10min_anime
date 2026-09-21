@@ -115,7 +115,11 @@ class LLMConfig(BaseModel):
     budget_tolerance: float = Field(default=0.12, ge=0)
     # 语义校验（script/validate.py）失败后的重试次数，**不含**首发。原来写死在
     # script/single.py 的函数体里，既不可配也不可在测试里调。0 = 首轮失败就直接抛。
-    validation_retries: int = Field(default=1, ge=0)
+    # 默认 2 而不是 1：ValidateConfig.max_holds 让「留白数量超标」也成了判错条件，
+    # 而判错一次只剩一次机会就等于把掉集率押在模型的单次运气上——重试耗尽会写
+    # 03_script/E{NN}.rejected.json 并中断这一集，批处理是按集纵向跑的，后面 5 个
+    # 阶段全都不会执行。一轮实测 29 秒（最坏 561 秒），多留一次远比掉一集便宜。
+    validation_retries: int = Field(default=2, ge=0)
     # 时长预算返工的轮数。0 = 只报 warning 不返工。每一轮都是一次完整的 LLM 调用
     # （实测 ~561 秒），所以默认只给 1 轮。
     budget_rewrite_rounds: int = Field(default=1, ge=0)
@@ -288,6 +292,17 @@ class ValidateConfig(BaseModel):
     min_beats: int = Field(default=3, ge=1)
     # 上限只给 warning。实测 13 份样本的节点数是 6–7，全落在 5–8 内。
     max_beats: int = Field(default=8, ge=1)
+    # 全片留白（hold）数量上限，**唯一一条会判错重试的创作约定**。提示词
+    # single_episode.md 的「留白（holds）」一节要求 3–8 处；实测 4 份真实 script.json
+    # 是 5 / 7 / 8 / 11，其中 7 与 8 出自人工确认过「质量达标」的样本，所以上限取 8
+    # 而不是提示词原来写的 6（否则第一个被判错的就是自家的黄金快照）。
+    # 之所以只有这一条判错：每处 hold 是 2–4 秒旁白静音，11 处就是 22–44 秒，占 240
+    # 秒预算的 1/6 到 1/5，而且 hold 时长会从旁白字数预算里扣，直接挤掉解说内容——它
+    # 是这批 off-spec 项里唯一真的改变成片的，且模型改一轮就能修。对照着放弃的三条：
+    # 零个 climax 在 render/timeline/audio/tts/docgen 里**一个消费者都没有**（全项目
+    # 只有 validate.py 自己读 role，且只用 hook/outro 豁免时间线检查）；节点数偏少与
+    # 单节点 clip 偏多是节奏粗细的量变，照样出片。它们都只给 warning。
+    max_holds: int = Field(default=8, ge=1)
 
     # clip 起点与 anchor 行字幕时间的容差：差得比这个多就以字幕时间为准。
     # 它取决于这部番的 SRT 时间码有多准，是数据质量旋钮。

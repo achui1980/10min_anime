@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -71,6 +72,15 @@ _ARTIFACTS: dict[str, tuple[str, str]] = {
     # 一个可能是任意垃圾），共用一个文件名会让用户打开它时不知道该期待什么。
     # 它不是任何阶段的输入或输出，不参与 _is_fresh。
     "script_rejected": ("03_script", ".rejected.json"),
+    # script 阶段**每次真正跑完都写**（哪怕一条 warning 都没有，写空列表）：
+    # 原来 warnings 只在内存里攒着、运行末尾由 cli.py 打一次黄字，既不落盘也不进
+    # 对照表；而阶段一旦 fresh 就被跳过，重跑连那次黄字都不再出现。于是 validate.py
+    # 里那批「只给 warning」的检查（锚点落窗外、画面拉伸超界、留白引不到原声、时间线
+    # 倒退）在「没人盯终端」的用法下等于空转。
+    # 空列表与文件缺失刻意区分开：空 = 查过了没发现问题，缺失 = 从没跑过。每次都写
+    # 也顺带避免上一跑的警告文件变成过期的谎言。
+    # 它不是任何阶段的输入或输出，不参与 _is_fresh。
+    "script_warnings": ("03_script", ".warnings.json"),
     "table": ("out", ".解说方案.md"),
     "narration": ("out", ".narration.txt"),
     "voice_dir": ("04_voice", ""),
@@ -112,6 +122,9 @@ class Paths:
 
     def script_rejected(self, episode: int) -> Path:
         return self._artifact("script_rejected", episode)
+
+    def script_warnings(self, episode: int) -> Path:
+        return self._artifact("script_warnings", episode)
 
     def table(self, episode: int) -> Path:
         return self._artifact("table", episode)
@@ -364,6 +377,17 @@ async def run_script(
             raw_output=error.raw_output,
         ) from error
     _write_json(paths.script(episode), script.model_dump_json(indent=2))
+    # 每次跑完都写，哪怕 warnings 是空的（理由见 _ARTIFACTS["script_warnings"]）。
+    # 写在 script 落盘之后：warnings 描述的是刚写下去那一份剧本，顺序反了会出现
+    # 「警告文件指向一份还没落盘的剧本」这种中间态。
+    _write_json(
+        paths.script_warnings(episode),
+        json.dumps(
+            {"episode": episode, "warnings": list(warnings)},
+            ensure_ascii=False,
+            indent=2,
+        ),
+    )
     return script, warnings
 
 

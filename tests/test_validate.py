@@ -17,6 +17,8 @@ from tenmin.script.validate import (
     ANCHOR_OUTSIDE_MAX_RATIO,
     ANCHOR_OVERWRITE_MAX_SECONDS,
     CREDITS_OVERLAP_MAX_RATIO,
+    SPEC_MAX_CLIPS_PER_BEAT,
+    SPEC_MIN_BEATS,
     AnchorIndex,
     ScriptValidationError,
     check_script,
@@ -67,11 +69,12 @@ def clip(start, end, anchors=(), silent=False):
 
 
 def make_script(clips_per_beat, *, pad=True):
-    """pad=True 时补齐到 min_beats 个节点，避免触发节点数下限检查。
+    """pad=True 时补齐到 SPEC_MIN_BEATS 个节点、并把第二个节点标成 climax，
+    避免触发节点数下限与「零个 climax」这两条结构 warning。
     填充 clip 落在 300s 附近，刻意避开测试里用到的 OP(153-225) / ED(1348+) 区间。"""
     rows = list(clips_per_beat)
     if pad:
-        while len(rows) < 3:
+        while len(rows) < SPEC_MIN_BEATS:
             rows.append([clip(300.0 + 10 * len(rows), 305.0 + 10 * len(rows))])
     beats = []
     for i, clips in enumerate(rows):
@@ -79,11 +82,19 @@ def make_script(clips_per_beat, *, pad=True):
         # 不然每一条「warnings == []」的断言都会被结构 warning 污染。原来这里
         # 全是 hook/act，最后一个是 act。
         last = i == len(rows) - 1
+        if i == 0:
+            role = "hook"
+        elif last:
+            role = "outro"
+        elif i == 1:
+            role = "climax"
+        else:
+            role = "act"
         beats.append(
             Beat(
                 id=f"b{i + 1}",
                 label=(f"收尾：节点{i + 1}" if last else f"节点{i + 1}"),
-                role=("hook" if i == 0 else "outro" if last else "act"),
+                role=role,
                 narration="旁白" * 20,
                 clips=list(clips),
             )
@@ -822,6 +833,94 @@ def test_the_shape_real_products_use_warns_about_nothing():
         labels=["Hook 开场", "阶段一", "阶段二", "阶段三", "阶段四", "阶段五", "收尾：完"],
     )
     assert run(s).warnings == []
+
+
+# --- 结构：后补的三条 warning 与唯一一条判错 ---
+
+
+def test_too_few_beats_warns_but_does_not_raise():
+    """提示词要求 5–8 个节点，但 4 个节点照样能出片（见 ValidateConfig.min_beats
+    的注释），所以只给 warning。判错会烧掉一次几百秒的调用并赌上整集掉件。"""
+    s = structure_script(["hook", "act", "climax", "outro"])
+    hits = [w for w in run(s).warnings if "低于提示词要求" in w]
+    assert len(hits) == 1, run(s).warnings
+
+
+def test_beat_count_at_the_spec_floor_does_not_warn():
+    """边界：恰好 SPEC_MIN_BEATS 个不报。"""
+    s = structure_script(["hook", "act", "climax", "act", "outro"])
+    assert len(s.beats) == SPEC_MIN_BEATS
+    assert [w for w in run(s).warnings if "低于提示词要求" in w] == []
+
+
+def test_no_climax_warns_but_does_not_raise():
+    """零个 climax 只给 warning 是刻意的：beat.role == "climax" 在 src/ 里
+    **没有任何消费者**（全项目只有 validate.py 读 role，且只用 hook/outro 豁免
+    时间线检查），render / timeline / audio / tts / docgen 一处都不读。为一个
+    不影响输出的字段判错等于白烧一次调用。"""
+    s = structure_script(["hook", "act", "act", "act", "outro"])
+    hits = [w for w in run(s).warnings if "没有 role=climax" in w]
+    assert len(hits) == 1, run(s).warnings
+
+
+def test_too_many_clips_in_one_beat_warns_but_does_not_raise():
+    """单节点 clip 超上限是量变不是质变：每个 clip 被 render/timeline.py 的
+    per-beat ratio 摊得更短、切点更多，但照样出片。"""
+    rows = [
+        [
+            clip(100.0 + 10 * i, 105.0 + 10 * i)
+            for i in range(SPEC_MAX_CLIPS_PER_BEAT + 1)
+        ]
+    ]
+    s = make_script(rows)
+    hits = [w for w in run(s).warnings if "个 clip，超过提示词要求" in w]
+    assert len(hits) == 1, run(s).warnings
+
+
+def test_clip_count_at_the_spec_ceiling_does_not_warn():
+    """边界：恰好 SPEC_MAX_CLIPS_PER_BEAT 个不报。"""
+    rows = [
+        [clip(100.0 + 10 * i, 105.0 + 10 * i) for i in range(SPEC_MAX_CLIPS_PER_BEAT)]
+    ]
+    assert run(make_script(rows)).warnings == []
+
+
+def test_too_many_holds_raises():
+    """全片留白数量是**唯一**升级成判错的创作约定：每处 hold 是 2–4 秒旁白静音，
+    超上限那一版实测写了 11 处 = 22–44 秒，占 240 秒预算的 1/6 到 1/5，而且 hold
+    时长还会从旁白字数预算里扣，直接挤掉解说内容。模型改一轮就能修。"""
+    s = make_script([[clip(10.0, 15.0)]])
+    over = DEFAULT_VALIDATE.max_holds + 1
+    s.beats[0].audio.holds = [
+        Hold(at=1.0 + i, duration=2.0, quote="金句") for i in range(over)
+    ]
+    with pytest.raises(ScriptValidationError) as exc:
+        run(s)
+    assert "留白" in str(exc.value)
+    # 落盘给 pipeline 用的那一版必须带着（一次真实调用可达 561 秒）。
+    assert exc.value.script is not None
+
+
+def test_holds_at_the_cap_do_not_raise():
+    """边界：恰好 max_holds 处不判错。上限取 8 而不是提示词原来写的 6，是因为
+    tests/snapshots/saijo_e02.script.json（当质量基准用的样本）本身有 8 处 ——
+    按 6 判错第一个被拦的就是自家黄金快照。提示词已同步改成 3–8。"""
+    s = make_script([[clip(10.0, 15.0)]])
+    s.beats[0].audio.holds = [
+        Hold(at=1.0 + i, duration=2.0, quote="金句")
+        for i in range(DEFAULT_VALIDATE.max_holds)
+    ]
+    assert len(run(s).script.beats) == SPEC_MIN_BEATS
+
+
+def test_hold_count_is_summed_across_beats():
+    """判据是**全片**留白数，不是单节点。提示词写的是「全集给 3–8 处」。"""
+    s = make_script([[clip(10.0, 15.0)], [clip(100.0, 105.0)]])
+    per_beat = [Hold(at=1.0 + i, duration=2.0, quote="金句") for i in range(5)]
+    s.beats[0].audio.holds = list(per_beat)
+    s.beats[1].audio.holds = list(per_beat)
+    with pytest.raises(ScriptValidationError):
+        run(s)
 
 
 # --- B2：narration 非空 ---

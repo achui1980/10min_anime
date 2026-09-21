@@ -76,6 +76,12 @@ QUOTE_FRAGMENT_MIN_RATIO = 0.6
 
 # 提示词 single_episode.md 的「节点结构」一节要求末节点 label 以这个前缀开头。
 OUTRO_LABEL_PREFIX = "收尾："
+# 提示词要求的节点数下限（「总共 5–8 个节点」）与单节点 clip 数上限（「2–5 个 clip」）。
+# 跟 OUTRO_LABEL_PREFIX 同一类：提示词文本的镜像常量，不是「这部番想要什么」的创作
+# 旋钮，所以刻意不进 ValidateConfig。上限 max_beats 在 config 里是因为它本来就在，
+# 而这两个新的只用于 warning、改它们只会让 warning 变多变少，不影响判错。
+SPEC_MIN_BEATS = 5
+SPEC_MAX_CLIPS_PER_BEAT = 5
 # 「落在窗**外**的 anchor 行占比」的上限。名字里的 OUTSIDE 是刻意的：它原来叫
 # ANCHOR_COVERAGE_MIN_RATIO（「覆盖率下限」），而代码里比的是 outside/total，
 # 语义正好反过来 —— 读代码的人会以为 0.5 是「至少一半要被覆盖」。
@@ -411,6 +417,16 @@ def _check_structure(script: Script, cfg: ValidateConfig) -> list[str]:
     + akujo2 + 两份已提交样本）**全部满足**这四条：首节点 role=hook、末节点 role=outro
     且 label 以「收尾：」开头、6–7 个节点、恰好 1 个 climax。所以它们报出来一定是真的
     不合规格，不是判据太严。
+
+    后来补的三条（节点数低于 SPEC_MIN_BEATS、零个 climax、单节点 clip 数超过
+    SPEC_MAX_CLIPS_PER_BEAT）同样只给 warning，而且是**刻意**的：
+    - 零个 climax：`beat.role == "climax"` 在 src/ 里没有任何消费者（全项目只有本文件
+      读 role，且只用 hook/outro 豁免 _check_timeline_order），判错等于为一个不影响
+      输出的字段烧一次调用并赌上整集掉件；
+    - 节点数偏少：见 ValidateConfig.min_beats 的注释（「结构完整、能出片」）；
+    - 单节点 clip 偏多：每个 clip 被 ratio 摊得更短、切点变多，是量变不是质变。
+    唯一升级成判错的是「全片留白数量超过 cfg.max_holds」，它在 repair_script 里，
+    理由见 ValidateConfig.max_holds 的注释。
     """
     beats = script.beats
     if not beats:
@@ -434,12 +450,25 @@ def _check_structure(script: Script, cfg: ValidateConfig) -> list[str]:
             f"节点数 {len(beats)} 超过上限 {cfg.max_beats}（提示词要求 5–8 个），"
             f"每个节点分到的时长会被摊薄"
         )
+    elif len(beats) < SPEC_MIN_BEATS:
+        warnings.append(
+            f"节点数 {len(beats)} 低于提示词要求的 {SPEC_MIN_BEATS}–{cfg.max_beats} 个，"
+            f"节奏会偏粗"
+        )
     climaxes = [beat.label for beat in beats if beat.role == "climax"]
     if len(climaxes) > 1:
         warnings.append(
             f"有 {len(climaxes)} 个 climax 节点（{'、'.join(climaxes)}），"
             f"提示词要求最多 1 个"
         )
+    elif not climaxes:
+        warnings.append("没有 role=climax 的节点，提示词要求情绪最高的那个节点标 climax")
+    for beat in beats:
+        if len(beat.clips) > SPEC_MAX_CLIPS_PER_BEAT:
+            warnings.append(
+                f"节点 {beat.label!r} 有 {len(beat.clips)} 个 clip，"
+                f"超过提示词要求的 {SPEC_MAX_CLIPS_PER_BEAT} 个，单个镜头会被摊得过短"
+            )
     return warnings
 
 
@@ -544,6 +573,17 @@ def repair_script(
     if len(script.beats) < cfg.min_beats:
         raise ScriptValidationError(
             f"剧本节点数 {len(script.beats)} 少于下限 {cfg.min_beats}，重试",
+            script=script,
+        )
+
+    # 全片留白数量：唯一一条会判错重试的创作约定（理由见 ValidateConfig.max_holds）。
+    # 放在这里而不是 _check_structure 里，是因为 check_script 那一半按约定纯读只返
+    # warning，一个字节都不改也一次都不抛。
+    holds = sum(len(beat.audio.holds) for beat in script.beats)
+    if holds > cfg.max_holds:
+        raise ScriptValidationError(
+            f"全片留白 {holds} 处，超过上限 {cfg.max_holds}（提示词要求 3–8 处）："
+            f"每处 2–4 秒旁白静音，还要从旁白字数预算里扣，重试",
             script=script,
         )
 

@@ -110,19 +110,40 @@ def llm_beat(bid, label, role, chars, start, end, anchors=()):
     )
 
 
-def valid_llm_script(chars_per_beat=(360, 360, 360)):
-    roles = ["hook", "act", "outro"]
-    labels = ["Hook 开场", "阶段一：入职即地狱", "收尾：修罗场引爆"]
+def valid_llm_script(chars_per_beat=(216, 216, 216, 216, 216)):
+    # 默认 5 个节点、第二个是 climax：提示词「节点结构」要求的最小合规形状（5–8 个
+    # 节点、恰好 1 个 climax）。原来是 3 个节点、零 climax，validate 的结构检查补上
+    # 下限之后会照实报两条 warning，把「warnings == []」的断言污染掉。
+    # 5 × 216 字 = 1080 字 = 240 秒，跟原来 3 × 360 字**完全相同** —— 时长预算、
+    # 返工轮触发条件、est_total_seconds 的断言全部一字不变。
+    # 显式传 3 元组的调用点仍然得到 3 个节点（那些测试断言的是返工/择优行为，
+    # 不看 warning）。
+    count = len(chars_per_beat)
+
+    def role_of(i):
+        if i == 0:
+            return "hook"
+        if i == count - 1:
+            return "outro"
+        return "climax" if i == 1 else "act"
+
+    def label_of(i):
+        if i == 0:
+            return "Hook 开场"
+        if i == count - 1:
+            return "收尾：修罗场引爆"
+        return f"阶段{i}：入职即地狱"
+
     return LLMScript(
         beats=[
-            # 10/310/610 三个起点全部避开 op_range (153.486, 224.681) 与 ed_range
+            # 起点 10/310/610/… 全部避开 op_range (153.486, 224.681) 与 ed_range；
             # 只有 beat1 anchor 到第 1 行（偏差 2.88s 在 5s 容差内）；
             # track 只有 6 行覆盖 7-51s，物理上覆盖不到 310s/610s
             # clip 长度按 chars/4.5 给足：原来固定 5 秒，对 360 字（80 秒）的旁白
             # 就是 16 倍拉伸，validate 的 A3「画面/旁白预算」会报 warning。clip 长度
             # 对这些测试是无关变量，给成跟旁白同量级才不会掩盖真正要断言的东西。
             llm_beat(
-                f"b{i + 1}", labels[i], roles[i], chars,
+                f"b{i + 1}", label_of(i), role_of(i), chars,
                 10.0 + i * 300, 10.0 + i * 300 + chars / 4.5,
                 anchors=[1] if i == 0 else [],
             )
@@ -317,7 +338,7 @@ def test_to_script_maps_fields(cfg):
     assert script.mode == "single_episode"
     assert script.episodes == [2]
     assert script.target_seconds == pytest.approx(240.0)
-    assert len(script.beats) == 3
+    assert len(script.beats) == 5
     assert script.beats[0].label == "Hook 开场"
     assert script.beats[0].clips[0].visual == "画面 ➔ 特写"
 
@@ -388,7 +409,7 @@ async def test_generate_script_records_only_current_episode(track, report):
 async def test_generate_script_happy_path(cfg, track, report):
     provider = FakeProvider([valid_llm_script()])
     script, warnings = await generate_script(cfg, track, report, provider)
-    assert len(script.beats) == 3
+    assert len(script.beats) == 5
     assert script.est_total_seconds == pytest.approx(240.0)
     assert warnings == []
     assert len(provider.calls) == 1
@@ -418,12 +439,15 @@ async def test_generate_script_retries_once_on_validation_error(cfg, track, repo
     provider = FakeProvider([bad, valid_llm_script()])
     script, _ = await generate_script(cfg, track, report, provider)
     assert len(provider.calls) == 2
-    assert len(script.beats) == 3
+    assert len(script.beats) == 5
 
 
 @pytest.mark.asyncio
 async def test_generate_script_gives_up_after_second_validation_error(cfg, track, report):
     bad = LLMScript(beats=[llm_beat("b1", "Hook 开场", "hook", 360, 9000.0, 9005.0)])
+    # 显式钉住 1 次重试，不吃默认值：这条测的是「重试耗尽就放弃」，
+    # 不是「默认重试几次」（那是 test_validation_retries_comes_from_config 的活）。
+    cfg.llm.validation_retries = 1
     provider = FakeProvider([bad, bad])
     from tenmin.script.validate import ScriptValidationError
 
@@ -660,11 +684,12 @@ async def test_warnings_of_the_kept_first_draft_are_reported(cfg, track, report)
 @pytest.mark.asyncio
 async def test_validation_retries_comes_from_config(cfg, track, report):
     bad = LLMScript(beats=[llm_beat("b1", "Hook 开场", "hook", 360, 9000.0, 9080.0)])
-    cfg.llm.validation_retries = 2
-    provider = FakeProvider([bad, bad, valid_llm_script()])
+    # 3 而不是 2：2 跟现在的默认值重合，重合就证明不了这个字段真的被读了。
+    cfg.llm.validation_retries = 3
+    provider = FakeProvider([bad, bad, bad, valid_llm_script()])
     script, _ = await generate_script(cfg, track, report, provider)
-    assert len(provider.calls) == 3
-    assert len(script.beats) == 3
+    assert len(provider.calls) == 4
+    assert len(script.beats) == 5
 
 
 @pytest.mark.asyncio
@@ -682,7 +707,7 @@ async def test_budget_tolerance_comes_from_config(cfg, track, report):
     """1080 字 = 240s 正好达标；把容差收到 0 之后 +0.0% 仍然不超，
     但 1290 字（+19.4%）在默认 12% 下要重写、把容差放到 30% 就不该重写。"""
     cfg.llm.budget_tolerance = 0.30
-    provider = FakeProvider([valid_llm_script(chars_per_beat=(430, 430, 430))])
+    provider = FakeProvider([valid_llm_script(chars_per_beat=(258,) * 5)])
     _, warnings = await generate_script(cfg, track, report, provider)
     assert len(provider.calls) == 1
     assert warnings == []
@@ -698,7 +723,7 @@ async def test_final_validation_error_carries_the_rejected_script(cfg, track, re
     from tenmin.script.validate import ScriptValidationError
 
     bad = LLMScript(beats=[llm_beat("b1", "Hook 开场", "hook", 360, 9000.0, 9080.0)])
-    provider = FakeProvider([bad, bad])
+    provider = FakeProvider([bad] * (1 + cfg.llm.validation_retries))
     with pytest.raises(ScriptValidationError) as exc:
         await generate_script(cfg, track, report, provider)
     assert exc.value.script is not None

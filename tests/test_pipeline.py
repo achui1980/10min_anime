@@ -73,33 +73,41 @@ def project(tmp_path, golden_srt_path):
 
 
 def fake_script_response(episode: int = 2):
-    labels = ["Hook 开场", "阶段一：入职即地狱", "收尾：修罗场引爆"]
-    roles = ["hook", "act", "outro"]
+    # 5 个节点、其中一个 role=climax：提示词「节点结构」一节要求的最小合规形状
+    # （5–8 个节点、恰好 1 个 climax）。原来是 3 个节点、零 climax，validate 的结构
+    # 检查补上下限之后会照实报两条 warning —— 这份 fixture 表达的是「一次健康的
+    # 批处理」，该修的是 fixture 不是判据。
+    labels = [
+        "Hook 开场",
+        "阶段一：入职即地狱",
+        "阶段二：修罗场",
+        "阶段三：反击",
+        "收尾：修罗场引爆",
+    ]
+    roles = ["hook", "act", "climax", "act", "outro"]
     return LLMScript(
         beats=[
             LLMBeat(
                 id=f"b{i + 1}",
                 label=labels[i],
                 role=roles[i],
-                # 360 字，但**带句读**：12 句 ×（29 字 + 「。」）。原来是光秃秃的
-                # "啊" * 360，那是一个 360 字的单句，字幕会折成 12 行 —— 字幕可读性
-                # 检查因此照实报 warning，而这个 fixture 想表达的是「一次健康的批处理」。
-                # 字数不变（时长预算、clip 长度、chunk 划分全部照旧），只是补上真实旁白
-                # 必然有的句号。
-                narration=("啊" * 29 + "。") * 12,
+                # 216 字 = 48 秒旁白（4.5 字/秒）。5 个节点合计仍是 240 秒，跟原来
+                # 3 × 360 字完全相同，时长预算与返工轮的行为一字不变。
+                # **带句读**：12 句 ×（17 字 + 「。」）。光秃秃的一个长单句会让字幕
+                # 折成十几行 —— 字幕可读性检查照实报 warning。
+                narration=("啊" * 17 + "。") * 12,
                 clips=[
                     LLMClip(
                         episode=episode,
                         start=300.0 + i * 100,
-                        # 360 字 ≈ 80 秒旁白，画面就给 80 秒。原来这里只给 5 秒，
-                        # 拉伸倍率 16 倍——validate 的 A3「画面/旁白预算」会报 warning，
-                        # 而这个 fixture 的 clip 长度本来就是随手写的无关变量。
-                        end=300.0 + i * 100 + 80.0,
+                        # 画面跟旁白 1:1 给足 48 秒。给少了 validate 的 A3
+                        # 「画面/旁白预算」会报拉伸倍率 warning。
+                        end=300.0 + i * 100 + 48.0,
                         visual="画面 ➔ 特写",
                     )
                 ],
             )
-            for i in range(3)
+            for i in range(5)
         ]
     )
 
@@ -205,6 +213,7 @@ FROZEN_LAYOUT = {
     "script": "03_script/E02.script.json",
     "script_raw": "03_script/E02.raw.txt",
     "script_rejected": "03_script/E02.rejected.json",
+    "script_warnings": "03_script/E02.warnings.json",
     "table": "out/E02.解说方案.md",
     "narration": "out/E02.narration.txt",
     "voice_dir": "04_voice/E02",
@@ -1831,7 +1840,8 @@ async def test_run_script_persists_the_rejected_draft(project):
             for i in range(3)
         ]
     )
-    provider = FakeProvider([bad, bad])
+    # 首发 + LLMConfig.validation_retries 次重试，全喂同一份坏稿把重试耗尽。
+    provider = FakeProvider([bad] * (1 + project.llm.validation_retries))
     paths = Paths(project.root)
     with pytest.raises(ScriptValidationError) as exc:
         await run_script(project, provider, episode=2)
@@ -1839,6 +1849,66 @@ async def test_run_script_persists_the_rejected_draft(project):
     assert rejected.exists()
     assert Script.model_validate_json(rejected.read_text(encoding="utf-8")).beats
     assert str(rejected) in str(exc.value)
+
+
+@pytest.mark.asyncio
+async def test_run_script_persists_an_empty_warnings_file(project):
+    """warnings 原来只在内存里攒着、运行末尾由 cli.py 打一次黄字：不落盘、不进对照表，
+    而阶段一旦 fresh 就被跳过，重跑连黄字都不再出现。于是 validate.py 里那批「只给
+    warning」的检查在「没人盯终端」的用法下等于空转。
+
+    没有 warning 也要写文件：空列表 = 查过了没发现问题，文件缺失 = 从没跑过，
+    这两件事必须能分开。"""
+    run_ingest(project)
+    run_signals(project)
+    paths = Paths(project.root)
+    _, warnings = await run_script(
+        project, FakeProvider([fake_script_response()]), episode=2
+    )
+    assert warnings == []
+    path = paths.script_warnings(2)
+    assert path.exists()
+    assert json.loads(path.read_text(encoding="utf-8")) == {
+        "episode": 2,
+        "warnings": [],
+    }
+
+
+@pytest.mark.asyncio
+async def test_run_script_persists_the_warnings_it_found(project):
+    """3 个节点、零 climax：两条结构 warning，都不判错（min_beats 还是 3）。
+    这就是「只落盘不判错」那一档要留下的证据。"""
+    off_spec = LLMScript(
+        beats=[
+            LLMBeat(
+                id=f"b{i + 1}",
+                label=["Hook 开场", "阶段一", "收尾：完"][i],
+                role=["hook", "act", "outro"][i],
+                narration=("啊" * 29 + "。") * 12,
+                clips=[
+                    LLMClip(
+                        episode=2,
+                        start=300.0 + i * 100,
+                        end=300.0 + i * 100 + 80.0,
+                        visual="画面",
+                    )
+                ],
+            )
+            for i in range(3)
+        ]
+    )
+    run_ingest(project)
+    run_signals(project)
+    paths = Paths(project.root)
+    _, warnings = await run_script(
+        project, FakeProvider([off_spec, off_spec]), episode=2
+    )
+    assert warnings, "3 个节点 + 零 climax 该报 warning"
+    payload = json.loads(paths.script_warnings(2).read_text(encoding="utf-8"))
+    assert payload["episode"] == 2
+    assert payload["warnings"] == warnings
+    # 中文必须是原样的字，不是 \\uXXXX 转义 —— 这份文件是给人打开看的。
+    assert "节点数" in paths.script_warnings(2).read_text(encoding="utf-8")
 
 
 @pytest.mark.asyncio
