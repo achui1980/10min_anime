@@ -1713,10 +1713,11 @@ class _Box(BaseModel):
 
 
 def test_schema_repair_is_public():
-    """它本来就是 provider 无关的通用机制，此前只是恰好只有一个消费者。
+    """它本来就是 provider 无关的通用机制，此前只被两个 provider 自己调用。
 
-    这条与下面三条是重叠的（那三条都 import 这个名字），留着是为了把「这个名字是
-    公开契约、不要再加回下划线」写成一句独立的话。
+    这条与下面四条是重叠的 —— 文件头的模块级 import 已经会在名字改回私有时让整个
+    文件收集失败。留着它只为把「这个名字是公开契约、不要再加回下划线」写成一句
+    独立的断言。
     """
     assert hasattr(llm, "complete_with_schema_repair")
 

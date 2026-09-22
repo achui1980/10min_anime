@@ -263,8 +263,17 @@ async def complete_with_schema_repair[T: BaseModel](
     下面那条 except 刻意按窄类型捕获，否则 send 内部任何一个 ValueError 都会被误当成
     「输出形态不对」白重试几轮。
 
-    去掉前导下划线是因为它不再只有一个消费者。它一直是 provider 无关的通用机制，
-    此前只是恰好只被 provider 自己调用。
+    check 必须是只读的 —— 只做校验、抛错或放行，不要就地改 parsed。签名是 -> None、
+    返回值被丢弃，所以就地修改虽然**会**被保留下来（返回的是同一个对象），但那是隐式
+    副作用，不是这个钩子的契约。
+
+    check 抛出的异常经 str() 后会被截到 REPAIR_ERROR_MAX_CHARS（今天是 1500）个字符
+    才进 RepairContext.error。上面那种「漏了哪几条」的清单在几百条译文轨上很容易超
+    上限、被静默砍掉半截，所以调用方要自己先摘要（写「缺 137,298 等共 N 条」而不是
+    硬拼全量清单）。
+
+    去掉前导下划线是为了让 provider 之外的调用方也能用（翻译阶段会是第一个）。此前
+    它只被两个 provider 自己调用。
     """
     repair: RepairContext | None = None
     last_error = ""
