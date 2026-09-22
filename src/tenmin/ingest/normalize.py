@@ -161,6 +161,7 @@ def build_track(
     episode: int,
     show_title: str = "",
     convert_traditional: bool = True,
+    source: Literal["srt", "asr"] = "srt",
     glossary: dict[str, str] | None = None,
     op_range: tuple[float, float] | None = None,
     ed_range: tuple[float, float] | None = None,
@@ -184,6 +185,10 @@ def build_track(
 
     ingest / credits 收全部数值阈值。刻意传整个 config 对象而不是散装参数：
     两者加起来有近 20 个旋钮，摊平成关键字参数这个签名就没法看了。
+
+    source 说的是这份对白从哪来（原生字幕 / 机器听写），不是文件格式 —— 三条来源路径
+    给出的都是 SRT。它会被写进产物，下游靠它判断这是什么语言的对白：翻译阶段只对
+    听写来的日语对白动手，而繁转简（OpenCC）对日语是有害的。
     """
     ingest = ingest or DEFAULT_INGEST
     credits = credits or DEFAULT_CREDITS
@@ -201,10 +206,14 @@ def build_track(
     # 才需要「先分类、再从 credits 行反推区间」的老顺序。
     manual_op = _resolve_manual_range(op_range, credits.default_op_range, duration)
     manual_ed = _resolve_manual_range(ed_range, credits.default_ed_range, duration)
+    # 听写来的对白是源片的原生语言（日语），过一遍繁转简会被改字（实测 `製作の話`
+    # → `制作の话`）。这里强制关掉而不是要求调用方记得传：source 是「数据是什么」的
+    # 事实，而 convert_traditional 是「想怎么处理繁体中文」的创作旋钮，前者该压住后者。
+    convert = convert_traditional and source == "srt"
     lines: list[DialogueLine] = []
 
     for cue in cues:
-        cleaned = clean_text(cue.text, convert=convert_traditional, glossary=glossary)
+        cleaned = clean_text(cue.text, convert=convert, glossary=glossary)
         window = in_credit_window(
             cue.start, duration, cfg=credits, op=manual_op, ed=manual_ed
         )
@@ -242,7 +251,7 @@ def build_track(
     inferred_op, inferred_ed = find_credit_ranges(lines, duration, cfg=credits)
     return DialogueTrack(
         episode=episode,
-        source="srt",
+        source=source,
         duration=duration,
         op_range=manual_op or inferred_op,
         ed_range=manual_ed or inferred_ed,

@@ -531,3 +531,38 @@ def test_credit_range_source_reports_which_level_won():
     # 项目级默认写了但在这一集上解析不出合法区间（duration 早于起点）→ 实际走推断，
     # 显示也必须说推断，不能因为「字段填了」就报 project。
     assert credit_range_source(None, (1290.0, None), 100.0) == "inferred"
+
+
+def test_build_track_records_the_source(tmp_path):
+    srt = tmp_path / "a.srt"
+    srt.write_text("1\n00:00:01,000 --> 00:00:02,000\nはい\n", encoding="utf-8")
+
+    track = build_track(srt, episode=1, source="asr")
+    assert track.source == "asr"
+
+
+def test_build_track_defaults_to_srt_source(tmp_path):
+    srt = tmp_path / "a.srt"
+    srt.write_text("1\n00:00:01,000 --> 00:00:02,000\n你好\n", encoding="utf-8")
+
+    assert build_track(srt, episode=1).source == "srt"
+
+
+def test_an_asr_source_never_goes_through_opencc(tmp_path):
+    """繁转简作用在日语上会改字（製作 → 制作 这类）。听写路径必须绕开它，
+    而且不能依赖调用方记得传 convert_traditional=False。"""
+    srt = tmp_path / "a.srt"
+    srt.write_text("1\n00:00:01,000 --> 00:00:02,000\n製作の話\n", encoding="utf-8")
+
+    track = build_track(srt, episode=1, source="asr", convert_traditional=True)
+    assert "製作" in "".join(line.text for line in track.lines)
+
+
+def test_an_srt_source_still_goes_through_opencc(tmp_path):
+    """上面那条的对照：压住 convert 的必须是「这份对白是听写来的」，
+    而不是「convert 这条路整个坏掉了」（把 convert 恒设 False 时这条会红）。"""
+    srt = tmp_path / "a.srt"
+    srt.write_text("1\n00:00:01,000 --> 00:00:02,000\n製作の話\n", encoding="utf-8")
+
+    track = build_track(srt, episode=1, convert_traditional=True)
+    assert "制作" in "".join(line.text for line in track.lines)

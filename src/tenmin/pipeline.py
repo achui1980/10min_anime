@@ -14,6 +14,7 @@ from tenmin.config import EpisodeConfig, ProjectConfig
 from tenmin.docgen.narration import render_narration
 from tenmin.docgen.table import render_table
 from tenmin.ingest.normalize import build_track
+from tenmin.ingest.resolve import resolve_subtitle_source
 from tenmin.models import DialogueTrack, Script, SignalReport, Timeline, VoiceTrack
 from tenmin.progress import NullProgressReporter, ProgressReporter
 from tenmin.render.audio import mix_audio
@@ -283,26 +284,53 @@ def _source_duration(cfg: ProjectConfig, episode: EpisodeConfig) -> float | None
         return None
 
 
+def _ingest_inputs(cfg: ProjectConfig) -> list[Path]:
+    """ingest 阶段的新鲜度输入。
+
+    每集取「手传字幕」与「源视频」里存在的那些。原来只取字幕，对一个只有视频的集会
+    得到空列表 —— 而空输入在新鲜度判据里等于「跳过」，于是换了片源也不会重跑。
+    反过来也别顺手把整份列表滤空：那样 ingest 就只盯 project.yaml，「改了字幕再重跑」
+    会被静默 stage_skip，下游各阶段因为 dialogue.json 没变而跟着一起跳过。
+    两条不变量各有一条测试守着。
+
+    刻意**不**把语音转写的缓存（Paths.asr_cache）算进来：它是 ingest 自己的产物，
+    算进输入会让「转写完写出缓存」这个动作立刻使 ingest 变得不新鲜，每次都重跑。
+    它自己的失效判据在 ingest.resolve 里，对着源视频的 mtime 单独判。
+
+    也别把 None 留在返回值里：唯一的消费者是 run_pipeline 的 ingest 分枝，而
+    _is_fresh 对每个输入调 Path.exists，一个 None 会把它崩成 AttributeError ——
+    指不到「这一集是生肉」这个根因。
+    """
+    inputs: list[Path] = []
+    for episode in cfg.episodes:
+        srt = cfg.srt_path(episode)
+        if srt is not None:
+            inputs.append(srt)
+        if episode.video is not None:
+            inputs.append(cfg.video_path(episode))
+    return inputs
+
+
 def run_ingest(cfg: ProjectConfig) -> list[DialogueTrack]:
     paths = Paths(cfg.root)
     tracks = []
     for episode in cfg.episodes:
-        # 临时守卫，接上对白轨来源解析之后连这段注释一起删（那一步会把这一行整个换成
-        # resolve_subtitle_source，生肉集从此有正经出路）。在那之前它必须在：CLI 已经
-        # 允许「只传 --video」登记一集，而 register_episode 在跑到这儿**之前**就把
-        # project.yaml 落盘了，这个循环又遍历**全部** cfg.episodes —— 少了它，一次生肉
-        # 登记会让这个项目往后每一次**跑到 ingest 的**运行都崩在 Path(None) 的 TypeError
-        # 上（TypeError 不在 cli.PIPELINE_ERRORS 里，用户拿到的是裸 traceback），连针对
-        # 其他完好集的运行一起拖下水。ValueError 在那张表里，所以这里换到的是一行红字。
-        srt = cfg.srt_path(episode)
-        if srt is None:
-            raise ValueError(
-                f"第 {episode.number} 集只有视频、没有字幕，"
-                "从视频里取对白轨的功能还没接上（软字幕轨抽取 / 语音转写）"
-            )
+        # 三条来源路径（手传 SRT / 视频内嵌软字幕轨 / 语音转写）都归一成一份 SRT，
+        # 所以 build_track 拿到的东西形态不变。这里每集**只解析一次**：软字幕轨那条
+        # 分枝每次调用都会重抽一遍（见 ingest/resolve.py 里那段注释），多调一次就多
+        # 一次 demux。
+        source = resolve_subtitle_source(
+            cfg.srt_path(episode),
+            cfg.video_path(episode) if episode.video is not None else None,
+            cache=paths.asr_cache(episode.number),
+            asr_config=cfg.asr,
+            ffmpeg_path=cfg.render.ffmpeg_path,
+            ffprobe_path=cfg.render.ffprobe_path,
+        )
         track = build_track(
-            srt,
+            source.path,
             episode=episode.number,
+            source=source.kind,
             glossary=cfg.glossary,
             convert_traditional=cfg.locale.convert_traditional,
             show_title=cfg.show,
@@ -821,14 +849,7 @@ async def run_pipeline(
 
     paths = Paths(cfg.root)
     numbers = [ep.number for ep in cfg.episodes]
-    # 生肉集（只有 video、没有 srt）在这里没有字幕输入可比，直接跳过它。
-    # 不能让 None 流进 is_fresh：唯一消费这份列表的是下面 ingest 那个分枝，而
-    # _is_fresh 对每个输入调 Path.exists，一个 None 会把它崩成 AttributeError ——
-    # 指不到「这一集是生肉」这个根因。
-    # 反过来也别顺手把整份列表滤空：那样 ingest 就只盯 project.yaml，「改了字幕再
-    # 重跑」会被静默 stage_skip，下游各阶段因为 dialogue.json 没变而跟着一起跳过
-    # （守在 test_a_newer_srt_makes_ingest_rerun）。
-    srt_inputs = [p for p in (cfg.srt_path(ep) for ep in cfg.episodes) if p is not None]
+    ingest_inputs = _ingest_inputs(cfg)
     warnings: list[str] = []
 
     def is_fresh(outputs: list[Path], inputs: list[Path]) -> bool:
@@ -850,7 +871,7 @@ async def run_pipeline(
 
     if "ingest" in wanted:
         outputs = [paths.dialogue(n) for n in numbers]
-        if force or not is_fresh(outputs, srt_inputs):
+        if force or not is_fresh(outputs, ingest_inputs):
             reporter.stage_start("ingest")
             warnings.extend(ingest_warnings(run_ingest(cfg)))
             reporter.stage_done("ingest")

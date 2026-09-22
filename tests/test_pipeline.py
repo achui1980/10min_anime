@@ -8,6 +8,7 @@ import yaml
 
 from tenmin.atomic import part_path
 from tenmin.config import EpisodeConfig, ProjectConfig, load_project
+from tenmin.ingest.resolve import SubtitleSource
 from tenmin.models import (
     AudioDirection,
     Beat,
@@ -24,6 +25,7 @@ from tenmin.pipeline import (
     STAGES,
     Paths,
     _find_episode,
+    _ingest_inputs,
     _is_fresh,
     ingest_warnings,
     register_episode,
@@ -2185,32 +2187,6 @@ def test_register_episode_without_an_srt_omits_it_from_the_yaml(tmp_path):
     assert "srt" not in entry
 
 
-def test_ingest_rejects_a_video_only_episode_with_a_clean_error(project, tmp_path):
-    """生肉集走到 run_ingest 必须撞上那个**临时**守卫，拿一条 ValueError。
-
-    这条测试跟 run_ingest 里那个守卫是一对，等对白轨来源解析接上、守卫被换成
-    resolve_subtitle_source 之后一起删。
-
-    在那之前它守的是：ValueError 在 cli.PIPELINE_ERRORS 里，而没有守卫时那里抛的是
-    `Path(None)` 上的 TypeError（不在那张表里）→ 用户拿到裸 traceback。更坏的是
-    register_episode 那时已经把 project.yaml 落盘了、run_ingest 又遍历全部集，所以
-    一次生肉登记会让这个项目往后每一次**跑到 ingest 的**运行都崩（没跑到 ingest 的
-    不受影响：run_ingest 只在 "ingest" in wanted 时才跑）。故意让第 2 集（字幕齐全）
-    留在配置里并排在生肉集之前，钉住「那一集自己是好的也照样被拖崩」这一半。
-    """
-    video = tmp_path / "e11.mp4"
-    video.write_bytes(b"fake")
-    register_episode(project, episode=11, srt=None, video=video)
-
-    with pytest.raises(ValueError, match="还没接上"):
-        run_ingest(project)
-
-    # 完好的第 2 集在中止之前已经把自己的产物落了盘 ——「它自己没病也照样被拖崩」。
-    # 光有上面那条 raises 断言不够：它对第 2 集有没有被碰过完全无感，把循环换成
-    # reversed(cfg.episodes)（生肉集先撞上、第 2 集压根不会被处理）照样绿。
-    assert Paths(project.root).dialogue(2).is_file()
-
-
 def test_register_episode_without_an_srt_clears_a_previous_one(tmp_path, golden_srt_path):
     """重登记同一集时不传 srt，就等于「这一集改走生肉路线」，旧字幕字段必须清掉。
 
@@ -2234,9 +2210,9 @@ def test_register_episode_without_an_srt_clears_a_previous_one(tmp_path, golden_
 async def test_ingest_freshness_survives_a_video_only_episode(project):
     """ingest 的新鲜度判据扫**全部**集的字幕输入，一集没有 srt 不能把它打死。
 
-    只跑 ingest、且刻意让它判成「已最新」：这条要测的是判据本身，不是 run_ingest
-    （生肉集的 run_ingest 还要等对白轨解析接上来才跑得动）。判据里没滤掉 None 的话
-    崩点是 _is_fresh 里的 `p.exists()`，报一个指不到根因的 AttributeError。
+    只跑 ingest、且刻意让它判成「已最新」：这条要测的是判据本身，不是 run_ingest。
+    判据里没滤掉 None 的话崩点是 _is_fresh 里的 `p.exists()`，报一个指不到根因的
+    AttributeError。
 
     别把 only 换成 []（什么都不跑）：那样 srt 输入压根不会被送进 _is_fresh，
     测试对「有没有滤掉 None」完全无感（实测把滤除去掉照样全绿）。
@@ -2263,10 +2239,10 @@ async def test_a_newer_srt_makes_ingest_rerun(project):
     """改了字幕就必须重跑 ingest —— 那份 SRT 是这个阶段的输入，不只是个摆设。
 
     跟上面那条是一对：滤掉生肉集的 None 时很容易顺手把整份字幕输入都丢掉
-    （`srt_inputs = []`），而那样一来 ingest 就只盯 project.yaml，「改字幕再重跑」
-    会被静默 stage_skip、下游各阶段又因为 dialogue.json 没变而跟着一起跳过，用户
-    拿到跟改动前一模一样的产物。实测把那一行换成空列表时全仓测试**一条都不红**，
-    所以这条不变量此前压根没人守。
+    （让 _ingest_inputs 返回空列表），而那样一来 ingest 就只盯 project.yaml，
+    「改字幕再重跑」会被静默 stage_skip、下游各阶段又因为 dialogue.json 没变而跟着
+    一起跳过，用户拿到跟改动前一模一样的产物。实测把那份输入换成空列表时全仓测试
+    **一条都不红**，所以这条不变量此前压根没人守。
     """
     paths = Paths(project.root)
     _file(paths.dialogue(2), '{"episode": 0, "lines": []}')
@@ -2280,3 +2256,108 @@ async def test_a_newer_srt_makes_ingest_rerun(project):
 
     assert ("stage_start", "ingest") in reporter.calls
     assert ("stage_skip", "ingest") not in reporter.calls
+
+
+def test_ingest_inputs_include_a_video_only_episodes_video(tmp_path):
+    """只有 video 的集也得能算出「该不该重跑」。原来的输入集合只取 srt，
+    对这种集会得到一个空输入列表 —— 而空输入在新鲜度判据里等于「跳过」，
+    于是换了片源也不会重跑。"""
+    cfg = _project_config(tmp_path)
+    video = tmp_path / "e11.mp4"
+    video.write_bytes(b"fake")
+    cfg = register_episode(cfg, episode=11, srt=None, video=video)
+
+    assert video.resolve() in _ingest_inputs(cfg)
+
+
+def test_ingest_inputs_include_both_when_both_exist(tmp_path, golden_srt_path):
+    cfg = _project_config(tmp_path)
+    srt = tmp_path / "hand.srt"
+    srt.write_text(golden_srt_path.read_text(encoding="utf-8"), encoding="utf-8")
+    video = tmp_path / "e11.mp4"
+    video.write_bytes(b"fake")
+    cfg = register_episode(cfg, episode=11, srt=srt, video=video)
+
+    inputs = _ingest_inputs(cfg)
+    assert video.resolve() in inputs
+    assert cfg.root / "srt" / "E11.srt" in inputs
+
+
+def test_ingest_inputs_exclude_the_asr_cache(tmp_path):
+    """转写缓存是 ingest 自己的产物。把它算进 ingest 的输入会让
+    「转写完写出缓存」这个动作立刻使 ingest 变得不新鲜 —— 每次都重跑。"""
+    cfg = _project_config(tmp_path)
+    video = tmp_path / "e11.mp4"
+    video.write_bytes(b"fake")
+    cfg = register_episode(cfg, episode=11, srt=None, video=video)
+    _file(Paths(cfg.root).asr_cache(11), "1\n00:00:01,000 --> 00:00:02,000\nはい\n")
+
+    assert all(".asr.srt" not in str(p) for p in _ingest_inputs(cfg))
+
+
+def _fake_resolve(recorded: list[dict]):
+    """替掉 run_ingest 里的来源解析：记下每次调用，按「有没有手传 srt」分两条路。
+
+    刻意不整份写死成一个固定返回值：run_ingest 遍历全部集，而这些用例的项目里既有
+    生肉集也有字幕齐全的第 2 集，写死会把后者一起改掉、看不出是哪一条路在起作用。
+    """
+
+    def fake(srt, video, **kwargs):
+        recorded.append({"srt": srt, "video": video, **kwargs})
+        if srt is not None:
+            return SubtitleSource(srt, "srt")
+        return SubtitleSource(kwargs["cache"], "asr")
+
+    return fake
+
+
+def _register_raw_episode(cfg: ProjectConfig, tmp_path: Path, text: str) -> ProjectConfig:
+    """登记一个只有视频的第 11 集，并把它的转写缓存预先摆好（内容由调用方给）。"""
+    video = tmp_path / "e11.mp4"
+    video.write_bytes(b"fake")
+    cfg = register_episode(cfg, episode=11, srt=None, video=video)
+    _file(Paths(cfg.root).asr_cache(11), text)
+    return cfg
+
+
+def test_ingest_resolves_a_video_only_episode_through_the_source_layer(
+    project, tmp_path, monkeypatch
+):
+    """生肉集不再撞守卫，而是走来源解析拿到一份 SRT。
+
+    顺带钉住转写缓存的落点来自 Paths（产物布局的唯一权威表）而不是某处内联的字面量：
+    改 _ARTIFACTS 里 asr_cache 那一行的后缀，这条断言就红。
+    """
+    cfg = _register_raw_episode(
+        project, tmp_path, "1\n00:00:01,000 --> 00:00:02,000\nはい\n"
+    )
+    recorded: list[dict] = []
+    monkeypatch.setattr(
+        "tenmin.pipeline.resolve_subtitle_source", _fake_resolve(recorded)
+    )
+
+    tracks = run_ingest(cfg)
+
+    raw = next(call for call in recorded if call["srt"] is None)
+    assert raw["cache"] == Paths(cfg.root).asr_cache(11)
+    # 软字幕轨那条路每次调用都会重抽，所以每集只许解析一次。
+    assert len(recorded) == len(cfg.episodes)
+    assert next(t for t in tracks if t.episode == 11).source == "asr"
+
+
+def test_ingest_never_runs_opencc_on_a_transcribed_track(project, tmp_path, monkeypatch):
+    """项目开着繁转简（默认就开）也不能碰听写来的日语对白 —— OpenCC 会改字。
+
+    这一条要在 run_ingest 这一层锁：normalize 那边的单元测试管「build_track 自己
+    压得住 convert」，这里管「run_ingest 真的把 source 递了下去」。
+    """
+    assert project.locale.convert_traditional is True
+    cfg = _register_raw_episode(
+        project, tmp_path, "1\n00:00:01,000 --> 00:00:02,000\n製作の話\n"
+    )
+    monkeypatch.setattr("tenmin.pipeline.resolve_subtitle_source", _fake_resolve([]))
+
+    tracks = run_ingest(cfg)
+
+    track = next(t for t in tracks if t.episode == 11)
+    assert "製作" in "".join(line.text for line in track.lines)
