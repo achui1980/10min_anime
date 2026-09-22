@@ -816,4 +816,8 @@ def test_run_still_requires_episode_when_registering_only_a_video(
     )
 
     assert result.exit_code == 1
-    assert "--episode" in out(result)
+    # 断言整句而不只是 `"--episode" in out(result)`：松散形式是假绿 —— 把文案改回旧的
+    # 「传 --srt/--video 时必须同时传 --episode」照样过，而这条测试走的正是 --video
+    # 单飞那条路，「别点用户压根没用的 --srt」就是这句文案唯一的存在理由。光看 flag
+    # 名更是被 _find_episode 的「没有注册」提示等其它含 --episode 的输出满足过。
+    assert "传 --video 时必须同时传 --episode" in out(result)

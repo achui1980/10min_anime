@@ -291,8 +291,8 @@ def run_ingest(cfg: ProjectConfig) -> list[DialogueTrack]:
         # resolve_subtitle_source，生肉集从此有正经出路）。在那之前它必须在：CLI 已经
         # 允许「只传 --video」登记一集，而 register_episode 在跑到这儿**之前**就把
         # project.yaml 落盘了，这个循环又遍历**全部** cfg.episodes —— 少了它，一次生肉
-        # 登记会让这个项目往后每一次 tenmin run 都崩在 Path(None) 的 TypeError 上
-        # （TypeError 不在 cli.PIPELINE_ERRORS 里，用户拿到的是裸 traceback），连针对
+        # 登记会让这个项目往后每一次**跑到 ingest 的**运行都崩在 Path(None) 的 TypeError
+        # 上（TypeError 不在 cli.PIPELINE_ERRORS 里，用户拿到的是裸 traceback），连针对
         # 其他完好集的运行一起拖下水。ValueError 在那张表里，所以这里换到的是一行红字。
         srt = cfg.srt_path(episode)
         if srt is None:

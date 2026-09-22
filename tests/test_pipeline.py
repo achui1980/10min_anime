@@ -2194,8 +2194,9 @@ def test_ingest_rejects_a_video_only_episode_with_a_clean_error(project, tmp_pat
     在那之前它守的是：ValueError 在 cli.PIPELINE_ERRORS 里，而没有守卫时那里抛的是
     `Path(None)` 上的 TypeError（不在那张表里）→ 用户拿到裸 traceback。更坏的是
     register_episode 那时已经把 project.yaml 落盘了、run_ingest 又遍历全部集，所以
-    一次生肉登记会让这个项目往后每次 run 都崩。故意让第 2 集（字幕齐全）留在配置里
-    并排在生肉集之前，钉住「那一集自己是好的也照样被拖崩」这一半。
+    一次生肉登记会让这个项目往后每一次**跑到 ingest 的**运行都崩（没跑到 ingest 的
+    不受影响：run_ingest 只在 "ingest" in wanted 时才跑）。故意让第 2 集（字幕齐全）
+    留在配置里并排在生肉集之前，钉住「那一集自己是好的也照样被拖崩」这一半。
     """
     video = tmp_path / "e11.mp4"
     video.write_bytes(b"fake")
@@ -2203,6 +2204,11 @@ def test_ingest_rejects_a_video_only_episode_with_a_clean_error(project, tmp_pat
 
     with pytest.raises(ValueError, match="还没接上"):
         run_ingest(project)
+
+    # 完好的第 2 集在中止之前已经把自己的产物落了盘 ——「它自己没病也照样被拖崩」。
+    # 光有上面那条 raises 断言不够：它对第 2 集有没有被碰过完全无感，把循环换成
+    # reversed(cfg.episodes)（生肉集先撞上、第 2 集压根不会被处理）照样绿。
+    assert Paths(project.root).dialogue(2).is_file()
 
 
 def test_register_episode_without_an_srt_clears_a_previous_one(tmp_path, golden_srt_path):
