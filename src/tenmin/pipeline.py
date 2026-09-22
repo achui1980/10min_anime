@@ -969,7 +969,8 @@ async def run_pipeline(
 
     **script 阶段的多集并发**（`llm.script_concurrency`）：编排保持「按集纵向」，
     只给 script 加一个**有界预取窗口** —— 走到第 i 集时确保前 `i + concurrency` 集的
-    script task 都已经起了，然后 await 第 i 集那个。取舍见 `_launch_scripts` 的注释。
+    script task 都已经起了，然后 await 第 i 集那个。本次运行含 translate 时窗口被钳到 1
+    （术语表是 script 的输入却由循环里的 translate 写）。取舍见 `_launch_scripts` 的注释。
     """
     if cfg.mode == "season":
         raise NotImplementedError("整季模式尚未实现，请使用 mode: single_episode")
@@ -1075,9 +1076,14 @@ async def run_pipeline(
         那几次 LLM 调用的 token 白花了。串行下它们压根不会发出去。这也是默认值取 1 的
         三条依据之一，另两条见 config.LLMConfig.script_concurrency。
 
-        新鲜度在**起 task 的时刻**判，比原来早了几集。等价性：script 阶段的输入是
-        dialogue/signals（都由循环之前的全局阶段写完了）加 project.yaml，而
-        paths.script(n) 只会被第 n 集自己的 task 写 —— 没有任何一集能改变另一集的判据。
+        新鲜度在**起 task 的时刻**判，比原来早了几集。这只在「这一集的判据与产物没有
+        任何别的集能动」时才等价：dialogue/signals 都由循环之前的全局阶段写完了，
+        project.yaml 不变，paths.script(n) 也只会被第 n 集自己的 task 写。
+
+        累积术语表是这条等价性唯一的破口 —— 它在 _script_inputs 里，却是**纵向循环里**
+        的 translate 写的。所以本次运行含 translate 时窗口被钳到 1（见调用处）：不钳的话
+        后面几集的 script 会在自己的 translate 之前既判新鲜度又执行，可能被判 fresh 而
+        跳过（解说稿用旧译名），也可能 load_glossary 读到还缺本集术语的表 —— 非确定性。
         """
         for number in target_numbers[:through]:
             if number in script_tasks:
@@ -1094,6 +1100,12 @@ async def run_pipeline(
                 )
             else:
                 script_tasks[number] = None
+
+    # 含 translate 的运行里预取窗口只能是「当前这一集」：术语表由纵向循环里的 translate
+    # 写，而它是 script 的新鲜度输入之一，跨集预取会让判据取决于「循环走到哪了」。
+    # 钳成 1 是保守的（繁中片源上 translate 是零动作，术语表压根不会出现），但换来的是
+    # 确定性；想在批量重跑解说稿时拿回并发就用 --from script / --only script。
+    script_window = 1 if "translate" in wanted else max(1, cfg.llm.script_concurrency)
 
     # 预取的 task 必须被这个 try/finally 完整包住：循环里**任何**阶段抛异常时
     # （不只是 script 自己），还在飞的那几集都得取消掉。
@@ -1115,7 +1127,7 @@ async def run_pipeline(
                     reporter.stage_skip("translate")
 
             if "script" in wanted:
-                _launch_scripts(position + max(1, cfg.llm.script_concurrency))
+                _launch_scripts(position + script_window)
                 task = script_tasks[number]
                 if task is None:
                     reporter.stage_skip("script")

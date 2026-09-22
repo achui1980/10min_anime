@@ -2,8 +2,9 @@
 
 只在「这一集既没有手传 SRT、视频里也没有软字幕轨」时才走到这里。产物落成一份普通
 SRT 而不是直接给出 cue 对象，有两个刻意的好处：转写一集要几分钟，落盘就等于缓存，
-重跑 ingest 不用重付；而且 SRT 是人能直接改的格式，转差了可以手动修，改完下次就走
-「手传 SRT」那条路。
+重跑 ingest 不用重付；而且 SRT 是人能直接改的格式，转差了可以手动修。手改**不会**把
+这一集翻成「手传 SRT」那条路（那条只看 project.yaml 的 `episodes[].srt`），仍然按
+`kind="asr"` 复用 —— 判据与理由见 resolve._is_usable_asr_cache 的 docstring。
 
 跟 srt_parser 并排：它们是同一层的两个 cue 来源，上面由 resolve 决定走哪个。
 """

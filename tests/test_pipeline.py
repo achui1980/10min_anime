@@ -20,6 +20,7 @@ from tenmin.models import (
     LLMClip,
     LLMScript,
     Script,
+    TranslatedTrack,
 )
 from tenmin.pipeline import (
     _ARTIFACTS,
@@ -2639,3 +2640,112 @@ def test_translate_freshness_does_not_include_the_glossary(tmp_path):
     _file(paths.glossary, '{"リディア": "莉迪亚"}')
     _shift_mtime(paths.glossary, 60.0)
     assert _is_fresh(outputs, _translate_inputs(paths, 11)) is True
+
+
+# --- script 的预取窗口与 translate 的交互 -----------------------------------
+
+
+def _project_with_asr_dialogues(
+    tmp_path: Path, numbers: tuple[int, ...]
+) -> tuple[ProjectConfig, Paths]:
+    """多集全是听写来的（source="asr"）project，对白轨已落盘。
+
+    只够 translate/script 做新鲜度判定用：这些用例把两个阶段本体都换成替身，所以
+    不需要真 SRT，也不需要 signals 产物（_is_fresh 自己会滤掉不存在的输入）。
+    """
+    root = tmp_path / "saijo"
+    (root / "srt").mkdir(parents=True, exist_ok=True)
+    entries = ""
+    for number in numbers:
+        video = tmp_path / f"e{number}.mp4"
+        video.write_bytes(b"fake")
+        entries += f"- number: {number}\n  video: {video}\n"
+    yaml_path = root / "project.yaml"
+    yaml_path.write_text(
+        "show: 才女的侍从\nslug: saijo\nmode: single_episode\n"
+        f"target_seconds: 240\nepisodes:\n{entries}",
+        encoding="utf-8",
+    )
+    cfg = load_project(yaml_path)
+    paths = Paths(cfg.root)
+    for number in numbers:
+        track = DialogueTrack(
+            episode=number,
+            source="asr",
+            duration=100.0,
+            lines=[DialogueLine(idx=1, start=1.0, end=2.0, text="はい", raw="はい")],
+        )
+        _file(paths.dialogue(number), track.model_dump_json(indent=2))
+    return cfg, paths
+
+
+def _spy_translate_and_script(monkeypatch) -> list[str]:
+    """把 translate/script 本体换成只记顺序的替身，返回那份共享的顺序清单。
+
+    script 的替身记 start/done 两笔、中间让出一次事件循环：少了这个让出点，替身会在
+    create_task 之后的第一次调度里一口气跑完，预取过的窗口跟没预取的长得一模一样，
+    这些用例就分辨不出窗口宽度了（实测：不让出时，把窗口钳到 1 的变异照样绿）。
+    """
+    order: list[str] = []
+
+    async def spy_translate(cfg, provider, episode):
+        order.append(f"translate{episode}")
+        return TranslatedTrack(episode=episode, lines=[])
+
+    async def spy_script(cfg, provider, episode, *, reporter=None):
+        order.append(f"script{episode}-start")
+        await asyncio.sleep(0.05)
+        order.append(f"script{episode}-done")
+        return None, []
+
+    monkeypatch.setattr("tenmin.pipeline.run_translate", spy_translate)
+    monkeypatch.setattr("tenmin.pipeline.run_script", spy_script)
+    return order
+
+
+@pytest.mark.asyncio
+async def test_run_pipeline_never_starts_a_script_before_its_own_translate(
+    tmp_path, monkeypatch
+):
+    """累积术语表是 script 的输入，而写它的是**纵向循环里**的 translate。
+
+    所以预取窗口一旦跨过当前这一集，后面几集的 script 就会在自己的 translate 之前既
+    判新鲜度又执行 —— 可能被判 fresh 而跳过（解说稿用旧译名），也可能 load_glossary
+    读到还缺本集术语的表。非确定性，两种都不该发生。
+    """
+    cfg, _ = _project_with_asr_dialogues(tmp_path, (1, 2, 3))
+    cfg.llm.script_concurrency = 3
+    order = _spy_translate_and_script(monkeypatch)
+
+    await run_pipeline(cfg, FakeProvider([]), only=["translate", "script"])
+
+    assert order == [
+        item
+        for number in (1, 2, 3)
+        for item in (
+            f"translate{number}",
+            f"script{number}-start",
+            f"script{number}-done",
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_run_pipeline_still_prefetches_scripts_without_translate(
+    tmp_path, monkeypatch
+):
+    """钳窗口只许发生在 translate 真的在这次运行里的时候。
+
+    预取窗口存在的理由是 script 最慢也最容易失败（单次调用实测 561 秒），
+    `--only script` / `--from script` 这类不含 translate 的运行必须照旧预取。
+    """
+    cfg, _ = _project_with_asr_dialogues(tmp_path, (1, 2, 3))
+    cfg.llm.script_concurrency = 3
+    order = _spy_translate_and_script(monkeypatch)
+
+    await run_pipeline(cfg, FakeProvider([]), only=["script"])
+
+    # 三集的 script 全在第一集跑完之前就起了。只钉「三笔 start 排在最前」，不钉 done 的
+    # 先后：那取决于三个同长 sleep 的醒来顺序，不是这条用例要保护的性质。
+    assert order[:3] == ["script1-start", "script2-start", "script3-start"]
+    assert sorted(order[3:]) == ["script1-done", "script2-done", "script3-done"]
