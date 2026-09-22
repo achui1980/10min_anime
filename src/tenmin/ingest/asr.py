@@ -196,7 +196,15 @@ def transcribe(
     # mlx-whisper 的 API 变了什么，后者要去看片源有没有人声轨。并成一句（原来的
     # `result.get("segments") or []`）等于把形状变化伪装成片源问题。
     if "segments" not in result:
-        raise ASRError(f"转写结果里没有 segments 这个键，只有 {sorted(result)}")
+        # `sorted(map(str, ...))` 而不是裸 `sorted(result)`：这条守卫存在的理由就是
+        # 「模型返回的形状变了」，而 result 不是 dict 时它自己会炸。实测裸版本拿
+        # `[{"a": 1}, {"b": 2}]`（最像的那种形状变化：直接返回 segment 列表）抛
+        # `TypeError: '<' not supported between instances of 'dict' and 'dict'`，
+        # 而 TypeError **不在** cli.PIPELINE_ERRORS 里 —— 报错语句自己漏出一整页
+        # traceback，比它要报的那件事更难查。先 str() 再排序对任何可迭代对象都成立。
+        # （注意不是「凡 list 必炸」：`[1, 2]` 排得动。炸的是元素之间不可比的那些，
+        # 也就是真实场景里的绝大多数。）
+        raise ASRError(f"转写结果里没有 segments 这个键，只有 {sorted(map(str, result))}")
     raw_segments = result["segments"]
     # str / bytes / Mapping 都是 Iterable，光判 Iterable 会把它们直接放行，然后在
     # segments_to_cues 的循环里漏成裸 AttributeError（`'str' object has no attribute

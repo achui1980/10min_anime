@@ -139,6 +139,10 @@ PROJECT_TEMPLATE_HEADER = """\
 # 登记一集（推荐，路径会自动填好；源片不会被拷进 work/，只记它的绝对路径）：
 #   tenmin run {slug} --episode 2 --srt <字幕路径> --video <源片路径>
 #
+# 没有字幕的生肉片源省掉 --srt 就行（对白轨靠视频里的软字幕轨或语音转写拿，
+# 后者要先 `uv sync --extra asr`）：
+#   tenmin run {slug} --episode 2 --video <源片路径>
+#
 # 也可以手写。srt 相对本文件所在目录解析，video 可以是相对路径或绝对路径：
 #   episodes:
 #   - number: 2
@@ -251,7 +255,7 @@ def run(
     srt: Path | None = SRT_OPTION,
     video: Path | None = VIDEO_OPTION,
 ) -> None:
-    """跑流水线：ingest -> signals -> script -> docgen -> voice -> timeline -> audio -> render。"""
+    """跑流水线：ingest→translate→signals→script→docgen→voice→timeline→audio→render。"""
     cfg = load_project(_project_file(work_dir, slug))
 
     # 三条规则（原来是「--srt 与 --video 必须一起传」那一条对称的规则）：

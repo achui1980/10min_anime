@@ -260,7 +260,7 @@ def test_rewrite_instruction_admits_when_expanding_is_impossible():
     assert "不能" in text and "减少或缩短留白" in text
 
 
-# --- 秒→字的反向换算只有一份实现（N2）--------------------------------------
+# --- 秒→字的反向换算只有一份实现 ----------------------------------------------
 
 
 @pytest.mark.parametrize("rate", ["+0%", "+20%", "-30%"])
@@ -291,7 +291,7 @@ def test_narration_chars_for_seconds_does_not_clamp_negatives():
     assert narration_chars_for_seconds(-10.0) < 0
 
 
-# --- beat_seconds 与 chunks 的跨度只有一份实现（N2）--------------------------
+# --- beat_seconds 与 chunks 的跨度只有一份实现 --------------------------------
 
 
 @pytest.mark.parametrize("rate", ["+0%", "+20%", "-20%"])

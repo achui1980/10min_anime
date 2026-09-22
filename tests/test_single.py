@@ -329,8 +329,8 @@ def test_prompt_tells_the_model_that_every_beat_needs_an_id(cfg, track, report):
 
 def test_prompt_tells_the_model_what_clip_episode_should_be(cfg, track, report):
     """
-    LLMClip.episode 是必填的（models.py:321），填错则 validate 静默丢掉该 clip
-    （R1），丢光一个节点就抛 ScriptValidationError。模板此前只有「集数：第 N 集」
+    LLMClip.episode 是必填的（models.py:321），填错则 validate 静默丢掉该 clip，
+    丢光一个节点就抛 ScriptValidationError。模板此前只有「集数：第 N 集」
     这一行素材，没说过它要被抄进每个 clip。
     """
     assert "`clip.episode`" in build_user_prompt(cfg, track, report)

@@ -432,7 +432,7 @@ def test_misconfigured_ffprobe_reaches_ingest_for_real(project):
 def test_run_signals_writes_signals_json(project):
     run_ingest(project)
     reports = run_signals(project)
-    # Task 10 实测：本集有 26 个 ≥3s 的无字幕间隙（候选池，不是高光集合）。
+    # 实测：本集有 26 个 ≥3s 的无字幕间隙（候选池，不是高光集合）。
     # tests/test_aggregate.py 对同一黄金样本断言的也是 26。
     assert len(reports[0].silent_gaps) == 26
     assert Paths(project.root).signals(2).exists()
@@ -1283,7 +1283,7 @@ def test_register_episode_updates_existing_entry_in_place(tmp_path, golden_srt_p
 
 def test_register_episode_preserves_other_episodes_op_range(tmp_path, golden_srt_path):
     """register_episode() 注册一个不相关的新集时，不能把其它已注册集的
-    op_range/ed_range 从 project.yaml 里静默抹掉（Task 12 code review 发现的 bug）。
+    op_range/ed_range 从 project.yaml 里静默抹掉（曾经真出过这个 bug）。
     """
     root = tmp_path / "saijo"
     (root / "srt").mkdir(parents=True)

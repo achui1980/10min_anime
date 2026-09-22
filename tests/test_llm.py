@@ -1596,7 +1596,7 @@ async def test_max_attempts_of_one_means_a_single_request(monkeypatch):
     assert "连续 1 次" in str(exc.value)
 
 
-# --- OpenAI 兼容路径也要认「输出被截断」（N4）--------------------------------
+# --- OpenAI 兼容路径也要认「输出被截断」---------------------------------------
 #
 # Gemini 那条路有 `_check_gemini_finish`，能把 `MAX_TOKENS` 翻译成「请调高
 # llm.max_output_tokens」。OpenAI 兼容那条路原来压根不看 `choices[0].finish_reason`，
@@ -1669,7 +1669,7 @@ async def test_truncation_error_is_in_the_pipeline_error_table(monkeypatch):
     assert issubclass(LLMFinishReasonError, PIPELINE_ERRORS)
 
 
-# --- last_usage 在并发下不可靠，这是**记录在案**的行为（N10）----------------
+# --- last_usage 在并发下不可靠，这是**记录在案**的行为 -------------------------
 
 
 @pytest.mark.asyncio

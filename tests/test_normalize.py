@@ -68,7 +68,7 @@ def test_merge_continuations_only_merges_dialogue_kind():
 
 def test_merge_continuations_skips_long_lines():
     """6.589s 的「才没有染呢我」是拖长音的完整一句，不是被折断的续行；
-    合并它会破坏 Task 11 的字密度最小值锚点。"""
+    合并它会破坏 signals 那边标定的字密度最小值锚点。"""
     lines = [dline(1, 0.0, 6.589, "才没有染呢我"), dline(2, 6.7, 8.0, "真的")]
     assert len(merge_continuations(lines)) == 2
 

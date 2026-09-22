@@ -27,6 +27,15 @@ from tenmin.render import ffmpeg
 _ASR_SUFFIX = ".asr.srt"
 _EMBEDDED_SUFFIX = ".embedded.srt"
 
+# ffmpeg 拒绝「位图字幕 → 文本字幕」时 stderr 里的原话（实测 ffmpeg 9.0.1 的二进制里
+# 就是这一句）。认它是为了把一整屏 ffmpeg 报错换成一句能照着做的中文。
+#
+# 只挑句子中间那一段来匹配，不含首尾：前缀 `Subtitle encoding currently only possible`
+# 里带 "currently"，那是 ffmpeg 留给自己改口的措辞；而整句连标点一起钉住的话，任何一次
+# 上游润色都会让这个分枝静默失效（失效的表现是退回旧行为 —— 一屏英文报错，不是变红，
+# 所以测试抓不到）。中间这段描述的是 ffmpeg 的能力边界本身，最不容易被改。
+_BITMAP_SUBTITLE_MARKER = "text to text or bitmap to bitmap"
+
 
 class SubtitleSource(NamedTuple):
     """选中的对白轨来源。
@@ -156,7 +165,23 @@ def resolve_subtitle_source(
         # 是数分钟（倍率见 ingest/asr.py 里记的那次 spike），两者不在同一个量级。所以
         # 这条路选最笨也最难错的做法。
         embedded = _embedded_dest(cache)
-        ffmpeg.extract_subtitle_track(video, embedded, ffmpeg=ffmpeg_path)
+        try:
+            ffmpeg.extract_subtitle_track(video, embedded, ffmpeg=ffmpeg_path)
+        except ffmpeg.FFmpegError as exc:
+            # 位图字幕轨（Blu-ray PGS / DVD VobSub）会走到这里：`has_subtitle_stream`
+            # 只回答「有没有字幕轨」，答不了「是不是文本」，于是抽取那一步撞上 ffmpeg 的
+            # 跨族转码守卫。**刻意不在这里自动回落到语音转写**：那等于把一次几分钟的
+            # 有损操作藏在一个看起来只是「抽个字幕」的分枝里，而且位图轨是能 OCR 的
+            # （信息还在），悄悄换成听写是把用户手上更好的那份素材丢了。
+            #
+            # 也刻意不把这段判断挪进 ffmpeg.py：那一层的 docstring 明写「不含业务判断」，
+            # 而「碰上位图轨该怎么办」（手传 SRT？换片源走听写？）是本模块的三岔职责。
+            if _BITMAP_SUBTITLE_MARKER not in str(exc):
+                raise
+            raise ValueError(
+                f"{video.name} 的字幕轨是位图格式（PGS / VobSub），抽不成 SRT。"
+                "手传一份 --srt，或者用一个没有字幕轨的片源让它走语音转写。"
+            ) from exc
         return SubtitleSource(embedded, "srt")
 
     if _is_usable_asr_cache(cache, video):

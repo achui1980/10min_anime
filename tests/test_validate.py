@@ -708,7 +708,7 @@ def test_footage_budget_uses_the_render_layer_clip_sum(monkeypatch):
     assert seen == [b.id for b in s.beats]
 
 
-# --- render.rate 必须一路穿到 validate（M2）-------------------------------
+# --- render.rate 必须一路穿到 validate ----------------------------------------
 #
 # validate 的两处 `beat_seconds(beat)` 原来不传 rate，落到 budget.DEFAULT_RATE
 # （"+0%"）；而 render/chunks.py 的 assign_holds 传了 rate，两边的注释都写着

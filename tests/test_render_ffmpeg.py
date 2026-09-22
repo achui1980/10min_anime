@@ -58,10 +58,10 @@ ENCODERS_SAMPLE = """Encoders:
 def pretend_binaries_exist(monkeypatch):
     """本文件里绝大多数用例打的是 `subprocess.run`，测的是**解析**而不是二进制发现。
 
-    `_require_binary` 现在挡在 ffmpeg **与 ffprobe** 两条路的前面（M3 之前只挡 ffmpeg
-    那条），如果不把 `shutil.which` 也桩掉，这些用例就变成「本机 PATH 上有没有
-    ffmpeg/ffprobe」的环境依赖 —— 实测把 PATH 收窄到 /usr/bin:/bin 之后，M3 之前就有
-    2 条会红（ffmpeg 侧），M3 之后是 25 条。
+    `_require_binary` 挡在 ffmpeg **与 ffprobe** 两条路的前面（它原来只挡 ffmpeg 那条），
+    如果不把 `shutil.which` 也桩掉，这些用例就变成「本机 PATH 上有没有 ffmpeg/ffprobe」
+    的环境依赖 —— 实测把 PATH 收窄到 /usr/bin:/bin 之后，只挡 ffmpeg 那一版有 2 条会红
+    （ffmpeg 侧），两条都挡之后是 25 条。
 
     「二进制不存在」本身有专门的用例（`test_capability_probe_says_which_binary`、
     `test_ffprobe_side_also_requires_the_binary` 等），它们自己再 setattr 一次覆盖掉
@@ -1140,7 +1140,7 @@ def test_has_audio_stream_is_false_on_empty_output(monkeypatch, tmp_path):
     assert has_audio_stream(media) is False
 
 
-# --- has_audio_stream 必须走 _probe_field 那个共享壳子（M3）------------------
+# --- has_audio_stream 必须走 _probe_field 那个共享壳子 -----------------------
 #
 # 它原来手写了第三份 subprocess.run，形状与 `_probe_field(..., stream="a")` 完全同构，
 # 但漏了那个壳子里的两条保护。下面三条各锁一个洞。

@@ -212,6 +212,51 @@ def test_saving_a_changed_table_does_rewrite(tmp_path):
     assert path.stat().st_mtime != 1_000_000.0
 
 
+def test_saving_over_a_dict_equal_but_differently_formatted_file_rewrites_it(tmp_path):
+    """「没变就不写」比的必须是**将要写下去的那份 payload**，不是字典。
+
+    这条挡的是两个看起来等价的实现：`json.loads(path.read_text(...)) == dict(glossary)`
+    与 `path.read_text(...).strip() == payload.strip()`。两者在全量测试下都存活，而它们
+    会把「字典相同、盘上格式不同」判成无需写 —— 于是一份被别的工具（或早期版本）写成
+    `ensure_ascii=True` 的表会永久保持转义态（`\\u30ea\\u30c7\\u30a3\\u30a2`），
+    save_glossary 承诺的「这是个人会手动纠错的文件，diff 得可读」就此静默失效，
+    而且没有任何症状能让人发现。
+    """
+    import json
+
+    path = tmp_path / "glossary.json"
+    table = {"リディア": "莉迪亚", "ルーファス": "鲁弗斯"}
+    # 同一个字典，但转义过、缩进 4、没有尾换行 —— 三处都跟 save_glossary 的规范形式不同。
+    path.write_text(json.dumps(table, ensure_ascii=True, indent=4), encoding="utf-8")
+
+    g.save_glossary(path, table)
+
+    body = path.read_text(encoding="utf-8")
+    assert "リディア" in body
+    assert "\\u30ea" not in body
+    assert body.endswith("\n")
+    assert body == json.dumps(dict(sorted(table.items())), ensure_ascii=False, indent=2) + "\n"
+
+
+def test_saving_over_a_file_that_only_lacks_the_trailing_newline_rewrites_it(tmp_path):
+    """上面那条挡不住 `.strip() == payload.strip()`（实测：那个变异体在它下面存活）。
+
+    只差首尾空白的那一档必须单独有一条：`.strip()` 版本会把「一模一样但少了尾换行」判成
+    没变，于是 `test_saved_file_ends_with_a_newline` 承诺的形状对**存量文件**永久不成立，
+    而每次运行都看起来很正常。
+    """
+    import json
+
+    path = tmp_path / "glossary.json"
+    table = {"リディア": "莉迪亚"}
+    payload = json.dumps(dict(sorted(table.items())), ensure_ascii=False, indent=2) + "\n"
+    path.write_text(payload.strip(), encoding="utf-8")
+
+    g.save_glossary(path, table)
+
+    assert path.read_text(encoding="utf-8") == payload
+
+
 def test_saving_over_a_corrupt_file_still_writes(tmp_path):
     """读盘比对失败（文件坏了 / 不是 UTF-8）时必须退回「照写」，而不是当成「没变」。"""
     path = tmp_path / "glossary.json"

@@ -1115,7 +1115,7 @@ async def test_synthesize_track_surfaces_bad_hold_warnings(tmp_path):
     assert any("900.0" in w and "最后一句" in w for w in warnings)
 
 
-# --- `.part` 命名只有一套（N8）----------------------------------------------
+# --- `.part` 命名只有一套 -----------------------------------------------------
 
 
 def test_leftover_parts_helper_actually_sees_a_part_file(tmp_path):

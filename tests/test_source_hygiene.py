@@ -1,11 +1,14 @@
 """跨模块的源码不变量。用 AST 扫 src/tenmin/，不是文本 grep。
 
-这里只放「一处漏了就会在别人的机器上炸、而本机测试永远绿」的规则。目前三条：
+前三条是「一处漏了就会在别人的机器上炸、而本机测试永远绿」；后两条是「一处漏了会让
+读代码的人跑错方向」，它们只扫文本、而且第 5 条连 tests/ 一起扫。目前五条：
 
 1. 文本 I/O 必须显式写 encoding。
 2. src/ 里不许有 assert（`python -O` 会把它整句剥掉）。
 3. 产物写入必须走 `tenmin.atomic`，不许直接 `Path.write_text` / `write_bytes` /
    `shutil.copyfile`。
+4. 注释里不许写 `模块.py:行号` 这种指向本项目自己的交叉引用（行号一定会漂）。
+5. 注释里不许留内部任务代号（计划文档只是某个时间点的快照，代号对读代码的人没有意义）。
 """
 
 from __future__ import annotations
@@ -97,7 +100,7 @@ def test_atomic_write_text_pins_utf8():
     assert default == "utf-8"
 
 
-# --- 守卫本身有洞：裸 open() 那一支（M4）------------------------------------
+# --- 守卫本身有洞：裸 open() 那一支 -------------------------------------------
 #
 # `_offenders` 原来是 `name = func.attr if isinstance(func, ast.Attribute) else None`
 # 紧跟一句 `if name is None: continue`，所以 `name == "open"` 那一支**只对
@@ -161,7 +164,7 @@ def test_no_assert_statements_in_src(path: Path):
     assert lines == [], f"{path.name} 第 {lines} 行有 assert"
 
 
-# --- 产物写入必须走 tenmin.atomic（M5）--------------------------------------
+# --- 产物写入必须走 tenmin.atomic ---------------------------------------------
 #
 # `pipeline._is_fresh` 只比 mtime。被 Ctrl-C 或 ffmpeg 中途失败留下的半截产物 mtime
 # 恰好最新，于是下一次运行把它判成「已是最新」整段跳过，一个截断的 .m4a/.mp4/.json
@@ -240,7 +243,7 @@ def test_the_atomic_audit_lets_the_atomic_helper_through(tmp_path):
     assert _non_atomic_writes(path) == []
 
 
-# --- 注释里不许写 `模块.py:行号` 这种交叉引用（N1）--------------------------
+# --- 注释里不许写 `模块.py:行号` 这种交叉引用 ---------------------------------
 #
 # 审查时逐条核过 13 处这种引用，**正确率 0/13** —— 它们全部在后续重构里漂掉了，
 # 而且漂得毫无痕迹（读注释的人会跳到一段完全无关的代码，然后怀疑自己）。行号是
@@ -302,7 +305,7 @@ def test_the_line_reference_audit_catches_an_internal_ref(tmp_path):
     ]
 
 
-# --- 注释里不许留内部任务代号（N7）------------------------------------------
+# --- 注释里不许留内部任务代号 -------------------------------------------------
 #
 # 形如「P + 一位数字 + 短横 + 一个大写字母」的代号曾经散在 60 多处注释里。它们对读代码
 # 的人**毫无意义**：那些计划文档是某个时间点的快照，代号既不指向代码里的任何东西，也不
@@ -312,8 +315,21 @@ def test_the_line_reference_audit_catches_an_internal_ref(tmp_path):
 # 描述一个已经做完的改动，正确写法是说清**它做了什么**：写「产物原子写
 # （tenmin.atomic）」，不写代号。
 #
-# 下面这条正则刻意不含任何字面代号，所以本文件不会自我命中。
-_TASK_CODE = re.compile(r"\bP\d-[A-Z]\b|\bP\d 的\b")
+# 三条分支，都是实测补上的（原来只有第一条，而它一个字母 + 数字的代号都抓不到 ——
+# 那种形态散在 tests/ 的 18 处注释里全部漏网）：
+#
+# 1. 「P + 一位数字 + 短横 + 一个大写字母」以及「P + 一位数字 + 的」—— 最早那一批的形态。
+# 2. **全角括号里的一个大写字母 + 数字**，分节标记最爱用的写法。全角括号是必要的收窄：
+#    裸 `\b[A-Z]\d\b` 会把默认模型名 `MiniMax` 后面跟的那个 `-` + 字母 + 数字判成违规
+#    （`-` 是非单词字符，所以那里有词边界），而它是本仓默认配置、在 src/ 与 tests/ 里
+#    到处都是。实测确认过这个误报。
+# 3. 「Task + 空格 + 数字」—— 计划文档里的任务编号。末尾的 `\d` 是必需的：asyncio 那句
+#    "Task was destroyed but it is pending" 会被无 `\d` 的版本误判（实测，
+#    tests/test_pipeline.py 里就有一条）。
+#
+# 下面这三条分支刻意都不含任何字面代号，本文件的注释也一律只描述形态、不举实例，
+# 所以这条审计不会自我命中。
+_TASK_CODE = re.compile(r"\bP\d-[A-Z]\b|\bP\d 的\b|（[A-Z]\d+）|\bTask \d+\b")
 
 # 也扫 tests/：那边原来占了三分之二。
 _ALL_AUDITED_DIRS = (SRC, Path(__file__).resolve().parent)
@@ -348,6 +364,40 @@ def test_the_task_code_audit_can_see_a_violation(tmp_path):
     code = "P" + "1-G"
     path.write_text(f"# 那是 {code} 的范围\n", encoding="utf-8")
     assert _task_codes(path) == [f"synthetic.py:1 {code}"]
+
+
+def test_the_task_code_audit_sees_a_parenthesised_letter_digit_code(tmp_path):
+    """全角括号里那种分节标记是漏得最多的一档：原来的正则只认「P + 数字 + 短横 + 字母」，
+    于是 tests/ 里 18 处「一个字母 + 数字」的代号长期全绿。"""
+    path = tmp_path / "synthetic.py"
+    code = "（" + "M" + "3）"
+    path.write_text(f"# --- 某条不变量{code}---------\n", encoding="utf-8")
+    assert len(_task_codes(path)) == 1
+
+
+def test_the_task_code_audit_does_not_flag_the_default_model_name(tmp_path):
+    """全角括号那条分支的收窄是必要的，不是保守：裸 `\\b[A-Z]\\d\\b` 会把本仓默认的
+    模型名判成违规（`-` 是非单词字符，所以 `M3` 前面有词边界）。"""
+    path = tmp_path / "synthetic.py"
+    path.write_text(
+        'MODEL = "Mini" + "Max-M3"\n# thinking 是 Mini""Max-M3 专属\n', encoding="utf-8"
+    )
+    assert _task_codes(path) == []
+
+
+def test_the_task_code_audit_sees_a_plan_task_number(tmp_path):
+    path = tmp_path / "synthetic.py"
+    code = "Task" + " 12"
+    path.write_text(f"# 收敛是 {code} 的事\n", encoding="utf-8")
+    assert _task_codes(path) == [f"synthetic.py:1 {code}"]
+
+
+def test_the_task_code_audit_does_not_flag_the_asyncio_message(tmp_path):
+    """`\\d` 是必需的：少了它，asyncio 那句 "Task was destroyed but it is pending"
+    会被判成任务代号（tests/test_pipeline.py 里就有一条真的）。"""
+    path = tmp_path / "synthetic.py"
+    path.write_text('# 会印一串 "Task was destroyed but it is pending"\n', encoding="utf-8")
+    assert _task_codes(path) == []
 
 
 def test_the_task_code_audit_covers_the_tests_directory():

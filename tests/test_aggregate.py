@@ -320,7 +320,7 @@ def test_build_report_wires_everything(golden_track):
     report = build_report(golden_track)
     assert report.episode == golden_track.episode
     assert report.median_char_rate > 0
-    # Task 10 实测：本集有 26 个 ≥3s 的无字幕间隙（这是候选池，不是高光集合）。
+    # 实测：本集有 26 个 ≥3s 的无字幕间隙（这是候选池，不是高光集合）。
     # 真正的回归护栏是 test_gaps.py 的宽松区间测试，这里只验 build_report 的接线。
     assert len(report.silent_gaps) == 26
     assert report.highlights

@@ -129,6 +129,49 @@ def test_parse_detailed_counts_clamped_cues():
     assert result.cues[1].clamped is False
 
 
+def _five_cue_srt() -> str:
+    return "".join(
+        f"{i}\n00:00:{i:02d},000 --> 00:00:{i + 1:02d},000\n第{i}句のせりふ\n\n"
+        for i in range(1, 6)
+    )
+
+
+def test_a_truncated_srt_warns_only_when_the_cut_lands_in_a_header_line():
+    """被打断写到一半的 SRT 里，「有没有 skipped_blocks」取决于截断落在哪一行。
+
+    这条不变量是 ingest/resolve.py 那个「软字幕轨每次重抽、绝不拿 dest 存在当复用判据」
+    决定的判据：一份截断的 SRT 在语法上是合法的（没有文件尾结构，一串顺序 cue 块的前缀
+    本身就能解析），所以 skipped_blocks 这个**给人看片源质量**的数字既可能多一条、也可能
+    一声不响 —— 而丢多少对白跟它无关（下面 body 那一档丢了两条 cue 却零警告）。
+
+    刻意**只钉定性关系**，不钉「一共有几个截断点」「其中几个零警告」：那两个数字只是
+    fixture 长度（序号位数、正文字数）的算术函数，换一份素材就变，钉住它们等于把测试焊在
+    这份 fixture 上而不是焊在这条不变量上。
+    """
+    text = _five_cue_srt()
+    third = text.index("3\n00:00:03")
+
+    # 序号行刚写下、时间戳行一个字符都还没到 → 那半个块找不到 `-->`，整块跳过。
+    cut_in_index = parse_srt_detailed(text[: third + 1])
+    assert cut_in_index.skipped_blocks >= 1
+
+    # 截断落在时间戳行中间（`00:00:03,000 --> 00:0`）→ 同理。
+    cut_in_timestamp = parse_srt_detailed(text[: third + len("3\n") + 12])
+    assert cut_in_timestamp.skipped_blocks >= 1
+
+    # 截断落在正文里 → 时间戳行是完整的，那一条 cue 照样成立（文本短了一截），
+    # **一条警告都没有**，而前面两条 cue 已经彻底不见了。
+    cut_in_body = parse_srt_detailed(text[: text.index("第3句のせりふ") + 2])
+    assert cut_in_body.skipped_blocks == 0
+    assert len(cut_in_body.cues) == 3
+    assert cut_in_body.cues[-1].text in "第3句のせりふ"
+
+    # 完整的那份是对照组：5 条、零警告。
+    whole = parse_srt_detailed(text)
+    assert len(whole.cues) == 5
+    assert whole.skipped_blocks == 0
+
+
 def test_parse_srt_stays_a_plain_list():
     """老调用点与老测试继续拿到纯 list，不受详细版影响。"""
     cues = parse_srt("1\n00:00:01,000 --> 00:00:02,000\nA\n")

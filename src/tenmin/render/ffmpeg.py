@@ -509,8 +509,16 @@ def extract_audio_track(video: Path, dest: Path, *, ffmpeg: str = FFMPEG) -> Non
 
     `-vn` 只是省掉一次白解码：实测不加它 wav 也照样出（wav muxer 把视频轨丢掉，
     `video:0KiB`，出来的字节数与加了 `-vn` 完全一致），但那会让 ffmpeg 白解一整条
-    24 分钟的视频流。`-y` 与「dest 不是原子落盘」两件事的理由见 extract_subtitle_track，
-    对这个函数逐字适用。
+    24 分钟的视频流。
+
+    `-y` 与「dest 不是原子落盘」两件事的**结论**跟 extract_subtitle_track 一样（被打断
+    留下的半份文件在下游看不出是残骸，所以不许拿 dest 存在当复用判据），但**机制不同**，
+    别把那边的理由逐字搬过来：那边是「SRT 没有文件尾结构，一串 cue 块的前缀本身就是一份
+    合法 SRT」，而 wav 有文件头、头里还声明了 data 块长度。真正的原因是 demuxer **容忍
+    声明长度与实际字节数不符**：实测一份 10 秒 16k 单声道的 wav 共 320078 字节、
+    `ffprobe -v error` 报 10.000000；截断到 40%（128031 字节）之后它退出码仍是 0、报
+    3.998563 秒、一条警告都没有。也就是说这里同样拿不到一个能区分「完整」与「截断」的
+    廉价体检，dest 存在与否不构成可用判据。
     """
     _require_source_video(video)
     dest = Path(dest)

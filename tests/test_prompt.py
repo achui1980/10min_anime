@@ -62,7 +62,10 @@ def test_single_episode_prompt_declares_all_placeholders():
 
 def test_golden_example_asset_exists_and_has_seven_beats():
     path = PROMPTS_DIR / "examples" / "saijo_e02.md"
-    assert path.exists(), "黄金样本 few-shot 资产缺失，见 Task 13 的人工资产门禁说明"
+    assert path.exists(), (
+        "黄金样本 few-shot 资产缺失。它是人工挑出来的，不能由代码重新生成 —— "
+        "少了它 build_user_prompt 拼不出范例段"
+    )
     text = path.read_text(encoding="utf-8")
     for label in (
         "Hook 开场",

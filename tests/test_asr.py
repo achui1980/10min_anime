@@ -2,6 +2,7 @@
 只测我们自己那几层：段落转 cue 的过滤规则、SRT 渲染、缺依赖时的报错。"""
 
 from pathlib import Path
+from types import MappingProxyType
 
 import pytest
 
@@ -9,10 +10,14 @@ from tenmin.ingest import asr
 
 
 def test_segments_to_cues_keeps_normal_segments():
+    """第二条刻意是 `MappingProxyType` 而不是 dict：元素级守卫声明的是 `Mapping`，
+    而把它收窄成 `isinstance(segment, dict)` 在只喂 dict 的测试集上**全绿** —— 然后一个
+    返回不可变映射（或任何 Mapping 实现）的模型版本会被判成「形状变了」而整批报错。
+    """
     cues = asr.segments_to_cues(
         [
             {"start": 1.0, "end": 2.5, "text": "こんにちは"},
-            {"start": 3.0, "end": 4.0, "text": "元気ですか"},
+            MappingProxyType({"start": 3.0, "end": 4.0, "text": "元気ですか"}),
         ]
     )
     assert [(c.idx, c.start, c.end, c.text) for c in cues] == [
@@ -75,6 +80,11 @@ def test_segments_to_cues_drops_non_finite_timestamps():
         [
             {"start": nan, "end": nan, "text": "幻"},
             {"start": 1.0, "end": nan, "text": "幻"},
+            # start 那一半必须单独有一条坏数据，否则 `isfinite(start) and isfinite(end)`
+            # 收窄成只判 end 也全绿：上面三条的 end 侧都已经非有限。而这一条在只判 end 的
+            # 版本下会被**留下来** —— end=2.0 是有限的，而兜底那句 `end <= start` 也救不了
+            # （`2.0 <= nan` 是 False）。
+            {"start": nan, "end": 2.0, "text": "幻"},
             {"start": float("-inf"), "end": float("inf"), "text": "幻"},
             {"start": 1.0, "end": 2.0, "text": "本物"},
         ]
@@ -107,7 +117,6 @@ def test_segments_to_cues_renumbers_after_dropping():
         ]
     )
     assert [c.idx for c in cues] == [1, 2]
-
 
 
 def test_segments_to_cues_raises_when_a_segment_is_not_a_mapping():
@@ -161,6 +170,7 @@ def test_format_timestamp_only_swaps_the_one_separator():
     from tenmin.timecode import format_timestamp
 
     assert format_timestamp(1.5).count(".") == 1
+
 
 def test_render_srt_uses_comma_millisecond_separator():
     """SRT 的毫秒分隔符是逗号。timecode.format_timestamp 产出的是点号版本，
@@ -430,6 +440,32 @@ def test_transcribe_tells_a_missing_segments_key_apart_from_an_empty_transcripti
         asr.transcribe(video, tmp_path / "out.srt", asr=AsrConfig())
     assert "segments" in str(excinfo.value)
     assert "没得到任何对白" not in str(excinfo.value)
+
+
+def test_a_missing_segments_key_reports_cleanly_even_when_the_result_is_a_list(
+    tmp_path, monkeypatch
+):
+    """这条守卫报错时**自己不许炸**。
+
+    `"segments" not in result` 对 list 也成立（成员判断），所以一个直接返回 segment 列表
+    的模型版本会走进这一支 —— 而裸 `sorted(result)` 在那里抛
+    `TypeError: '<' not supported between instances of 'dict' and 'dict'`（实测），
+    TypeError 不在 cli.PIPELINE_ERRORS 里，于是本该是一行红字的形状变化变成一整页
+    traceback，报错语句比它要报的那件事更难查。
+
+    刻意用 dict 列表而不是 `[1, 2]`：后者排得动，钉不住这个洞。
+    """
+    from tenmin.config import AsrConfig
+
+    video = tmp_path / "a.mp4"
+    video.write_bytes(b"x")
+    monkeypatch.setattr(
+        asr.ffmpeg, "extract_audio_track", lambda src, wav, **k: Path(wav).write_bytes(b"x")
+    )
+    monkeypatch.setattr(asr, "_run_model", lambda **k: [{"start": 0.0}, {"end": 1.0}])
+
+    with pytest.raises(asr.ASRError, match="没有 segments 这个键"):
+        asr.transcribe(video, tmp_path / "out.srt", asr=AsrConfig())
 
 
 def test_transcribe_feeds_the_model_the_extracted_wav(tmp_path, monkeypatch):

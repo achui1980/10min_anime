@@ -150,6 +150,73 @@ def test_an_existing_extracted_subtitle_is_re_extracted_anyway(tmp_path, stub):
     assert "截断残骸" not in body
 
 
+# --- 位图字幕轨（PGS / VobSub）------------------------------------------------
+#
+# has_subtitle_stream 只回答「有没有字幕轨」，答不了「是不是文本」，所以位图轨必然走进
+# 抽取那条分枝并在 ffmpeg 的跨族转码守卫上失败。不需要真的位图样本：要钉的是「认出那条
+# 报错并换成能照着做的话」，fake 掉 extract_subtitle_track 抛一个带那句原话的
+# FFmpegError 就够。
+
+
+def _raise_bitmap_error(video, dest, **kwargs):
+    raise resolve.ffmpeg.FFmpegError(
+        "ffmpeg 输出尾部...\n"
+        "Subtitle encoding currently only possible from text to text or bitmap to bitmap\n"
+    )
+
+
+def test_a_bitmap_subtitle_track_gets_an_actionable_chinese_error(monkeypatch, tmp_path, stub):
+    _, state = stub
+    state["has_subtitle"] = True
+    monkeypatch.setattr(resolve.ffmpeg, "extract_subtitle_track", _raise_bitmap_error)
+
+    with pytest.raises(ValueError) as caught:
+        resolve.resolve_subtitle_source(
+            None, _video(tmp_path), cache=_cache(tmp_path), asr_config=AsrConfig()
+        )
+
+    message = str(caught.value)
+    assert "e11.mp4" in message
+    assert "位图" in message
+    # 两条出路都必须在消息里：位图轨是能 OCR 的（信息还在），所以这一层刻意不自动回落到
+    # 听写 —— 那就有责任告诉人手上有哪些选择。
+    assert "--srt" in message
+    assert "语音转写" in message
+    # ValueError 而不是 FFmpegError 也无妨（两者都在 cli.PIPELINE_ERRORS 里），但英文原话
+    # 不许再出现在给人看的那行里，否则这个分枝只是在一屏报错上多贴了一句中文。
+    assert "bitmap to bitmap" not in message
+
+
+def test_an_unrelated_ffmpeg_failure_is_not_rewritten(monkeypatch, tmp_path, stub):
+    """只认位图那一条。别的 ffmpeg 失败原样抛出去 —— 换掉消息等于把真因抹了。"""
+    _, state = stub
+    state["has_subtitle"] = True
+
+    def fake_extract(video, dest, **kwargs):
+        raise resolve.ffmpeg.FFmpegError("No space left on device")
+
+    monkeypatch.setattr(resolve.ffmpeg, "extract_subtitle_track", fake_extract)
+
+    with pytest.raises(resolve.ffmpeg.FFmpegError, match="No space left on device"):
+        resolve.resolve_subtitle_source(
+            None, _video(tmp_path), cache=_cache(tmp_path), asr_config=AsrConfig()
+        )
+
+
+def test_a_bitmap_track_does_not_silently_fall_back_to_transcription(monkeypatch, tmp_path, stub):
+    """自动回落是个有诱惑力的错误：它把一次几分钟的有损操作藏进一个抽字幕的分枝里。"""
+    calls, state = stub
+    state["has_subtitle"] = True
+    monkeypatch.setattr(resolve.ffmpeg, "extract_subtitle_track", _raise_bitmap_error)
+
+    with pytest.raises(ValueError):
+        resolve.resolve_subtitle_source(
+            None, _video(tmp_path), cache=_cache(tmp_path), asr_config=AsrConfig()
+        )
+
+    assert calls["transcribe"] == []
+
+
 def test_transcription_is_the_last_resort(tmp_path, stub):
     calls, state = stub
     state["has_subtitle"] = False
