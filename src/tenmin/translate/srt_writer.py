@@ -35,7 +35,7 @@ def render_zh_srt(track: DialogueTrack, translated: TranslatedTrack) -> str:
     那些行压根不会被送去翻译），译文为空白的也跳过 —— 空字幕块会让播放器显示一个空行。
     这里只按「有没有内容」判，不追究空白是「从没送去翻译」还是「模型把一条译成了空串」：
     后者是内容级的漏译，该由翻译阶段自己的 id 对齐校验（进去多少条就该出来多少条）拦，
-    计划落在 translate/lines.py，目前还没有这个模块。
+    那道校验住在 translate/lines.py 的 check_alignment。
 
     反过来，带了轨里不存在的 id 一律报错，跟上面的静默跳过刻意不对称：多出来的 id 是
     「上游对齐没对上」的硬证据，而且它必然指到一行**不是这句**的时间上 —— 静默处理等于

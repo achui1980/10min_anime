@@ -287,7 +287,9 @@ def run(
         raise typer.Exit(code=2) from error
 
     provider = None
-    if "script" in stages:
+    # translate 也吃 provider（它是第二个要 LLM 的阶段）。漏掉它的话
+    # `--only translate` 会带着 provider=None 进 run_pipeline，炸在翻译那一层。
+    if {"script", "translate"} & set(stages):
         try:
             provider = build_provider(cfg.llm, Settings())
         except RuntimeError as error:

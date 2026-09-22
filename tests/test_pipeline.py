@@ -13,6 +13,7 @@ from tenmin.models import (
     AudioDirection,
     Beat,
     Clip,
+    DialogueLine,
     DialogueTrack,
     Hold,
     LLMBeat,
@@ -27,6 +28,8 @@ from tenmin.pipeline import (
     _find_episode,
     _ingest_inputs,
     _is_fresh,
+    _script_inputs,
+    _translate_inputs,
     ingest_warnings,
     register_episode,
     run_audio,
@@ -37,6 +40,7 @@ from tenmin.pipeline import (
     run_script,
     run_signals,
     run_timeline,
+    run_translate,
     run_voice,
     stages_from,
 )
@@ -118,6 +122,7 @@ def fake_script_response(episode: int = 2):
 def test_stage_names():
     assert STAGES == [
         "ingest",
+        "translate",
         "signals",
         "script",
         "docgen",
@@ -2380,3 +2385,164 @@ def test_ingest_never_runs_opencc_on_a_transcribed_track(project, tmp_path, monk
 
     track = next(t for t in tracks if t.episode == 11)
     assert "製作" in "".join(line.text for line in track.lines)
+
+
+# --- translate 阶段 ---------------------------------------------------------
+
+
+def _project_with_dialogue(
+    tmp_path: Path, *, episode: int, source: str
+) -> tuple[ProjectConfig, Paths]:
+    """一个只登记了这一集的 project，外加一份已落盘的对白轨产物。
+
+    刻意只登记一集：run_translate 走 _load_tracks，而它要求 cfg.episodes 里的**每一
+    集**都有对白轨产物，多登记一集就得多摆一份产物，而这些用例只关心一集。
+
+    yaml 里写不写 srt 跟着 source 走（听写来的那一集只有视频），纯粹为了让
+    project.yaml 看着像真的：run_translate 的判据只有对白轨里的 source 字段。
+    """
+    root = tmp_path / "saijo"
+    (root / "srt").mkdir(parents=True, exist_ok=True)
+    video = tmp_path / f"e{episode}.mp4"
+    video.write_bytes(b"fake")
+    entry = f"- number: {episode}\n  video: {video}\n"
+    if source == "srt":
+        srt_name = f"E{episode:02d}.srt"
+        (root / "srt" / srt_name).write_text(
+            "1\n00:00:01,000 --> 00:00:02,000\n你好\n", encoding="utf-8"
+        )
+        entry += f"  srt: srt/{srt_name}\n"
+    yaml_path = root / "project.yaml"
+    yaml_path.write_text(
+        "show: 才女的侍从\nslug: saijo\nmode: single_episode\n"
+        f"target_seconds: 240\nepisodes:\n{entry}",
+        encoding="utf-8",
+    )
+    cfg = load_project(yaml_path)
+    paths = Paths(cfg.root)
+    track = DialogueTrack(
+        episode=episode,
+        source=source,
+        duration=100.0,
+        lines=[
+            DialogueLine(idx=1, start=1.0, end=2.0, text="はい", raw="はい"),
+            DialogueLine(idx=2, start=3.0, end=4.0, text="そうですね", raw="そうですね"),
+        ],
+    )
+    _file(paths.dialogue(episode), track.model_dump_json(indent=2))
+    return cfg, paths
+
+
+def _translation_response(glossary: dict[str, str] | None = None) -> dict:
+    return {
+        "episode": 11,
+        "lines": [{"id": 1, "zh": "是的"}, {"id": 2, "zh": "说得对"}],
+        "glossary": glossary or {},
+    }
+
+
+def test_translate_sits_between_ingest_and_signals():
+    assert STAGES.index("ingest") < STAGES.index("translate") < STAGES.index("signals")
+
+
+async def test_run_translate_writes_all_three_artifacts(tmp_path):
+    """译文轨（中间产物）、中文字幕（交付物）、累积术语表（回写）。"""
+    cfg, paths = _project_with_dialogue(tmp_path, episode=11, source="asr")
+    provider = FakeProvider([_translation_response({"リディア": "莉迪亚"})])
+
+    await run_translate(cfg, provider, 11)
+
+    assert paths.zh_lines(11).is_file()
+    assert paths.zh_subtitles(11).is_file()
+    assert "是的" in paths.zh_subtitles(11).read_text(encoding="utf-8")
+    assert json.loads(paths.glossary.read_text(encoding="utf-8")) == {"リディア": "莉迪亚"}
+
+
+async def test_run_translate_accumulates_into_an_existing_glossary(tmp_path):
+    """第 2 集要看得见第 1 集定下的译名，且不能把它改掉。"""
+    cfg, paths = _project_with_dialogue(tmp_path, episode=11, source="asr")
+    _file(paths.glossary, json.dumps({"リディア": "莉迪亚"}, ensure_ascii=False))
+    provider = FakeProvider(
+        [_translation_response({"リディア": "莉蒂亚", "ルーファス": "鲁弗斯"})]
+    )
+
+    await run_translate(cfg, provider, 11)
+
+    stored = json.loads(paths.glossary.read_text(encoding="utf-8"))
+    assert stored["リディア"] == "莉迪亚"
+    assert stored["ルーファス"] == "鲁弗斯"
+
+
+async def test_run_translate_skips_a_native_subtitle_episode(tmp_path):
+    """现有片源自带中文字幕，整个阶段不该跑，zh/ 目录都不该建。
+
+    判据是对白轨的 source 字段，刻意不做语言自动检测：那是个会错的猜测，而 source
+    是一个确定的事实。FakeProvider 的预置响应给空列表，它被调用就抛。
+    """
+    cfg, paths = _project_with_dialogue(tmp_path, episode=2, source="srt")
+
+    result = await run_translate(cfg, FakeProvider([]), 2)
+
+    assert not paths.zh_lines(2).exists()
+    assert not paths.zh_subtitles(2).exists()
+    assert not paths.glossary.exists()
+    # 返回值仍然得是这一集的空轨：库调用方拿它当「这一集翻了什么」的答案。
+    assert result.episode == 2
+    assert result.lines == []
+
+
+async def test_run_pipeline_runs_translate_for_a_transcribed_episode(tmp_path):
+    """接线：--only translate 真的会把这一集翻出来。"""
+    cfg, paths = _project_with_dialogue(tmp_path, episode=11, source="asr")
+    provider = FakeProvider([_translation_response()])
+
+    await run_pipeline(cfg, provider, only=["translate"])
+
+    assert paths.zh_lines(11).is_file()
+    assert provider.calls
+
+
+async def test_run_pipeline_skips_a_fresh_translate(tmp_path):
+    """产物比对白轨新就别再付一次翻译费。"""
+    cfg, paths = _project_with_dialogue(tmp_path, episode=11, source="asr")
+    _file(paths.zh_lines(11), "{}")
+    _file(paths.zh_subtitles(11), "x")
+    _shift_mtime(paths.zh_lines(11), 60.0)
+    _shift_mtime(paths.zh_subtitles(11), 60.0)
+    provider = FakeProvider([])
+    reporter = FakeReporter()
+
+    await run_pipeline(cfg, provider, only=["translate"], reporter=reporter)
+
+    assert provider.calls == []
+    assert ("stage_skip", "translate") in reporter.calls
+
+
+def test_script_freshness_depends_on_the_glossary(tmp_path):
+    """手改了译名，解说稿该重跑 —— 术语表是 script 的真输入。"""
+    paths = Paths(tmp_path)
+    _file(paths.dialogue(11), "{}")
+    _file(paths.signals(11), "{}")
+    script = _file(paths.script(11), "{}")
+
+    assert paths.glossary in _script_inputs(paths, 11)
+    assert _is_fresh([script], _script_inputs(paths, 11)) is True
+    _file(paths.glossary, '{"リディア": "莉迪亚"}')
+    _shift_mtime(paths.glossary, 60.0)
+    assert _is_fresh([script], _script_inputs(paths, 11)) is False
+
+
+def test_translate_freshness_does_not_include_the_glossary(tmp_path):
+    """术语表既是 translate 的输入又是它的输出。把它算进输入集，这个阶段就永远不
+    新鲜 —— 每次都重跑，每次都重新付翻译费。"""
+    paths = Paths(tmp_path)
+    _file(paths.dialogue(11), "{}")
+    outputs = [_file(paths.zh_lines(11), "{}"), _file(paths.zh_subtitles(11), "x")]
+
+    inputs = _translate_inputs(paths, 11)
+    assert paths.dialogue(11) in inputs
+    assert paths.glossary not in inputs
+
+    _file(paths.glossary, '{"リディア": "莉迪亚"}')
+    _shift_mtime(paths.glossary, 60.0)
+    assert _is_fresh(outputs, _translate_inputs(paths, 11)) is True

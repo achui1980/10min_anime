@@ -138,6 +138,25 @@ def test_run_without_only_passes_none(tmp_path, monkeypatch):
     assert captured["only"] is None
 
 
+def test_run_only_translate_still_builds_a_provider(tmp_path, monkeypatch):
+    """translate 也吃 provider。只跑它时漏建 provider 会带着 None 进流水线。"""
+    _minimal_project(tmp_path)
+    seen: dict[str, object] = {}
+    sentinel = object()
+
+    async def fake_pipeline(cfg, provider, **kwargs):
+        seen["provider"] = provider
+        return []
+
+    monkeypatch.setattr("tenmin.cli.run_pipeline", fake_pipeline)
+    monkeypatch.setattr("tenmin.cli.build_provider", lambda llm, settings: sentinel)
+    result = runner.invoke(
+        app, ["run", "akujo2", "--work-dir", str(tmp_path), "--only", "translate"]
+    )
+    assert result.exit_code == 0, out(result)
+    assert seen["provider"] is sentinel
+
+
 def _bootstrap(work, golden_srt_path):
     root = work / "saijo"
     (root / "srt").mkdir(parents=True)

@@ -15,7 +15,14 @@ from tenmin.docgen.narration import render_narration
 from tenmin.docgen.table import render_table
 from tenmin.ingest.normalize import build_track
 from tenmin.ingest.resolve import resolve_subtitle_source
-from tenmin.models import DialogueTrack, Script, SignalReport, Timeline, VoiceTrack
+from tenmin.models import (
+    DialogueTrack,
+    Script,
+    SignalReport,
+    Timeline,
+    TranslatedTrack,
+    VoiceTrack,
+)
 from tenmin.progress import NullProgressReporter, ProgressReporter
 from tenmin.render.audio import mix_audio
 from tenmin.render.ffmpeg import (
@@ -33,9 +40,19 @@ from tenmin.script.llm import LLMProvider, LLMSchemaError
 from tenmin.script.single import generate_script
 from tenmin.script.validate import ScriptValidationError
 from tenmin.signals.aggregate import build_report
+from tenmin.translate.glossary import load_glossary, merge_glossary, save_glossary
+from tenmin.translate.lines import translate_track
+from tenmin.translate.srt_writer import render_zh_srt
 
+# translate 紧跟 ingest：它吃对白轨，而下游的解说稿要用它回写的累积术语表。
+#
+# **已知的顺序错位，已知且无害**：signals 是全局阶段（run_pipeline 在按集纵向循环
+# **之前**就把所有集跑完），而 translate 住在纵向循环里 —— 所以真实执行顺序是 signals
+# 先于 translate。这不违反任何依赖：signals 不读对白文本，只看时间戳与字数，跟语言无关。
+# 这张表里的位置表达的是「逻辑上它紧跟 ingest」以及 --only / --from 的语义顺序。
 STAGES = [
     "ingest",
+    "translate",
     "signals",
     "script",
     "docgen",
@@ -350,6 +367,30 @@ def _ingest_inputs(cfg: ProjectConfig) -> list[Path]:
     return inputs
 
 
+def _translate_inputs(paths: Paths, episode: int) -> list[Path]:
+    """翻译阶段的新鲜度输入。
+
+    只看对白轨。累积术语表刻意**不**在里面：它既是这个阶段的输入（喂给模型的「已定
+    术语」）又是它的输出（回写新认出来的词），算进输入集会让这个阶段永远不新鲜 ——
+    每一次运行都重跑，每一次都重新付一集的翻译费。
+
+    代价是：手改了术语表不会让已经翻好的集自动重翻（要 --force）。这是有意的取舍 ——
+    改译名的主要目的是让**后面**几集和解说稿用对写法，而解说稿那边的新鲜度是真的挂着
+    术语表的（见 _script_inputs）。
+    """
+    return [paths.dialogue(episode)]
+
+
+def _script_inputs(paths: Paths, episode: int) -> list[Path]:
+    """解说稿阶段的新鲜度输入。
+
+    术语表是这里的真输入：解说稿的 prompt 会读它，手动改了译名就该重写解说稿。
+    文件不存在时会被 _is_fresh 自己过滤掉（它只看存在的那些输入），所以无条件列进来是
+    安全的 —— 现有的繁中片源压根不会有这个文件。
+    """
+    return [paths.dialogue(episode), paths.signals(episode), paths.glossary]
+
+
 def run_ingest(cfg: ProjectConfig) -> list[DialogueTrack]:
     paths = Paths(cfg.root)
     tracks = []
@@ -416,6 +457,41 @@ def _load_tracks(cfg: ProjectConfig) -> list[DialogueTrack]:
             raise FileNotFoundError(f"缺少对白轨产物 {path}，请先跑 ingest 阶段")
         tracks.append(DialogueTrack.model_validate_json(path.read_text(encoding="utf-8")))
     return tracks
+
+
+async def run_translate(
+    cfg: ProjectConfig, provider: LLMProvider, episode: int
+) -> TranslatedTrack:
+    """翻译一集：落译文轨、中文字幕，并把新认出的术语并回累积表。
+
+    只对听写来的对白动手。手传的字幕与从视频里抽出来的软字幕轨都是片源自带的，本来
+    就是观众能读的语言。判据用对白轨的 source 字段，刻意不做语言自动检测 —— 那是个
+    会错的猜测，而 source 是一个确定的事实。
+
+    跳过时连 `zh/` 目录都不建（早退发生在任何写盘之前），所以现有的繁中片源在磁盘上
+    看不出这个阶段存在过。代价是这个函数每次运行都会被叫一遍：那一集的产物永远不会出现，
+    而新鲜度判据（_translate_inputs + _is_fresh）只看文件 mtime、拿不到 source 字段，
+    于是它每次都判「不新鲜」。一次读盘换「判据不必认识对白轨的内容」，划得来。
+    读的量是 _load_tracks 的全量（cfg.episodes 里每一集的对白轨），跟 run_script 同一个
+    口径 —— 十几集的 json 相对一次 LLM 调用可以忽略。
+
+    已知边界：手传一份日语 SRT（或者软字幕轨恰好是日语）时，这一阶段不会跑，而且那份
+    对白还会被繁转简改字。目前的片源都不是这种情况，真碰上了再说。
+    """
+    track = next(t for t in _load_tracks(cfg) if t.episode == episode)
+    if track.source != "asr":
+        return TranslatedTrack(episode=episode)
+
+    paths = Paths(cfg.root)
+    accumulated = load_glossary(paths.glossary)
+    translated = await translate_track(cfg, track, provider, accumulated=accumulated)
+
+    _write_json(paths.zh_lines(episode), translated.model_dump_json(indent=2))
+    _write_text(paths.zh_subtitles(episode), render_zh_srt(track, translated))
+    # merge 的方向是「累积的赢」：已经定下的译名不许被后面某一集改掉。喂给模型的那份表
+    # 另有一个方向（手写的赢），那一步在 translate_track 内部做。
+    save_glossary(paths.glossary, merge_glossary(accumulated, translated.glossary))
+    return translated
 
 
 def run_signals(cfg: ProjectConfig) -> list[SignalReport]:
@@ -990,7 +1066,7 @@ async def run_pipeline(
         for number in target_numbers[:through]:
             if number in script_tasks:
                 continue
-            inputs = [paths.dialogue(number), paths.signals(number)]
+            inputs = _script_inputs(paths, number)
             if force or not is_fresh([paths.script(number)], inputs):
                 script_tasks[number] = asyncio.create_task(
                     run_script(
@@ -1009,6 +1085,18 @@ async def run_pipeline(
         for position, number in enumerate(target_numbers):
             if episode is None:
                 reporter.episode_start(number, number_to_index[number], len(target_numbers))
+
+            if "translate" in wanted:
+                # **刻意不做多集并发**（script 上面那个有界预取窗口不往这里搬）：第 1 集
+                # 写完累积术语表、第 2 集才读到含第 1 集的版本，并发会让累积失去意义，
+                # 而且两个 task 会同时回写同一个文件。
+                outputs = [paths.zh_lines(number), paths.zh_subtitles(number)]
+                if force or not is_fresh(outputs, _translate_inputs(paths, number)):
+                    reporter.stage_start("translate")
+                    await run_translate(cfg, provider, number)
+                    reporter.stage_done("translate")
+                else:
+                    reporter.stage_skip("translate")
 
             if "script" in wanted:
                 _launch_scripts(position + max(1, cfg.llm.script_concurrency))
