@@ -219,6 +219,8 @@ FROZEN_LAYOUT = {
     "script_warnings": "03_script/E02.warnings.json",
     "table": "out/E02.解说方案.md",
     "narration": "out/E02.narration.txt",
+    "zh_lines": "zh/E02.zh.json",
+    "zh_subtitles": "out/E02.zh.srt",
     "voice_dir": "04_voice/E02",
     "voice": "04_voice/E02.voice.json",
     "timeline": "05_timeline/E02.timeline.json",
@@ -270,6 +272,17 @@ def test_paths_are_rooted_at_the_given_root(tmp_path):
     paths = Paths(tmp_path / "work" / "saijo")
     for kind in FROZEN_LAYOUT:
         assert getattr(paths, kind)(2).is_relative_to(tmp_path / "work" / "saijo"), kind
+
+
+def test_glossary_path_is_project_level(tmp_path):
+    """累积术语表不带集号：它的意义就是跨集共享。
+
+    做成 property 而不是方法是刻意的 —— test_paths_exposes_exactly_the_frozen_artifacts
+    断言 Paths 上可调用的公开名字集合正好等于按集产物那张表，property 不是 callable，
+    自动落在那个集合之外。
+    """
+    paths = Paths(tmp_path)
+    assert paths.glossary == tmp_path / "zh" / "glossary.json"
 
 
 def test_paths_layout(tmp_path):

@@ -22,6 +22,8 @@ from tenmin.models import (
     SubtitleCue,
     Timeline,
     TimelineSegment,
+    TranslatedLine,
+    TranslatedTrack,
     VoiceChunk,
     VoiceTrack,
 )
@@ -331,3 +333,27 @@ def test_timeline_output_seconds_ignores_a_negative_outro():
 def test_timeline_frame_rate_defaults_to_none():
     """存量 timeline.json 没有这个键，None = 「没探到」而不是「帧率是 0」。"""
     assert Timeline(episode=2).frame_rate is None
+
+
+def test_translated_track_round_trips():
+    track = TranslatedTrack(
+        episode=11,
+        lines=[TranslatedLine(id=1, zh="你好"), TranslatedLine(id=2, zh="再见")],
+        glossary={"リディア": "莉迪亚"},
+    )
+    restored = TranslatedTrack.model_validate_json(track.model_dump_json())
+    assert restored == track
+
+
+def test_translated_track_glossary_defaults_to_empty():
+    assert TranslatedTrack(episode=1, lines=[]).glossary == {}
+
+
+def test_translated_track_rejects_unknown_keys():
+    """译文轨是落盘产物，拼错的键必须当场报错而不是静默退回默认值。
+
+    这条钉的是「基类是 _StageModel（extra="forbid"）而不是裸 BaseModel」：
+    上面那条 round-trip 测试对基类的选择完全无感（换成 BaseModel 照样绿）。
+    """
+    with pytest.raises(ValidationError):
+        TranslatedTrack(episode=1, lines=[], glosary={})

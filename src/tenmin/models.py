@@ -188,6 +188,31 @@ class DialogueTrack(_StageModel):
     clamped_cues: int = Field(default=0, ge=0, description="end < start 被夹成零时长的 cue 数")
 
 
+class TranslatedLine(_StageModel):
+    """一条对白的中文译文。
+
+    id 是这条对白在 DialogueTrack.lines 里的位置（从 1 起），刻意**不是**
+    DialogueLine.idx —— 后者是 cue 级的键，一条 cue 被 split_dual_track 拆成多段时各段
+    沿用同一个 idx（见 DialogueLine 的 docstring），拿它当翻译对齐的键会让两段互相覆盖。
+    位置下标天然唯一，而且让「进去多少条就该出来多少条」这条校验变成一次集合相等判断。
+    """
+
+    id: int
+    zh: str
+
+
+class TranslatedTrack(_StageModel):
+    """一集的中文译文轨，加这一集认出来的专有名词译法。
+
+    glossary 跟译文放在同一个模型里、由同一次模型调用产出，是刻意的：分成两次调用就
+    没法保证译文里用的就是它报上来的那个译名。
+    """
+
+    episode: int
+    lines: list[TranslatedLine] = Field(default_factory=list)
+    glossary: dict[str, str] = Field(default_factory=dict)
+
+
 class Signal(_StageModel):
     """单条检测规则的原始输出，聚类前的中间产物。"""
 

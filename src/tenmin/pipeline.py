@@ -58,8 +58,8 @@ def episode_stem(episode: int) -> str:
 # tests/test_pipeline.py 的 FROZEN_LAYOUT 按字面量逐条锁死这张表拼出来的结果。
 #
 # 目录名带序号前缀（01_/02_/…）是刻意的：`ls work/<slug>` 就能按流水线顺序读出来。
-# 两个例外：out/ 不带序号，因为它是给人看的交付物目录，不是中间产物；srt/ 是输入目录，
-# 理由见 asr_cache 那条。
+# 三个例外：out/ 不带序号，因为它是给人看的交付物目录，不是中间产物；srt/ 是输入目录，
+# 理由见 asr_cache 那条；zh/ 是翻译阶段的中间产物目录，理由见 zh_lines 那条。
 _ARTIFACTS: dict[str, tuple[str, str]] = {
     "dialogue": ("01_dialogue", ".dialogue.json"),
     "signals": ("02_signals", ".signals.json"),
@@ -85,6 +85,15 @@ _ARTIFACTS: dict[str, tuple[str, str]] = {
     "script_warnings": ("03_script", ".warnings.json"),
     "table": ("out", ".解说方案.md"),
     "narration": ("out", ".narration.txt"),
+    # 翻译阶段。目录刻意不占 0N 编号：现有的 01_dialogue → 07_render 是连续的，
+    # 真按执行顺序插进去要把后面六个目录全部改名，而这些字符串是磁盘上的存量契约
+    # （改一个字符，work/ 下已有的全部产物路径失配），同时全仓大量注释按名字引用它们。
+    # docgen 把给人看的东西写进 out/ 已经立了「编号不等于执行顺序」这个先例。
+    # 项目级的累积术语表也住这个目录，但它不带集号，所以不在本表里（见 Paths.glossary）。
+    "zh_lines": ("zh", ".zh.json"),
+    # 中文字幕是交付物，跟解说方案、配音文本并排放 out/：那个目录的约定是
+    # 「给人看的东西都在这」，标准 SRT 可以直接拖进播放器。
+    "zh_subtitles": ("out", ".zh.srt"),
     "voice_dir": ("04_voice", ""),
     "voice": ("04_voice", ".voice.json"),
     "timeline": ("05_timeline", ".timeline.json"),
@@ -118,6 +127,9 @@ class Paths:
     这里要的是「布局知识只有一份」，不是「代码行数最少」。
     （这段原来写着方法个数，而那个数字在加第 14 个条目时就已经过期了 ——
     真正锁住「表与方法一一对应」的是 test_paths_exposes_exactly_the_frozen_artifacts。）
+
+    表外还挂着一个 property（glossary）：项目级产物不带集号，_artifact() 拼不出来，
+    理由见它自己的 docstring。
     """
 
     def __init__(self, root: Path):
@@ -150,6 +162,27 @@ class Paths:
 
     def narration(self, episode: int) -> Path:
         return self._artifact("narration", episode)
+
+    def zh_lines(self, episode: int) -> Path:
+        return self._artifact("zh_lines", episode)
+
+    def zh_subtitles(self, episode: int) -> Path:
+        return self._artifact("zh_subtitles", episode)
+
+    @property
+    def glossary(self) -> Path:
+        """跨集累积的专有名词表。
+
+        项目级、不带集号 —— 它的全部意义就是让第 2 集知道第 1 集把人名译成了什么。
+        所以它进不了 _ARTIFACTS：那张表的每一行都要靠集号才拼得出文件名。
+        刻意是 property 而不是方法：按集产物那张表有个测试断言 Paths 上可调用的公开
+        名字集合正好等于表里的键，property 不是 callable，自动落在那个集合之外。
+
+        目录名刻意从 _ARTIFACTS["zh_lines"] 上取而不是再写一个 "zh" 字面量：术语表跟
+        逐集译文必须同目录（`ls work/<slug>/zh` 要能一眼看全翻译阶段的中间产物），
+        而两份字面量之间没有任何机制能防止它们分叉。
+        """
+        return self.root / _ARTIFACTS["zh_lines"][0] / "glossary.json"
 
     def voice_dir(self, episode: int) -> Path:
         return self._artifact("voice_dir", episode)
