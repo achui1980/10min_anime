@@ -426,8 +426,11 @@ def has_subtitle_stream(path: Path, *, ffprobe: str = FFPROBE) -> bool:
 
     那条守卫的消息是**实测**的（ffmpeg 9.0.1，从反方向撞出来的：`-c:s dvdsub` 喂一份
     SRT 被同一句话拦住，而 `-c:s mov_text` 通过）。位图**源**那一侧没实测 —— 手上没有
-    PGS/VobSub 样本，而 ffmpeg 9 没有能造出一条来的编码器。消息本身列举了允许的组合
-    （text→text、bitmap→bitmap），bitmap→text 不在其中。
+    PGS/VobSub 样本，而本机造不出一份：ffmpeg 9 的位图字幕编码器是有的（`dvdsub` =
+    dvd_subtitle/VOBSUB、`dvbsub`、`xsub`），但从我们手上仅有的文本字幕出发，唯一的
+    入口是 text→bitmap，而它被**同一条守卫**以同一句话拦住 —— 也就是说那条守卫既是
+    要记的现象、也是造不出反例的原因。消息本身列举了允许的组合（text→text、
+    bitmap→bitmap），bitmap→text 不在其中。
 
     现在不修的理由：本项目的片源全是 WEB-DL，字幕轨要么没有、要么是文本轨，这条路一次
     没走到过；而失败是响亮的（FFmpegError 在 cli.PIPELINE_ERRORS 里，用户看到一行红字），
