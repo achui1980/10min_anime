@@ -28,6 +28,12 @@ def _clean(entries: Mapping[str, str]) -> dict[str, str]:
     `null` 或数字的条目强转出来是译名 `"None"` / `"3"`，会原样喂进 prompt 当成「已经
     定下的译法」，比少一条难查得多。声明的入参类型本来就是 `Mapping[str, str]`，强转
     是在回答一个没人问的问题。
+
+    键那一半的判据（`isinstance(key, str)`）跟值那一半**不对称**：走 `load_glossary`
+    那条路时它恒为真（JSON 对象的键必然是 str），只有 `merge_glossary` /
+    `effective_glossary` 的调用方 —— 它们收的是人写的 Python dict —— 才可能真的踩到它。
+    所以别把它读成给 load 路径准备的守卫。实测：单独删掉这半个判据，全量测试仍然全绿，
+    也就是说没有任何测试喂过非 str 的键。
     """
     cleaned: dict[str, str] = {}
     for key, value in entries.items():
@@ -50,10 +56,13 @@ def load_glossary(path: Path) -> dict[str, str]:
     `JSONDecodeError` 的，漏掉它的话一份被非 UTF-8 编辑器存回去的表会把异常漏出去、
     停掉整条管线 —— 正是这个函数发誓不做的事。
 
-    第一句 `is_file` 检查在行为上是**冗余**的（实测：缺文件 → `FileNotFoundError`、
-    路径是目录 → `IsADirectoryError`，两个都是 `OSError` 子类，下面那组捕获照样兜住
-    并返回空表）。留着它纯粹是为了把「文件不存在不是错误」这条意图写在显眼处，而不是
-    藏在一个 except 子句里；所以删掉它不会让任何测试变红，别把那当成「这里没被测到」。
+    第一句 `is_file` 检查只对**缺文件与目录**这两种情况是冗余的（实测：缺文件 →
+    `FileNotFoundError`、路径是目录 → `IsADirectoryError`，两个都是 `OSError` 子类，
+    下面那组捕获照样兜住并返回空表）。所以删掉它不会让任何测试变红 —— 但别据此当成
+    「没测到、可以删」：对 FIFO / 字符设备它**不冗余**。那种路径 `is_file()` 为 False 而
+    `exists()` 为 True（实测 `os.mkfifo` 建出来的就是这个组合），少了这一句
+    `read_text()` 会在 open 上**永久阻塞**、根本不抛异常，下面那组 except 兜不住。
+    顺带它也把「文件不存在不是错误」这条意图写在了显眼处，而不是藏在一个 except 子句里。
     """
     if not path.is_file():
         return {}
@@ -75,6 +84,10 @@ def save_glossary(path: Path, glossary: Mapping[str, str]) -> None:
 
     不用自己 mkdir：`atomic.write_text` 会代建父目录（实测），而这个表住在 `zh/` 底下，
     第一次存盘时那个目录还不存在。
+
+    **刻意不再过一遍 `_clean`** —— 所以模块 docstring 里说的那三个入口不含 save。理由是
+    传进来的表本身来自 `merge_glossary`，已经洗过了。这件事没有任何测试钉住：将来要是有
+    人把生数据直接喂给 save，「洗不洗」得重新想一遍，别默认它已经洗过。
     """
     payload = json.dumps(dict(sorted(glossary.items())), ensure_ascii=False, indent=2)
     atomic.write_text(path, payload + "\n")

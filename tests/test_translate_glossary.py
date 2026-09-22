@@ -29,7 +29,18 @@ def test_save_creates_the_parent_directory(tmp_path):
 
 
 def test_save_leaves_no_part_file_behind(tmp_path):
-    """守住「走的是原子写」：临时文件必须被 replace 掉，不许留在产物目录里。"""
+    """守住「产物目录里不许留临时文件」：save 之后那个目录里只有正式产物一个文件。
+
+    刻意**不要**把这条读成「守住了原子写」。实测证伪过：把 `save_glossary` 里的
+    `atomic.write_text` 换成裸 `path.write_text`（完全绕过原子写），本文件照样 26 passed
+    全绿 —— 普通 `write_text` 同样不留 `.part`，所以这条断言在原理上钉不住原子性。原子写
+    那条不变量由 `test_source_hygiene.py` 的 `test_artifact_writes_go_through_atomic`
+    守着（那次变异实验里只有它变红）。
+
+    两条各管一半、都不该删：那条审计是**语法**的，能抓到「调用点绕过了 atomic」这种这里
+    测不出来的形态，但它看不出 `atomic` 自己还好不好使；而这条是运行时的，`atomic_path`
+    哪天不 replace 了、或者 save 开始在旁边留个备份文件，只有它会红。
+    """
     path = tmp_path / "glossary.json"
     g.save_glossary(path, {"イ": "伊"})
     assert [p.name for p in tmp_path.iterdir()] == ["glossary.json"]
