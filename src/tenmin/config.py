@@ -453,6 +453,22 @@ class RenderConfig(BaseModel):
     ffprobe_path: str = "ffprobe"
 
 
+class AsrConfig(BaseModel):
+    """语音转写参数。只在「这一集既没有手传 SRT、视频里也没有软字幕轨」时才用得上。
+
+    刻意没有 engine 字段：本项目只支持 mlx-whisper 一个引擎（作者只在 Apple Silicon
+    Mac 上自用，faster-whisper 的跳平台优势买不到东西），多一层引擎抽象是为不存在的
+    需求付复杂度。真要换引擎时再加这个字段，那时也才知道抽象该切在哪。
+    """
+
+    # 实测：这个模型在 M 系列芯片上约 8 倍实时速度，一集 24 分钟的番约 3 分钟转完，
+    # 转出来的日语跟画面硬字幕交叉核对过，语义级吻合。再大的模型换不来可感知的收益
+    # （对白只是喂给 script 阶段当剧情理解材料，不进成片）。
+    model: str = "mlx-community/whisper-large-v3-turbo"
+    # 源片语言。不做自动检测：这是「素材是什么」的事实，让人填一次比让机器每集猜一次可靠。
+    language: str = "ja"
+
+
 class ProjectConfig(BaseModel):
     show: str
     slug: str
@@ -467,6 +483,7 @@ class ProjectConfig(BaseModel):
     signals: SignalsConfig = Field(default_factory=SignalsConfig)
     validate_script: ValidateConfig = Field(default_factory=ValidateConfig)
     render: RenderConfig = Field(default_factory=RenderConfig)
+    asr: AsrConfig = Field(default_factory=AsrConfig)
 
     _root: Path = PrivateAttr(default=Path("."))
 
@@ -518,6 +535,7 @@ DEFAULT_CREDITS = CreditsConfig()
 DEFAULT_SIGNALS = SignalsConfig()
 DEFAULT_VALIDATE = ValidateConfig()
 DEFAULT_RENDER = RenderConfig()
+DEFAULT_ASR = AsrConfig()
 DEFAULT_LLM = LLMConfig()
 
 

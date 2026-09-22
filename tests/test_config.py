@@ -550,3 +550,29 @@ episodes:
     cfg = load_project(path)
     assert cfg.credits.default_op_range == (300.0, 390.0)
     assert cfg.credits.default_ed_range == (1290.0, None)
+
+
+def test_asr_config_defaults():
+    from tenmin.config import AsrConfig
+
+    cfg = AsrConfig()
+    assert cfg.model == "mlx-community/whisper-large-v3-turbo"
+    assert cfg.language == "ja"
+
+
+def test_project_config_carries_an_asr_section():
+    from tenmin.config import AsrConfig, ProjectConfig
+
+    cfg = ProjectConfig(show="测试番", slug="test")
+    assert isinstance(cfg.asr, AsrConfig)
+    assert cfg.asr.language == "ja"
+
+
+def test_asr_section_is_overridable_from_yaml_shaped_data():
+    from tenmin.config import ProjectConfig
+
+    cfg = ProjectConfig.model_validate(
+        {"show": "测试番", "slug": "test", "asr": {"language": "en", "model": "tiny"}}
+    )
+    assert cfg.asr.language == "en"
+    assert cfg.asr.model == "tiny"

@@ -1,6 +1,6 @@
-"""conftest 的 render marker 门。
+"""conftest 的默认跳过 marker 门（render 与 asr）。
 
-`pyproject` 里 render 这个 marker 写的是「默认跳过（跑法：uv run pytest -m render）」，
+`pyproject` 里这两个 marker 写的都是「默认跳过（跑法：uv run pytest -m xxx）」，
 执行这条约定的是 `conftest.pytest_collection_modifyitems`。它原来的判据是**子串**匹配
 （`if "render" in (config.getoption("-m") or "")`）：
 
@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import pytest
 
-from .conftest import selects_render_marker
+from .conftest import selects_marker
 
 
 @pytest.mark.parametrize(
@@ -43,7 +43,25 @@ from .conftest import selects_render_marker
     ],
 )
 def test_selects_render_marker(expression, expected):
-    assert selects_render_marker(expression) is expected
+    assert selects_marker(expression, "render") is expected
+
+
+@pytest.mark.parametrize(
+    ("expression", "expected"),
+    [
+        ("asr", True),
+        ("asr and not slow", True),
+        ("not asr", False),
+        ("", False),
+        (None, False),
+        ("render", False),
+        # 两个门互不串：点名 render 不该把 asr 的门也打开
+        ("asrx", False),
+        ("not asr_e2e", False),
+    ],
+)
+def test_selects_asr_marker(expression, expected):
+    assert selects_marker(expression, "asr") is expected
 
 
 def test_the_gate_is_wired_to_the_collection_hook():
@@ -53,4 +71,4 @@ def test_the_gate_is_wired_to_the_collection_hook():
     from . import conftest
 
     source = inspect.getsource(conftest.pytest_collection_modifyitems)
-    assert "selects_render_marker" in source
+    assert "selects_marker" in source
