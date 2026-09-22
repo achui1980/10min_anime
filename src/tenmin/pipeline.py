@@ -287,15 +287,21 @@ def _source_duration(cfg: ProjectConfig, episode: EpisodeConfig) -> float | None
 def _ingest_inputs(cfg: ProjectConfig) -> list[Path]:
     """ingest 阶段的新鲜度输入。
 
-    每集取「手传字幕」与「源视频」里存在的那些。原来只取字幕，对一个只有视频的集会
-    得到空列表 —— 而空输入在新鲜度判据里等于「跳过」，于是换了片源也不会重跑。
+    每集取「手传字幕」与「源视频」里**配置了**的那些 —— 判据是字段不是 None，这一层
+    压根不查文件在不在（存在性过滤在 _is_fresh 里做：`[p for p in inputs if p.exists()]`）。
+    原来只取字幕，对一个只有视频的集会得到空列表 —— 而空输入在新鲜度判据里等于
+    「跳过」，于是换了片源也不会重跑。
     反过来也别顺手把整份列表滤空：那样 ingest 就只盯 project.yaml，「改了字幕再重跑」
     会被静默 stage_skip，下游各阶段因为 dialogue.json 没变而跟着一起跳过。
     两条不变量各有一条测试守着。
 
-    刻意**不**把语音转写的缓存（Paths.asr_cache）算进来：它是 ingest 自己的产物，
-    算进输入会让「转写完写出缓存」这个动作立刻使 ingest 变得不新鲜，每次都重跑。
-    它自己的失效判据在 ingest.resolve 里，对着源视频的 mtime 单独判。
+    刻意**不**把 ingest 自己落在 srt/ 里的那两份产物算进来 —— 语音转写的缓存
+    （Paths.asr_cache，`E{NN}.asr.srt`）与软字幕轨抽出来的那份（`E{NN}.embedded.srt`，
+    见 ingest.resolve 的 _embedded_dest）：算进输入会让「解析完写出这份 SRT」这个动作
+    立刻使 ingest 变得不新鲜，每次都重跑。两者各自的失效判据都在 ingest.resolve 里对着
+    源视频判（缓存按 mtime 复用，抽出来那份每次重写）。当前实现两份都进不来（输入只来自
+    episodes[].srt），所以这一段不是在描述一层真实过滤，而是给「顺手 glob 一下 srt/
+    目录」这个改法留的警告 —— 两份都得排除，不是只排除缓存那一份。
 
     也别把 None 留在返回值里：唯一的消费者是 run_pipeline 的 ingest 分枝，而
     _is_fresh 对每个输入调 Path.exists，一个 None 会把它崩成 AttributeError ——

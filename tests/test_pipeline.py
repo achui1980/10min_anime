@@ -2325,8 +2325,14 @@ def test_ingest_resolves_a_video_only_episode_through_the_source_layer(
 ):
     """生肉集不再撞守卫，而是走来源解析拿到一份 SRT。
 
-    顺带钉住转写缓存的落点来自 Paths（产物布局的唯一权威表）而不是某处内联的字面量：
-    改 _ARTIFACTS 里 asr_cache 那一行的后缀，这条断言就红。
+    顺带钉住转写缓存的落点跟 Paths.asr_cache 一致：实现里内联一条与布局表不符的路径
+    （目录或后缀写错）这条会红 —— 实测把 cache 换成 `01_dialogue/E11.asr.srt` 或
+    `srt/E11.transcript.srt` 两种内联写法，这条都失败。
+
+    但它**不**保护「路径必须经由 Paths 取」：断言两边读的是同一张表，所以换成一条与
+    当前布局一致的内联字面量（`srt/E11.asr.srt`）全仓照样全绿（实测）。布局表自己改
+    后缀由 test_paths_layout_is_frozen 与
+    test_the_transcription_cache_name_ends_with_asr_srt 守，不由这条守。
     """
     cfg = _register_raw_episode(
         project, tmp_path, "1\n00:00:01,000 --> 00:00:02,000\nはい\n"

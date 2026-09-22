@@ -90,12 +90,11 @@ class EpisodeConfig(BaseModel):
         """至少要有 srt 或 video 之一。
 
         srt 从必填变成可选之后，这条保证就没别人管了。没有它的话，一个只写了
-        number 的 episode 会一路飘到 ingest 才炸，而它撞上的是 run_ingest 里那个
-        临时守卫、拿到的消息是「第 N 集只有视频、没有字幕」—— 对一个**两个来源都没写**
-        的 episode 这句话是错的（它连视频都没有），而且照样指向「解析对白轨时才发现」
-        而不是「你在 project.yaml 里这一集压根没写来源」这个根因。
-        （对白轨来源解析接上、那个临时守卫删掉之后，它会换成 resolve 的「既没有字幕
-        文件也没有源视频」—— 措辞不再撒谎了，但仍然指不到根因。）
+        number 的 episode 会一路飘到 ingest 才炸，撞上的是 resolve_subtitle_source
+        抛的「既没有字幕文件也没有源视频，无法得到对白轨」（实测：绕开本 validator
+        造一个 srt 与 video 全为 None 的 episode 再跑 run_ingest，抛的就是这句）。
+        措辞不撒谎，但仍然指向「解析对白轨时才发现」而不是「你在 project.yaml 里
+        这一集压根没写来源」这个根因。
         """
         if self.srt is None and self.video is None:
             raise ValueError(
