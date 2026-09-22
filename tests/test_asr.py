@@ -67,6 +67,21 @@ def test_segments_to_cues_drops_pronunciation_free_text():
     assert [c.text for c in cues] == ["ありがとう"]
 
 
+def test_segments_to_cues_drops_non_finite_timestamps():
+    """nan 必须在**这一层**挡住：`nan <= nan` 是 `False`，所以它溜过零长度那条判据，
+    然后在 render_srt 里变成一个 ValueError —— 报错点离真因隔了两层。"""
+    nan = float("nan")
+    cues = asr.segments_to_cues(
+        [
+            {"start": nan, "end": nan, "text": "幻"},
+            {"start": 1.0, "end": nan, "text": "幻"},
+            {"start": float("-inf"), "end": float("inf"), "text": "幻"},
+            {"start": 1.0, "end": 2.0, "text": "本物"},
+        ]
+    )
+    assert [c.text for c in cues] == ["本物"]
+
+
 def test_segments_to_cues_keeps_latin_and_digits():
     """歌名/型号这类内容是有效对白，不能被「没假名就丢」的规则误杀。"""
     cues = asr.segments_to_cues(
@@ -93,6 +108,59 @@ def test_segments_to_cues_renumbers_after_dropping():
     )
     assert [c.idx for c in cues] == [1, 2]
 
+
+
+def test_segments_to_cues_raises_when_a_segment_is_not_a_mapping():
+    """整个形状守卫的存在理由就是「模型换了返回形状要响亮」，所以这里 raise 而不是
+    continue —— 静默跳过等于把守卫拆了。没有它，一个 `[1, 2]` 会漏成裸 AttributeError，
+    而 AttributeError 不在 cli.PIPELINE_ERRORS 里。"""
+    with pytest.raises(asr.ASRError, match="segment"):
+        asr.segments_to_cues([{"start": 1.0, "end": 2.0, "text": "本物"}, 42])
+
+
+def test_segments_to_cues_accepts_a_generator():
+    """声明的入参契约是 Iterable，收窄成 Sequence 会把生成器挡在外面（mlx-whisper 的
+    某些版本就是流式吐 segment 的）。"""
+    cues = asr.segments_to_cues({"start": 1.0, "end": 2.0, "text": "本物"} for _ in range(2))
+    assert [c.idx for c in cues] == [1, 2]
+
+
+def test_format_timestamp_clamps_negative_seconds():
+    """负数不能原样拼出去。`-1:59:59,000` 看着像坏数据，但 srt_parser 的 `-->` 行正则用的
+    是 search 不是 match，会在里面找到 `1:59:59,000` 当成 1 小时 59 分 —— 静默错时间比
+    报错坏得多。"""
+    assert asr._format_timestamp(-1.0) == "00:00:00,000"
+
+
+def test_format_timestamp_rounds_millis_rather_than_truncating():
+    """`2.4569` 是能区分 round 与截断的最小例子（截断得 ,456）。其余用例里的值都是
+    浮点精确的千分数，对这个差别完全不敏感。"""
+    assert asr._format_timestamp(2.4569) == "00:00:02,457"
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+def test_format_timestamp_rejects_non_finite_with_a_readable_message(value):
+    """必须是 ValueError（在 cli.PIPELINE_ERRORS 里）且带上那个坏数据。
+
+    手写一份 `int(round(...))` 的话 nan 得到 CPython 的「cannot convert float NaN to
+    integer」，inf 更糟：OverflowError **不在** PIPELINE_ERRORS 里，整页 traceback。
+    """
+    from tenmin.cli import PIPELINE_ERRORS
+
+    with pytest.raises(ValueError, match="秒数必须是有限数") as excinfo:
+        asr._format_timestamp(value)
+    assert isinstance(excinfo.value, PIPELINE_ERRORS)
+
+
+def test_format_timestamp_only_swaps_the_one_separator():
+    """钉住「只把点换成逗号」这个做法的前提：共用格式化器的输出里只有一个点。
+
+    它今天成立（`HH:MM:SS.mmm`），但那是隐式耦合 —— 哪天 format_timestamp 改成带别的
+    点（比如小时位溢出写成 `1.02:03:04.005`），replace 会静默把它一起换掉。
+    """
+    from tenmin.timecode import format_timestamp
+
+    assert format_timestamp(1.5).count(".") == 1
 
 def test_render_srt_uses_comma_millisecond_separator():
     """SRT 的毫秒分隔符是逗号。timecode.format_timestamp 产出的是点号版本，
@@ -125,6 +193,20 @@ def test_render_srt_round_trips_through_the_parser():
         (1.5, 2.25, "はい"),
         (10.0, 12.125, "そうですね"),
     ]
+
+
+def test_render_srt_renumbers_instead_of_reusing_cue_idx():
+    """序号按列表位置重数。纯外观（srt_parser 只把它存进不参与定位的 src_idx），但
+    docstring 明说了这件事，所以钉一下 —— 未经验证的 docstring 声明跟没写一样。"""
+    from tenmin.models import RawCue
+
+    text = asr.render_srt(
+        [
+            RawCue(idx=7, start=1.0, end=2.0, text="はい"),
+            RawCue(idx=9, start=3.0, end=4.0, text="いいえ"),
+        ]
+    )
+    assert [line for line in text.split("\n") if line.isdigit()] == ["1", "2"]
 
 
 def test_render_srt_of_nothing_is_empty():
@@ -262,8 +344,20 @@ def test_transcribe_leaves_no_file_behind_when_it_fails(tmp_path, monkeypatch):
     assert list(dest.parent.glob("*")) == []
 
 
-def test_transcribe_raises_when_segments_is_not_a_list(tmp_path, monkeypatch):
-    """mlx-whisper 换了返回形状时要在这里响亮地停，而不是让一个 int 漂进 for 循环。"""
+@pytest.mark.parametrize(
+    "segments",
+    [42, "abc", b"abc", {"a": "b"}, None],
+    ids=["int", "str", "bytes", "dict", "none"],
+)
+def test_transcribe_raises_when_segments_is_not_a_list(tmp_path, monkeypatch, segments):
+    """容器本身的形状不对。
+
+    光判 `isinstance(x, Iterable)` 是不够的：`str`/`bytes`/`dict` 全是 Iterable 直接
+    放行。它们**不会**漏成裸 AttributeError（逐元素那道守卫会接住），但接住之后报的是
+    「有个 segment 不是 dict: <class 'str'>」—— 对着一个 `segments="abc"` 或
+    `segments={"a": "b"}` 说「列表里有个元素不对」是在指错方向。所以这里断言的是
+    **容器级**那条消息，不是随便一个 ASRError。
+    """
     from tenmin.config import AsrConfig
 
     video = tmp_path / "a.mp4"
@@ -271,10 +365,111 @@ def test_transcribe_raises_when_segments_is_not_a_list(tmp_path, monkeypatch):
     monkeypatch.setattr(
         asr.ffmpeg, "extract_audio_track", lambda src, wav, **k: Path(wav).write_bytes(b"x")
     )
-    monkeypatch.setattr(asr, "_run_model", lambda **k: {"segments": 42})
+    monkeypatch.setattr(asr, "_run_model", lambda **k: {"segments": segments})
 
-    with pytest.raises(asr.ASRError, match="segments"):
+    with pytest.raises(asr.ASRError, match="segments 不是个列表"):
         asr.transcribe(video, tmp_path / "out.srt", asr=AsrConfig())
+
+
+def test_transcribe_raises_when_a_segment_is_not_a_mapping(tmp_path, monkeypatch):
+    """容器没问题，是**元素**的类型变了。没有这道守卫就是裸 AttributeError
+    （`'int' object has no attribute 'get'`），而它不在 cli.PIPELINE_ERRORS 里。"""
+    from tenmin.config import AsrConfig
+
+    video = tmp_path / "a.mp4"
+    video.write_bytes(b"x")
+    monkeypatch.setattr(
+        asr.ffmpeg, "extract_audio_track", lambda src, wav, **k: Path(wav).write_bytes(b"x")
+    )
+    monkeypatch.setattr(asr, "_run_model", lambda **k: {"segments": [1, 2]})
+
+    with pytest.raises(asr.ASRError, match="segment 不是 dict"):
+        asr.transcribe(video, tmp_path / "out.srt", asr=AsrConfig())
+
+
+def test_transcribe_accepts_a_generator_of_segments(tmp_path, monkeypatch):
+    """守卫不许把 Iterable 契约偷偷收窄成 Sequence。
+
+    必须走 transcribe 而不是直接调 segments_to_cues —— 那道容器级守卫住在 transcribe 里，
+    只测 segments_to_cues 的话把它改成 `isinstance(x, Sequence)` 照样全绿。
+    """
+    from tenmin.config import AsrConfig
+
+    video = tmp_path / "a.mp4"
+    video.write_bytes(b"x")
+    dest = tmp_path / "out.srt"
+    monkeypatch.setattr(
+        asr.ffmpeg, "extract_audio_track", lambda src, wav, **k: Path(wav).write_bytes(b"x")
+    )
+    monkeypatch.setattr(
+        asr,
+        "_run_model",
+        lambda **k: {"segments": ({"start": 0.0, "end": 1.0, "text": "あ"} for _ in range(1))},
+    )
+
+    asr.transcribe(video, dest, asr=AsrConfig())
+    assert "あ" in dest.read_text(encoding="utf-8")
+
+
+def test_transcribe_tells_a_missing_segments_key_apart_from_an_empty_transcription(
+    tmp_path, monkeypatch
+):
+    """「返回里压根没有 segments 这个键」是形状变化，跟「转写出来是空的」处置不同：
+    前者要去看 mlx-whisper 的 API，后者要去看片源有没有人声轨。原来 `result.get(...) or []`
+    把两者并成同一句话，等于把形状变化伪装成片源问题。"""
+    from tenmin.config import AsrConfig
+
+    video = tmp_path / "a.mp4"
+    video.write_bytes(b"x")
+    monkeypatch.setattr(
+        asr.ffmpeg, "extract_audio_track", lambda src, wav, **k: Path(wav).write_bytes(b"x")
+    )
+    monkeypatch.setattr(asr, "_run_model", lambda **k: {"text": "おはよう"})
+
+    with pytest.raises(asr.ASRError) as excinfo:
+        asr.transcribe(video, tmp_path / "out.srt", asr=AsrConfig())
+    assert "segments" in str(excinfo.value)
+    assert "没得到任何对白" not in str(excinfo.value)
+
+
+def test_transcribe_feeds_the_model_the_extracted_wav(tmp_path, monkeypatch):
+    """模型吃的必须是抽出来的 wav、而且那一刻它还在。
+
+    两件事都只能在 fake 里当场查：转写完 wav 就被删了，事后再看什么都看不到。
+    直接喂 video 在真实运行里**不会报错**（mlx-whisper 自己能解 mp4），只是白丢掉
+    extract_audio_track 存在的全部理由（16k 单声道、不依赖模型库自己找 ffmpeg）。
+
+    顺手把 `word_timestamps` 一起钉住：它是唯一一个会让一集多花几十秒的开关，而它
+    改的恰好是我们唯一消费的 segment 边界。
+    """
+    from tenmin.config import AsrConfig
+
+    video = tmp_path / "a.mp4"
+    video.write_bytes(b"x")
+    checked: dict[str, object] = {}
+
+    def fake_extract(src, wav, **kwargs):
+        Path(wav).write_bytes(b"fake wav")
+
+    def fake_model(**kwargs):
+        audio = Path(str(kwargs["audio"]))
+        checked["suffix"] = audio.suffix
+        checked["existed"] = audio.is_file()
+        checked["is_the_video"] = audio == video
+        checked["word_timestamps"] = kwargs.get("word_timestamps")
+        return {"segments": [{"start": 0.0, "end": 1.0, "text": "あ"}]}
+
+    monkeypatch.setattr(asr.ffmpeg, "extract_audio_track", fake_extract)
+    monkeypatch.setattr(asr, "_run_model", fake_model)
+
+    asr.transcribe(video, tmp_path / "out.srt", asr=AsrConfig())
+
+    assert checked == {
+        "suffix": ".wav",
+        "existed": True,
+        "is_the_video": False,
+        "word_timestamps": True,
+    }
 
 
 def test_transcribe_cleans_up_the_temporary_wav(tmp_path, monkeypatch):
@@ -299,8 +494,34 @@ def test_transcribe_cleans_up_the_temporary_wav(tmp_path, monkeypatch):
     assert not wavs[0].exists()
 
 
+def test_transcribe_cleans_up_the_temporary_wav_when_the_model_blows_up(tmp_path, monkeypatch):
+    """失败路径也得清 —— 那份 wav 约 46 MB，而「转写中途被打断」正是最常见的走法。"""
+    from tenmin.config import AsrConfig
+
+    video = tmp_path / "a.mp4"
+    video.write_bytes(b"x")
+    wavs: list[Path] = []
+
+    def fake_extract(src, wav, **kwargs):
+        wavs.append(Path(wav))
+        Path(wav).write_bytes(b"x")
+
+    def boom(**kwargs):
+        raise asr.ASRError("模型炸了")
+
+    monkeypatch.setattr(asr.ffmpeg, "extract_audio_track", fake_extract)
+    monkeypatch.setattr(asr, "_run_model", boom)
+
+    with pytest.raises(asr.ASRError):
+        asr.transcribe(video, tmp_path / "out.srt", asr=AsrConfig())
+
+    assert wavs
+    assert not wavs[0].exists()
+    assert not wavs[0].parent.exists()
+
+
 def test_transcribe_keeps_the_wav_out_of_the_destination_directory(tmp_path, monkeypatch):
-    """那份 wav 是喂模型的入参、不是产物（一集 16k 单声道约 45 MB）。落在 work/ 下
+    """那份 wav 是喂模型的入参、不是产物（一集 16k 单声道约 46 MB）。落在 work/ 下
     会让人以为它该被保留，也会在中途失败时留一个没人清的大文件。"""
     from tenmin.config import AsrConfig
 
