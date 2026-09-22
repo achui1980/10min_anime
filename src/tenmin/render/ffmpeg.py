@@ -145,19 +145,21 @@ def run(args: list[str], *, ffmpeg: str = FFMPEG, timeout: float | None = None) 
     UTF-8 解码遇到这种输入必炸——所以这里用 errors="replace"，脏字节换成 U+FFFD，
     不让一段无关的元数据把整条渲染流水线搞挂。
 
-    **本函数目前没有生产调用方**：出片路径上的两次真实编码（audio.mix_audio、
-    video 的剪辑拼接）都走 run_with_progress，preflight 里那些探测各自直接
-    subprocess.run。刻意留着而不删，是因为它是这一层「安全地 shell out 到 ffmpeg」的
-    单次调用形态，身上那三条保护每一条都是踩过坑才加的（`-nostdin` + stdin=DEVNULL
-    防抢 TTY 挂死、errors="replace" 防非 UTF-8 容器元数据、失败时截 stderr 末尾），
-    而这三条各自都有回归测试挂在这个函数上。删掉它等于把那些测试搬到
-    run_with_progress —— 那是另一个函数、另一套失败面（要 total_seconds 与进度管道），
-    属于重构而不是清理。
+    **调用方**：`extract_subtitle_track` / `extract_audio_track`（生肉路径的素材层）。
+    出片路径上那两次真实编码（audio.mix_audio、video 的剪辑拼接）仍走 run_with_progress，
+    preflight 里那些探测各自直接 subprocess.run。
+
+    `_require_binary` 这一行是跟着那两个调用方一起加的，不是顺手：它们把这个函数接到了
+    **ingest 阶段**，而那里不跑 render 的 preflight —— 也就是说 ffmpeg 侧原来那条
+    「`_require_binary` 全靠 preflight 经 has_filter 顺手调到」的隐式保障在这条路上不存在。
+    没有它，`render.ffmpeg_path` 打错一个字符换来的是一行裸 `[Errno 2]`。
+    （`run_with_progress` 身上是同一个洞，只是仍被 preflight 遮着。）
 
     timeout 默认 None = 不设上限，这是**刻意的**：这个函数是给「一次几分钟的真实编码」
     准备的形态，设上限只会在慢机器上误杀一次已经跑了一半的活。长跑任务的中止交给用户
     Ctrl-C（现在会正确杀掉子进程）。「本该毫秒级返回」的探测才该传具体值进来。
     """
+    _require_binary(ffmpeg)
     argv = [ffmpeg, "-nostdin", *args]
     try:
         completed = subprocess.run(
@@ -195,12 +197,13 @@ def _probe_field(
 ) -> str:
     """跑一次 ffprobe 读一个字段，返回 stdout（已 strip）。失败一律 FFmpegError。
 
-    三个 ffprobe 消费者（probe_duration / probe_frame_rate / has_audio_stream）**全部**
-    走这个壳子：它们的失败处理、超时、`_require_binary` 前置检查、以及那条「刻意不加
-    -nostdin」的约束必须一模一样，各写一份迟早会漂（has_audio_stream 就漂过一次：手写
-    第三份 subprocess.run，既没有 TimeoutExpired 处理也没有 is_file 前置检查，而
-    `subprocess.TimeoutExpired` 不在 cli.PIPELINE_ERRORS 里 —— 「源片在掉线的外置盘上」
-    这个正是那个 timeout 要处理的场景，用户会看到一整页 traceback）。
+    四个 ffprobe 消费者（probe_duration / probe_frame_rate / has_audio_stream /
+    has_subtitle_stream）**全部**走这个壳子：它们的失败处理、超时、`_require_binary` 前置
+    检查、以及那条「刻意不加 -nostdin」的约束必须一模一样，各写一份迟早会漂
+    （has_audio_stream 就漂过一次：手写第三份 subprocess.run，既没有 TimeoutExpired 处理
+    也没有 is_file 前置检查，而 `subprocess.TimeoutExpired` 不在 cli.PIPELINE_ERRORS 里
+    —— 「源片在掉线的外置盘上」这个正是那个 timeout 要处理的场景，用户会看到一整页
+    traceback）。
 
     `what` 只进错误消息。
     """
@@ -448,8 +451,18 @@ def extract_subtitle_track(video: Path, dest: Path, *, ffmpeg: str = FFMPEG) -> 
     `-y` 时打一句 `File '...' already exists. Exiting.`、什么都不写，然后**退出码 0**。
     而 `run` 只在非零退出时抛错 —— 于是重跑会「成功」地把上一次的旧文件留在原地，
     下游拿到的是过期对白轨，一句警告都没有。
+
+    **dest 不是原子落盘，这一层刻意不做。** ffmpeg 自己流式写 dest，中途 Ctrl-C 留下的
+    半份文件会是**语法合法**的 —— 不是实测，是 SRT 的格式决定的：它没有文件尾结构，
+    一串顺序 cue 块的前缀本身就是一份能解析的 SRT，所以解析器不会报错，只是对白少了一半。
+    要原子就得在这里用 tenmin.atomic 包住 dest 再 os.replace，但那样「产物叫什么名字、
+    什么情况下算可复用」这套策略就漏进了一个纯命令封装里，而这一层刻意不含业务判断。
+    所以责任转移给调用方：**绝对不要拿「dest 存在」当复用判据**，要么每次重抽（这两条
+    命令都是幂等的，代价只是一次解码），要么自己走 atomic_path + 完整性体检（参照
+    render/tts.py 的 synthesize：`atomic_path` 暂存 + probe_duration 体检通过才 os.replace）。
     """
     _require_source_video(video)
+    dest = Path(dest)
     dest.parent.mkdir(parents=True, exist_ok=True)
     run(
         [
@@ -475,9 +488,11 @@ def extract_audio_track(video: Path, dest: Path, *, ffmpeg: str = FFMPEG) -> Non
 
     `-vn` 只是省掉一次白解码：实测不加它 wav 也照样出（wav muxer 把视频轨丢掉，
     `video:0KiB`，出来的字节数与加了 `-vn` 完全一致），但那会让 ffmpeg 白解一整条
-    24 分钟的视频流。`-y` 的理由见 extract_subtitle_track。
+    24 分钟的视频流。`-y` 与「dest 不是原子落盘」两件事的理由见 extract_subtitle_track，
+    对这个函数逐字适用。
     """
     _require_source_video(video)
+    dest = Path(dest)
     dest.parent.mkdir(parents=True, exist_ok=True)
     run(
         [

@@ -1183,7 +1183,9 @@ def test_has_audio_stream_checks_the_file_exists_first(monkeypatch, tmp_path):
 
 
 @pytest.mark.parametrize(
-    "probe", [has_audio_stream, probe_duration, probe_frame_rate], ids=lambda f: f.__name__
+    "probe",
+    [has_audio_stream, has_subtitle_stream, probe_duration, probe_frame_rate],
+    ids=lambda f: f.__name__,
 )
 def test_ffprobe_side_also_requires_the_binary(monkeypatch, tmp_path, probe):
     """ffprobe 那条路上也必须调 `_require_binary`，否则抛的是裸 FileNotFoundError。
@@ -1192,6 +1194,12 @@ def test_ffprobe_side_also_requires_the_binary(monkeypatch, tmp_path, probe):
     `_probe_capabilities`（ffmpeg 侧）调用。实测改前
     `probe_duration(p, ffprobe='不存在')` 抛 `FileNotFoundError` —— 而它是 OSError
     子类，正好落进 pipeline._source_duration 那条刻意的静默降级里。
+
+    `has_subtitle_stream` 也挂在这里，锁的是它的 `_require_binary` 与 is_file 前置检查
+    （它走 `_probe_field`，两条都是白拿的，但「白拿」正是会在重构里被弄丢的那种东西）。
+    **这条锁不住「ffprobe= 参数有没有转发」** —— 本用例把 `shutil.which` 整个桩成 None，
+    写死 `ffprobe=FFPROBE` 的实现照样会在 `_require_binary` 处抛（实测如此）。那件事由
+    各自的 `..._uses_the_configured_ffprobe_path` 用例按 argv[0] 锁。
     """
     media = tmp_path / "a.mkv"
     media.write_bytes(b"fake")
@@ -1204,6 +1212,28 @@ def test_ffprobe_side_also_requires_the_binary(monkeypatch, tmp_path, probe):
     with pytest.raises(FFmpegBinaryError) as exc:
         probe(media, ffprobe="/definitely/not/a/real/ffprobe")
     assert "render.ffprobe_path" in str(exc.value)
+
+
+def test_run_requires_the_binary(monkeypatch):
+    """`run` 那条路上同样必须调 `_require_binary`，理由跟 ffprobe 侧一字不差。
+
+    这个洞原来不显形，纯粹是因为 `run` 没有生产调用方：出片路径上 ffmpeg 侧的
+    `_require_binary` 全靠 preflight 经 `has_filter` → `_probe_capabilities` 顺手调到。
+    而两个 extract_* 把 `run` 接到了 ingest 阶段 —— **那里不跑 render 的 preflight**，
+    于是 `render.ffmpeg_path` 打错一个字符，用户拿到的是一行裸 `[Errno 2]`，而不是
+    `_require_binary` 里那句指路。
+
+    （`run_with_progress` 身上是同一个洞，只是仍被 preflight 遮着，不在本次范围内。）
+    """
+
+    def unreachable(args, **kwargs):
+        raise AssertionError("二进制不存在时不该 spawn 它")
+
+    monkeypatch.setattr("tenmin.render.ffmpeg.shutil.which", lambda _name: None)
+    monkeypatch.setattr("tenmin.render.ffmpeg.subprocess.run", unreachable)
+    with pytest.raises(FFmpegBinaryError) as exc:
+        run(["-i", "a.mkv"], ffmpeg="/definitely/not/a/real/ffmpeg")
+    assert "render.ffmpeg_path" in str(exc.value)
 
 
 def test_ffmpeg_binary_error_is_an_ffmpeg_error():
@@ -1370,6 +1400,26 @@ def test_has_subtitle_stream_selects_the_subtitle_stream(monkeypatch, tmp_path):
     assert seen["args"][seen["args"].index("-select_streams") + 1] == "s"
 
 
+def test_has_subtitle_stream_uses_the_configured_ffprobe_path(monkeypatch, tmp_path):
+    """跟 probe_duration / probe_frame_rate 同一套（见「可执行文件路径可覆盖」那节）。
+
+    必须按 argv[0] 断言：写死 `ffprobe=FFPROBE` 的实现在
+    `test_ffprobe_side_also_requires_the_binary` 下**是绿的**（那条把 `shutil.which`
+    整个桩成 None，写死的那个名字照样会在 `_require_binary` 处抛），所以只有这里才拦得住。
+    """
+    media = tmp_path / "a.mkv"
+    media.write_bytes(b"fake")
+    seen: dict[str, list[str]] = {}
+
+    def fake_run(args, **kwargs):
+        seen["args"] = list(args)
+        return FakeCompleted(stdout="0\n")
+
+    monkeypatch.setattr("tenmin.render.ffmpeg.subprocess.run", fake_run)
+    has_subtitle_stream(media, ffprobe="/opt/x/ffprobe")
+    assert seen["args"][0] == "/opt/x/ffprobe"
+
+
 def test_extract_subtitle_track_builds_an_srt_command(monkeypatch, tmp_path):
     media = tmp_path / "a.mkv"
     media.write_bytes(b"fake")
@@ -1408,6 +1458,8 @@ def test_extract_audio_track_builds_a_16k_mono_wav_command(monkeypatch, tmp_path
     extract_audio_track(media, dest)
 
     args = seen["args"]
+    # -vn 不是功能必需（实测不加也出一模一样的 wav），锁住它是为了别退化成白解
+    # 一整条 24 分钟的视频流
     assert "-vn" in args
     assert args[args.index("-ac") + 1] == "1"
     assert args[args.index("-ar") + 1] == "16000"
@@ -1450,3 +1502,45 @@ def test_extract_helpers_reject_a_missing_video(monkeypatch, tmp_path, extract, 
         extract(missing, tmp_path / f"o{suffix}")
     assert str(missing) in str(exc.value)
     assert isinstance(exc.value, PIPELINE_ERRORS)
+
+
+@pytest.mark.parametrize(
+    "extract, suffix",
+    [(extract_subtitle_track, ".srt"), (extract_audio_track, ".wav")],
+    ids=lambda v: getattr(v, "__name__", v),
+)
+def test_extract_helpers_use_the_configured_ffmpeg_path(monkeypatch, tmp_path, extract, suffix):
+    """生肉路径也必须认 `render.ffmpeg_path`（见上面那节「可执行文件路径可覆盖」）。
+
+    用户常有两个 ffmpeg 装，而「哪个编了 libass」是本项目的老痛点。丢掉这次转发是
+    **静默**的：命令拼得完全对，只是跑在了另一个二进制上 —— 所以只断言命令形状的那
+    几条用例一条都发现不了。
+    """
+    media = tmp_path / "a.mkv"
+    media.write_bytes(b"fake")
+    seen: dict[str, object] = {}
+
+    def fake_run(args, **kwargs):
+        seen["ffmpeg"] = kwargs.get("ffmpeg")
+        return ""
+
+    monkeypatch.setattr("tenmin.render.ffmpeg.run", fake_run)
+    extract(media, tmp_path / f"o{suffix}", ffmpeg="/opt/custom/bin/ffmpeg")
+    assert seen["ffmpeg"] == "/opt/custom/bin/ffmpeg"
+
+
+def test_extract_helpers_accept_a_string_dest(monkeypatch, tmp_path):
+    """dest 传 str 不该炸在 `dest.parent` 上 —— AttributeError 不在 PIPELINE_ERRORS 里。
+
+    `_require_source_video` 对 video 侧已经做了 `Path(...)` 强转（跟 `_probe_field`
+    的 `path = Path(path)` 同一套），dest 侧没有理由例外。
+    """
+    media = tmp_path / "a.mkv"
+    media.write_bytes(b"fake")
+    monkeypatch.setattr("tenmin.render.ffmpeg.run", lambda args, **kwargs: "")
+
+    extract_subtitle_track(media, str(tmp_path / "s" / "out.srt"))
+    extract_audio_track(media, str(tmp_path / "w" / "out.wav"))
+
+    assert (tmp_path / "s" / "out.srt").parent.is_dir()
+    assert (tmp_path / "w" / "out.wav").parent.is_dir()
