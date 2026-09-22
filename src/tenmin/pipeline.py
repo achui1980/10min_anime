@@ -375,8 +375,8 @@ def _translate_inputs(paths: Paths, episode: int) -> list[Path]:
     每一次运行都重跑，每一次都重新付一集的翻译费。
 
     代价是：手改了术语表不会让已经翻好的集自动重翻（要 --force）。这是有意的取舍 ——
-    改译名的主要目的是让**后面**几集和解说稿用对写法，而解说稿那边的新鲜度是真的挂着
-    术语表的（见 _script_inputs）。
+    改译名的主要目的是让**后面**几集用对写法，而那条路是通的（下一集的 translate 会读到
+    改后的表）。解说稿那边只是新鲜度挂着这张表，prompt 还没读它，见 _script_inputs。
     """
     return [paths.dialogue(episode)]
 
@@ -384,7 +384,14 @@ def _translate_inputs(paths: Paths, episode: int) -> list[Path]:
 def _script_inputs(paths: Paths, episode: int) -> list[Path]:
     """解说稿阶段的新鲜度输入。
 
-    术语表是这里的真输入：解说稿的 prompt 会读它，手动改了译名就该重写解说稿。
+    累积术语表（zh/glossary.json）是**提前挂上**的，当下还不是真输入：解说稿的 prompt
+    目前只读 project.yaml 里手写的那份术语表（`cfg.glossary`），累积的那份接进去是下一
+    步。先把新鲜度挂上，免得切过去的时候漏掉「改了译名要让 script 重跑」这一条。
+
+    在此之前它已经有一个真实的副作用：累积表每跑一集 translate 就被完整回写一次（内容
+    没变也会刷 mtime），所以某一集翻译之后，先前几集的解说稿会变旧、下次运行重写一遍。
+    不划算的话该做的是把累积表接进 prompt，而不是把它从这个列表里摘掉。
+
     文件不存在时会被 _is_fresh 自己过滤掉（它只看存在的那些输入），所以无条件列进来是
     安全的 —— 现有的繁中片源压根不会有这个文件。
     """

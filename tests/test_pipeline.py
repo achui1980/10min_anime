@@ -2492,14 +2492,17 @@ async def test_run_translate_skips_a_native_subtitle_episode(tmp_path):
 
 
 async def test_run_pipeline_runs_translate_for_a_transcribed_episode(tmp_path):
-    """接线：--only translate 真的会把这一集翻出来。"""
+    """接线：--only translate 真的会把这一集翻出来，而且进度上报是「跑了」而不是「跳了」。"""
     cfg, paths = _project_with_dialogue(tmp_path, episode=11, source="asr")
     provider = FakeProvider([_translation_response()])
+    reporter = FakeReporter()
 
-    await run_pipeline(cfg, provider, only=["translate"])
+    await run_pipeline(cfg, provider, only=["translate"], reporter=reporter)
 
     assert paths.zh_lines(11).is_file()
     assert provider.calls
+    assert ("stage_start", "translate") in reporter.calls
+    assert ("stage_done", "translate") in reporter.calls
 
 
 async def test_run_pipeline_skips_a_fresh_translate(tmp_path):
@@ -2518,8 +2521,32 @@ async def test_run_pipeline_skips_a_fresh_translate(tmp_path):
     assert ("stage_skip", "translate") in reporter.calls
 
 
+async def test_run_pipeline_rebuilds_a_deleted_zh_subtitle(tmp_path):
+    """上面那条的姊妹用例：中文字幕是交付物，缺了就不许跳过。
+
+    译文轨住在 zh/（中间产物）、中文字幕住在 out/（交付物），用户会单独去删后者。
+    所以两者都得算进 translate 的产物集 —— 只看译文轨的话，这里会静默跳过，那份
+    被删掉的字幕再也补不回来。
+    """
+    cfg, paths = _project_with_dialogue(tmp_path, episode=11, source="asr")
+    _file(paths.zh_lines(11), "{}")
+    _shift_mtime(paths.zh_lines(11), 60.0)
+    assert not paths.zh_subtitles(11).exists()
+    provider = FakeProvider([_translation_response()])
+
+    await run_pipeline(cfg, provider, only=["translate"])
+
+    assert provider.calls
+    assert paths.zh_subtitles(11).is_file()
+    assert "是的" in paths.zh_subtitles(11).read_text(encoding="utf-8")
+
+
 def test_script_freshness_depends_on_the_glossary(tmp_path):
-    """手改了译名，解说稿该重跑 —— 术语表是 script 的真输入。"""
+    """累积术语表进 script 的输入集 —— 提前挂上的那条线，别被顺手摘掉。
+
+    当下解说稿的 prompt 还只读 project.yaml 里手写的那份，所以这条钉的是新鲜度接线
+    本身，而不是「重跑之后解说稿会变」。见 _script_inputs 的 docstring。
+    """
     paths = Paths(tmp_path)
     _file(paths.dialogue(11), "{}")
     _file(paths.signals(11), "{}")
