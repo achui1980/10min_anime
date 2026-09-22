@@ -57,7 +57,8 @@ def episode_stem(episode: int) -> str:
 # tests/test_pipeline.py 的 FROZEN_LAYOUT 按字面量逐条锁死这张表拼出来的结果。
 #
 # 目录名带序号前缀（01_/02_/…）是刻意的：`ls work/<slug>` 就能按流水线顺序读出来。
-# out/ 不带序号，因为它是给人看的交付物目录，不是中间产物。
+# 两个例外：out/ 不带序号，因为它是给人看的交付物目录，不是中间产物；srt/ 是输入目录，
+# 理由见 asr_cache 那条。
 _ARTIFACTS: dict[str, tuple[str, str]] = {
     "dialogue": ("01_dialogue", ".dialogue.json"),
     "signals": ("02_signals", ".signals.json"),
@@ -89,15 +90,20 @@ _ARTIFACTS: dict[str, tuple[str, str]] = {
     "subtitles": ("05_timeline", ".ass"),
     "mixed_audio": ("06_audio", ".mixed.m4a"),
     "video": ("07_render", ".mp4"),
-    # 语音转写的落点。它是本表里唯一一个**不在**带序号的阶段目录里的条目，刻意的：
-    # 这份 SRT 是双重身份的 —— 它是 ingest 自己产出的缓存，同时也是下一次运行的
-    # **输入**（转差了就手改，改完 resolve 就走「手传 SRT」那条路）。放进 srt/ 才
-    # 让「手传的字幕和机器听写的字幕在同一个抽屉里、名字上一眼分得开」这件事成立。
+    # 语音转写的落点。它是本表里唯一一个落在 srt/（输入目录）里的条目，也是唯一一个
+    # 既不在带序号的阶段目录、也不在 out/ 交付目录里的，刻意的：这份 SRT 是双重身份的
+    # —— 它是 ingest 自己产出的缓存，同时也是下一次运行的**输入**（转差了就手改，
+    # _is_usable_asr_cache 会按 mtime 认它、照样按 kind="asr" 复用，所以手改的结果仍然
+    # 被当成机器听写，下游该繁转简还是该翻译不因手改而变，见 resolve 的 SubtitleSource
+    # docstring；它**不会**走 resolve 的「手传 SRT」那条分枝 —— 手改一份缓存文件不会
+    # 往 project.yaml 的 episodes[].srt 里放任何东西）。放进 srt/ 才让「手传的字幕和
+    # 机器听写的字幕在同一个抽屉里、名字上一眼分得开」这件事成立。
     #
-    # 后缀 `.asr.srt` 必须跟 ingest/resolve.py 的 _ASR_SUFFIX 一致，而这里是那个
+    # 后缀 `.asr.srt` 应当跟 ingest/resolve.py 的 _ASR_SUFFIX 保持一致，而这里是那个
     # 名字的**唯一权威**：resolve 只收一个现成的 cache 路径、对它的名字形状不作任何
-    # 要求（_embedded_dest 对任何输入都能换出不撞车的 .embedded.srt 名），所以「转写
-    # 缓存到底叫什么」只能由本表钉住。
+    # 要求。所以不一致只丢观感（改成 `.transcribed.srt` 会得到 `E11.transcribed.embedded.srt`
+    # 这种名字，而规范名得到的是干净的 `E11.embedded.srt`），不会撞车 —— 防撞车全靠
+    # _embedded_dest 的 `Path(name).stem`。
     "asr_cache": ("srt", ".asr.srt"),
 }
 
@@ -281,8 +287,21 @@ def run_ingest(cfg: ProjectConfig) -> list[DialogueTrack]:
     paths = Paths(cfg.root)
     tracks = []
     for episode in cfg.episodes:
+        # 临时守卫，接上对白轨来源解析之后连这段注释一起删（那一步会把这一行整个换成
+        # resolve_subtitle_source，生肉集从此有正经出路）。在那之前它必须在：CLI 已经
+        # 允许「只传 --video」登记一集，而 register_episode 在跑到这儿**之前**就把
+        # project.yaml 落盘了，这个循环又遍历**全部** cfg.episodes —— 少了它，一次生肉
+        # 登记会让这个项目往后每一次 tenmin run 都崩在 Path(None) 的 TypeError 上
+        # （TypeError 不在 cli.PIPELINE_ERRORS 里，用户拿到的是裸 traceback），连针对
+        # 其他完好集的运行一起拖下水。ValueError 在那张表里，所以这里换到的是一行红字。
+        srt = cfg.srt_path(episode)
+        if srt is None:
+            raise ValueError(
+                f"第 {episode.number} 集只有视频、没有字幕，"
+                "从视频里取对白轨的功能还没接上（软字幕轨抽取 / 语音转写）"
+            )
         track = build_track(
-            cfg.srt_path(episode),
+            srt,
             episode=episode.number,
             glossary=cfg.glossary,
             convert_traditional=cfg.locale.convert_traditional,
@@ -806,8 +825,9 @@ async def run_pipeline(
     # 不能让 None 流进 is_fresh：唯一消费这份列表的是下面 ingest 那个分枝，而
     # _is_fresh 对每个输入调 Path.exists，一个 None 会把它崩成 AttributeError ——
     # 指不到「这一集是生肉」这个根因。
-    # 反过来也别顺手把整份列表滤空：那样所有阶段就只盯 project.yaml，「改了字幕再
-    # 重跑」会被静默 stage_skip（守在 test_a_newer_srt_makes_ingest_rerun）。
+    # 反过来也别顺手把整份列表滤空：那样 ingest 就只盯 project.yaml，「改了字幕再
+    # 重跑」会被静默 stage_skip，下游各阶段因为 dialogue.json 没变而跟着一起跳过
+    # （守在 test_a_newer_srt_makes_ingest_rerun）。
     srt_inputs = [p for p in (cfg.srt_path(ep) for ep in cfg.episodes) if p is not None]
     warnings: list[str] = []
 

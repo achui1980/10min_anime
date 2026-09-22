@@ -20,6 +20,7 @@ from tenmin.models import (
     Script,
 )
 from tenmin.pipeline import (
+    _ARTIFACTS,
     STAGES,
     Paths,
     _find_episode,
@@ -241,8 +242,16 @@ def test_paths_layout_is_frozen(tmp_path, kind):
 
 
 def test_paths_exposes_exactly_the_frozen_artifacts(tmp_path):
-    """新增一种产物就必须同时进 FROZEN_LAYOUT，否则它的路径没人锁。"""
+    """新增一种产物就必须同时进 FROZEN_LAYOUT，否则它的路径没人锁。
+
+    两个方向各一条断言，缺任何一条都留个洞：
+    - 方法 ↔ FROZEN_LAYOUT：加了 Paths 方法却没进 FROZEN_LAYOUT，路径没人钉。
+    - _ARTIFACTS ↔ FROZEN_LAYOUT：往表里加一行却不加方法（实测这个变异此前**存活**）。
+      那样的条目只是无害的死数据，但 Paths 的 docstring 声称「表与方法一一对应」
+      由本条测试锁住，所以那句话得真的成立。
+    """
     assert _artifact_methods() == set(FROZEN_LAYOUT)
+    assert set(_ARTIFACTS) == set(FROZEN_LAYOUT)
 
 
 @pytest.mark.parametrize("episode,stem", [(1, "E01"), (12, "E12"), (123, "E123")])
@@ -2176,6 +2185,26 @@ def test_register_episode_without_an_srt_omits_it_from_the_yaml(tmp_path):
     assert "srt" not in entry
 
 
+def test_ingest_rejects_a_video_only_episode_with_a_clean_error(project, tmp_path):
+    """生肉集走到 run_ingest 必须撞上那个**临时**守卫，拿一条 ValueError。
+
+    这条测试跟 run_ingest 里那个守卫是一对，等对白轨来源解析接上、守卫被换成
+    resolve_subtitle_source 之后一起删。
+
+    在那之前它守的是：ValueError 在 cli.PIPELINE_ERRORS 里，而没有守卫时那里抛的是
+    `Path(None)` 上的 TypeError（不在那张表里）→ 用户拿到裸 traceback。更坏的是
+    register_episode 那时已经把 project.yaml 落盘了、run_ingest 又遍历全部集，所以
+    一次生肉登记会让这个项目往后每次 run 都崩。故意让第 2 集（字幕齐全）留在配置里
+    并排在生肉集之前，钉住「那一集自己是好的也照样被拖崩」这一半。
+    """
+    video = tmp_path / "e11.mp4"
+    video.write_bytes(b"fake")
+    register_episode(project, episode=11, srt=None, video=video)
+
+    with pytest.raises(ValueError, match="还没接上"):
+        run_ingest(project)
+
+
 def test_register_episode_without_an_srt_clears_a_previous_one(tmp_path, golden_srt_path):
     """重登记同一集时不传 srt，就等于「这一集改走生肉路线」，旧字幕字段必须清掉。
 
@@ -2228,9 +2257,10 @@ async def test_a_newer_srt_makes_ingest_rerun(project):
     """改了字幕就必须重跑 ingest —— 那份 SRT 是这个阶段的输入，不只是个摆设。
 
     跟上面那条是一对：滤掉生肉集的 None 时很容易顺手把整份字幕输入都丢掉
-    （`srt_inputs = []`），而那样一来所有阶段都只盯 project.yaml，「改字幕再重跑」
-    会被静默 stage_skip、用户拿到跟改动前一模一样的产物。实测把那一行换成空列表时
-    全仓测试**一条都不红**，所以这条不变量此前压根没人守。
+    （`srt_inputs = []`），而那样一来 ingest 就只盯 project.yaml，「改字幕再重跑」
+    会被静默 stage_skip、下游各阶段又因为 dialogue.json 没变而跟着一起跳过，用户
+    拿到跟改动前一模一样的产物。实测把那一行换成空列表时全仓测试**一条都不红**，
+    所以这条不变量此前压根没人守。
     """
     paths = Paths(project.root)
     _file(paths.dialogue(2), '{"episode": 0, "lines": []}')

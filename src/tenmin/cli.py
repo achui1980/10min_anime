@@ -262,8 +262,11 @@ def run(
         typer.secho("传 --srt 时必须同时传 --video", fg=typer.colors.RED)
         raise typer.Exit(code=1)
 
+    # 消息只点 --video：上面那条已经把「只有 --srt」拦掉了，所以能走到这里必然带着
+    # --video（--srt 可有可无）。原文案「传 --srt/--video 时」会在 --video 单飞的场合
+    # 点一个用户压根没用的 flag。
     if video is not None and episode is None:
-        typer.secho("传 --srt/--video 时必须同时传 --episode", fg=typer.colors.RED)
+        typer.secho("传 --video 时必须同时传 --episode", fg=typer.colors.RED)
         raise typer.Exit(code=1)
 
     if video is not None:

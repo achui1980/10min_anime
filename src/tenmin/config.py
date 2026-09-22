@@ -63,7 +63,14 @@ def _validate_open_credit_range(
 
 class EpisodeConfig(BaseModel):
     number: int
-    # 两个来源至少得有一个，由 _require_a_source 守着。
+    # 两个来源至少得有一个，由 _require_a_source 守着 —— 但它只在**构造**时跑。
+    # register_episode 走的是 `existing.srt = ...` / `existing.video = ...` 属性赋值，
+    # 而这个模型没开 validate_assignment，所以那条路上 validator 不会重跑（实测
+    # 把一个已有 episode 的两个字段依次赋成 None 不报错，会留下一个无源 episode）。
+    # 今天不可达，因为 register_episode 的 video 参数是必填的 Path。
+    # 刻意不开 validate_assignment 补这个洞：对只有 srt 的旧集重登记时，
+    # `existing.srt = None` 会在 `existing.video` 赋值**之前**触发 validator，
+    # 把一条合法的改集操作炸成 ValidationError。
     # srt 可空是为了「只有生肉视频」那条路（对白轨靠软字幕轨抽取或语音转写拿到）；
     # video 可空是历史约定（v1 只吃字幕、压根不碰视频文件，`--only ingest` 至今还这么用）。
     srt: Path | None = None
@@ -83,9 +90,12 @@ class EpisodeConfig(BaseModel):
         """至少要有 srt 或 video 之一。
 
         srt 从必填变成可选之后，这条保证就没别人管了。没有它的话，一个只写了
-        number 的 episode 会一路飘到 ingest 才炸，而那时的错误信息说的是「既没有
-        字幕文件也没有源视频」（resolve 抛的），指向的是「解析对白轨时才发现」，
+        number 的 episode 会一路飘到 ingest 才炸，而它撞上的是 run_ingest 里那个
+        临时守卫、拿到的消息是「第 N 集只有视频、没有字幕」—— 对一个**两个来源都没写**
+        的 episode 这句话是错的（它连视频都没有），而且照样指向「解析对白轨时才发现」
         而不是「你在 project.yaml 里这一集压根没写来源」这个根因。
+        （对白轨来源解析接上、那个临时守卫删掉之后，它会换成 resolve 的「既没有字幕
+        文件也没有源视频」—— 措辞不再撒谎了，但仍然指不到根因。）
         """
         if self.srt is None and self.video is None:
             raise ValueError(
