@@ -88,7 +88,9 @@ SRT_OPTION = typer.Option(
     None, "--srt", help="要注册的字幕文件路径，需配合 --episode 和 --video"
 )
 VIDEO_OPTION = typer.Option(
-    None, "--video", help="要注册的视频文件路径，需配合 --episode 和 --srt"
+    None,
+    "--video",
+    help="要注册的视频文件路径，需配合 --episode；不传 --srt 就是生肉入口",
 )
 
 PROJECT_TEMPLATE_FIELDS: dict[str, Any] = {
@@ -252,15 +254,19 @@ def run(
     """跑流水线：ingest -> signals -> script -> docgen -> voice -> timeline -> audio -> render。"""
     cfg = load_project(_project_file(work_dir, slug))
 
-    if (srt is None) != (video is None):
-        typer.secho("--srt 和 --video 必须一起传", fg=typer.colors.RED)
+    # 三条规则（原来是「--srt 与 --video 必须一起传」那一条对称的规则）：
+    # - 传 --srt 必须配 --video：视频是 render 阶段的硬需求，只有字幕出不了片。
+    # - 只传 --video 合法，这就是生肉入口（对白轨靠软字幕轨抽取或语音转写拿）。
+    # - 传了 --video 就必须说这是第几集，否则没法登记进 project.yaml。
+    if srt is not None and video is None:
+        typer.secho("传 --srt 时必须同时传 --video", fg=typer.colors.RED)
         raise typer.Exit(code=1)
 
-    if srt is not None and episode is None:
+    if video is not None and episode is None:
         typer.secho("传 --srt/--video 时必须同时传 --episode", fg=typer.colors.RED)
         raise typer.Exit(code=1)
 
-    if srt is not None and video is not None:
+    if video is not None:
         cfg = register_episode(cfg, episode=episode, srt=srt, video=video)
 
     if episode is not None:

@@ -576,3 +576,46 @@ def test_asr_section_is_overridable_from_yaml_shaped_data():
     )
     assert cfg.asr.language == "en"
     assert cfg.asr.model == "tiny"
+
+
+# --- 生肉入口：一集可以只有视频 -------------------------------------------
+
+
+def test_episode_may_have_only_a_video():
+    episode = EpisodeConfig(number=11, video=Path("/tmp/e11.mp4"))
+    assert episode.srt is None
+    assert episode.video == Path("/tmp/e11.mp4")
+
+
+def test_episode_may_have_only_an_srt():
+    episode = EpisodeConfig(number=11, srt=Path("srt/E11.srt"))
+    assert episode.video is None
+
+
+def test_episode_with_neither_srt_nor_video_is_rejected():
+    """两个字段都可选之后，「至少得有一个」这条保证就没人管了 —— 显式补上。
+
+    没有它的话，一个空 episode 会一路飘到 ingest 才炸，且错误信息指不到根因。
+    """
+    with pytest.raises(ValidationError) as excinfo:
+        EpisodeConfig(number=11)
+    assert "srt" in str(excinfo.value)
+
+
+def test_srt_path_is_none_for_a_video_only_episode(tmp_path):
+    cfg = ProjectConfig(
+        show="测试番",
+        slug="test",
+        episodes=[EpisodeConfig(number=11, video=tmp_path / "e11.mp4")],
+    ).bind_root(tmp_path)
+    assert cfg.srt_path(cfg.episodes[0]) is None
+
+
+def test_srt_path_still_resolves_a_relative_srt(tmp_path):
+    """可选化不许顺手把「相对 project.yaml 解析」这条既有语义弄没。"""
+    cfg = ProjectConfig(
+        show="测试番",
+        slug="test",
+        episodes=[EpisodeConfig(number=11, srt=Path("srt/E11.srt"))],
+    ).bind_root(tmp_path)
+    assert cfg.srt_path(cfg.episodes[0]) == tmp_path / "srt" / "E11.srt"

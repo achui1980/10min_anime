@@ -89,16 +89,28 @@ _ARTIFACTS: dict[str, tuple[str, str]] = {
     "subtitles": ("05_timeline", ".ass"),
     "mixed_audio": ("06_audio", ".mixed.m4a"),
     "video": ("07_render", ".mp4"),
+    # 语音转写的落点。它是本表里唯一一个**不在**带序号的阶段目录里的条目，刻意的：
+    # 这份 SRT 是双重身份的 —— 它是 ingest 自己产出的缓存，同时也是下一次运行的
+    # **输入**（转差了就手改，改完 resolve 就走「手传 SRT」那条路）。放进 srt/ 才
+    # 让「手传的字幕和机器听写的字幕在同一个抽屉里、名字上一眼分得开」这件事成立。
+    #
+    # 后缀 `.asr.srt` 必须跟 ingest/resolve.py 的 _ASR_SUFFIX 一致，而这里是那个
+    # 名字的**唯一权威**：resolve 只收一个现成的 cache 路径、对它的名字形状不作任何
+    # 要求（_embedded_dest 对任何输入都能换出不撞车的 .embedded.srt 名），所以「转写
+    # 缓存到底叫什么」只能由本表钉住。
+    "asr_cache": ("srt", ".asr.srt"),
 }
 
 
 class Paths:
     """一个 project 的全部阶段产物路径。
 
-    13 个方法都是 _ARTIFACTS 表的一行薄包装。刻意保留显式方法而不是 __getattr__
+    每个方法都是 _ARTIFACTS 表的一行薄包装。刻意保留显式方法而不是 __getattr__
     动态派发：调用点（pipeline / cli / 一堆测试）到处在用 paths.script(2)，
     动态派发会让拼错的名字变成运行时 AttributeError、IDE 跳转与补全全失效。
     这里要的是「布局知识只有一份」，不是「代码行数最少」。
+    （这段原来写着方法个数，而那个数字在加第 14 个条目时就已经过期了 ——
+    真正锁住「表与方法一一对应」的是 test_paths_exposes_exactly_the_frozen_artifacts。）
     """
 
     def __init__(self, root: Path):
@@ -149,6 +161,10 @@ class Paths:
 
     def video(self, episode: int) -> Path:
         return self._artifact("video", episode)
+
+    def asr_cache(self, episode: int) -> Path:
+        """语音转写结果的落点，也是 resolve_subtitle_source 的 cache 参数。"""
+        return self._artifact("asr_cache", episode)
 
 
 def stages_from(stage: str) -> list[str]:
@@ -418,9 +434,14 @@ def _find_episode(cfg: ProjectConfig, episode_number: int) -> EpisodeConfig:
 
 
 def register_episode(
-    cfg: ProjectConfig, *, episode: int, srt: Path, video: Path
+    cfg: ProjectConfig, *, episode: int, srt: Path | None, video: Path
 ) -> ProjectConfig:
     """把这一集登记进 project.yaml：SRT 拷进项目目录，视频只记路径不拷。
+
+    srt 传 None 就是生肉入口：yaml 里这一集只有 video，对白轨留给 ingest 那边的
+    resolve_subtitle_source 去解（软字幕轨抽取或语音转写）。重登记一集时传 None
+    会把已有的 srt 字段**清掉** —— 那正是「这一集改走生肉路线」的意思，留着旧值
+    会让解析继续走「手传 SRT」那条路、对着一份用户已经不想用的字幕出片。
 
     如果这一集已经注册过，就覆盖 srt/video 路径（保留其它字段）；
     否则追加一条新的 episode 记录。返回更新后的 ProjectConfig（root 已绑定）。
@@ -444,12 +465,14 @@ def register_episode(
     走各自 EpisodeConfig 的 model_dump 落盘，存量的相对路径（work/saijo/ 下 10 个
     已经拷好的 mp4）逐字节不变，video_path() 照旧按 project.yaml 所在目录解析。
     """
-    srt_dest = cfg.root / "srt" / f"E{episode:02d}.srt"
-    # 原子拷：这份 SRT 是 ingest 阶段的输入，半截字幕会静默产出一条缺对白的对白轨
-    # （srt_parser 对截断输入不报错），而它的 mtime 是最新的，_is_fresh 不会重跑。
-    atomic.copy_file(srt, srt_dest)
+    relative_srt: Path | None = None
+    if srt is not None:
+        srt_dest = cfg.root / "srt" / f"E{episode:02d}.srt"
+        # 原子拷：这份 SRT 是 ingest 阶段的输入，半截字幕会静默产出一条缺对白的对白轨
+        # （srt_parser 对截断输入不报错），而它的 mtime 是最新的，_is_fresh 不会重跑。
+        atomic.copy_file(srt, srt_dest)
+        relative_srt = srt_dest.relative_to(cfg.root)
 
-    relative_srt = srt_dest.relative_to(cfg.root)
     # 绝对化：CLI 传进来的 --video 通常是相对当前工作目录的，而 project.yaml 里的
     # 相对路径是相对 work/<slug>/ 解析的，原样存进去会指向完全不同的位置。
     video_source = Path(video).resolve()
@@ -779,7 +802,10 @@ async def run_pipeline(
 
     paths = Paths(cfg.root)
     numbers = [ep.number for ep in cfg.episodes]
-    srt_inputs = [cfg.srt_path(ep) for ep in cfg.episodes]
+    # 生肉集（只有 video、没有 srt）在这里没有字幕输入可比，直接跳过它。
+    # 不能让 None 流进 is_fresh：这一行在**任何**阶段之前无条件执行，一个 None 会让
+    # `--only render` 这种压根不碰字幕的调用也一起崩在 Path.exists 上。
+    srt_inputs = [p for p in (cfg.srt_path(ep) for ep in cfg.episodes) if p is not None]
     warnings: list[str] = []
 
     def is_fresh(outputs: list[Path], inputs: list[Path]) -> bool:

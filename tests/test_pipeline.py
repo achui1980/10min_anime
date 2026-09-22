@@ -222,6 +222,7 @@ FROZEN_LAYOUT = {
     "subtitles": "05_timeline/E02.ass",
     "mixed_audio": "06_audio/E02.mixed.m4a",
     "video": "07_render/E02.mp4",
+    "asr_cache": "srt/E02.asr.srt",
 }
 
 
@@ -2127,3 +2128,88 @@ async def test_run_pipeline_does_not_launch_scripts_for_fresh_episodes(
     assert [c for c in reporter.calls if c == ("stage_skip", "script")] == [
         ("stage_skip", "script")
     ] * 3
+
+
+# --- 生肉入口：一集可以只有视频 -------------------------------------------
+
+
+def test_the_transcription_cache_name_ends_with_asr_srt(tmp_path):
+    """转写缓存的名字形状由 Paths 一处钉死。
+
+    ingest/resolve.py 的 _embedded_dest 刻意对 cache 的名字**不作形状要求**（它靠
+    Path(name).stem 对任何输入都能换出一个不撞车的 .embedded.srt 名），所以「转写
+    缓存到底叫什么」这件事在那一侧完全没有守卫。如果调用方把它拼成 srt/E11.srt，
+    抽出来的软字幕仍然叫 E11.embedded.srt，而这份机器听写的东西就跟手传字幕同名
+    同形，从文件名上再也分不出来 —— 那正是 resolve 里两个后缀必须不同的理由。
+    所以这条不变量必须由命名权威（Paths）这一侧来锁。
+    """
+    assert Paths(tmp_path).asr_cache(11).name.endswith(".asr.srt")
+
+
+def test_the_transcription_cache_sits_next_to_the_hand_written_srt(tmp_path):
+    """它落在 srt/ 而不是 01_dialogue/：转差了要能当手传字幕直接改、直接复用。"""
+    assert Paths(tmp_path).asr_cache(11).parent == tmp_path / "srt"
+
+
+def test_register_episode_without_an_srt_leaves_the_field_empty(tmp_path):
+    cfg = _project_config(tmp_path)
+    video = tmp_path / "e11.mp4"
+    video.write_bytes(b"fake")
+
+    updated = register_episode(cfg, episode=11, srt=None, video=video)
+
+    episode = next(e for e in updated.episodes if e.number == 11)
+    assert episode.srt is None
+    assert episode.video == video.resolve()
+    assert not (cfg.root / "srt" / "E11.srt").exists()
+
+
+def test_register_episode_without_an_srt_omits_it_from_the_yaml(tmp_path):
+    cfg = _project_config(tmp_path)
+    video = tmp_path / "e11.mp4"
+    video.write_bytes(b"fake")
+
+    register_episode(cfg, episode=11, srt=None, video=video)
+
+    data = yaml.safe_load(cfg.config_path.read_text(encoding="utf-8"))
+    entry = next(e for e in data["episodes"] if e["number"] == 11)
+    assert "srt" not in entry
+
+
+def test_register_episode_without_an_srt_clears_a_previous_one(tmp_path, golden_srt_path):
+    """重登记同一集时不传 srt，就等于「这一集改走生肉路线」，旧字幕字段必须清掉。
+
+    留着旧值会让 resolve 继续走「手传 SRT」那条路、对着一份用户已经不想用的字幕
+    出片，而 project.yaml 上看不出任何异常。
+    """
+    cfg = _project_config(tmp_path)
+    srt = tmp_path / "incoming.srt"
+    srt.write_text(golden_srt_path.read_text(encoding="utf-8"), encoding="utf-8")
+    video = tmp_path / "e11.mp4"
+    video.write_bytes(b"fake")
+    register_episode(cfg, episode=11, srt=srt, video=video)
+
+    register_episode(cfg, episode=11, srt=None, video=video)
+
+    episode = next(e for e in cfg.episodes if e.number == 11)
+    assert episode.srt is None
+
+
+@pytest.mark.asyncio
+async def test_run_pipeline_survives_a_video_only_episode_in_the_project(
+    project, monkeypatch
+):
+    """新鲜度判据收集 srt 输入时会扫**全部**集，一集没有 srt 不能把它打死。
+
+    那一行在 run_pipeline 开头无条件执行，跟跑哪几个阶段无关，所以一个 None
+    会让 `--only render` 这种压根不碰字幕的调用也一起崩。
+    """
+    video = project.root / "e11.mp4"
+    video.write_bytes(b"fake")
+    project.episodes.append(EpisodeConfig(number=11, video=video))
+
+    # only=[] 让全部阶段都不跑（resolve_stages 刻意保留的语义）：这条要测的就是
+    # 「阶段之前那段准备工作」本身。
+    warnings = await run_pipeline(project, FakeProvider([]), only=[])
+
+    assert warnings == []

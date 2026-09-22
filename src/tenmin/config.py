@@ -12,7 +12,14 @@ from pathlib import Path
 from typing import Literal
 
 import yaml
-from pydantic import BaseModel, Field, PrivateAttr, SecretStr, field_validator
+from pydantic import (
+    BaseModel,
+    Field,
+    PrivateAttr,
+    SecretStr,
+    field_validator,
+    model_validator,
+)
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from tenmin.models import STRENGTH_MAX, STRENGTH_MIN
@@ -56,7 +63,10 @@ def _validate_open_credit_range(
 
 class EpisodeConfig(BaseModel):
     number: int
-    srt: Path
+    # 两个来源至少得有一个，由 _require_a_source 守着。
+    # srt 可空是为了「只有生肉视频」那条路（对白轨靠软字幕轨抽取或语音转写拿到）；
+    # video 可空是历史约定（v1 只吃字幕、压根不碰视频文件，`--only ingest` 至今还这么用）。
+    srt: Path | None = None
     video: Path | None = None
     op_range: tuple[float, float] | None = None
     ed_range: tuple[float, float] | None = None
@@ -67,6 +77,21 @@ class EpisodeConfig(BaseModel):
         cls, value: tuple[float, float] | None
     ) -> tuple[float, float] | None:
         return _validate_credit_range(value)
+
+    @model_validator(mode="after")
+    def _require_a_source(self) -> EpisodeConfig:
+        """至少要有 srt 或 video 之一。
+
+        srt 从必填变成可选之后，这条保证就没别人管了。没有它的话，一个只写了
+        number 的 episode 会一路飘到 ingest 才炸，而那时的错误信息说的是「既没有
+        字幕文件也没有源视频」（resolve 抛的），指向的是「解析对白轨时才发现」，
+        而不是「你在 project.yaml 里这一集压根没写来源」这个根因。
+        """
+        if self.srt is None and self.video is None:
+            raise ValueError(
+                f"第 {self.number} 集既没有 srt 也没有 video，至少要填一个"
+            )
+        return self
 
 
 class LocaleConfig(BaseModel):
@@ -522,8 +547,19 @@ class ProjectConfig(BaseModel):
         self._root = Path(root).resolve()
         return self
 
-    def srt_path(self, episode: EpisodeConfig) -> Path:
-        """episode.srt 是相对 project.yaml 的路径；绝对路径原样返回。"""
+    def srt_path(self, episode: EpisodeConfig) -> Path | None:
+        """这一集的字幕路径；这一集没配字幕就返回 None。
+
+        episode.srt 是相对 project.yaml 的路径；绝对路径原样返回。返回 None 意味着
+        对白轨要从视频里拿（软字幕轨抽取或语音转写），由 ingest 那边的
+        resolve_subtitle_source 决定走哪条。
+
+        刻意返回 None 而不是像 video_path 那样抛 ValueError：「没有 srt」是生肉入口
+        的**正常**状态（video_path 那边抛错是因为 render 阶段没视频真的没法继续），
+        用异常表达一个合法状态会逼每个调用点包 try。
+        """
+        if episode.srt is None:
+            return None
         if episode.srt.is_absolute():
             return episode.srt
         return self._root / episode.srt

@@ -757,3 +757,69 @@ def test_run_passes_progress_reporter(tmp_path, monkeypatch):
     )
     assert result.exit_code == 0, out(result)
     assert isinstance(captured["reporter"], ProgressReporter)
+
+
+# --- 生肉入口：只传 --video 也能登记一集 -----------------------------------
+# 这三条刻意都跑真的 register_episode，只把 run_pipeline 换成假的：要测的正是
+# 「CLI 的校验放行之后，登记这一步真的能在没有 srt 的情况下走完」，而把
+# register_episode 也换成假的就只测到了 if 条件本身。
+
+
+def test_run_accepts_a_video_without_an_srt(work, golden_srt_path, tmp_path, monkeypatch):
+    _bootstrap(work, golden_srt_path)
+    video = tmp_path / "e11.mp4"
+    video.write_bytes(b"fake")
+
+    async def fake_pipeline(cfg, provider, **kwargs):
+        return []
+
+    monkeypatch.setattr("tenmin.cli.run_pipeline", fake_pipeline)
+    result = runner.invoke(
+        app,
+        [
+            "run", "saijo", "--work-dir", str(work),
+            "--episode", "11", "--video", str(video),
+            # 限到 ingest 只为绕开 script 阶段的 API key 检查（它在登记之后、
+            # run_pipeline 之前），跟本条要测的登记行为无关。
+            "--only", "ingest",
+        ],
+    )
+
+    assert result.exit_code == 0, out(result)
+    reloaded = yaml.safe_load(
+        (work / "saijo" / "project.yaml").read_text(encoding="utf-8")
+    )
+    entry = next(e for e in reloaded["episodes"] if e["number"] == 11)
+    assert "srt" not in entry
+    assert entry["video"] == str(video.resolve())
+
+
+def test_run_rejects_an_srt_without_a_video(work, golden_srt_path):
+    """反过来不行：视频是 render 阶段的硬需求。"""
+    _bootstrap(work, golden_srt_path)
+    result = runner.invoke(
+        app,
+        [
+            "run", "saijo", "--work-dir", str(work),
+            "--episode", "11", "--srt", str(golden_srt_path),
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "--video" in out(result)
+
+
+def test_run_still_requires_episode_when_registering_only_a_video(
+    work, golden_srt_path, tmp_path
+):
+    """--video 单飞也一样要说这是第几集，否则登记进不去 project.yaml。"""
+    _bootstrap(work, golden_srt_path)
+    video = tmp_path / "e11.mp4"
+    video.write_bytes(b"fake")
+
+    result = runner.invoke(
+        app, ["run", "saijo", "--work-dir", str(work), "--video", str(video)]
+    )
+
+    assert result.exit_code == 1
+    assert "--episode" in out(result)
