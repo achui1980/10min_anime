@@ -238,7 +238,7 @@ def _followup_prompt(base: str, previous: Script, heading: str, instruction: str
       关系写反、事件顺序与时间戳不一致）全部只能对着对白原文才判得出来；预算重写要
       改的是旁白正文，而提示词里 5 条废稿条件有 4 条是「以对白原文为准」——把源材料
       撤掉再让它改写散文，正是制造幻觉的做法。所以这里**不能**照搬 llm.py 的
-      `_complete_with_schema_repair` 那种「schema 修复轮完全不重发正文」的省法：
+      `complete_with_schema_repair` 那种「schema 修复轮完全不重发正文」的省法：
       那一层的报错是纯格式问题，不需要上下文。
     - 高能点清单 2067 字（6.0%）：必须重发。「每个节点至少有一个 clip 落在 gap 区间里」
       这条要求靠它。

@@ -26,6 +26,7 @@ from tenmin.script.llm import (
     _extract_json,
     _strip_reasoning,
     build_provider,
+    complete_with_schema_repair,
 )
 
 from .fakes import FakeProvider
@@ -1702,3 +1703,99 @@ async def test_last_usage_is_only_the_last_finished_call_under_concurrency(monke
     assert provider.last_usage is not None
     assert provider.last_usage.total_tokens in (11, 22)
     assert provider.last_usage.total_tokens != 33
+
+
+# --- schema 修复层：公开名字与输出后置校验钩子 ------------------------------
+
+
+class _Box(BaseModel):
+    n: int
+
+
+def test_schema_repair_is_public():
+    """它本来就是 provider 无关的通用机制，此前只是恰好只有一个消费者。
+
+    这条与下面三条是重叠的（那三条都 import 这个名字），留着是为了把「这个名字是
+    公开契约、不要再加回下划线」写成一句独立的话。
+    """
+    assert hasattr(llm, "complete_with_schema_repair")
+
+
+@pytest.mark.asyncio
+async def test_check_failure_triggers_a_repair_round():
+    """schema 管不了跨条目的约束（比如「id 一条都不能漏」）。把那种校验交给 check，
+    让它抛 LLMResponseFormatError 就能复用已有的回灌重试。"""
+    seen: list[object] = []
+    payloads = ['{"n": 1}', '{"n": 2}']
+
+    async def send(repair):
+        seen.append(repair)
+        return payloads[len(seen) - 1]
+
+    def check(box: _Box) -> None:
+        if box.n != 2:
+            raise LLMResponseFormatError("n 必须是 2，你给的是 1")
+
+    result = await complete_with_schema_repair(
+        send, _Box, max_attempts=3, label="测试", check=check
+    )
+
+    assert result.n == 2
+    assert seen[0] is None
+    # 回灌消息由 check 自己写 —— 下游要靠这个把「你漏了哪几条 id」具体地告诉模型。
+    assert seen[1] is not None
+    assert "n 必须是 2" in seen[1].error
+
+
+@pytest.mark.asyncio
+async def test_check_exhaustion_raises_schema_error_with_the_raw_output():
+    async def send(repair):
+        return '{"n": 1}'
+
+    def check(box: _Box) -> None:
+        raise LLMResponseFormatError("永远不满意")
+
+    with pytest.raises(LLMSchemaError) as excinfo:
+        await complete_with_schema_repair(
+            send, _Box, max_attempts=2, label="测试", check=check
+        )
+    assert excinfo.value.raw_output == '{"n": 1}'
+
+
+@pytest.mark.asyncio
+async def test_check_must_raise_llm_response_format_error_to_be_retried():
+    """只有 LLMResponseFormatError 会被回灌重试；别的异常原样冒出去。
+
+    这条是给 check 的实现者看的契约：随手 `raise ValueError(...)` 不会触发重试，
+    尽管 LLMResponseFormatError 本身是 ValueError 的子类。except 子句刻意按窄类型
+    捕获，否则 send 内部任何一个 ValueError 都会被误当成「输出形态不对」重试三次。
+    """
+    calls = 0
+
+    async def send(repair):
+        nonlocal calls
+        calls += 1
+        return '{"n": 1}'
+
+    def check(box: _Box) -> None:
+        raise ValueError("裸 ValueError")
+
+    with pytest.raises(ValueError, match="裸 ValueError"):
+        await complete_with_schema_repair(
+            send, _Box, max_attempts=3, label="测试", check=check
+        )
+    assert calls == 1
+
+
+@pytest.mark.asyncio
+async def test_no_check_means_the_old_behaviour():
+    calls = 0
+
+    async def send(repair):
+        nonlocal calls
+        calls += 1
+        return '{"n": 7}'
+
+    result = await complete_with_schema_repair(send, _Box, max_attempts=3, label="测试")
+    assert result.n == 7
+    assert calls == 1

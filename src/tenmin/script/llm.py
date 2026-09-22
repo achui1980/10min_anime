@@ -218,7 +218,7 @@ class LLMFinishReasonError(LLMError):
       「输出被截断」只表现成「连续 N 次输出不符合 LLMScript」—— 一个指向完全错误方向的
       报错，而 `_payload` 现在会传 `max_tokens`，正好让这个失败模式更容易发生。
 
-    刻意**不**被 `_complete_with_schema_repair` 的 except 网住：同一个 max_tokens 只会
+    刻意**不**被 `complete_with_schema_repair` 的 except 网住：同一个 max_tokens 只会
     再截断一次，重试是纯浪费（Gemini 那条路的行为一直如此，这里保持一致）。
     """
 
@@ -235,13 +235,14 @@ class RepairContext:
     error: str
 
 
-async def _complete_with_schema_repair[T: BaseModel](
+async def complete_with_schema_repair[T: BaseModel](
     send: Callable[[RepairContext | None], Awaitable[str]],
     schema: type[T],
     *,
     max_attempts: int,
     label: str,
     diagnostics: Callable[[], str] | None = None,
+    check: Callable[[T], None] | None = None,
 ) -> T:
     """provider 无关的「校验失败 → 把报错回灌 → 重试」包装层。
 
@@ -254,6 +255,16 @@ async def _complete_with_schema_repair[T: BaseModel](
 
     diagnostics 是可选的「补充现场」回调，耗尽时拼进错误消息（目前用来报告流里跳过
     了几条畸形 SSE 行、传输层重试了几次）。
+
+    check 是校验通过 schema 之后、返回之前的一道额外关卡。用途是 schema 表达不了的
+    跨条目约束 —— 比如「输入多少条就必须输出多少条、id 一条不漏」这种。让它抛
+    LLMResponseFormatError 就会走同一套回灌重试，而且回灌的消息由它自己写（能写成
+    「你漏了第 137、298 行」这种模型照着就能改的具体话）。它抛别的异常会原样冒出去：
+    下面那条 except 刻意按窄类型捕获，否则 send 内部任何一个 ValueError 都会被误当成
+    「输出形态不对」白重试几轮。
+
+    去掉前导下划线是因为它不再只有一个消费者。它一直是 provider 无关的通用机制，
+    此前只是恰好只被 provider 自己调用。
     """
     repair: RepairContext | None = None
     last_error = ""
@@ -264,7 +275,10 @@ async def _complete_with_schema_repair[T: BaseModel](
         last_raw = ""
         try:
             last_raw = await send(repair)
-            return schema.model_validate_json(_extract_json(last_raw))
+            parsed = schema.model_validate_json(_extract_json(last_raw))
+            if check is not None:
+                check(parsed)
+            return parsed
         except (ValidationError, LLMResponseFormatError) as exc:
             last_error = str(exc)[:REPAIR_ERROR_MAX_CHARS]
             repair = RepairContext(
@@ -448,7 +462,7 @@ class _StreamTally:
     """一次 complete() 期间跨轮累计的「值得报告但不该拿去日志」的现场。
 
     本项目刻意不引入 logging，所以这些数字只走异常消息（见 _StreamTally.summary
-    被当作 _complete_with_schema_repair 的 diagnostics 传进去）。
+    被当作 complete_with_schema_repair 的 diagnostics 传进去）。
     """
 
     malformed_lines: int = 0
@@ -651,7 +665,7 @@ class GeminiProvider:
                     )
                 return text
 
-            return await _complete_with_schema_repair(
+            return await complete_with_schema_repair(
                 send, schema, max_attempts=self.max_attempts, label=type(self).__name__
             )
         finally:
@@ -939,7 +953,7 @@ class OpenAICompatibleProvider:
                     self._payload(messages, json_mode=True), tally
                 )
 
-            return await _complete_with_schema_repair(
+            return await complete_with_schema_repair(
                 send,
                 schema,
                 max_attempts=self.max_attempts,

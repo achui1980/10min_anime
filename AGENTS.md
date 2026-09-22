@@ -57,7 +57,7 @@ cat /path/to/zscaler_ca_bundle.pem >> .venv/lib/python3.14/site-packages/certifi
 
   健壮性分成三层，改这个文件前先分清自己在动哪一层：
   1. **传输层**（`_stream_with_retries`）：429/5xx 与连接类异常走指数退避 + 抖动 + `Retry-After`，次数由 `transport_max_attempts` 管。其余 4xx 与非限流的业务错误码立即失败。
-  2. **schema 修复层**（`_complete_with_schema_repair`，provider 无关，两个 provider 共用）：校验失败就把「schema + 报错 + 截断后的坏输出」回灌重试，次数由 `max_attempts` 管。**纠错轮刻意不重发首轮那份 ~35k 字符的正文。**
+  2. **schema 修复层**（`complete_with_schema_repair`，provider 无关，两个 provider 共用）：校验失败就把「schema + 报错 + 截断后的坏输出」回灌重试，次数由 `max_attempts` 管。**纠错轮刻意不重发首轮那份 ~35k 字符的正文。**
   3. **异常族**：全部继承 `LLMError`（`RuntimeError` 子类，已进 `cli.py` 的 `PIPELINE_ERRORS`）。`LLMHTTPError` 把响应体摘要拼进消息，`LLMBusinessError` 管 HTTP 200 + `base_resp.status_code != 0`，`LLMSchemaError.raw_output` 带着最后一次的原始模型输出（由 `pipeline.run_script` 落到 `03_script/E{NN}.raw.txt`），`LLMFinishReasonError` 管「没有可用输出」的 finish_reason —— **两条 provider 路径共用它**（Gemini 的 `_check_gemini_finish` 与 OpenAI 兼容的 `_stream_once` 里那次截断判定），而且它刻意不被 schema 修复层网住：同一个 max_tokens 只会再截断一次。
   退避的 `_sleep` / `_rand` 是模块级函数，测试 monkeypatch 掉它们，所以**新增退避路径时不要改成直接 `asyncio.sleep`**，否则测试会真睡。
 - `src/tenmin/render/`：`subtitles.py`（ASS 字幕生成，含手动 CJK 换行，因为 libass 不会按 CJK 字符边界自动换行）、`timeline.py`（时间轴重算 + 按句拆分字幕 cue）、`audio.py`（原声 ducking + 混音 + 淡出 + 结尾静音）、`video.py`（剪辑拼接烧字幕 + 淡出 + 结尾卡片）、`ffmpeg.py`（subprocess 封装，所有调用都用 `text=True, errors="replace"`，因为老番源文件的容器元数据经常不是合法 UTF-8）。
