@@ -12,6 +12,7 @@ import yaml
 
 from tenmin import atomic
 from tenmin.config import ProjectConfig, Settings, load_project
+from tenmin.ingest.asr import ASRError
 from tenmin.ingest.normalize import credit_range_source
 from tenmin.models import DialogueTrack, SignalReport
 from tenmin.pipeline import (
@@ -41,6 +42,10 @@ app = typer.Typer(add_completion=False, help="把番剧压成解说方案的流�
 #   ValidationError**（它是 ValueError 子类，产物 json 被手改坏时走这条）。
 #   所以这里不许把 ValueError 换成更窄的类型。
 # - FFmpegError：ffmpeg 没编 libass / 编码器不存在 / 转码失败。
+# - ASRError：生肉片源（没传 --srt、视频里也没有软字幕轨）要走语音转写，而转写依赖
+#   没装（子类 ASRUnavailableError，消息里带 `uv sync --extra asr`）或者一条对白都没
+#   转出来。同样是 RuntimeError 子类，不在 ValueError 那条网里。只登记父类就够 ——
+#   ASRUnavailableError 继承它。
 # - ScriptValidationError：它是 RuntimeError 子类而不是 ValueError 子类，
 #   历史上漏在表外——LLM 出的剧本过不了 validate 时用户看的是裸 traceback。
 # - httpx.HTTPError：provider 里没被包成 LLMError 的传输类异常（比如 base_url 写成
@@ -55,6 +60,7 @@ PIPELINE_ERRORS = (
     FileNotFoundError,
     ValueError,
     FFmpegError,
+    ASRError,
     ScriptValidationError,
     httpx.HTTPError,
     LLMError,
