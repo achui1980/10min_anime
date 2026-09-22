@@ -17,7 +17,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Literal, NamedTuple
 
-from tenmin.config import AsrConfig
+from tenmin.config import DEFAULT_RENDER, AsrConfig
 from tenmin.ingest import asr
 from tenmin.render import ffmpeg
 
@@ -41,13 +41,21 @@ class SubtitleSource(NamedTuple):
 
 
 def _embedded_dest(cache: Path) -> Path:
-    """软字幕轨抽出来的那份 SRT 落在哪。
+    """软字幕轨抽出来的那份 SRT 落在哪。跟转写缓存同目录、只换后缀。
 
-    跟转写缓存同目录、只换后缀。刻意**不**写成
-    `cache.name.replace(".asr.srt", ".embedded.srt")`：那种写法在调用方给的名字不以
-    `.asr.srt` 收尾时会**静默什么都不换**，于是两条路撞在同一个文件上 —— 而那正是
-    这个函数存在的唯一目的。这里改成「认得出那个后缀就剥掉、认不出就剥掉最后一段
-    扩展名」，两种情况都必然换出一个新名字。
+    **防撞车靠的是 `Path(name).stem`**：它剥掉最后一段扩展名，所以拼回
+    `.embedded.srt` 之后对**任何**输入都必然得到一个跟 cache 不同的名字（`E11`
+    → `E11.embedded.srt`，连 `E11.embedded.srt` → `E11.embedded.embedded.srt`
+    这种自指输入也换得出来）。这一条是有意义的不变量，别把它换成
+    `cache.name.replace(_ASR_SUFFIX, _EMBEDDED_SUFFIX)`：那种写法只在名字恰好以
+    `.asr.srt` 收尾时有效，其余情况**静默原样返回** —— 实测 6 个形态（`E11.asr.srt` /
+    `E11.srt` / `E11.asr.SRT` / `dialogue.srt` / `E11` / `E11.embedded.srt`）里有 5 个
+    会直接撞回 cache 自己，只有规范的那个 `E11.asr.srt` 例外，而两条路共用一个文件正是
+    这个函数存在的唯一目的所要避免的事。
+
+    `endswith(_ASR_SUFFIX)` 那个分枝**只为观感，不参与防撞车**：没有它
+    `E11.asr.srt` 会变成 `E11.asr.embedded.srt`（不撞车，只是名字里留着一个已经
+    不成立的 `.asr`）。想删它的人可以放心删，丢掉的只有好看。
     """
     name = cache.name
     stem = name[: -len(_ASR_SUFFIX)] if name.endswith(_ASR_SUFFIX) else Path(name).stem
@@ -61,12 +69,24 @@ def _is_usable_asr_cache(cache: Path, video: Path) -> bool:
     新鲜度时的口径一致）。mtime 比源视频旧则判为过期：换了片源（重新压制、换了个
     版本）就得重转。
 
+    **刻意不把 AsrConfig 掺进判据**（不按模型/语言的指纹失效）。理由是这份 `.asr.srt`
+    是一份**人能手改**的产物 —— 转差了直接改文件、下次就走「手传 SRT」那条路，这是
+    转写层落盘成 SRT 而不是直接返回 cue 的主要好处之一（见 ingest/asr.py 的模块
+    docstring）。按指纹失效就意味着用户改完 `asr.model` 之后那些手改会被**静默冲掉**，
+    而那比反过来那个毛病坏得多：「换了模型却没重转」打开文件就看得出来（也能靠删文件
+    解决），静默覆盖是无声的。代价说清楚：换模型想重转必须自己删掉那份 `.asr.srt`。
+
     只对转写结果成立，**不能**拿去判断抽出来的那份 —— 理由写在
     resolve_subtitle_source 里那段注释。
     """
-    if not cache.is_file() or cache.stat().st_size == 0:
+    if not cache.is_file():
         return False
-    return cache.stat().st_mtime >= video.stat().st_mtime
+    # 一次 stat 取两个字段。分两次调用不只是多一次 syscall，还会让两个判据看到**两个
+    # 不同时刻**的文件状态。
+    info = cache.stat()
+    if info.st_size == 0:
+        return False
+    return info.st_mtime >= video.stat().st_mtime
 
 
 def resolve_subtitle_source(
@@ -75,8 +95,8 @@ def resolve_subtitle_source(
     *,
     cache: Path,
     asr_config: AsrConfig,
-    ffmpeg_path: str = ffmpeg.FFMPEG,
-    ffprobe_path: str = ffmpeg.FFPROBE,
+    ffmpeg_path: str = DEFAULT_RENDER.ffmpeg_path,
+    ffprobe_path: str = DEFAULT_RENDER.ffprobe_path,
 ) -> SubtitleSource:
     """挑一条路，返回一份可解析的 SRT 及其来源类型。
 
@@ -102,10 +122,17 @@ def resolve_subtitle_source(
         #
         # - extract_subtitle_track 是 ffmpeg 直接流式写 dest（它的 docstring 明确把
         #   「不要拿 dest 存在当复用判据」这件事转交给调用方）。中途 Ctrl-C 留下的半份
-        #   文件**语法合法** —— SRT 没有文件尾结构，一串顺序 cue 块的前缀本身就是一份
-        #   能解析的 SRT，所以 srt_parser 会零警告地把它解析成半份对白轨。
+        #   文件**解析器不会报错**，只是对白少了一半 —— SRT 没有文件尾结构，一串顺序
+        #   cue 块的前缀本身就是一份能解析的 SRT。
         # - transcribe 走 tenmin.atomic 落盘，失败路径上一个文件都不留，所以那边
         #   「文件在就复用」是安全的。
+        #
+        # 关键**不是**「一条警告都没有」。实测拿一份 5 条 cue 的 SRT 穷举全部 208 个
+        # 截断点，其中 140 个（67%）会多出至少一条 skipped_blocks —— 截断落在序号行或
+        # 时间戳行中间时，那半个块找不到 `-->` 就被整块跳过；剩下 68 个（33%，截断落在
+        # 正文里或正好在块边界）连这条警告都没有。真正的问题是**那条警告指不出真因**：
+        # skipped_blocks 跟「片源字幕格式略歪」完全同形，而它恰好是报给用户看片源质量的
+        # 那个数字，多出来的一条会被当成片源的毛病。
         #
         # 另一条可选做法是在这里包 atomic_path + 完整性体检，然后照样按 mtime 复用。
         # 没这么做的理由是「体检」这一半找不到实现：截断的 SRT 跟完整的 SRT 在结构上
@@ -120,8 +147,13 @@ def resolve_subtitle_source(
     if _is_usable_asr_cache(cache, video):
         return SubtitleSource(cache, "asr")
 
-    # 这是三条路里唯一一条既费时间又有损的，所以让它被看见。刻意不做成一个要用户每次
-    # 记得传的 flag：软字幕那条是无损的，不值得为它多打字；值得被看见的只有这一条。
-    print(f"  {video.name} 没有字幕轨，将对音轨做语音转写（约需数分钟）")
+    # 这是三条路里唯一一条既费时间又有损的，所以让它被看见，而且必须打在调用**之前**
+    # （几分钟的静默会让人以为卡死了）。刻意不做成一个要用户每次记得传的 flag：软字幕
+    # 那条是无损的，不值得为它多打字；值得被看见的只有这一条。
+    #
+    # 这一行的增量信息只有「为什么走到了这一步」。耗时提示留给 transcribe 自己那句
+    # 「正在转写音轨（约需数分钟）」—— 两行都带文件名又都带「约需数分钟」，第二遍就
+    # 只是噪音。
+    print(f"  {video.name} 没有字幕轨，只能走语音转写")
     asr.transcribe(video, cache, asr=asr_config, ffmpeg_path=ffmpeg_path)
     return SubtitleSource(cache, "asr")

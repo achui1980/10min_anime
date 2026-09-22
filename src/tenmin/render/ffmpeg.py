@@ -416,6 +416,24 @@ def has_subtitle_stream(path: Path, *, ffprobe: str = FFPROBE) -> bool:
     轨的 mkv 跑 `-select_streams s` 退出码仍然是 **0**、stdout 是空的，所以判据只能是
     **stdout 有没有内容**。看 returncode 会让「生肉」永远被判成「有内嵌字幕」，于是抽出
     一个空 SRT，语音转写那条路一次都走不到。
+
+    **已知限制：位图字幕轨会被判成「有字幕」，然后在抽取那一步硬失败。** 这里只看
+    `-select_streams s` 有没有输出、不看 codec，所以 Blu-ray remux（`hdmv_pgs_subtitle`）
+    与 DVD rip（`dvd_subtitle`）这类**位图**字幕轨同样返回 True。后果是 ingest 走进
+    extract_subtitle_track，而它的 `-c:s srt` 会被 ffmpeg 的跨族转码守卫拦下
+    （`Subtitle encoding currently only possible from text to text or bitmap to bitmap`），
+    抛 FFmpegError —— 于是这一集拿不到对白轨，尽管语音转写那条路本来跑得通。
+
+    那条守卫的消息是**实测**的（ffmpeg 9.0.1，从反方向撞出来的：`-c:s dvdsub` 喂一份
+    SRT 被同一句话拦住，而 `-c:s mov_text` 通过）。位图**源**那一侧没实测 —— 手上没有
+    PGS/VobSub 样本，而 ffmpeg 9 没有能造出一条来的编码器。消息本身列举了允许的组合
+    （text→text、bitmap→bitmap），bitmap→text 不在其中。
+
+    现在不修的理由：本项目的片源全是 WEB-DL，字幕轨要么没有、要么是文本轨，这条路一次
+    没走到过；而失败是响亮的（FFmpegError 在 cli.PIPELINE_ERRORS 里，用户看到一行红字），
+    不是静默错数据。真要修，方向是把这里的探测从 `stream=index` 收窄成
+    `stream=codec_name` 再按文本类 codec 白名单（subrip / ass / ssa / mov_text / webvtt…）
+    过滤，让位图轨走到语音转写那条路上去 —— 那需要一个位图样本来验，不然白名单本身没法测。
     """
     return bool(_probe_field(path, "stream=index", "字幕轨", ffprobe=ffprobe, stream="s"))
 

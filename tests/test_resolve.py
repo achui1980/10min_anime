@@ -12,14 +12,24 @@ from tenmin.ingest import resolve
 
 
 @pytest.fixture
-def stub(monkeypatch):
+def stub(monkeypatch, capsys):
     """把三条路的出口都换成记账用的假货。
 
     `calls["kwargs"]` 单独存一份最后一次的关键字参数：可执行文件路径与 AsrConfig 的
     转发只能在这里当场查（调用完就没了），而把它们混进上面那三个列表会让
     「calls["probe"] == []」这类形状断言跟着一起变糊。
+
+    `calls["announced_before"]` 存的是「转写开始那一刻 stdout 上已经有什么」。它也只能
+    在这里当场取：测完再看 capsys 分不出那句告知是打在调用之前还是之后，而「之前」正是
+    那句告知的**全部**价值（打在之后等于那几分钟静默照旧）。
     """
-    calls: dict[str, list | dict] = {"probe": [], "extract": [], "transcribe": [], "kwargs": {}}
+    calls: dict[str, list | dict] = {
+        "probe": [],
+        "extract": [],
+        "transcribe": [],
+        "kwargs": {},
+        "announced_before": [],
+    }
     state = {"has_subtitle": False}
 
     def fake_has_subtitle(path, **kwargs):
@@ -36,6 +46,7 @@ def stub(monkeypatch):
     def fake_transcribe(video, dest, **kwargs):
         calls["transcribe"].append((Path(video), Path(dest)))
         calls["kwargs"]["transcribe"] = kwargs
+        calls["announced_before"].append(capsys.readouterr().out)
         Path(dest).parent.mkdir(parents=True, exist_ok=True)
         Path(dest).write_text("1\n00:00:01,000 --> 00:00:02,000\n転写した\n", encoding="utf-8")
 
@@ -102,14 +113,23 @@ def test_an_embedded_subtitle_track_is_extracted_instead_of_transcribed(tmp_path
     assert "抽出来的" in source.path.read_text(encoding="utf-8")
     assert calls["extract"]
     assert calls["transcribe"] == []
+    # 探的必须是**源视频**。探成 cache（那个文件此刻还不存在）会让这条分枝在真实运行里
+    # 永远判 False，而 fake 照旧记一笔，形状断言看不出来。
+    assert calls["probe"] == [tmp_path / "e11.mp4"]
 
 
 def test_an_existing_extracted_subtitle_is_re_extracted_anyway(tmp_path, stub):
     """软字幕那条路**不许**拿「文件在 + mtime 够新」当复用判据。
 
-    抽取是 ffmpeg 直接流式写 dest，中途被打断留下的半份文件**语法合法**（SRT 没有文件尾
-    结构），srt_parser 会零警告地把它解析成半份对白轨。所以这条路每次重抽，代价只是一次
-    demux —— 跟下面转写那条路（原子落盘、失败不留文件，所以能安全复用）刻意不同。
+    抽取是 ffmpeg 直接流式写 dest，中途被打断留下的半份文件**解析器不会报错**（SRT 没有
+    文件尾结构，前缀即合法），只是对白少了一半。关键不是「一条警告都没有」—— 实测拿一份
+    5 条 cue 的 SRT（209 字符）穷举全部 208 个截断点，140 个（67%）会多出至少一条
+    skipped_blocks，只有 68 个（33%，截断落在正文里或正好在块边界）是真的零警告。真正的
+    问题是**那条警告指不出真因**：skipped_blocks 跟「片源字幕格式略歪」完全同形，而它
+    恰好是报给用户看片源质量的那个数字。
+
+    所以这条路每次重抽，代价只是一次 demux —— 跟转写那条路（原子落盘、失败不留文件，
+    所以能安全复用）刻意不同。
     """
     calls, state = stub
     state["has_subtitle"] = True
@@ -218,6 +238,39 @@ def test_every_failure_mode_is_caught_by_the_cli_error_net():
     assert issubclass(FileNotFoundError, PIPELINE_ERRORS)
 
 
+@pytest.mark.parametrize(
+    "name",
+    ["E11.asr.srt", "E11.srt", "E11.asr.SRT", "dialogue.srt", "E11", "E11.embedded.srt"],
+)
+def test_the_embedded_dest_never_collides_with_the_cache(tmp_path, name):
+    """抽出来那份**绝不能**落在转写缓存那个文件上，对任何 cache 名字都成立。
+
+    只测 `E11.asr.srt` 这个规范名字等于没测：它恰好是
+    `cache.name.replace(".asr.srt", ".embedded.srt")` 这种 naive 写法唯一能工作的形状。
+    实测这 6 个名字里有 5 个会让 naive 写法**静默原样返回**、于是两条路撞在同一个文件上
+    （只有 `E11.asr.srt` 例外）—— 而两条路的处置刻意相反（转写那份按 mtime 复用、抽出来
+    那份每次重写），撞在一起意味着「复用」那半边的判据落到一份不该被信任的文件上。
+    """
+    cache = tmp_path / "srt" / name
+
+    dest = resolve._embedded_dest(cache)
+
+    assert dest != cache
+    assert dest.parent == cache.parent
+    assert dest.name.endswith(".embedded.srt")
+
+
+def test_the_canonical_cache_name_yields_a_clean_embedded_name(tmp_path):
+    """`E11.asr.srt` → `E11.embedded.srt`，而不是 `E11.asr.embedded.srt`。
+
+    这一条**纯观感**（防撞车靠的是 `Path.stem`，上面那条参数化测试才是守不变量的那个），
+    但还是值得钉：这个名字是 `srt/` 目录里人会看到、也可能被 `--srt` 手传回来的文件名，
+    悄悄变形会留下两代命名的文件混在一个目录里。上面那条参数化测试**杀不掉**这个改动 ——
+    `E11.asr.embedded.srt` 照样不撞车。
+    """
+    assert resolve._embedded_dest(tmp_path / "E11.asr.srt").name == "E11.embedded.srt"
+
+
 def test_the_extracted_subtitle_does_not_squat_the_asr_cache_name(tmp_path, stub):
     """从软字幕轨抽出来的东西不该占 ASR 缓存那个名字 —— 两者的处置**不一样**（那份能
     按 mtime 复用、这份每次重抽），混用同一个文件名会让人分不清手上这份 SRT 是抽的
@@ -276,12 +329,23 @@ def test_the_configured_ffmpeg_and_asr_config_reach_transcribe(tmp_path, stub):
     }
 
 
-def test_the_transcription_is_announced_before_it_starts(tmp_path, stub, capsys):
-    """三条路里唯一一条既费时间又有损的。几分钟的静默会让人以为卡死了。"""
+def test_the_transcription_is_announced_before_it_starts(tmp_path, stub):
+    """三条路里唯一一条既费时间又有损的。几分钟的静默会让人以为卡死了。
+
+    断言的是「转写**开始**那一刻 stdout 上已经有那句话」，不是「跑完之后 stdout 上有」——
+    后者对「把 print 挪到 transcribe 调用之后」这个改动完全不敏感，而那个改动恰好把这句
+    告知的全部价值抹掉了。
+    """
+    calls, _ = stub
+
     resolve.resolve_subtitle_source(
         None, _video(tmp_path), cache=_cache(tmp_path), asr_config=AsrConfig()
     )
-    assert "e11.mp4" in capsys.readouterr().out
+
+    announced = calls["announced_before"][0]
+    assert "e11.mp4" in announced
+    # 这一行的增量信息只有「为什么走到了这一步」；耗时提示是 transcribe 自己那句话的活儿。
+    assert "没有字幕轨" in announced
 
 
 def test_the_source_kind_is_only_srt_or_asr():
@@ -289,8 +353,10 @@ def test_the_source_kind_is_only_srt_or_asr():
     取值集合必须是封闭的。
 
     走 get_type_hints 而不是 `__annotations__`：resolve 有 `from __future__ import
-    annotations`，直接读 `__annotations__` 拿到的是**字符串**，`== Literal[...]`
-    永远为假。
+    annotations`，直接读 `__annotations__` 拿到的是一个**未求值的 `ForwardRef`**
+    （实测 Python 3.14.6：`ForwardRef("Literal['srt', 'asr']")`，`annotationlib.ForwardRef`
+    类型，连 `isinstance(x, str)` 都是 False），`== Literal[...]` 永远为假 —— 也就是说
+    那样写会得到一条永远红的测试。
     """
     from typing import Literal, get_args, get_type_hints
 
