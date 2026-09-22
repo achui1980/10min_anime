@@ -357,3 +357,14 @@ def test_translated_track_rejects_unknown_keys():
     """
     with pytest.raises(ValidationError):
         TranslatedTrack(episode=1, lines=[], glosary={})
+
+
+def test_translated_track_rejects_unknown_keys_inside_a_line():
+    """行也是 _StageModel（extra="forbid"），不是裸 BaseModel。
+
+    上面那条只钉住了**外层**：把 `TranslatedLine` 的基类换成 BaseModel，它照样绿。
+    而拼错的键出现在行上的概率更高（行是逐条生成的），静默退回默认值会让一条空译文
+    一路进中文字幕。
+    """
+    with pytest.raises(ValidationError):
+        TranslatedTrack(episode=1, lines=[{"id": 1, "zh": "x", "note": "y"}])
