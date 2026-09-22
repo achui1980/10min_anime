@@ -241,6 +241,13 @@ def test_glossary_block_empty_says_none():
     assert "无" in build_glossary_block({})
 
 
+def test_glossary_section_says_the_left_column_may_be_japanese(cfg, track, report):
+    """术语表的左列在日语片源下是日语原文（翻译阶段攒的表就是这个方向）。模板原来只说
+    「专有名词必须按这个写法」，没有一个字交代左右两列各是什么，模型只能靠猜。"""
+    text = build_user_prompt(cfg, track, report)
+    assert "对白是日语时，左边就是日语原文" in text
+
+
 # --- credits block ---
 #
 # 模板两次要求「不要落在片头曲/片尾曲区间」（clips 小节与自检第 6 条），而
@@ -425,6 +432,42 @@ async def test_generate_script_sends_schema_and_materials(cfg, track, report):
     assert "你是谁" in call["user"]
     assert "gap:19.8s" in call["user"]
     assert "Hook 开场" in call["user"]  # few-shot 范例已注入
+
+
+@pytest.mark.asyncio
+async def test_generate_script_uses_the_supplied_glossary(cfg, track, report):
+    """日语片源下喂进来的是「日语原文 → 中文译法」，由翻译阶段攒出来、pipeline 读盘传入。
+
+    第二条断言（手写那份不再出现）是这条测试的要害：少了它，实现里把两份表并起来
+    也照样绿，而「传进来的那份说了算」就没人守。
+    """
+    provider = FakeProvider([valid_llm_script()])
+    await generate_script(
+        cfg, track, report, provider, glossary={"リディア": "莉迪亚"}
+    )
+    assert "リディア → 莉迪亚" in provider.calls[0]["user"]
+    assert "伊月 → 伊月" not in provider.calls[0]["user"]
+
+
+@pytest.mark.asyncio
+async def test_generate_script_falls_back_to_the_project_glossary(cfg, track, report):
+    """不传时退回 project.yaml 里那份，现有的中文片源路径行为不变。"""
+    provider = FakeProvider([valid_llm_script()])
+    await generate_script(cfg, track, report, provider)
+    assert "伊月 → 伊月" in provider.calls[0]["user"]
+
+
+@pytest.mark.asyncio
+async def test_generate_script_puts_the_glossary_into_the_rework_prompt_too(
+    cfg, track, report
+):
+    """返工轮摘掉的只有 few-shot 范例，术语表必须照旧在场 —— 返工要改的是旁白正文，
+    正是最会把专有名词写飘的那一轮。"""
+    too_long = valid_llm_script(chars_per_beat=(600, 600, 600))  # 1800 字 = 400s
+    provider = FakeProvider([too_long, valid_llm_script()])
+    await generate_script(cfg, track, report, provider, glossary={"リディア": "莉迪亚"})
+    assert len(provider.calls) == 2
+    assert "リディア → 莉迪亚" in provider.calls[1]["user"]
 
 
 @pytest.mark.asyncio

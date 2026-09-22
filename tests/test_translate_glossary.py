@@ -1,5 +1,7 @@
 """累积术语表。纯文件读写与字典合并，没有外部依赖。"""
 
+import os
+
 from tenmin.translate import glossary as g
 
 
@@ -184,3 +186,38 @@ def test_a_saved_table_is_a_fixed_point_of_merge(tmp_path):
     table = {"リディア": "莉迪亚", "ルーファス": "鲁弗斯"}
     g.save_glossary(path, table)
     assert g.merge_glossary(g.load_glossary(path), {}) == table
+
+
+def test_saving_the_same_table_twice_does_not_touch_the_file(tmp_path):
+    """累积表是 script 阶段的新鲜度输入，无条件回写会让每一集的 translate 把前几集
+    已经写好的解说稿判旧、下次运行白重跑一遍。"""
+    path = tmp_path / "glossary.json"
+    g.save_glossary(path, {"リディア": "莉迪亚"})
+    os.utime(path, (1_000_000.0, 1_000_000.0))
+
+    g.save_glossary(path, {"リディア": "莉迪亚"})
+
+    assert path.stat().st_mtime == 1_000_000.0
+
+
+def test_saving_a_changed_table_does_rewrite(tmp_path):
+    """上面那条的反面：真有新词时必须落盘，否则跳过写入就变成了丢数据。"""
+    path = tmp_path / "glossary.json"
+    g.save_glossary(path, {"リディア": "莉迪亚"})
+    os.utime(path, (1_000_000.0, 1_000_000.0))
+
+    g.save_glossary(path, {"リディア": "莉迪亚", "ルーファス": "鲁弗斯"})
+
+    assert g.load_glossary(path) == {"リディア": "莉迪亚", "ルーファス": "鲁弗斯"}
+    assert path.stat().st_mtime != 1_000_000.0
+
+
+def test_saving_over_a_corrupt_file_still_writes(tmp_path):
+    """读盘比对失败（文件坏了 / 不是 UTF-8）时必须退回「照写」，而不是当成「没变」。"""
+    path = tmp_path / "glossary.json"
+    path.write_bytes(b"\xff\xfe not json")
+    os.utime(path, (1_000_000.0, 1_000_000.0))
+
+    g.save_glossary(path, {"リディア": "莉迪亚"})
+
+    assert g.load_glossary(path) == {"リディア": "莉迪亚"}

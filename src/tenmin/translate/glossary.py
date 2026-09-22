@@ -78,19 +78,38 @@ def load_glossary(path: Path) -> dict[str, str]:
 
 
 def save_glossary(path: Path, glossary: Mapping[str, str]) -> None:
-    """写累积表。
+    """写累积表。**内容与盘上现有内容逐字节相同时直接返回，不碰文件。**
 
     键排序 + 不转义非 ASCII：这是个人会去手动纠错的文件，diff 得可读。
 
     不用自己 mkdir：`atomic.write_text` 会代建父目录（实测），而这个表住在 `zh/` 底下，
     第一次存盘时那个目录还不存在。
 
+    「没变就不写」不是性能优化，是正确性：这个文件是 script 阶段的新鲜度输入
+    （见 pipeline._script_inputs），而每一集的 translate 都会把整张表回写一遍。无条件
+    写的话，一次 E01…E10 的批处理跑完，最后几集的 translate 会把前面几集**已经写好的**
+    解说稿全部判旧，下一次运行白付好几次 LLM 费（一次调用实测可达 561 秒）。真有新词时
+    照写、照刷 mtime —— 那种重跑是该付的（prompt 里的术语表确实变了）。
+
+    比的是**自己将要写下去的那份 payload**，不是入参：入参经过排序与 JSON 序列化才成为
+    磁盘内容，拿字典去跟文件比根本对不上。读盘失败（文件不存在、坏了、不是 UTF-8）一律
+    退回「照写」—— 判不出「没变」就不许跳过。`is_file` 那道守卫跟 `load_glossary` 里那句
+    同源：FIFO 之类的路径上 `read_text` 会在 open 上永久阻塞，而 except 兜不住阻塞。
+
     **刻意不再过一遍 `_clean`** —— 所以模块 docstring 里说的那三个入口不含 save。理由是
     传进来的表本身来自 `merge_glossary`，已经洗过了。这件事没有任何测试钉住：将来要是有
     人把生数据直接喂给 save，「洗不洗」得重新想一遍，别默认它已经洗过。
     """
-    payload = json.dumps(dict(sorted(glossary.items())), ensure_ascii=False, indent=2)
-    atomic.write_text(path, payload + "\n")
+    payload = (
+        json.dumps(dict(sorted(glossary.items())), ensure_ascii=False, indent=2) + "\n"
+    )
+    if path.is_file():
+        try:
+            if path.read_text(encoding="utf-8") == payload:
+                return
+        except (UnicodeDecodeError, OSError):
+            pass
+    atomic.write_text(path, payload)
 
 
 def merge_glossary(

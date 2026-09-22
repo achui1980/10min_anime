@@ -1957,6 +1957,56 @@ async def test_run_script_reports_substeps(project, monkeypatch):
     assert seen and seen[0][0] == "script"
 
 
+# --- script 的术语表来源：累积表叠手写表 ---
+
+
+@pytest.mark.asyncio
+async def test_run_script_feeds_the_accumulated_glossary(project):
+    """盘上那份跨集累积表真的进了 prompt。
+
+    project fixture 的 yaml 没写 glossary，所以这一条只可能来自 zh/glossary.json。
+    """
+    run_ingest(project)
+    run_signals(project)
+    paths = Paths(project.root)
+    _file(paths.glossary, json.dumps({"リディア": "莉迪亚"}, ensure_ascii=False))
+    provider = FakeProvider([fake_script_response()])
+
+    await run_script(project, provider, episode=2)
+
+    assert "リディア → 莉迪亚" in provider.calls[0]["user"]
+
+
+@pytest.mark.asyncio
+async def test_run_script_lets_the_manual_glossary_override_the_accumulated_one(project):
+    """手写表是纠错入口：改了 project.yaml 却不生效会是个很难查的问题。"""
+    project.glossary = {"リディア": "莉蒂亚"}
+    run_ingest(project)
+    run_signals(project)
+    paths = Paths(project.root)
+    _file(paths.glossary, json.dumps({"リディア": "莉迪亚"}, ensure_ascii=False))
+    provider = FakeProvider([fake_script_response()])
+
+    await run_script(project, provider, episode=2)
+
+    prompt = provider.calls[0]["user"]
+    assert "リディア → 莉蒂亚" in prompt
+    assert "莉迪亚" not in prompt
+
+
+@pytest.mark.asyncio
+async def test_run_script_survives_a_missing_glossary(project):
+    """现有的繁中片源压根不会有 zh/glossary.json，那不是错误。"""
+    run_ingest(project)
+    run_signals(project)
+    assert not Paths(project.root).glossary.exists()
+    provider = FakeProvider([fake_script_response()])
+
+    await run_script(project, provider, episode=2)
+
+    assert "（无术语表）" in provider.calls[0]["user"]
+
+
 # --- script 阶段的多集并发（llm.script_concurrency）---
 
 
@@ -2473,6 +2523,25 @@ async def test_run_translate_accumulates_into_an_existing_glossary(tmp_path):
     assert stored["ルーファス"] == "鲁弗斯"
 
 
+async def test_run_translate_leaves_an_unchanged_glossary_untouched(tmp_path):
+    """内容没变就不许刷 mtime —— 累积表现在是 script 的真输入。
+
+    不然一次 E01…E10 的批处理跑完，E10 的 translate 会把前 9 集的解说稿全部判旧，
+    下一次运行白付 9 次 LLM 费（一次调用实测可达 561 秒）。
+    """
+    cfg, paths = _project_with_dialogue(tmp_path, episode=11, source="asr")
+    provider = FakeProvider([_translation_response({"リディア": "莉迪亚"})] * 2)
+
+    await run_translate(cfg, provider, 11)
+    # 往回挪，免得「两次写盘落在同一个时间戳」把回归悄悄盖掉。
+    _shift_mtime(paths.glossary, -600.0)
+    stamp = paths.glossary.stat().st_mtime
+
+    await run_translate(cfg, provider, 11)
+
+    assert paths.glossary.stat().st_mtime == stamp
+
+
 async def test_run_translate_skips_a_native_subtitle_episode(tmp_path):
     """现有片源自带中文字幕，整个阶段不该跑，zh/ 目录都不该建。
 
@@ -2542,11 +2611,8 @@ async def test_run_pipeline_rebuilds_a_deleted_zh_subtitle(tmp_path):
 
 
 def test_script_freshness_depends_on_the_glossary(tmp_path):
-    """累积术语表进 script 的输入集 —— 提前挂上的那条线，别被顺手摘掉。
-
-    当下解说稿的 prompt 还只读 project.yaml 里手写的那份，所以这条钉的是新鲜度接线
-    本身，而不是「重跑之后解说稿会变」。见 _script_inputs 的 docstring。
-    """
+    """累积术语表是 script 的真输入：run_script 把它喂进 prompt 的术语表那一节，
+    所以表变了旧解说稿里的译名就对不上，必须重跑。"""
     paths = Paths(tmp_path)
     _file(paths.dialogue(11), "{}")
     _file(paths.signals(11), "{}")

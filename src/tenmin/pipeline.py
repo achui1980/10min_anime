@@ -40,7 +40,12 @@ from tenmin.script.llm import LLMProvider, LLMSchemaError
 from tenmin.script.single import generate_script
 from tenmin.script.validate import ScriptValidationError
 from tenmin.signals.aggregate import build_report
-from tenmin.translate.glossary import load_glossary, merge_glossary, save_glossary
+from tenmin.translate.glossary import (
+    effective_glossary,
+    load_glossary,
+    merge_glossary,
+    save_glossary,
+)
 from tenmin.translate.lines import translate_track
 from tenmin.translate.srt_writer import render_zh_srt
 
@@ -376,7 +381,8 @@ def _translate_inputs(paths: Paths, episode: int) -> list[Path]:
 
     代价是：手改了术语表不会让已经翻好的集自动重翻（要 --force）。这是有意的取舍 ——
     改译名的主要目的是让**后面**几集用对写法，而那条路是通的（下一集的 translate 会读到
-    改后的表）。解说稿那边只是新鲜度挂着这张表，prompt 还没读它，见 _script_inputs。
+    改后的表）。解说稿那边不一样：那张表是它 prompt 的一部分，所以它把表算进了输入，
+    见 _script_inputs。
     """
     return [paths.dialogue(episode)]
 
@@ -384,13 +390,12 @@ def _translate_inputs(paths: Paths, episode: int) -> list[Path]:
 def _script_inputs(paths: Paths, episode: int) -> list[Path]:
     """解说稿阶段的新鲜度输入。
 
-    累积术语表（zh/glossary.json）是**提前挂上**的，当下还不是真输入：解说稿的 prompt
-    目前只读 project.yaml 里手写的那份术语表（`cfg.glossary`），累积的那份接进去是下一
-    步。先把新鲜度挂上，免得切过去的时候漏掉「改了译名要让 script 重跑」这一条。
+    累积术语表（zh/glossary.json）在里面，因为它是 prompt 的一部分：run_script 把它叠上
+    project.yaml 手写的那份喂给模型。表变了旧解说稿里的译名就对不上了，必须重跑。
 
-    在此之前它已经有一个真实的副作用：累积表每跑一集 translate 就被完整回写一次（内容
-    没变也会刷 mtime），所以某一集翻译之后，先前几集的解说稿会变旧、下次运行重写一遍。
-    不划算的话该做的是把累积表接进 prompt，而不是把它从这个列表里摘掉。
+    「表变了」得是真的变了：save_glossary 在内容与盘上逐字节相同时不碰文件，所以一集
+    translate 跑完并不必然刷这张表的 mtime。少了那一条，批处理里最后几集的 translate 会
+    把前面几集刚写好的解说稿全部判旧、下次运行白重跑一遍。
 
     文件不存在时会被 _is_fresh 自己过滤掉（它只看存在的那些输入），所以无条件列进来是
     安全的 —— 现有的繁中片源压根不会有这个文件。
@@ -534,9 +539,13 @@ async def run_script(
     reports = _load_reports(cfg)
     track = next(t for t in tracks if t.episode == episode)
     report = next(r for r in reports if r.episode == episode)
+    # 累积表叠手写表，手写的赢：手写表是纠错入口，机器译错了人得能盖掉它。两边都空时
+    # 结果是空字典，build_glossary_block 会印「（无术语表）」—— 现有的繁中片源走的就是
+    # 这条路（它们压根没有 zh/glossary.json）。
+    glossary = effective_glossary(load_glossary(paths.glossary), cfg.glossary)
     try:
         script, warnings = await generate_script(
-            cfg, track, report, provider, reporter=reporter
+            cfg, track, report, provider, reporter=reporter, glossary=glossary
         )
     except ScriptValidationError as error:
         # 跟下面 LLMSchemaError 的落盘同理：pipeline 是唯一知道产物往哪写的一层。

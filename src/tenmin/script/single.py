@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+
 from tenmin.config import LLMConfig, ProjectConfig
 from tenmin.models import (
     SPEECH_KINDS,
@@ -168,11 +170,17 @@ def build_user_prompt(
     report: SignalReport,
     *,
     with_example: bool = True,
+    glossary: Mapping[str, str] | None = None,
 ) -> str:
     """拼首轮的 user prompt。
 
     `with_example=False` 用于**返工轮**：把 few-shot 范例整段摘掉（连它上面那个
     `## 参考范例` 小节标题一起）。取舍依据见 _followup_prompt 的 docstring。
+
+    `glossary` 是喂进术语表那一节的表。日语片源下它是「日语原文 → 中文译法」，由翻译
+    阶段跨集攒出来、pipeline.run_script 读盘后叠上手写表传进来。不传就退回
+    project.yaml 里手写的那份（中文片源那条路，同语言的用词归一）—— 这个回退让
+    `build_user_prompt` 的既有调用点（含测试）零改动。
     """
     return render_prompt(
         load_prompt(_TEMPLATE),
@@ -192,7 +200,9 @@ def build_user_prompt(
         narration_char_budget=narration_chars_for_seconds(
             cfg.target_seconds - HOLD_RESERVE_SECONDS, rate=cfg.render.rate
         ),
-        glossary_block=build_glossary_block(cfg.glossary),
+        glossary_block=build_glossary_block(
+            dict(cfg.glossary) if glossary is None else dict(glossary)
+        ),
         credits_block=build_credits_block(track),
         highlight_block=build_highlight_block(report),
         dialogue_block=build_dialogue_block(track),
@@ -299,19 +309,26 @@ async def generate_script(
     provider: LLMProvider,
     *,
     reporter: ProgressReporter | None = None,
+    glossary: Mapping[str, str] | None = None,
 ) -> tuple[Script, list[str]]:
     """生成一集的剧本：首稿 + 最多 N 次校验重试 + 最多 M 轮预算返工。
 
     N / M / 预算容差全部从 `cfg.llm` 取（validation_retries / budget_rewrite_rounds /
     budget_tolerance），原来是写死在函数体里的 1 / 1 / DEFAULT_TOLERANCE。
+
+    `glossary` 原样转给 build_user_prompt（含「不传就退回 cfg.glossary」那条回退），
+    首轮与返工轮共用同一份 —— 返工轮摘掉的只有 few-shot 范例，而返工改的恰好是旁白
+    正文，正是最会把专有名词写飘的那一轮。
     """
     reporter = reporter or NullProgressReporter()
     llm = cfg.llm
     rate = cfg.render.rate
     tracks = {track.episode: track}
     reports = {report.episode: report}
-    first_prompt = build_user_prompt(cfg, track, report)
-    followup_base = build_user_prompt(cfg, track, report, with_example=False)
+    first_prompt = build_user_prompt(cfg, track, report, glossary=glossary)
+    followup_base = build_user_prompt(
+        cfg, track, report, with_example=False, glossary=glossary
+    )
     warnings: list[str] = []
 
     # 一轮 = 一次 LLM 调用。上界用于给进度条一个确定的 total（rich 的 substep 行有
