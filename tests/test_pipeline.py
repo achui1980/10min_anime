@@ -2196,20 +2196,51 @@ def test_register_episode_without_an_srt_clears_a_previous_one(tmp_path, golden_
 
 
 @pytest.mark.asyncio
-async def test_run_pipeline_survives_a_video_only_episode_in_the_project(
-    project, monkeypatch
-):
-    """新鲜度判据收集 srt 输入时会扫**全部**集，一集没有 srt 不能把它打死。
+async def test_ingest_freshness_survives_a_video_only_episode(project):
+    """ingest 的新鲜度判据扫**全部**集的字幕输入，一集没有 srt 不能把它打死。
 
-    那一行在 run_pipeline 开头无条件执行，跟跑哪几个阶段无关，所以一个 None
-    会让 `--only render` 这种压根不碰字幕的调用也一起崩。
+    只跑 ingest、且刻意让它判成「已最新」：这条要测的是判据本身，不是 run_ingest
+    （生肉集的 run_ingest 还要等对白轨解析接上来才跑得动）。判据里没滤掉 None 的话
+    崩点是 _is_fresh 里的 `p.exists()`，报一个指不到根因的 AttributeError。
+
+    别把 only 换成 []（什么都不跑）：那样 srt 输入压根不会被送进 _is_fresh，
+    测试对「有没有滤掉 None」完全无感（实测把滤除去掉照样全绿）。
     """
     video = project.root / "e11.mp4"
     video.write_bytes(b"fake")
     project.episodes.append(EpisodeConfig(number=11, video=video))
 
-    # only=[] 让全部阶段都不跑（resolve_stages 刻意保留的语义）：这条要测的就是
-    # 「阶段之前那段准备工作」本身。
-    warnings = await run_pipeline(project, FakeProvider([]), only=[])
+    paths = Paths(project.root)
+    for number in (2, 11):
+        _file(paths.dialogue(number), '{"episode": 0, "lines": []}')
+        _shift_mtime(paths.dialogue(number), 60)
 
-    assert warnings == []
+    reporter = FakeReporter()
+    await run_pipeline(
+        project, FakeProvider([]), only=["ingest"], reporter=reporter
+    )
+
+    assert ("stage_skip", "ingest") in reporter.calls
+
+
+@pytest.mark.asyncio
+async def test_a_newer_srt_makes_ingest_rerun(project):
+    """改了字幕就必须重跑 ingest —— 那份 SRT 是这个阶段的输入，不只是个摆设。
+
+    跟上面那条是一对：滤掉生肉集的 None 时很容易顺手把整份字幕输入都丢掉
+    （`srt_inputs = []`），而那样一来所有阶段都只盯 project.yaml，「改字幕再重跑」
+    会被静默 stage_skip、用户拿到跟改动前一模一样的产物。实测把那一行换成空列表时
+    全仓测试**一条都不红**，所以这条不变量此前压根没人守。
+    """
+    paths = Paths(project.root)
+    _file(paths.dialogue(2), '{"episode": 0, "lines": []}')
+    _shift_mtime(paths.dialogue(2), 60)
+    _shift_mtime(project.srt_path(project.episodes[0]), 120)
+
+    reporter = FakeReporter()
+    await run_pipeline(
+        project, FakeProvider([]), only=["ingest"], reporter=reporter
+    )
+
+    assert ("stage_start", "ingest") in reporter.calls
+    assert ("stage_skip", "ingest") not in reporter.calls

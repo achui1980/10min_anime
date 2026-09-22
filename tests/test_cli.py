@@ -659,6 +659,14 @@ def test_run_prints_mp4_path(tmp_path, monkeypatch):
 
 
 def test_run_srt_without_video_fails(work, golden_srt_path):
+    """只有字幕出不了片（视频是 render 阶段的硬需求），所以 --srt 必须配 --video。
+
+    两处刻意的收紧，别放松回去：
+    - 用**已注册**的第 2 集。传一个没注册的集号时「第 N 集还没有注册」那条提示里
+      恰好带着 `--srt <srt路径> --video <视频路径>` 字样，于是「输出里有 --video」
+      在校验被整条删掉之后照样成立（实测把那条 if 改成 `if False` 全绿）。
+    - 断言具体那句话，而不只是 flag 名字，理由同上。
+    """
     _bootstrap(work, golden_srt_path)
     result = runner.invoke(
         app,
@@ -668,13 +676,13 @@ def test_run_srt_without_video_fails(work, golden_srt_path):
             "--work-dir",
             str(work),
             "--episode",
-            "1",
+            "2",
             "--srt",
             str(golden_srt_path),
         ],
     )
-    assert result.exit_code != 0
-    assert "--srt" in out(result) and "--video" in out(result)
+    assert result.exit_code == 1
+    assert "传 --srt 时必须同时传 --video" in out(result)
 
 
 def test_run_srt_video_without_episode_fails(work, golden_srt_path, tmp_path):
@@ -760,9 +768,10 @@ def test_run_passes_progress_reporter(tmp_path, monkeypatch):
 
 
 # --- 生肉入口：只传 --video 也能登记一集 -----------------------------------
-# 这三条刻意都跑真的 register_episode，只把 run_pipeline 换成假的：要测的正是
-# 「CLI 的校验放行之后，登记这一步真的能在没有 srt 的情况下走完」，而把
-# register_episode 也换成假的就只测到了 if 条件本身。
+# 两条都跑真的 register_episode，只把 run_pipeline 换成假的：要测的正是「CLI 的
+# 校验放行之后，登记这一步真的能在没有 srt 的情况下走完」，而把 register_episode
+# 也换成假的就只测到了 if 条件本身。
+# 反方向那条（只传 --srt 必须失败）在 test_run_srt_without_video_fails。
 
 
 def test_run_accepts_a_video_without_an_srt(work, golden_srt_path, tmp_path, monkeypatch):
@@ -792,21 +801,6 @@ def test_run_accepts_a_video_without_an_srt(work, golden_srt_path, tmp_path, mon
     entry = next(e for e in reloaded["episodes"] if e["number"] == 11)
     assert "srt" not in entry
     assert entry["video"] == str(video.resolve())
-
-
-def test_run_rejects_an_srt_without_a_video(work, golden_srt_path):
-    """反过来不行：视频是 render 阶段的硬需求。"""
-    _bootstrap(work, golden_srt_path)
-    result = runner.invoke(
-        app,
-        [
-            "run", "saijo", "--work-dir", str(work),
-            "--episode", "11", "--srt", str(golden_srt_path),
-        ],
-    )
-
-    assert result.exit_code == 1
-    assert "--video" in out(result)
 
 
 def test_run_still_requires_episode_when_registering_only_a_video(

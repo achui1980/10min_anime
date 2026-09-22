@@ -803,8 +803,11 @@ async def run_pipeline(
     paths = Paths(cfg.root)
     numbers = [ep.number for ep in cfg.episodes]
     # 生肉集（只有 video、没有 srt）在这里没有字幕输入可比，直接跳过它。
-    # 不能让 None 流进 is_fresh：这一行在**任何**阶段之前无条件执行，一个 None 会让
-    # `--only render` 这种压根不碰字幕的调用也一起崩在 Path.exists 上。
+    # 不能让 None 流进 is_fresh：唯一消费这份列表的是下面 ingest 那个分枝，而
+    # _is_fresh 对每个输入调 Path.exists，一个 None 会把它崩成 AttributeError ——
+    # 指不到「这一集是生肉」这个根因。
+    # 反过来也别顺手把整份列表滤空：那样所有阶段就只盯 project.yaml，「改了字幕再
+    # 重跑」会被静默 stage_skip（守在 test_a_newer_srt_makes_ingest_rerun）。
     srt_inputs = [p for p in (cfg.srt_path(ep) for ep in cfg.episodes) if p is not None]
     warnings: list[str] = []
 
