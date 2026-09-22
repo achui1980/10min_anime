@@ -12,10 +12,13 @@ from tenmin.cli import PIPELINE_ERRORS
 from tenmin.render.ffmpeg import (
     FFmpegBinaryError,
     FFmpegError,
+    extract_audio_track,
+    extract_subtitle_track,
     font_available,
     has_audio_stream,
     has_encoder,
     has_filter,
+    has_subtitle_stream,
     parse_names,
     preflight,
     probe_duration,
@@ -1318,3 +1321,132 @@ def test_probe_frame_rate_has_a_timeout(monkeypatch, tmp_path):
         probe_frame_rate(media)
     assert isinstance(seen["timeout"], (int, float))
     assert "超时" in str(exc.value)
+
+
+# --- 生肉路径：软字幕轨探测 + 字幕/音轨抽取 ---
+#
+# 这三个函数是给「只有视频、没有 SRT」那条路准备的素材层。测的全是**命令长什么样**
+# 与**前置检查有没有做**，一次都不真跑 ffmpeg：命令拼错在这一层是静默的（抽出来的
+# 东西形态不对，要到下游解析时才炸），而真跑一次需要一个带软字幕轨的真实片源。
+
+
+def test_has_subtitle_stream_true_when_ffprobe_names_a_stream(monkeypatch, tmp_path):
+    media = tmp_path / "a.mkv"
+    media.write_bytes(b"fake")
+    monkeypatch.setattr(
+        "tenmin.render.ffmpeg.subprocess.run",
+        lambda args, **kwargs: FakeCompleted(stdout="2\n"),
+    )
+    assert has_subtitle_stream(media) is True
+
+
+def test_has_subtitle_stream_false_on_empty_stdout(monkeypatch, tmp_path):
+    """没有字幕轨时 ffprobe 退出码仍是 0、stdout 为空 —— 只能看 stdout。
+
+    跟 has_audio_stream 同一个坑：看 returncode 会让「生肉」永远被判成「有内嵌字幕」，
+    于是抽出一个空 SRT，ASR 那条路一次都不会被走到。
+    """
+    media = tmp_path / "a.mkv"
+    media.write_bytes(b"fake")
+    monkeypatch.setattr(
+        "tenmin.render.ffmpeg.subprocess.run",
+        lambda args, **kwargs: FakeCompleted(returncode=0, stdout="\n"),
+    )
+    assert has_subtitle_stream(media) is False
+
+
+def test_has_subtitle_stream_selects_the_subtitle_stream(monkeypatch, tmp_path):
+    """不选流的话 ffprobe 会把视频/音频轨也打出来，`bool(stdout)` 就恒为 True。"""
+    media = tmp_path / "a.mkv"
+    media.write_bytes(b"fake")
+    seen: dict[str, list[str]] = {}
+
+    def fake_run(args, **kwargs):
+        seen["args"] = list(args)
+        return FakeCompleted(stdout="0\n")
+
+    monkeypatch.setattr("tenmin.render.ffmpeg.subprocess.run", fake_run)
+    has_subtitle_stream(media)
+    assert seen["args"][seen["args"].index("-select_streams") + 1] == "s"
+
+
+def test_extract_subtitle_track_builds_an_srt_command(monkeypatch, tmp_path):
+    media = tmp_path / "a.mkv"
+    media.write_bytes(b"fake")
+    dest = tmp_path / "out.srt"
+    seen: dict[str, list[str]] = {}
+
+    def fake_run(args, **kwargs):
+        seen["args"] = list(args)
+        return ""
+
+    monkeypatch.setattr("tenmin.render.ffmpeg.run", fake_run)
+    extract_subtitle_track(media, dest)
+
+    args = seen["args"]
+    assert args[args.index("-i") + 1] == str(media)
+    assert args[args.index("-map") + 1] == "0:s:0"
+    assert args[args.index("-c:s") + 1] == "srt"
+    assert args[-1] == str(dest)
+    # -y 挡的是一次静默无操作：实测 dest 已存在且没有 -y 时，ffmpeg 什么都不写却
+    # **退出码 0**，而 run 只看非零退出 —— 重跑会把上一次的旧文件留在原地
+    assert "-y" in args
+
+
+def test_extract_audio_track_builds_a_16k_mono_wav_command(monkeypatch, tmp_path):
+    """16kHz 单声道 pcm_s16le 是 whisper 系模型的原生输入，这三个 flag 一个都不能少。"""
+    media = tmp_path / "a.mkv"
+    media.write_bytes(b"fake")
+    dest = tmp_path / "out.wav"
+    seen: dict[str, list[str]] = {}
+
+    def fake_run(args, **kwargs):
+        seen["args"] = list(args)
+        return ""
+
+    monkeypatch.setattr("tenmin.render.ffmpeg.run", fake_run)
+    extract_audio_track(media, dest)
+
+    args = seen["args"]
+    assert "-vn" in args
+    assert args[args.index("-ac") + 1] == "1"
+    assert args[args.index("-ar") + 1] == "16000"
+    assert args[args.index("-c:a") + 1] == "pcm_s16le"
+    assert args[-1] == str(dest)
+
+
+def test_extract_helpers_create_the_destination_directory(monkeypatch, tmp_path):
+    """产物目录（`01_dialogue/` 之类）在首次运行时还不存在，ffmpeg 不会自己建。"""
+    media = tmp_path / "a.mkv"
+    media.write_bytes(b"fake")
+    monkeypatch.setattr("tenmin.render.ffmpeg.run", lambda args, **kwargs: "")
+
+    extract_subtitle_track(media, tmp_path / "subs" / "out.srt")
+    extract_audio_track(media, tmp_path / "wav" / "out.wav")
+
+    assert (tmp_path / "subs").is_dir()
+    assert (tmp_path / "wav").is_dir()
+
+
+@pytest.mark.parametrize(
+    "extract, suffix",
+    [(extract_subtitle_track, ".srt"), (extract_audio_track, ".wav")],
+    ids=lambda v: getattr(v, "__name__", v),
+)
+def test_extract_helpers_reject_a_missing_video(monkeypatch, tmp_path, extract, suffix):
+    """`run` 自己不做「源文件在不在」的检查（只有 `_probe_field` 做），所以这两个要自己做。
+
+    `run` 被桩成「一旦被调用就炸」，这一点是关键：真的 ffmpeg 对不存在的输入也会非零
+    退出、于是 `run` 也会抛 FFmpegError，只桩不炸的话这条用例在没有前置检查的实现上
+    **照样绿**，锁不住任何东西。
+    """
+
+    def unreachable(args, **kwargs):
+        raise AssertionError("源视频不存在时不该 spawn ffmpeg")
+
+    monkeypatch.setattr("tenmin.render.ffmpeg.run", unreachable)
+    missing = tmp_path / "video" / "E02.mkv"
+    with pytest.raises(FFmpegError) as exc:
+        extract(missing, tmp_path / f"o{suffix}")
+    assert str(missing) in str(exc.value)
+    assert isinstance(exc.value, PIPELINE_ERRORS)

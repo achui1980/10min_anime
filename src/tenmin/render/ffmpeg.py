@@ -406,6 +406,97 @@ def has_audio_stream(path: Path, *, ffprobe: str = FFPROBE) -> bool:
     return bool(_probe_field(path, "stream=index", "音轨", ffprobe=ffprobe, stream="a"))
 
 
+def has_subtitle_stream(path: Path, *, ffprobe: str = FFPROBE) -> bool:
+    """视频里有没有软字幕轨。
+
+    跟 has_audio_stream 逐字同形（连判据的坑都一样）：实测 ffprobe 9.0.1 对一个没有字幕
+    轨的 mkv 跑 `-select_streams s` 退出码仍然是 **0**、stdout 是空的，所以判据只能是
+    **stdout 有没有内容**。看 returncode 会让「生肉」永远被判成「有内嵌字幕」，于是抽出
+    一个空 SRT，语音转写那条路一次都走不到。
+    """
+    return bool(_probe_field(path, "stream=index", "字幕轨", ffprobe=ffprobe, stream="s"))
+
+
+def _require_source_video(video: Path) -> None:
+    """抽取类函数的源文件前置检查。抛 FFmpegError 而不是 FileNotFoundError。
+
+    `run` 自己不做这件事（只有 `_probe_field` 做），所以两个 extract_* 各自都得做。
+    没有它也**不是**静默失败：实测 ffmpeg 9 对不存在的输入退出码 254、stderr 里有
+    `No such file or directory`，`run` 照样会抛 FFmpegError。这个前置检查换来的是
+    两件小事 —— 报错里点名「源视频」而不是一句通用的 ENOENT（真因往往是 project.yaml
+    里的路径写错或外置盘没挂上），以及省掉一次注定失败的 spawn。
+
+    这里刻意**不**沿用 `_probe_field` 那边的 FileNotFoundError：那个类型是为了让
+    `pipeline._source_duration` 的静默降级接住它（见 FFmpegBinaryError 的 docstring），
+    而「要抽素材但源片不在」压根没有合理的降级 —— 没有对白轨整条管线做不下去，必须
+    响亮失败。FFmpegError 已在 cli.PIPELINE_ERRORS 里，用户看到的是一行红字。
+    """
+    if not Path(video).is_file():
+        raise FFmpegError(f"找不到源视频: {video}")
+
+
+def extract_subtitle_track(video: Path, dest: Path, *, ffmpeg: str = FFMPEG) -> None:
+    """把第一条软字幕轨抽成 SRT。
+
+    只抽第一条（`0:s:0`）：多语字幕的片源要选哪一条是个需要人判断的问题，而本项目遇到
+    的片源要么零字幕轨、要么正好一条。真碰到多轨时宁可让人手传 --srt，也不猜。
+
+    容器里可能是 ASS/SSA，`-c:s srt` 让 ffmpeg 负责转成 SRT（特效标记会被丢掉，而
+    ingest 的清洗层本来就要剥掉它们）。
+
+    `-y` 不是图省事，它挡的是一次**静默无操作**：实测 ffmpeg 9 在 dest 已存在且没有
+    `-y` 时打一句 `File '...' already exists. Exiting.`、什么都不写，然后**退出码 0**。
+    而 `run` 只在非零退出时抛错 —— 于是重跑会「成功」地把上一次的旧文件留在原地，
+    下游拿到的是过期对白轨，一句警告都没有。
+    """
+    _require_source_video(video)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    run(
+        [
+            "-y",
+            "-i",
+            str(video),
+            "-map",
+            "0:s:0",
+            "-c:s",
+            "srt",
+            str(dest),
+        ],
+        ffmpeg=ffmpeg,
+    )
+
+
+def extract_audio_track(video: Path, dest: Path, *, ffmpeg: str = FFMPEG) -> None:
+    """抽一条 16kHz 单声道 PCM wav，喂给语音转写。
+
+    这三个参数是 whisper 系模型的原生输入格式：它内部无论如何都要重采样到 16k 单声道，
+    在这里一次做完比让模型库自己去解 mp4 更快也更可控（也顺手绕开「模型库找不到
+    ffmpeg」这类环境问题 —— 本项目已经有一份 ffmpeg 路径配置了）。
+
+    `-vn` 只是省掉一次白解码：实测不加它 wav 也照样出（wav muxer 把视频轨丢掉，
+    `video:0KiB`，出来的字节数与加了 `-vn` 完全一致），但那会让 ffmpeg 白解一整条
+    24 分钟的视频流。`-y` 的理由见 extract_subtitle_track。
+    """
+    _require_source_video(video)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    run(
+        [
+            "-y",
+            "-i",
+            str(video),
+            "-vn",
+            "-ac",
+            "1",
+            "-ar",
+            "16000",
+            "-c:a",
+            "pcm_s16le",
+            str(dest),
+        ],
+        ffmpeg=ffmpeg,
+    )
+
+
 def font_available(name: str) -> bool | None:
     """fontconfig 认不认这个字体家族。**None = 查不了**（不是「不可用」）。
 
