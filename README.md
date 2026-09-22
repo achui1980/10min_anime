@@ -3,8 +3,10 @@
 把番剧字幕 + 视频变成解说成片。输入 SRT 与源片，输出「分段文案与剪辑时间轴对照表」、
 配音纯文本，以及配好音、烧好硬字幕的 mp4。
 
-**还没有 ASR**，所以只吃自带字幕的片源（生肉见下面的路线图 v3）。设计文档见
-`docs/superpowers/specs/2026-08-31-10min-anime-design.md`。
+吃自带字幕的片源，也吃生肉：对白轨有三条来源（手传 SRT / 视频里的软字幕轨 / 语音转写），
+生肉还会额外交付一份中文字幕。设计文档见
+`docs/superpowers/specs/2026-08-31-10min-anime-design.md`，生肉那部分见
+`docs/superpowers/specs/2026-09-21-tenmin-asr-translate-design.md`。
 
 ## 核心思路
 
@@ -21,6 +23,15 @@
 uv sync
 export TENMIN_GEMINI_API_KEY=your-key
 ```
+
+生肉片源（没有字幕、要靠语音转写）另外装一个 extra，它会把 torch 一起拽进来、几个 G：
+
+```bash
+uv sync --extra asr
+```
+
+不装也能跑 `tenmin --help` 和全部非转写用法；真需要转写时会报一句「跑一次
+`uv sync --extra asr` 再试」而不是 traceback。只支持 mlx-whisper（Apple Silicon）。
 
 渲染阶段需要编入 libass 的 ffmpeg（否则烧不了字幕）：
 
@@ -85,7 +96,13 @@ uv run tenmin run saijo --episode 2 --srt 你的字幕.srt --video 你的视频.
 这会把字幕拷进 `work/saijo/srt/E02.srt`（源片**留在原地**，只把它的绝对路径记进
 `project.yaml`——源片实测 300MB~1.4GB，拷进 work/ 是纯冗余），在 `project.yaml` 的
 `episodes:` 里补一条 `number: 2` 的记录，然后跑这一集的全链路。
-`--srt`/`--video` 必须一起传，且必须同时带 `--episode`。
+`--srt` 必须配 `--video`（视频是渲染阶段的硬需求），且必须同时带 `--episode`。
+
+**没有字幕的片源省掉 `--srt` 就行**，对白轨会自己找来源（见下一节）：
+
+```bash
+uv run tenmin run akujo --episode 11 --video 你的生肉.mp4
+```
 
 已经注册过的集，之后只需要带 `--episode` 就能重跑：
 
@@ -126,6 +143,73 @@ uv run tenmin run akujo2 --from voice
 ```bash
 uv run tenmin run akujo2 --from audio --force
 ```
+
+## 对白轨从哪来（三岔）
+
+ingest 之前有一层来源解析，按「无损且便宜」排序取第一条成立的：
+
+1. **手传的 SRT**（`--srt`，或 `project.yaml` 里那一集的 `srt:`）——人明确指定了，不猜。
+2. **视频里的软字幕轨**——`ffmpeg` 一条命令抽成 `work/<slug>/srt/E{NN}.embedded.srt`，
+   零成本零误差。**每次重抽**（抽取被打断留下的半份 SRT 在语法上合法，看不出是残骸）。
+3. **语音转写**——前两条都不成立时才走，落成 `work/<slug>/srt/E{NN}.asr.srt`。
+   开跑之前会打一行「没有字幕轨，只能走语音转写」，一集 24 分钟约 3 分钟。
+
+第 1、2 条的对白轨记作 `source: "srt"`，第 3 条记作 `source: "asr"`
+（在 `01_dialogue/E{NN}.dialogue.json` 里）。这个字段决定两件事：**要不要繁转简**
+（日语过 OpenCC 会被改字，所以听写路径强制关掉）和**要不要跑 translate 阶段**。
+
+### 两个旋钮
+
+```yaml
+asr:
+  model: mlx-community/whisper-large-v3-turbo
+  # 源片语言。**韩语/英语片源必须改这里**，它不做自动检测。
+  language: ja
+```
+
+### 换了模型要自己删缓存
+
+`E{NN}.asr.srt` 的复用判据只有「文件非空 + mtime 不早于源视频」，**刻意不看 `asr` 配置**。
+所以 **改完 `asr.model` 想重转，必须自己删掉那份 `.asr.srt`**：
+
+```bash
+rm work/<slug>/srt/E11.asr.srt
+```
+
+这么设计是因为那份 SRT 是**人可以手改**的产物（转差了就地改，改完 mtime 推过源视频、
+下次照样复用）。按配置指纹失效就意味着改一次 `asr.model` 会把那些手改**静默冲掉**，
+而「换了模型却没重转」打开文件就看得出来。
+
+## translate 阶段：中文字幕 + 累积术语表
+
+**只对 `source == "asr"` 的集跑**（判据是那个字段，不做语言检测）。自带字幕的片源本来就是
+观众读得懂的语言，这一阶段在磁盘上留不下任何痕迹——连 `zh/` 目录都不会建。
+
+产物：
+
+| 路径 | 是什么 |
+|---|---|
+| `work/<slug>/zh/E{NN}.zh.json` | 逐条译文（中间产物，带 id，对齐校验就盯它） |
+| `work/<slug>/out/E{NN}.zh.srt` | **中文字幕交付物**，能直接拖进播放器 |
+| `work/<slug>/zh/glossary.json` | **项目级**累积术语表（不带集号），日语原文 → 中文 |
+
+累积表是跨集对齐译名用的：E02 的翻译调用会把 E01 积下的表当输入塞回去（「这些已经定了，
+照用」），冲突时**累积的那个赢**——第 5 集换个写法会让成片看起来像换了个角色。它同时会被
+**script 阶段的 prompt 读进去**，所以字幕里的人名和解说稿里的人名是同一套。
+
+机器译错了要能盖掉它：在 `project.yaml` 里手写 `glossary`，**手写的赢**。
+
+```yaml
+glossary:
+  リディア: 莉迪亚
+```
+
+`zh/glossary.json` 是 script 阶段的新鲜度输入，所以它的内容真变了才会刷 mtime
+（否则一次 10 集的批处理会把前几集刚写好的解说稿全部判旧、下次白付好几次 LLM 费）。
+
+生肉路径下**必须手填 OP/ED 区间**（见下一节），这不是可选优化：片尾识别的全部判据都是
+「字幕组打在屏幕上的文字」特征（`©`、`作曲：`、`製作委員会`、人名罗列），而语音转写一条
+都不会产出——它把主题曲**歌词**转成了正常对白，不填的话解说稿会拿歌词当剧情素材。
 
 ## 标注 OP / ED 区间
 
@@ -177,7 +261,8 @@ uv run tenmin inspect akujo --episode 1
 
 | 阶段 | 产物 | 是否调 LLM |
 |---|---|---|
-| ingest | `01_dialogue/E{NN}.dialogue.json` | 否 |
+| ingest | `01_dialogue/E{NN}.dialogue.json` | 否（可能先跑一次语音转写，见上文三岔） |
+| translate | `zh/E{NN}.zh.json`、`out/E{NN}.zh.srt`、`zh/glossary.json` | **是**，且只对 `source == "asr"` 的集跑 |
 | signals | `02_signals/E{NN}.signals.json` | 否 |
 | script | `03_script/E{NN}.script.json` | **是** |
 | docgen | `out/E{NN}.解说方案.md`、`out/E{NN}.narration.txt` | 否 |
@@ -195,12 +280,24 @@ uv run pytest -q                              # 默认：全部离线，不联�
 uv run pytest -m llm                          # 真调 LLM 出快照（需 API key）
 uv run pytest -m generalize                   # 泛化复验（需自备 SRT）
 uv run pytest -m render     # 真跑渲染链路，需要真视频 + libass 版 ffmpeg
+uv run pytest -m asr        # 真跑语音转写，需要 --extra asr + 真视频
 ```
+
+## 已知限制
+
+- **位图字幕轨（Blu-ray PGS / DVD VobSub）走不通**：上面第 2 条分枝只判「有没有字幕轨」，
+  判不了「是不是文本」，于是位图轨会走进抽取路并在 ffmpeg 的跨族转码守卫上失败。会报一句
+  中文提示（手传 `--srt`，或换一个没有字幕轨的片源让它走语音转写），但**不会自动回落到
+  语音转写**——位图轨是能 OCR 的，悄悄换成听写等于把更好的素材丢了。
+- 手传一份**日语** SRT（或软字幕轨恰好是日语）时 translate 不会跑，而且那份对白还会被
+  繁转简改字。判据是 `source` 字段而不是语言检测。
+- `work/<slug>/project.yaml` 的 `render:` 配置是整个 project 共享的，不支持按集覆盖。
+- 源视频自带的原生硬字幕（某些片源有）在画面底部，某些时间点会跟 tenmin 烧的字幕重叠。
 
 ## 路线图
 
 - **v1**（已完成）SRT → 对照表 + 配音文本
-- **v2**（本版）Edge-TTS 配音 + ffmpeg 切片拼接 + 混音 + 烧硬字幕 → 1920x1080 mp4
-- **v3** Faster-Whisper ASR，支持生肉
+- **v2**（已完成）Edge-TTS 配音 + ffmpeg 切片拼接 + 混音 + 烧硬字幕 → 1920x1080 mp4
+- **v3**（本版）mlx-whisper 语音转写支持生肉 + `translate` 阶段交付中文字幕
 - **v4** 本地 Web GUI（`script.json` 可视化编辑器）
 - **v5** PySceneDetect + CLIP 视觉索引，整季 12 集压到 10 分钟

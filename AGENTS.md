@@ -4,15 +4,16 @@
 
 ## 项目是做什么的
 
-tenmin（10 分钟看番剧）：把番剧字幕（SRT）+ 视频，自动加工成"解说方案"文档 + 配音 + 烧字幕的成片。8 个阶段，每个阶段读上游产物、写自己的产物，靠文件 mtime 决定要不要重跑：
+tenmin（10 分钟看番剧）：把番剧字幕（SRT）或生肉视频 + 视频，自动加工成"解说方案"文档 + 配音 + 烧字幕的成片。9 个阶段，每个阶段读上游产物、写自己的产物，靠文件 mtime 决定要不要重跑：
 
 ```
-ingest → signals → script → docgen → voice → timeline → audio → render
+ingest → translate → signals → script → docgen → voice → timeline → audio → render
 ```
 
-- `ingest`：解析 SRT，生成对白轨（`01_dialogue/`）。
+- `ingest`：解析 SRT，生成对白轨（`01_dialogue/`）。**对白轨从哪来是三岔**（`ingest/resolve.py`）：手传 SRT → 视频里的软字幕轨直抽（`E{NN}.embedded.srt`，每次重抽）→ 语音转写（`E{NN}.asr.srt`，按 mtime 复用）。三条都归一成一个 SRT 路径，所以 `build_track` 的形态不变；`DialogueTrack.source` 记的是 `"srt"` 还是 `"asr"`。
+- `translate`：**只对 `source == "asr"` 的集跑**（判据是那个字段，不做语言检测），把日语对白逐条译成简体中文（`zh/E{NN}.zh.json` + 交付物 `out/E{NN}.zh.srt`），并把新认出的专有名词并进项目级累积表 `zh/glossary.json`（会被 script 的 prompt 读）。跳过时连 `zh/` 目录都不建。
 - `signals`：识别静音间隙、语速变化等"高能点"信号（`02_signals/`）。
-- `script`：调用 LLM，把信号转成分幕解说稿（`03_script/`，唯一需要 LLM 的阶段）。
+- `script`：调用 LLM，把信号转成分幕解说稿（`03_script/`）。
 - `docgen`：把 script.json 渲染成人类可读的对照表 + 纯配音文本（`out/`）。
 - `voice`：调用 TTS（edge-tts），把配音文本合成语音（`04_voice/`）。
 - `timeline`：根据真实配音时长重新计算时间轴，生成字幕（`05_timeline/`）。
@@ -23,7 +24,7 @@ ingest → signals → script → docgen → voice → timeline → audio → re
 
 ## 关键工具规则（非常重要）
 
-**跑本项目的 pipeline 命令和 pytest 时，一律用裸的 `uv run <cmd>`，绝对不要套 `rtk proxy` / `rtk pytest` / `rtk` 前缀。** 本项目的中文输出会把 rtk 的 UTF-8 抓取层搞崩。裸的 `rtk ls` / `rtk grep` / `rtk git` / `rtk read` / `rtk find` 是安全的，可以正常用。
+**跑本项目的 pipeline 命令和 pytest 时，一律用裸的 `uv run <cmd>`，绝对不要套 `rtk proxy` / `rtk pytest` / `rtk` 前缀。** 本项目的中文输出会把 rtk 的 UTF-8 抓取层搞崩。裸的 `rtk ls` / `rtk grep` / `rtk git` / `rtk read` 是安全的，可以正常用。
 
 ```bash
 # 对：
@@ -35,6 +36,14 @@ rtk pytest tests/
 rtk proxy uv run tenmin run saijo
 ```
 
+**`rtk find` 会拒绝 `-not` / `-exec`，而且 shell 层会把裸 `find` 也路由给 rtk。** 所以清 `__pycache__` 必须写绝对路径：
+
+```bash
+/usr/bin/find . -name __pycache__ -type d -not -path "./.venv/*" -exec rm -rf {} +
+```
+
+**做变异测试一律带 `PYTHONDONTWRITEBYTECODE=1`。** CPython 默认的 pyc 失效判据只看「源文件 mtime 的整秒值 + 字节数」，所以**等长**替换（比如把 `audio.wav` 改成 `audio.mp3`）且改坏与还原都发生在同一整秒内时，那两个记录值一个字节都不变 → 变异过的字节码被无限期当成有效，造成**假存活 / 假绿**。本分支真踩过一次。
+
 如果需要重装 `.venv`（`uv sync --reinstall`），edge-tts 走公司 Zscaler MITM 代理会报 SSL 证书错——需要把 Zscaler CA 追加进 certifi 的 cacert.pem：
 
 ```bash
@@ -43,14 +52,17 @@ cat /path/to/zscaler_ca_bundle.pem >> .venv/lib/python3.14/site-packages/certifi
 
 ## 代码结构
 
-- `src/tenmin/config.py`：`ProjectConfig` 与它的 6 个子 config（`.ingest` / `.credits` / `.signals` / `.validate_script` / `.render` / `.llm`）、`EpisodeConfig`，`Settings`（`BaseSettings`，读 `.env`，`env_prefix="TENMIN_"`）。**全项目所有「经验阈值」的唯一权威来源**；分家的判据是「这部番想要什么」的创作旋钮进 config，「物理上不可能／数据坏了」的合法性边界留在各模块的模块级常量里。各阶段模块只保留 `DEFAULT_XXX.field` 的模块级别名。
+- `src/tenmin/config.py`：`ProjectConfig`（14 个字段）与它的 8 个子 config（`.locale` / `.llm` / `.ingest` / `.credits` / `.signals` / `.validate_script` / `.render` / `.asr`）、`EpisodeConfig`，`Settings`（`BaseSettings`，读 `.env`，`env_prefix="TENMIN_"`）。**全项目所有「经验阈值」的唯一权威来源**；分家的判据是「这部番想要什么」的创作旋钮进 config，「物理上不可能／数据坏了」的合法性边界留在各模块的模块级常量里。各阶段模块只保留 `DEFAULT_XXX.field` 的模块级别名。改了子 config 的个数就来改这句数字（判据是 `ProjectConfig.model_fields` 里注解是 `BaseModel` 子类的那些）。
+
+  `AsrConfig` 只有 2 个字段（`model` / `language`），但有一条**不在代码里的操作约束**：`E{NN}.asr.srt` 的新鲜度只比源视频 mtime、**刻意不看 `AsrConfig`**，所以换了 `asr.model` 必须自己删那份 SRT。理由是它是一份人能手改的产物，按指纹失效会把手改静默冲掉。
 
   **OP/ED 区间是三级回退**，改 ingest 的 credits 相关代码前先分清自己在哪一级：`EpisodeConfig.op_range`/`ed_range`（逐集手填）→ `CreditsConfig.default_op_range`/`default_ed_range`（项目级手填，ED 终点允许 `None` = 到片尾，在 `normalize._resolve_manual_range` 里按**这一集**的 duration 解析）→ `credits.find_credit_ranges` 的启发式推断。关键点：**前两级（手填）还会直接驱动 `in_credit_window`** —— 拿到确定区间时窗就是那两段（各留 `manual_window_margin`=5 秒余量），`credit_head_window`/`ed_keyword_window_seconds` 那对盲窗完全不参与；两级都空才走盲窗，且那条路与改动前**逐字节等价**（实测新旧代码各跑一遍，13 份 `01_dialogue/*.json` 哈希全同）。手填模式刻意不受 `credit_window_max_ratio` 约束（那是给盲窗兜底的，静默收缩用户的显式声明比覆盖过宽更难查）。实测收益：接住 3 条落在 300 秒盲窗外的 staff 行、同时救回 5 条落在盲窗内被规则 4/5 误杀的真台词；代价是填错会在**你填的区间内**误判。`normalize.credit_range_source()` 报告实际生效的是哪一级（`tenmin inspect` 用），它刻意复用 `_resolve_manual_range` 而不是自己再判一遍「字段填了没」——项目级默认可能填了却在某一集上解析不出合法区间。
-- `src/tenmin/pipeline.py`：`Paths` 类（每阶段产物路径，全部按集号 `E{episode:02d}` 前缀），`STAGES` 列表，`run_pipeline()` 顶层编排（支持单集/批量两种模式，靠 `episode: int | None` 区分），`register_episode()`（`--episode --srt --video` 注册新集）。
+- `src/tenmin/pipeline.py`：`Paths` 类（每阶段产物路径，全部按集号 `E{episode:02d}` 前缀），`STAGES` 列表（9 项，`translate` 在 index 1），`run_pipeline()` 顶层编排（支持单集/批量两种模式，靠 `episode: int | None` 区分），`register_episode()`（`--episode --video` 注册新集，`--srt` 可省）。
 
   批量模式的编排是**按集纵向**（P0-C 定的：中途失败要留下完整交付物，而不是一堆半成品）。script 阶段的多集并发（`llm.script_concurrency`，默认 1）是在这个纵向循环上加一个**有界预取窗口** —— 走到第 i 集时确保前 `i + concurrency` 集的 script task 都起了，然后 await 第 i 集那个。**刻意不把 script 抽成横向并发阶段**：那会直接推翻上面那条不变量（全部集的 script 跑完之前一集成片都不会有，而 script 恰好是最慢也最容易失败的阶段）。默认 1 的三条依据见 `config.LLMConfig.script_concurrency` 的注释（最硬的一条：默认 provider 是 gemini，而它那条路上没有我们自己的传输层退避）。失败收摊走 `_drain_script_tasks`，`try/finally` 包住整个纵向循环。
-- `src/tenmin/cli.py`：Typer CLI（`tenmin init` / `tenmin run` / `tenmin inspect`）。`tenmin run` 支持三种用法：
+- `src/tenmin/cli.py`：Typer CLI（`tenmin init` / `tenmin run` / `tenmin inspect`）。`tenmin run` 支持四种用法：
   - `--episode N --srt <path> --video <path>`：注册新集并跑。
+  - `--episode N --video <path>`（不带 `--srt`）：**生肉入口**，对白轨靠软字幕轨抽取或语音转写拿。反过来「只传 `--srt`」非法（视频是渲染阶段的硬需求）。
   - `--episode N`（不带 srt/video）：重跑已注册的某一集。
   - 不带任何 flag：批处理模式，跑 project.yaml 里注册的所有集。
 - `src/tenmin/script/llm.py`：LLM provider 抽象。`LLMProvider`（Protocol，`complete` 有两条 PEP 695 重载：传 schema 返回该 schema 实例）、`GeminiProvider`（原生 google.genai SDK）、`OpenAICompatibleProvider`（通用 OpenAI 兼容 chat/completions 流式接口，schema 写进 prompt + pydantic 校验 + 报错重试，不依赖 `response_format=json_schema`）、`MiniMaxProvider(OpenAICompatibleProvider)`（MiniMax 专属子类，多了 `thinking` 深度思考开关，走 `_extra_payload_fields()` hook 注入）。`build_provider(cfg, settings)` 工厂函数按 `cfg.provider`（`"gemini"` / `"minimax"` / `"openai_compatible"`）分支构造对应 provider。
@@ -81,11 +93,12 @@ cat /path/to/zscaler_ca_bundle.pem >> .venv/lib/python3.14/site-packages/certifi
 uv run pytest tests/ -q          # 全量跑，默认跳过需要真实 API key / 素材的标记测试
 ```
 
-`tests/` 目录：`test_config.py`、`test_llm.py`、`test_pipeline.py`、`test_cli.py`、`test_render_*.py` 等，共 40 个文件（含 conftest.py / fakes.py / __init__.py）。pytest markers：
+`tests/` 目录：`test_config.py`、`test_llm.py`、`test_pipeline.py`、`test_cli.py`、`test_render_*.py` 等，共 45 个文件（含 conftest.py / fakes.py / __init__.py）。pytest markers（`pyproject.toml` 里是**四个**）：
 
 - `llm`：需要真实 LLM API key（默认跳过），跑法：`TENMIN_GEMINI_API_KEY=xxx uv run pytest -m llm`。
 - `generalize`：需要额外的番剧 SRT fixture。
 - `render`：需要真实视频 + 装了 libass 的 ffmpeg。
+- `asr`：需要 `uv sync --extra asr`（会拽 torch，几个 G）+ 真实视频。要加载几个 G 的语音模型跑上几分钟。
 
 改动 provider 相关代码后，务必确认 MiniMax 的现有测试（`test_minimax_*`）**行为不变**——`OpenAICompatibleProvider` 的重构原则是零行为变更，只是代码结构拆分。
 
@@ -97,3 +110,4 @@ uv run pytest tests/ -q          # 全量跑，默认跳过需要真实 API key 
 
 - 源视频自带的原生硬字幕（繁体中文，来自原始 ANIPLUS 流媒体版本）在画面底部，某些时间点会跟 tenmin 自己烧的字幕重叠。尝试过两种修复（不透明底框、全宽黑条），都被用户否决了；目前接受这个瑕疵，不再处理。
 - `work/<slug>/project.yaml`（单个项目的 `render:` 配置）目前是整个 project 共享的，不支持按集覆盖。
+- **位图字幕轨（Blu-ray PGS / DVD VobSub）走不通**：`has_subtitle_stream` 只判「有没有字幕轨」、判不了「是不是文本」，所以位图轨必然走进抽取路并在 ffmpeg 的跨族转码守卫上失败。`ingest/resolve.py` 认出那句报错并换成中文提示，但**刻意不自动回落到语音转写**（位图轨能 OCR，悄悄换成听写是把更好的素材丢了）。

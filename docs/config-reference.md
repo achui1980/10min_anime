@@ -14,8 +14,9 @@
 6. [signals](#6-signals-signalsconfigconfigpy250-27111-字段)
 7. [validate_script](#7-validate_script-yaml字段名如此类名是validateconfigconfigpy274-3126-字段)
 8. [render](#8-render-renderconfigconfigpy315-43828-字段)
-9. [环境变量（.env）](#补充环境变量env走settings类-configpy517-524)
-10. [全量配置示例](#9-全量配置示例所有字段含默认值)
+9. [asr](#9-asr-asrconfig2-字段)
+10. [环境变量（.env）](#补充环境变量env走settings类-configpy517-524)
+11. [全量配置示例](#10-全量配置示例所有字段含默认值)
 
 ---
 
@@ -29,8 +30,8 @@
 | `target_seconds` | `240.0`（必须 >0） | 目标解说时长（秒），script 阶段的时长预算基准 |
 | `locale.convert_traditional` | `true` | 是否把繁体转简体（ingest 阶段） |
 | `episodes` | `[]` | 见第 2 节 |
-| `glossary` | `{}` | 术语表，`dict[str, str]`，进 ingest 清洗和 script 提示词 |
-| `llm` / `ingest` / `credits` / `signals` / `validate_script` / `render` | 各自的 Config() 默认实例 | 见下方各节 |
+| `glossary` | `{}` | 术语表，`dict[str, str]`，进 ingest 清洗和 script 提示词。**手写的这份会盖掉 `zh/glossary.json` 里机器累积的同名条目**（它是纠错入口） |
+| `llm` / `ingest` / `credits` / `signals` / `validate_script` / `render` / `asr` | 各自的 Config() 默认实例 | 见下方各节 |
 
 ---
 
@@ -41,10 +42,13 @@
 | 字段 | 默认值 | 说明 |
 |---|---|---|
 | `number` | 必填 | 集数 |
-| `srt` | 必填 | 字幕路径，相对 `project.yaml` 所在目录解析（`config.py:481-485`），绝对路径原样使用 |
+| `srt` | `None` | 字幕路径，相对 `project.yaml` 所在目录解析（`config.py:481-485`），绝对路径原样使用。**可以不填**：不填时对白轨从视频里的软字幕轨抽取，没有软字幕轨就走语音转写 |
 | `video` | `None` | 视频路径，同上解析规则；渲染阶段前必须补上，否则 `video_path()` 报错（config.py:487-496） |
 | `op_range` | `None` | 逐集手填 OP 区间 `(start, end)`，**三级回退里最高优先级** |
 | `ed_range` | `None` | 逐集手填 ED 区间 `(start, end)` |
+
+`srt` 与 `video` **至少得有一个**（`_require_a_source` 守着，只在构造时跑）。只有 `srt`
+是 v1 的历史用法（`--only ingest` 至今这么用）；只有 `video` 是生肉入口。
 
 校验（`_validate_credit_range`, config.py:21-34）：`start`/`end` 都不能为负，且 `start < end`。写反的区间不会报错但下游 `intervals.subtract` 会静默当空集处理，等于没填，只能靠肉眼核对成片才能发现。
 
@@ -209,6 +213,32 @@
 
 ---
 
+## 9. asr（`AsrConfig`，2 字段）
+
+语音转写参数。**只在「这一集既没有手传 SRT、视频里也没有软字幕轨」时才用得上**，而且要先
+`uv sync --extra asr`（它会把 torch 一起拽进来，几个 G）。没装 extra 的人照旧能跑
+`tenmin --help` 和全部非转写阶段；真需要转写时会得到一句「跑一次 `uv sync --extra asr`
+再试」而不是 traceback。
+
+刻意没有 `engine` 字段：只支持 mlx-whisper 一个引擎（作者只在 Apple Silicon Mac 上自用），
+多一层引擎抽象是为不存在的需求付复杂度。
+
+| 字段 | 默认值 | 说明 |
+|---|---|---|
+| `model` | `"mlx-community/whisper-large-v3-turbo"` | mlx-whisper 的 `path_or_hf_repo`。首次用会一次性下载约 1.6G。实测 8 倍实时（120 秒音频转写 15 秒），按这个倍率**推算**一集 24 分钟约 3 分钟 |
+| `language` | `"ja"` | 源片语言，**不做自动检测**。韩语/英语片源必须改这里（那是「素材是什么」的事实，让人填一次比让机器每集猜一次可靠） |
+
+**改完 `model` 想重转，必须自己删掉 `work/<slug>/srt/E{NN}.asr.srt`。** 那份缓存的复用
+判据只有「文件非空 + mtime 不早于源视频」，**刻意不掺 `AsrConfig` 指纹**：它是一份人能
+手改的产物（转差了就地改，改完 mtime 推过源视频、下次照样按 `source: "asr"` 复用），
+按指纹失效意味着改一次 `model` 会把那些手改静默冲掉，而「换了模型却没重转」打开文件就
+看得出来。
+
+从软字幕轨抽出来的那份（`E{NN}.embedded.srt`）走的是相反策略——**每次重抽**，因为抽取
+被打断留下的半份 SRT 在语法上合法、看不出是残骸。
+
+---
+
 ## 补充：环境变量（.env，走 `Settings` 类，config.py:517-524）
 
 不在 `project.yaml` 里，通过 `.env`（`env_prefix="TENMIN_"`）或系统环境变量设置：
@@ -225,7 +255,7 @@ TENMIN_OPENAI_COMPATIBLE_API_KEY=xxx   # provider=openai_compatible 时必填
 
 ---
 
-## 9. 全量配置示例（所有字段，含默认值）
+## 10. 全量配置示例（所有字段，含默认值）
 
 以下 YAML 覆盖 `ProjectConfig` 的**每一个**字段，取值全部是代码里的默认值（`op_range`/`ed_range`/`default_op_range`/`default_ed_range` 除外——它们默认是 `null`，这里给出示例值以展示写法）。实际项目通常只需要覆盖第 1 节模板里那几个常改字段（见 `tenmin init` 生成的模板），其余留空即可走默认值；这份示例是给"想知道某个字段到底叫什么、该填在哪一层"的场景用的参考文档，不建议直接复制整份去覆盖生产项目。
 
@@ -241,7 +271,7 @@ locale:
 
 episodes:                  # 第 2 节：EpisodeConfig 列表，每集手填一项
   - number: 1
-    srt: srt/E01.srt        # 相对 project.yaml 所在目录解析
+    srt: srt/E01.srt        # 相对 project.yaml 所在目录解析；生肉片源可以整行不填
     video: video/E01.mp4    # 可选，渲染前必须补上
     op_range: null           # 例如 [30.5, 91.2]，逐集手填 OP 区间（最高优先级）
     ed_range: null           # 例如 [1348.2, 1416.6]，逐集手填 ED 区间
@@ -359,5 +389,10 @@ render:
   drift_tolerance: 0.5                  # 音频/视频时长漂移容差（秒）
   ffmpeg_path: ffmpeg
   ffprobe_path: ffprobe
+
+# ============ 第 9 节：asr（AsrConfig，2 字段） ============
+asr:
+  model: mlx-community/whisper-large-v3-turbo   # 换了它要自己删 srt/E{NN}.asr.srt
+  language: ja                                  # 源片语言，不做自动检测
 ```
 
