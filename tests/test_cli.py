@@ -920,6 +920,30 @@ def test_batch_run_tells_the_user_it_skipped_a_prefilled_episode(work, golden_sr
     assert not (root / "01_dialogue" / "E03.dialogue.json").exists()
 
 
+def test_batch_run_does_not_list_stale_deliverables_for_prefilled_episode(
+    work, golden_srt_path
+):
+    root = _bootstrap_with_prefilled(work, golden_srt_path)
+    active_table = root / "out" / "E02.解说方案.md"
+    stale_table = root / "out" / "E03.解说方案.md"
+    stale_narration = root / "out" / "E03.narration.txt"
+    stale_video = root / "07_render" / "E03.mp4"
+    active_table.parent.mkdir()
+    stale_video.parent.mkdir()
+    for path in (active_table, stale_table, stale_narration, stale_video):
+        path.write_bytes(b"stale")
+
+    result = runner.invoke(app, ["run", "saijo", "--work-dir", str(work), "--only", "ingest"])
+
+    assert result.exit_code == 0, out(result)
+    text = out(result)
+    assert "第 3 集还没有 video，已跳过" in text
+    assert f"对照表：{active_table}" in text
+    assert f"对照表：{stale_table}" not in text
+    assert f"配音文本：{stale_narration}" not in text
+    assert f"成品视频：{stale_video}" not in text
+
+
 def test_running_a_prefilled_episode_without_a_video_asks_for_one(work, golden_srt_path):
     _bootstrap_with_prefilled(work, golden_srt_path)
     result = runner.invoke(

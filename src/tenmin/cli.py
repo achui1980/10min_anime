@@ -330,7 +330,7 @@ def run(
     if episode is not None:
         printed_numbers = [episode]
     else:
-        printed_numbers = [e.number for e in cfg.episodes]
+        printed_numbers = [e.number for e in cfg.episodes if e.has_source]
 
     for number in printed_numbers:
         table_path = paths.table(number)
