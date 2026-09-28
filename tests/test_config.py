@@ -712,6 +712,42 @@ def test_duplicate_nested_keys_are_rejected(tmp_path):
     assert "font_size" in str(excinfo.value)
 
 
+def test_duplicate_merge_keys_are_rejected_with_both_line_numbers(tmp_path):
+    path = _write(
+        tmp_path,
+        "show: 某番\nslug: demo\nrender:\n"
+        "  <<: &base {font_size: 50}\n  <<: {width: 1280}\n",
+    )
+    with pytest.raises(ProjectConfigError) as excinfo:
+        load_project(path)
+    message = str(excinfo.value)
+    assert "project.yaml" in message
+    assert "<<" in message
+    assert "出现了两次" in message
+    assert "第 4 行" in message
+    assert "第 5 行" in message
+
+
+def test_single_merge_key_still_loads_and_allows_explicit_override(tmp_path):
+    path = _write(
+        tmp_path,
+        "show: 某番\nslug: demo\nrender:\n"
+        "  <<: &base {font_size: 50, width: 1280}\n  font_size: 60\n",
+    )
+    cfg = load_project(path)
+    assert cfg.render.font_size == 60
+    assert cfg.render.width == 1280
+
+
+def test_merge_key_and_literal_quoted_key_can_coexist(tmp_path):
+    path = _write(
+        tmp_path,
+        "show: 某番\nslug: demo\nglossary:\n"
+        "  <<: &names {甲: 甲}\n  '<<': 合并符号\n",
+    )
+    assert load_project(path).glossary == {"甲": "甲", "<<": "合并符号"}
+
+
 def test_project_config_error_is_a_value_error():
     """cli.PIPELINE_ERRORS 靠 ValueError 那条网兜住它。"""
     assert issubclass(ProjectConfigError, ValueError)

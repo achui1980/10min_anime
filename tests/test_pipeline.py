@@ -1769,6 +1769,48 @@ def test_register_episode_rejects_a_missing_srt_before_touching_anything(tmp_pat
     assert [e.number for e in cfg.episodes] == [2]
 
 
+def test_register_episode_rejects_invalidated_yaml_before_copying_srt(tmp_path):
+    cfg = _project_config(tmp_path)
+    before = (
+        "show: 才女的侍从\nslug: saijo\nrender:\n"
+        "  <<: &base {font_size: 50}\n  <<: {width: 1280}\n"
+    )
+    cfg.config_path.write_text(before, encoding="utf-8")
+    source = tmp_path / "source.srt"
+    source.write_text("1\n00:00:01,000 --> 00:00:02,000\n台词\n", encoding="utf-8")
+
+    with pytest.raises(ProjectConfigError, match="<<"):
+        register_episode(cfg, episode=3, srt=source, video=tmp_path / "e03.mkv")
+
+    assert cfg.config_path.read_text(encoding="utf-8") == before
+    assert not (cfg.root / "srt" / "E03.srt").exists()
+    assert [episode.number for episode in cfg.episodes] == [2]
+
+
+def test_register_episode_preserves_a_single_merge_key(tmp_path):
+    root = tmp_path / "saijo"
+    root.mkdir()
+    yaml_path = root / "project.yaml"
+    before = (
+        "show: 才女的侍从\nslug: saijo\nrender:\n"
+        "  <<: {font_size: 50, width: 1280}\n  font_size: 60\n"
+        "episodes: []\n"
+    )
+    yaml_path.write_text(before, encoding="utf-8")
+    cfg = load_project(yaml_path)
+    video = tmp_path / "e03.mkv"
+    video.write_bytes(b"fake")
+
+    register_episode(cfg, episode=3, srt=None, video=video)
+
+    after = yaml_path.read_text(encoding="utf-8")
+    assert "  <<: {font_size: 50, width: 1280}\n  font_size: 60\n" in after
+    reloaded = load_project(yaml_path)
+    assert reloaded.render.font_size == 60
+    assert reloaded.render.width == 1280
+    assert reloaded.episodes[0].video == video.resolve()
+
+
 # --- 产物原子写 -------------------------------------------------------------
 # _is_fresh 只比 mtime，所以每一个「会被当成输入或产物」的文件都必须原子落盘，
 # 否则半截文件的 mtime 恰好最新，下一轮直接跳过、坏产物一路进成片。

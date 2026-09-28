@@ -604,12 +604,17 @@ class DuplicateKeyError(yaml.YAMLError):
 
 
 class _UniqueKeyLoader(yaml.SafeLoader):
-    """在 SafeLoader 构造 mapping 时拒绝重复键，保留合法的 YAML 合并键。"""
+    """在 SafeLoader 构造 mapping 时拒绝重复键，保留单个合法的 YAML 合并键。"""
 
     def construct_mapping(self, node: yaml.MappingNode, deep: bool = False) -> dict[Any, Any]:
         seen: dict[Any, int] = {}
+        merge_line: int | None = None
         for key_node, _ in node.value:
             if key_node.tag == "tag:yaml.org,2002:merge":
+                line = key_node.start_mark.line + 1
+                if merge_line is not None:
+                    raise DuplicateKeyError("<<", merge_line, line)
+                merge_line = line
                 continue
             key = self.construct_object(key_node, deep=deep)
             try:
@@ -676,17 +681,23 @@ def _describe_validation_error(name: str, error: ValidationError) -> str:
     return "\n".join(lines)
 
 
-def load_project(path: Path) -> ProjectConfig:
-    """读 project.yaml；保留文件不存在异常，其余格式错误转成中文配置错误。"""
+def _parse_project_yaml(path: Path) -> Any:
+    """读 YAML 并校验语法与重复键，供加载配置及登记前检查共用。"""
     path = Path(path)
     if not path.exists():
         raise FileNotFoundError(f"找不到项目配置: {path}")
     try:
-        data = yaml.load(path.read_text(encoding="utf-8"), Loader=_UniqueKeyLoader) or {}
+        return yaml.load(path.read_text(encoding="utf-8"), Loader=_UniqueKeyLoader) or {}
     except DuplicateKeyError as error:
         raise ProjectConfigError(f"{path.name} 里{error}") from error
     except yaml.YAMLError as error:
         raise ProjectConfigError(f"{path.name} 不是合法的 YAML：{error}") from error
+
+
+def load_project(path: Path) -> ProjectConfig:
+    """读 project.yaml；保留文件不存在异常，其余格式错误转成中文配置错误。"""
+    path = Path(path)
+    data = _parse_project_yaml(path)
     try:
         cfg = ProjectConfig.model_validate(data)
     except ValidationError as error:

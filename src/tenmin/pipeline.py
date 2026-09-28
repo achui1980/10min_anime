@@ -13,7 +13,7 @@ from ruamel.yaml.comments import CommentedMap, CommentedSeq
 from ruamel.yaml.util import load_yaml_guess_indent
 
 from tenmin import atomic
-from tenmin.config import EpisodeConfig, ProjectConfig
+from tenmin.config import EpisodeConfig, ProjectConfig, _parse_project_yaml
 from tenmin.docgen.narration import render_narration
 from tenmin.docgen.table import render_table
 from tenmin.ingest.normalize import build_track
@@ -738,6 +738,9 @@ def register_episode(
     存量的相对路径（work/saijo/ 下 10 个已经拷好的 mp4）逐字节不变，video_path() 照旧按
     project.yaml 所在目录解析。
     """
+    # cfg 可能在载入后被人手改了文件；再次校验磁盘上的 YAML，避免拷好字幕
+    # 才由 round-trip parser 报错，留下没有登记成功的 SRT。
+    _parse_project_yaml(cfg.config_path)
     # 在拷贝字幕或改写配置之前检查输入，给出可读的错误并避免部分登记。
     if srt is not None and not Path(srt).is_file():
         raise FileNotFoundError(f"找不到要登记的字幕文件：{srt}")

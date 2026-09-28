@@ -870,6 +870,31 @@ def test_run_reports_an_unknown_field_without_a_traceback(work):
     assert "font_size" in out(result)
 
 
+def test_run_rejects_duplicate_merge_keys_before_copying_srt(work, golden_srt_path, tmp_path):
+    text = (
+        "show: 某番\nslug: saijo\nrender:\n"
+        "  <<: &base {font_size: 50}\n  <<: {width: 1280}\n"
+    )
+    _broken_project(work, text)
+    root = work / "saijo"
+    video = tmp_path / "e03.mkv"
+    video.write_bytes(b"fake")
+
+    result = runner.invoke(
+        app,
+        [
+            "run", "saijo", "--work-dir", str(work), "--episode", "3",
+            "--srt", str(golden_srt_path), "--video", str(video), "--only", "ingest",
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert _graceful(result), repr(result.exception)
+    assert "<<" in out(result) and "出现了两次" in out(result)
+    assert (root / "project.yaml").read_text(encoding="utf-8") == text
+    assert not (root / "srt" / "E03.srt").exists()
+
+
 def test_run_reports_a_missing_srt_without_a_traceback(work, golden_srt_path, tmp_path):
     root = _bootstrap(work, golden_srt_path)
     before = (root / "project.yaml").read_text(encoding="utf-8")
