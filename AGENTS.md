@@ -54,12 +54,18 @@ cat /path/to/zscaler_ca_bundle.pem >> .venv/lib/python3.14/site-packages/certifi
 
 - `src/tenmin/config.py`：`ProjectConfig`（14 个字段）与它的 8 个子 config（`.locale` / `.llm` / `.ingest` / `.credits` / `.signals` / `.validate_script` / `.render` / `.asr`）、`EpisodeConfig`，`Settings`（`BaseSettings`，读 `.env`，`env_prefix="TENMIN_"`）。**全项目所有「经验阈值」的唯一权威来源**；分家的判据是「这部番想要什么」的创作旋钮进 config，「物理上不可能／数据坏了」的合法性边界留在各模块的模块级常量里。各阶段模块只保留 `DEFAULT_XXX.field` 的模块级别名。改了子 config 的个数就来改这句数字（判据是 `ProjectConfig.model_fields` 里注解是 `BaseModel` 子类的那些）。
 
+  这 10 个配置模型（项目、8 个子配置、集配置）继承 `StrictModel`（`extra="forbid"`）；`Settings` 除外，因为 `.env` 可含别的程序的变量。`load_project` 用 `_UniqueKeyLoader`（PyYAML SafeLoader + 同层重复键检查）；YAML 语法/重复键或 pydantic 校验失败都包装为 `ProjectConfigError(ValueError)`，点名文件和完整字段路径（如 `render.font_sise`、`episodes[0].op_rang`），未知字段给拼写建议。`EpisodeConfig` 可预填仅有集号/OP/ED、没有 srt/video 的条目；运行时按 `has_source` 判：批处理跳过并警告，单集运行要求 `--video`，inspect 标「未登记视频」；登记时合并同一条并保留 OP/ED。
+
   `AsrConfig` 只有 2 个字段（`model` / `language`），但有一条**不在代码里的操作约束**：`E{NN}.asr.srt` 的新鲜度只比源视频 mtime、**刻意不看 `AsrConfig`**，所以换了 `asr.model` 必须自己删那份 SRT。理由是它是一份人能手改的产物，按指纹失效会把手改静默冲掉。
 
   **OP/ED 区间是三级回退**，改 ingest 的 credits 相关代码前先分清自己在哪一级：`EpisodeConfig.op_range`/`ed_range`（逐集手填）→ `CreditsConfig.default_op_range`/`default_ed_range`（项目级手填，ED 终点允许 `None` = 到片尾，在 `normalize._resolve_manual_range` 里按**这一集**的 duration 解析）→ `credits.find_credit_ranges` 的启发式推断。关键点：**前两级（手填）还会直接驱动 `in_credit_window`** —— 拿到确定区间时窗就是那两段（各留 `manual_window_margin`=5 秒余量），`credit_head_window`/`ed_keyword_window_seconds` 那对盲窗完全不参与；两级都空才走盲窗，且那条路与改动前**逐字节等价**（实测新旧代码各跑一遍，13 份 `01_dialogue/*.json` 哈希全同）。手填模式刻意不受 `credit_window_max_ratio` 约束（那是给盲窗兜底的，静默收缩用户的显式声明比覆盖过宽更难查）。实测收益：接住 3 条落在 300 秒盲窗外的 staff 行、同时救回 5 条落在盲窗内被规则 4/5 误杀的真台词；代价是填错会在**你填的区间内**误判。`normalize.credit_range_source()` 报告实际生效的是哪一级（`tenmin inspect` 用），它刻意复用 `_resolve_manual_range` 而不是自己再判一遍「字段填了没」——项目级默认可能填了却在某一集上解析不出合法区间。
 - `src/tenmin/pipeline.py`：`Paths` 类（每阶段产物路径，全部按集号 `E{episode:02d}` 前缀），`STAGES` 列表（9 项，`translate` 在 index 1），`run_pipeline()` 顶层编排（支持单集/批量两种模式，靠 `episode: int | None` 区分），`register_episode()`（`--episode --video` 注册新集，`--srt` 可省）。
 
-  批量模式的编排是**按集纵向**（P0-C 定的：中途失败要留下完整交付物，而不是一堆半成品）。script 阶段的多集并发（`llm.script_concurrency`，默认 1）是在这个纵向循环上加一个**有界预取窗口** —— 走到第 i 集时确保前 `i + concurrency` 集的 script task 都起了，然后 await 第 i 集那个。**刻意不把 script 抽成横向并发阶段**：那会直接推翻上面那条不变量（全部集的 script 跑完之前一集成片都不会有，而 script 恰好是最慢也最容易失败的阶段）。默认 1 的三条依据见 `config.LLMConfig.script_concurrency` 的注释（最硬的一条：默认 provider 是 gemini，而它那条路上没有我们自己的传输层退避）。失败收摊走 `_drain_script_tasks`，`try/finally` 包住整个纵向循环。
+  **新鲜度按阶段配置切片**（`config_slices.py` 的 `STAGE_FIELDS`）：`run_pipeline` 先写解析后的 `.config/E{NN}.<stage>.json`，signals 单独写项目级 `.config/signals.json`，替代整个 `project.yaml` 作为阶段输入。字段归属：ingest 读 locale/ingest/credits/asr/glossary/show/本集；translate 读 glossary 与 LLM provider/model/base_url/thinking/temperature/max_output_tokens；signals 读 signals；script 读 llm/validate_script/target_seconds/mode/glossary/show/render.rate；docgen 读 render.rate；voice 读 render.voice/rate；timeline、audio、render 各读对应的 render 字段及本集（详见映射表）。**新增阶段读取点时同步更新该阶段映射**：`tests/test_config_slices.py` 只检测字段是否挂到任一阶段，不能发现「已有字段又被另一阶段读取」；`EXCLUDED` 排除不影响产物的超时、重试、并发、代理、二进制路径、slug。内容不变不碰切片；首次创建 mtime 置 epoch 0，升级不触发整季重跑，但升级前已修改未跑的配置首次不会失效旧产物；这种情况及删掉 `.config/` 后需 `--force`。
+
+  ingest/signals **产物字节不变就不写**，避免下游因 mtime 变动连带重跑；全局阶段的新鲜度另由 `.config/{ingest,signals}.done` 记录上次完成时间及**每份产物 SHA-256 摘要**（`_is_fresh_stamped` 比对摘要和输入时间）。重跑前先将戳子置空，失败留下空戳子、下次必重跑；戳子不存在或是旧版阶段名纯文本时才退回按产物 mtime 判。`register_episode` 用 `ruamel.yaml` round-trip 只改目标集的 srt/video，保留其他字段、注释、键序、引号与原有序列缩进；配置读取仍用 PyYAML。登记 SRT 不存在时先报错，不拷贝也不写配置。
+
+  批量模式的编排是**按集纵向**（P0-C 定的：中途失败要留下完整交付物，而不是一堆半成品）。script 阶段的多集并发（`llm.script_concurrency`，默认 1）是在这个纵向循环上加一个**有界预取窗口** —— 走到第 i 集时确保前 `i + concurrency` 集的 script task 都起了，然后 await 第 i 集那个。**刻意不把 script 抽成横向并发阶段**：那会直接推翻上面那条不变量（全部集的 script 跑完之前一集成片都不会有，而 script 恰好是最慢也最容易失败的阶段）。默认 1 的依据见 `config.LLMConfig.script_concurrency` 的注释（并发易撞 429、失败时在飞调用白花钱、audio/render 的同步 ffmpeg 会堵住事件循环）。失败收摊走 `_drain_script_tasks`，`try/finally` 包住整个纵向循环。
 - `src/tenmin/cli.py`：Typer CLI（`tenmin init` / `tenmin run` / `tenmin inspect`）。`tenmin run` 支持四种用法：
   - `--episode N --srt <path> --video <path>`：注册新集并跑。
   - `--episode N --video <path>`（不带 `--srt`）：**生肉入口**，对白轨靠软字幕轨抽取或语音转写拿。反过来「只传 `--srt`」非法（视频是渲染阶段的硬需求）。
@@ -68,10 +74,11 @@ cat /path/to/zscaler_ca_bundle.pem >> .venv/lib/python3.14/site-packages/certifi
 - `src/tenmin/script/llm.py`：LLM provider 抽象。`LLMProvider`（Protocol，`complete` 有两条 PEP 695 重载：传 schema 返回该 schema 实例）、`GeminiProvider`（原生 google.genai SDK）、`OpenAICompatibleProvider`（通用 OpenAI 兼容 chat/completions 流式接口，schema 写进 prompt + pydantic 校验 + 报错重试，不依赖 `response_format=json_schema`）、`MiniMaxProvider(OpenAICompatibleProvider)`（MiniMax 专属子类，多了 `thinking` 深度思考开关，走 `_extra_payload_fields()` hook 注入）。`build_provider(cfg, settings)` 工厂函数按 `cfg.provider`（`"gemini"` / `"minimax"` / `"openai_compatible"`）分支构造对应 provider。
 
   健壮性分成三层，改这个文件前先分清自己在动哪一层：
-  1. **传输层**（`_stream_with_retries`）：429/5xx 与连接类异常走指数退避 + 抖动 + `Retry-After`，次数由 `transport_max_attempts` 管。其余 4xx 与非限流的业务错误码立即失败。
+  1. **传输层**（OpenAI 兼容 `_stream_with_retries`、Gemini `_generate_with_retries`）：429/5xx 与连接类异常走指数退避 + 抖动 + `Retry-After`，次数由 `transport_max_attempts` 管；其余 4xx 与非限流业务错误立即失败。Gemini 将 SDK `APIError` 按状态码判并包装为 `LLMHTTPError`，连接异常耗尽包装为 `LLMTransportError`；它显式传入自持有的 `httpx.AsyncClient`，绕开 SDK aiohttp 路径在 `attempts=1` 内仍会偷偷重试连接的行为，保证外层次数就是 HTTP 请求上限（连接异常识别仍兼容 httpx/aiohttp 两族）。
   2. **schema 修复层**（`complete_with_schema_repair`，provider 无关，两个 provider 共用）：校验失败就把「schema + 报错 + 截断后的坏输出」回灌重试，次数由 `max_attempts` 管。**纠错轮刻意不重发首轮那份 ~35k 字符的正文。**
   3. **异常族**：全部继承 `LLMError`（`RuntimeError` 子类，已进 `cli.py` 的 `PIPELINE_ERRORS`）。`LLMHTTPError` 把响应体摘要拼进消息，`LLMBusinessError` 管 HTTP 200 + `base_resp.status_code != 0`，`LLMSchemaError.raw_output` 带着最后一次的原始模型输出（由 `pipeline.run_script` 落到 `03_script/E{NN}.raw.txt`），`LLMFinishReasonError` 管「没有可用输出」的 finish_reason —— **两条 provider 路径共用它**（Gemini 的 `_check_gemini_finish` 与 OpenAI 兼容的 `_stream_once` 里那次截断判定），而且它刻意不被 schema 修复层网住：同一个 max_tokens 只会再截断一次。
   退避的 `_sleep` / `_rand` 是模块级函数，测试 monkeypatch 掉它们，所以**新增退避路径时不要改成直接 `asyncio.sleep`**，否则测试会真睡。
+  **用量**：`LLMUsage` 累计一次 `complete()` 内的全部请求（含 `cached_tokens`）。`script/usage.py` 的 `track_call` 在调用返回后立刻读 `provider.last_usage`（中间不能插 await，否则并发会串账），记录每次首稿/语义重试/预算返工或翻译/修复调用；写入 `03_script/E{NN}.usage.json`、`zh/E{NN}.usage.json`。失败调用也记录 `ok: false`；用量文件只供成本观察，不参与新鲜度。
 - `src/tenmin/render/`：`subtitles.py`（ASS 字幕生成，含手动 CJK 换行，因为 libass 不会按 CJK 字符边界自动换行）、`timeline.py`（时间轴重算 + 按句拆分字幕 cue）、`audio.py`（原声 ducking + 混音 + 淡出 + 结尾静音）、`video.py`（剪辑拼接烧字幕 + 淡出 + 结尾卡片）、`ffmpeg.py`（subprocess 封装，所有调用都用 `text=True, errors="replace"`，因为老番源文件的容器元数据经常不是合法 UTF-8）。
 - `src/tenmin/render/tts.py`：TTS 层，结构上刻意跟 `script/llm.py` 对齐。改它之前先分清自己在动哪一层：
   1. **缓存身份**：chunk 文件名是 `chunk_{序号:03d}.{hash8}.mp3`，哈希 = sha256(`engine.fingerprint` + `\x00` + text)，`fingerprint` 含 voice 与 rate。**序号只为人工试听时可读，身份全靠哈希** —— 复用先按确切名字找，找不到就在同目录里按哈希 glob（chunk 数量一变序号全平移，但内容没变的不该重合成）。改这里会让 `work/` 下的存量 chunk 全部失效。
@@ -98,7 +105,7 @@ cat /path/to/zscaler_ca_bundle.pem >> .venv/lib/python3.14/site-packages/certifi
 uv run pytest tests/ -q          # 全量跑，默认跳过需要真实 API key / 素材的标记测试
 ```
 
-`tests/` 目录：`test_config.py`、`test_llm.py`、`test_pipeline.py`、`test_cli.py`、`test_render_*.py` 等，共 45 个文件（含 conftest.py / fakes.py / __init__.py）。pytest markers（`pyproject.toml` 里是**四个**）：
+`tests/` 目录：`test_config.py`、`test_llm.py`、`test_pipeline.py`、`test_cli.py`、`test_config_slices.py`、`test_render_*.py` 等，共 46 个 Python 文件（含 conftest.py / fakes.py / __init__.py）。pytest markers（`pyproject.toml` 里是**四个**）：
 
 - `llm`：需要真实 LLM API key（默认跳过），跑法：`TENMIN_GEMINI_API_KEY=xxx uv run pytest -m llm`。
 - `generalize`：需要额外的番剧 SRT fixture。
