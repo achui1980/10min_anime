@@ -6,7 +6,6 @@ import asyncio
 import io
 import json
 from collections.abc import Sequence
-from itertools import pairwise
 from pathlib import Path
 
 from ruamel.yaml import YAML
@@ -653,30 +652,28 @@ def _write_back_episode(yaml_path: Path, entry: EpisodeConfig) -> None:
     长路径不折行。整份结果经原子写替换，避免中断损坏已登记的集数。
     """
     text = yaml_path.read_text(encoding="utf-8")
-    _, sequence_indent, sequence_offset = load_yaml_guess_indent(text)
-    # The helper's indent counts spaces up to the first item after `- `, not
-    # the mapping step. With `episodes:\n    - number: 2` it returns (6, 4),
-    # while the nested mapping step is 4. Use a nested map as evidence when
-    # present; otherwise the list's first item is one dash and space deeper.
-    lines = text.splitlines()
-    mapping_indent = next(
-        (
-            len(line) - len(line.lstrip(" "))
-            for parent, line in pairwise(lines)
-            if parent.endswith(":") and not parent.startswith(" ")
-            and line.startswith(" ") and not line.lstrip().startswith("- ")
-        ),
-        (sequence_indent - 2) if sequence_indent and sequence_offset else sequence_indent,
-    )
     round_trip = YAML()
     round_trip.preserve_quotes = True
     round_trip.width = 4096
+    data, sequence_indent, sequence_offset = load_yaml_guess_indent(text, yaml=round_trip)
+    # The helper stops at the first block sequence, so its indent describes
+    # the position after `- ` rather than earlier nested maps. The parser's
+    # key columns also handle `render: # settings` and intervening comments.
+    mapping_indent = sequence_indent
+    if isinstance(data, CommentedMap):
+        mapping_indent = next(
+            (
+                value.lc.key(next(iter(value)))[1] - data.lc.key(key)[1]
+                for key, value in data.items()
+                if isinstance(value, CommentedMap) and value and not value.fa.flow_style()
+            ),
+            (sequence_indent - 2) if sequence_indent and sequence_offset else sequence_indent,
+        )
     round_trip.indent(
         mapping=mapping_indent or 2,
         sequence=sequence_indent or 2,
         offset=sequence_offset or 0,
     )
-    data = round_trip.load(text)
     if data is None:
         data = CommentedMap()
     episodes = data.get("episodes")

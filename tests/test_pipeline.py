@@ -2955,6 +2955,59 @@ glossary:
     assert load_project(yaml_path).episodes[0].ed_range == (1300.0, 1420.0)
 
 
+def test_register_episode_preserves_mapping_indent_after_inline_comment(tmp_path):
+    root = tmp_path / "saijo"
+    root.mkdir()
+    yaml_path = root / "project.yaml"
+    before = """\
+show: 才女的侍从
+slug: saijo
+render: # settings
+    font_size: 60
+episodes:
+- number: 2
+  ed_range: [1300, 1420]
+"""
+    yaml_path.write_text(before, encoding="utf-8")
+    cfg = load_project(yaml_path)
+    video = tmp_path / "e02.mkv"
+    video.write_bytes(b"fake")
+
+    register_episode(cfg, episode=2, srt=None, video=video)
+
+    assert yaml_path.read_text(encoding="utf-8") == before.replace(
+        "  ed_range: [1300, 1420]\n",
+        f"  ed_range: [1300, 1420]\n  video: {video.resolve()}\n",
+    )
+
+
+def test_register_episode_uses_block_mapping_indent_after_flow_map(tmp_path):
+    root = tmp_path / "saijo"
+    root.mkdir()
+    yaml_path = root / "project.yaml"
+    before = """\
+show: 才女的侍从
+slug: saijo
+glossary: {伊月: 伊月}
+render: # settings
+    font_size: 60
+episodes:
+- number: 2
+  ed_range: [1300, 1420]
+"""
+    yaml_path.write_text(before, encoding="utf-8")
+    cfg = load_project(yaml_path)
+    video = tmp_path / "e02.mkv"
+    video.write_bytes(b"fake")
+
+    register_episode(cfg, episode=2, srt=None, video=video)
+
+    assert yaml_path.read_text(encoding="utf-8") == before.replace(
+        "  ed_range: [1300, 1420]\n",
+        f"  ed_range: [1300, 1420]\n  video: {video.resolve()}\n",
+    )
+
+
 def test_reregister_episode_preserves_nonempty_flow_sequence(tmp_path):
     root = tmp_path / "saijo"
     root.mkdir()
