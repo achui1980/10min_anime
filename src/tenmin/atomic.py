@@ -90,3 +90,24 @@ def copy_file(src: str | PathLike[str], dest: str | PathLike[str]) -> None:
     """
     with atomic_path(Path(dest)) as tmp:
         shutil.copyfile(src, tmp)
+
+
+def write_text_if_changed(path: Path, text: str, *, encoding: str = "utf-8") -> bool:
+    """内容跟盘上逐字节相同就不碰文件（保住旧 mtime），否则原子写。返回是否真的写了。
+
+    「没变就不写」在本项目里是正确性而不是性能：下游阶段只比 mtime，内容一字没变、
+    mtime 却刷新了，整条下游都会被判过期。
+
+    比的是字节而不是解码后的文本：换行符与编码上的任何差别都算「变了」。读盘失败
+    （文件不存在、没权限）一律照写。`is_file` 守卫避免读 FIFO 永久阻塞。
+    """
+    path = Path(path)
+    payload = text.encode(encoding)
+    if path.is_file():
+        try:
+            if path.read_bytes() == payload:
+                return False
+        except OSError:
+            pass
+    write_text(path, text, encoding=encoding)
+    return True

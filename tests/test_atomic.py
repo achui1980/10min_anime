@@ -2,9 +2,18 @@
 
 from __future__ import annotations
 
+import os
+
 import pytest
 
-from tenmin.atomic import PART_SUFFIX, atomic_path, copy_file, part_path, write_text
+from tenmin.atomic import (
+    PART_SUFFIX,
+    atomic_path,
+    copy_file,
+    part_path,
+    write_text,
+    write_text_if_changed,
+)
 
 
 def test_part_path_keeps_suffix_so_ffmpeg_can_infer_container(tmp_path):
@@ -116,3 +125,53 @@ def test_copy_file_keeps_the_old_copy_when_the_source_disappears(tmp_path):
         copy_file(tmp_path / "missing.srt", dest)
     assert dest.read_text(encoding="utf-8") == "旧字幕"
     assert not part_path(dest).exists()
+
+
+def test_write_text_if_changed_leaves_identical_content_untouched(tmp_path):
+    target = tmp_path / "a.json"
+    write_text(target, "x\n")
+    os.utime(target, ns=(10**18, 10**18))
+
+    assert write_text_if_changed(target, "x\n") is False
+    assert target.stat().st_mtime_ns == 10**18
+
+
+def test_write_text_if_changed_rewrites_different_content(tmp_path):
+    target = tmp_path / "a.json"
+    write_text(target, "x\n")
+
+    assert write_text_if_changed(target, "y\n") is True
+    assert target.read_text(encoding="utf-8") == "y\n"
+
+
+def test_write_text_if_changed_creates_a_missing_file(tmp_path):
+    target = tmp_path / "sub" / "a.json"
+
+    assert write_text_if_changed(target, "x\n") is True
+    assert target.read_text(encoding="utf-8") == "x\n"
+
+
+def test_write_text_if_changed_compares_bytes_in_the_requested_encoding(tmp_path):
+    target = tmp_path / "a.txt"
+    target.write_bytes("é".encode("latin-1"))
+    os.utime(target, ns=(10**18, 10**18))
+
+    assert write_text_if_changed(target, "é", encoding="latin-1") is False
+    assert target.stat().st_mtime_ns == 10**18
+    assert write_text_if_changed(target, "é") is True
+    assert target.read_bytes() == "é".encode()
+
+
+def test_write_text_if_changed_does_not_read_a_fifo(tmp_path, monkeypatch):
+    fifo = tmp_path / "fifo"
+    os.mkfifo(fifo)
+    original = type(fifo).read_bytes
+
+    def read_bytes(path):
+        if path == fifo:
+            pytest.fail("reading a FIFO would block")
+        return original(path)
+
+    monkeypatch.setattr(type(fifo), "read_bytes", read_bytes)
+    assert write_text_if_changed(fifo, "replacement") is True
+    assert fifo.read_text() == "replacement"
