@@ -256,7 +256,7 @@ def run(
     video: Path | None = VIDEO_OPTION,
 ) -> None:
     """跑流水线：ingest→translate→signals→script→docgen→voice→timeline→audio→render。"""
-    cfg = load_project(_project_file(work_dir, slug))
+    project_file = _project_file(work_dir, slug)
 
     # 三条规则（原来是「--srt 与 --video 必须一起传」那一条对称的规则）：
     # - 传 --srt 必须配 --video：视频是 render 阶段的硬需求，只有字幕出不了片。
@@ -273,15 +273,16 @@ def run(
         typer.secho("传 --video 时必须同时传 --episode", fg=typer.colors.RED)
         raise typer.Exit(code=1)
 
-    if video is not None:
-        cfg = register_episode(cfg, episode=episode, srt=srt, video=video)
-
-    if episode is not None:
-        try:
+    # 配置读取、登记与集号查询同样可能抛用户可处理的错误。
+    try:
+        cfg = load_project(project_file)
+        if video is not None:
+            cfg = register_episode(cfg, episode=episode, srt=srt, video=video)
+        if episode is not None:
             _find_episode(cfg, episode)
-        except ValueError as error:
-            typer.secho(str(error), fg=typer.colors.RED)
-            raise typer.Exit(code=1) from error
+    except PIPELINE_ERRORS as error:
+        typer.secho(_error_message(error), fg="red", err=True)
+        raise typer.Exit(code=1) from error
 
     only_stages = _parse_only(only)
     try:
@@ -361,7 +362,12 @@ def inspect(
     suspect: bool = typer.Option(False, "--suspect", help="只列疑似 OCR 噪声的行"),
 ) -> None:
     """打印对白轨与信号摘要，调试清洗规则用。"""
-    cfg = load_project(_project_file(work_dir, slug))
+    project_file = _project_file(work_dir, slug)
+    try:
+        cfg = load_project(project_file)
+    except PIPELINE_ERRORS as error:
+        typer.secho(_error_message(error), fg="red", err=True)
+        raise typer.Exit(code=1) from error
     paths = Paths(cfg.root)
 
     if not paths.dialogue(episode).exists():

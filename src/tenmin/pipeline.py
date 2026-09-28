@@ -643,6 +643,10 @@ def register_episode(
     走各自 EpisodeConfig 的 model_dump 落盘，存量的相对路径（work/saijo/ 下 10 个
     已经拷好的 mp4）逐字节不变，video_path() 照旧按 project.yaml 所在目录解析。
     """
+    # 在拷贝字幕或改写配置之前检查输入，给出可读的错误并避免部分登记。
+    if srt is not None and not Path(srt).is_file():
+        raise FileNotFoundError(f"找不到要登记的字幕文件：{srt}")
+
     relative_srt: Path | None = None
     if srt is not None:
         srt_dest = cfg.root / "srt" / f"E{episode:02d}.srt"

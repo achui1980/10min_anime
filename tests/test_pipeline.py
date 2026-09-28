@@ -1753,6 +1753,19 @@ def _project_config(tmp_path: Path) -> ProjectConfig:
     return load_project(yaml_path)
 
 
+def test_register_episode_rejects_a_missing_srt_before_touching_anything(tmp_path):
+    cfg = _project_config(tmp_path)
+    before = cfg.config_path.read_text(encoding="utf-8")
+
+    with pytest.raises(FileNotFoundError, match="找不到要登记的字幕文件"):
+        register_episode(
+            cfg, episode=3, srt=tmp_path / "nope.srt", video=tmp_path / "e03.mkv"
+        )
+
+    assert cfg.config_path.read_text(encoding="utf-8") == before
+    assert [e.number for e in cfg.episodes] == [2]
+
+
 # --- 产物原子写 -------------------------------------------------------------
 # _is_fresh 只比 mtime，所以每一个「会被当成输入或产物」的文件都必须原子落盘，
 # 否则半截文件的 mtime 恰好最新，下一轮直接跳过、坏产物一路进成片。

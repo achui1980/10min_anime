@@ -840,3 +840,56 @@ def test_run_still_requires_episode_when_registering_only_a_video(
     # 单飞那条路，「别点用户压根没用的 --srt」就是这句文案唯一的存在理由。光看 flag
     # 名更是被 _find_episode 的「没有注册」提示等其它含 --episode 的输出满足过。
     assert "传 --video 时必须同时传 --episode" in out(result)
+
+
+# --- 读配置与登记也在错误网里：一行中文红字，不出 traceback ----------------
+
+
+def _broken_project(work, text: str) -> None:
+    root = work / "saijo"
+    root.mkdir(parents=True)
+    (root / "project.yaml").write_text(text, encoding="utf-8")
+
+
+def test_run_reports_a_yaml_syntax_error_without_a_traceback(work):
+    _broken_project(work, "show: [没闭合\nslug: saijo\n")
+    result = runner.invoke(app, ["run", "saijo", "--work-dir", str(work), "--only", "ingest"])
+    assert result.exit_code == 1
+    assert _graceful(result), repr(result.exception)
+    assert "不是合法的 YAML" in out(result)
+
+
+def test_run_reports_an_unknown_field_without_a_traceback(work):
+    _broken_project(work, "show: 某番\nslug: saijo\nrender:\n  font_sise: 99\n")
+    result = runner.invoke(app, ["run", "saijo", "--work-dir", str(work), "--only", "ingest"])
+    assert result.exit_code == 1
+    assert _graceful(result), repr(result.exception)
+    assert "render.font_sise 不是已知字段" in out(result)
+    assert "font_size" in out(result)
+
+
+def test_run_reports_a_missing_srt_without_a_traceback(work, golden_srt_path, tmp_path):
+    root = _bootstrap(work, golden_srt_path)
+    before = (root / "project.yaml").read_text(encoding="utf-8")
+    video = tmp_path / "e03.mkv"
+    video.write_bytes(b"fake")
+    result = runner.invoke(
+        app,
+        [
+            "run", "saijo", "--work-dir", str(work),
+            "--episode", "3", "--srt", str(tmp_path / "nope.srt"), "--video", str(video),
+            "--only", "ingest",
+        ],
+    )
+    assert result.exit_code == 1
+    assert _graceful(result), repr(result.exception)
+    assert "找不到要登记的字幕文件" in out(result)
+    assert (root / "project.yaml").read_text(encoding="utf-8") == before
+
+
+def test_inspect_reports_a_broken_project_without_a_traceback(work):
+    _broken_project(work, "show: 某番\nslug: saijo\nrender:\n  font_sise: 99\n")
+    result = runner.invoke(app, ["inspect", "saijo", "--work-dir", str(work), "--episode", "2"])
+    assert result.exit_code == 1
+    assert _graceful(result), repr(result.exception)
+    assert "render.font_sise 不是已知字段" in out(result)
