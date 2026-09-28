@@ -597,14 +597,24 @@ def test_episode_may_have_only_an_srt():
     assert episode.video is None
 
 
-def test_episode_with_neither_srt_nor_video_is_rejected():
-    """两个字段都可选之后，「至少得有一个」这条保证就没人管了 —— 显式补上。
+def test_a_prefilled_episode_with_only_credit_ranges_loads(tmp_path):
+    """先写进 yaml 的 op/ed 可以在登记视频之前加载。"""
+    path = tmp_path / "project.yaml"
+    path.write_text(
+        MINIMAL + "  - number: 3\n    op_range: [10, 100]\n    ed_range: [1300, 1420]\n",
+        encoding="utf-8",
+    )
+    cfg = load_project(path)
+    prefilled = next(e for e in cfg.episodes if e.number == 3)
+    assert prefilled.has_source is False
+    assert prefilled.op_range == (10.0, 100.0)
+    assert next(e for e in cfg.episodes if e.number == 1).has_source is True
 
-    没有它的话，一个空 episode 会一路飘到 ingest 才炸，且错误信息指不到根因。
-    """
-    with pytest.raises(ValidationError) as excinfo:
-        EpisodeConfig(number=11)
-    assert "srt" in str(excinfo.value)
+
+def test_has_source_is_true_for_either_source():
+    assert EpisodeConfig(number=1, srt=Path("srt/E01.srt")).has_source is True
+    assert EpisodeConfig(number=1, video=Path("/v/e01.mkv")).has_source is True
+    assert EpisodeConfig(number=1).has_source is False
 
 
 def test_srt_path_is_none_for_a_video_only_episode(tmp_path):

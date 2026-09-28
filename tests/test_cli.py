@@ -893,3 +893,48 @@ def test_inspect_reports_a_broken_project_without_a_traceback(work):
     assert result.exit_code == 1
     assert _graceful(result), repr(result.exception)
     assert "render.font_sise 不是已知字段" in out(result)
+
+
+# --- 预填集条目的 CLI 行为 ---------------------------------------------------
+
+
+def _bootstrap_with_prefilled(work, golden_srt_path):
+    root = work / "saijo"
+    (root / "srt").mkdir(parents=True)
+    (root / "srt" / "E02.srt").write_bytes(golden_srt_path.read_bytes())
+    (root / "project.yaml").write_text(
+        "show: 才女的侍从\nslug: saijo\nepisodes:\n"
+        "- number: 2\n  srt: srt/E02.srt\n"
+        "- number: 3\n  op_range: [10.0, 100.0]\n",
+        encoding="utf-8",
+    )
+    return root
+
+
+def test_batch_run_tells_the_user_it_skipped_a_prefilled_episode(work, golden_srt_path):
+    root = _bootstrap_with_prefilled(work, golden_srt_path)
+    result = runner.invoke(app, ["run", "saijo", "--work-dir", str(work), "--only", "ingest"])
+    assert result.exit_code == 0, out(result)
+    assert "第 3 集还没有 video，已跳过" in out(result)
+    assert (root / "01_dialogue" / "E02.dialogue.json").exists()
+    assert not (root / "01_dialogue" / "E03.dialogue.json").exists()
+
+
+def test_running_a_prefilled_episode_without_a_video_asks_for_one(work, golden_srt_path):
+    _bootstrap_with_prefilled(work, golden_srt_path)
+    result = runner.invoke(
+        app, ["run", "saijo", "--work-dir", str(work), "--episode", "3", "--only", "ingest"]
+    )
+    assert result.exit_code == 1
+    assert _graceful(result), repr(result.exception)
+    assert "--video" in out(result)
+
+
+def test_inspect_lists_a_prefilled_episode_as_unregistered(work, golden_srt_path):
+    _bootstrap_with_prefilled(work, golden_srt_path)
+    result = runner.invoke(
+        app, ["inspect", "saijo", "--work-dir", str(work), "--episode", "3"]
+    )
+    assert result.exit_code == 0, out(result)
+    assert "未登记视频" in out(result)
+    assert "--video" in out(result)

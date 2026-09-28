@@ -21,7 +21,6 @@ from pydantic import (
     SecretStr,
     ValidationError,
     field_validator,
-    model_validator,
 )
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -72,14 +71,10 @@ class StrictModel(BaseModel):
 
 class EpisodeConfig(StrictModel):
     number: int
-    # 两个来源至少得有一个，由 _require_a_source 守着 —— 但它只在**构造**时跑。
-    # register_episode 走的是 `existing.srt = ...` / `existing.video = ...` 属性赋值，
-    # 而这个模型没开 validate_assignment，所以那条路上 validator 不会重跑（实测
-    # 把一个已有 episode 的两个字段依次赋成 None 不报错，会留下一个无源 episode）。
-    # 今天不可达，因为 register_episode 的 video 参数是必填的 Path。
-    # 刻意不开 validate_assignment 补这个洞：对只有 srt 的旧集重登记时，
-    # `existing.srt = None` 会在 `existing.video` 赋值**之前**触发 validator，
-    # 把一条合法的改集操作炸成 ValidationError。
+    # 两个来源都可空，而且可以**同时**为空：那是「预填」条目 —— 用户先把这一集的
+    # op_range/ed_range 写进 yaml，之后再用 `--episode N --video …` 登记源片（登记会并进
+    # 这一条、保留 op/ed）。「至少有一个来源」是运行时判据（has_source），由 pipeline 的
+    # 批处理跳过、单集模式报错，不在加载期拦 —— 拦在加载期的话整个项目都读不进来。
     # srt 可空是为了「只有生肉视频」那条路（对白轨靠软字幕轨抽取或语音转写拿到）；
     # video 可空是历史约定（v1 只吃字幕、压根不碰视频文件，`--only ingest` 至今还这么用）。
     srt: Path | None = None
@@ -94,22 +89,10 @@ class EpisodeConfig(StrictModel):
     ) -> tuple[float, float] | None:
         return _validate_credit_range(value)
 
-    @model_validator(mode="after")
-    def _require_a_source(self) -> EpisodeConfig:
-        """至少要有 srt 或 video 之一。
-
-        srt 从必填变成可选之后，这条保证就没别人管了。没有它的话，一个只写了
-        number 的 episode 会一路飘到 ingest 才炸，撞上的是 resolve_subtitle_source
-        抛的「既没有字幕文件也没有源视频，无法得到对白轨」（实测：绕开本 validator
-        造一个 srt 与 video 全为 None 的 episode 再跑 run_ingest，抛的就是这句）。
-        措辞不撒谎，但仍然指向「解析对白轨时才发现」而不是「你在 project.yaml 里
-        这一集压根没写来源」这个根因。
-        """
-        if self.srt is None and self.video is None:
-            raise ValueError(
-                f"第 {self.number} 集既没有 srt 也没有 video，至少要填一个"
-            )
-        return self
+    @property
+    def has_source(self) -> bool:
+        """srt 与 video 至少有一个。两个都没有 = 预填条目，不参与任何阶段。"""
+        return self.srt is not None or self.video is not None
 
 
 class LocaleConfig(StrictModel):

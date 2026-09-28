@@ -2807,3 +2807,51 @@ async def test_a_skipped_translate_writes_no_usage_file(tmp_path):
     await run_translate(cfg, FakeProvider([]), 2)
     assert not paths.zh_usage(2).exists()
     assert not (cfg.root / "zh").exists()
+
+
+# --- 预填集条目：只有 op/ed、还没有 srt/video --------------------------------
+
+
+@pytest.mark.asyncio
+async def test_batch_mode_skips_a_prefilled_episode_with_a_notice(project):
+    project.episodes.append(EpisodeConfig(number=3, ed_range=(1300.0, 1420.0)))
+
+    warnings = await run_pipeline(
+        project, FakeProvider([fake_script_response()]), only=V1_STAGES
+    )
+
+    paths = Paths(project.root)
+    assert "第 3 集还没有 video，已跳过" in warnings
+    assert paths.script(2).exists()
+    assert not paths.dialogue(3).exists()
+
+
+@pytest.mark.asyncio
+async def test_single_episode_mode_on_a_prefilled_episode_asks_for_a_video(project):
+    project.episodes.append(EpisodeConfig(number=3, ed_range=(1300.0, 1420.0)))
+
+    with pytest.raises(ValueError, match="--video"):
+        await run_pipeline(project, FakeProvider([]), only=V1_STAGES, episode=3)
+
+
+def test_registering_a_prefilled_episode_keeps_its_credit_ranges(tmp_path):
+    root = tmp_path / "saijo"
+    (root / "srt").mkdir(parents=True)
+    yaml_path = root / "project.yaml"
+    yaml_path.write_text(
+        "show: 才女的侍从\nslug: saijo\nepisodes:\n"
+        "- number: 3\n  op_range: [10.0, 100.0]\n  ed_range: [1300.0, 1420.0]\n",
+        encoding="utf-8",
+    )
+    cfg = load_project(yaml_path)
+    video = tmp_path / "e03.mkv"
+    video.write_bytes(b"fake")
+
+    register_episode(cfg, episode=3, srt=None, video=video)
+
+    reloaded = load_project(yaml_path)
+    (episode,) = reloaded.episodes
+    assert episode.op_range == (10.0, 100.0)
+    assert episode.ed_range == (1300.0, 1420.0)
+    assert episode.video == video.resolve()
+    assert episode.has_source is True

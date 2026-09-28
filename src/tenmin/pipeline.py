@@ -315,6 +315,11 @@ def _is_fresh(outputs: list[Path], inputs: list[Path]) -> bool:
     return oldest_output >= newest_input
 
 
+def _active_episodes(cfg: ProjectConfig) -> list[EpisodeConfig]:
+    """登记过来源（srt 或 video）的集。预填条目（只写了 op/ed）不参与任何阶段。"""
+    return [episode for episode in cfg.episodes if episode.has_source]
+
+
 def _source_duration(cfg: ProjectConfig, episode: EpisodeConfig) -> float | None:
     """尽力拿这一集源视频的真实片长；拿不到就返回 None（让调用方退化到字幕末尾）。
 
@@ -374,7 +379,7 @@ def _ingest_inputs(cfg: ProjectConfig) -> list[Path]:
     指不到「这一集是生肉」这个根因。
     """
     inputs: list[Path] = []
-    for episode in cfg.episodes:
+    for episode in _active_episodes(cfg):
         srt = cfg.srt_path(episode)
         if srt is not None:
             inputs.append(srt)
@@ -417,7 +422,7 @@ def _script_inputs(paths: Paths, episode: int) -> list[Path]:
 def run_ingest(cfg: ProjectConfig) -> list[DialogueTrack]:
     paths = Paths(cfg.root)
     tracks = []
-    for episode in cfg.episodes:
+    for episode in _active_episodes(cfg):
         # 三条来源路径（手传 SRT / 视频内嵌软字幕轨 / 语音转写）都归一成一份 SRT，
         # 所以 build_track 拿到的东西形态不变。这里每集**只解析一次**：软字幕轨那条
         # 分枝每次调用都会重抽一遍（见 ingest/resolve.py 里那段注释），多调一次就多
@@ -474,7 +479,7 @@ def ingest_warnings(tracks: Sequence[DialogueTrack]) -> list[str]:
 def _load_tracks(cfg: ProjectConfig) -> list[DialogueTrack]:
     paths = Paths(cfg.root)
     tracks = []
-    for episode in cfg.episodes:
+    for episode in _active_episodes(cfg):
         path = paths.dialogue(episode.number)
         if not path.exists():
             raise FileNotFoundError(f"缺少对白轨产物 {path}，请先跑 ingest 阶段")
@@ -536,7 +541,7 @@ def run_signals(cfg: ProjectConfig) -> list[SignalReport]:
 def _load_reports(cfg: ProjectConfig) -> list[SignalReport]:
     paths = Paths(cfg.root)
     reports = []
-    for episode in cfg.episodes:
+    for episode in _active_episodes(cfg):
         path = paths.signals(episode.number)
         if not path.exists():
             raise FileNotFoundError(f"缺少信号产物 {path}，请先跑 signals 阶段")
@@ -623,6 +628,12 @@ def _find_episode(cfg: ProjectConfig, episode_number: int) -> EpisodeConfig:
     """
     for episode in cfg.episodes:
         if episode.number == episode_number:
+            if not episode.has_source:
+                raise ValueError(
+                    f"第 {episode_number} 集在 project.yaml 里只是预填条目（还没有 video）。"
+                    f"请用 `tenmin run {cfg.slug} --episode {episode_number} "
+                    "--video <视频路径>` 登记源片，已填的 op_range/ed_range 会保留。"
+                )
             return episode
     raise ValueError(
         f"第 {episode_number} 集还没有注册。"
@@ -1004,7 +1015,8 @@ async def run_pipeline(
     wanted = resolve_stages(from_stage=from_stage, only=only)
 
     paths = Paths(cfg.root)
-    numbers = [ep.number for ep in cfg.episodes]
+    active = _active_episodes(cfg)
+    numbers = [ep.number for ep in active]
     ingest_inputs = _ingest_inputs(cfg)
     warnings: list[str] = []
 
@@ -1018,6 +1030,13 @@ async def run_pipeline(
         return _is_fresh(outputs, [cfg.config_path, *inputs])
 
     if episode is None:
+        # 预填条目在批处理里跳过，但不能静默：用户会以为那一集跑过了。只在批处理模式下
+        # 提示 —— 单集模式跑的是别的集，报一句无关的集号只是噪音。
+        warnings.extend(
+            f"第 {ep.number} 集还没有 video，已跳过"
+            for ep in cfg.episodes
+            if not ep.has_source
+        )
         target_numbers = numbers
     else:
         _find_episode(cfg, episode)  # 找不到会抛 ValueError（"没有注册"）

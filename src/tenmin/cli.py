@@ -370,6 +370,19 @@ def inspect(
         raise typer.Exit(code=1) from error
     paths = Paths(cfg.root)
 
+    ep_cfg = next((ep for ep in cfg.episodes if ep.number == episode), None)
+    prefilled = [ep for ep in cfg.episodes if not ep.has_source]
+    if prefilled:
+        typer.echo(
+            "未登记视频的预填条目：" + "、".join(f"E{ep.number:02d}" for ep in prefilled)
+        )
+    if ep_cfg is not None and not ep_cfg.has_source:
+        typer.echo(
+            f"E{episode:02d}：未登记视频（op_range={ep_cfg.op_range}，ed_range={ep_cfg.ed_range}）"
+        )
+        typer.echo(f"登记源片：tenmin run {slug} --episode {episode} --video <源片路径>")
+        return
+
     if not paths.dialogue(episode).exists():
         typer.secho(
             f"缺少 {paths.dialogue(episode)}，先跑 tenmin run {slug} --only ingest",
@@ -387,7 +400,6 @@ def inspect(
 
     typer.echo(f"对白轨 E{episode:02d}：{len(track.lines)} 行，时长 {track.duration:.3f}s")
     typer.echo("  分类：" + "、".join(f"{k}={v}" for k, v in sorted(counts.items())))
-    ep_cfg = next((ep for ep in cfg.episodes if ep.number == episode), None)
     for label, value, filled, default in (
         ("片头曲", track.op_range, ep_cfg and ep_cfg.op_range, cfg.credits.default_op_range),
         ("片尾曲", track.ed_range, ep_cfg and ep_cfg.ed_range, cfg.credits.default_ed_range),
