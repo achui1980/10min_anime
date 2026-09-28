@@ -2926,6 +2926,60 @@ def test_reregistering_changes_only_that_entrys_source_lines(tmp_path, golden_sr
     assert "    op_range: [153.5, 224.7]" in after.splitlines()
 
 
+def test_register_episode_preserves_four_space_mapping_indent(tmp_path):
+    root = tmp_path / "saijo"
+    root.mkdir()
+    yaml_path = root / "project.yaml"
+    before = """\
+show: 才女的侍从
+slug: saijo
+render:
+    font_size: 60  # 字号
+    width: 1920
+episodes:
+    - number: 2
+      ed_range: [1300, 1420]
+glossary:
+    伊月: 伊月
+"""
+    yaml_path.write_text(before, encoding="utf-8")
+    cfg = load_project(yaml_path)
+    video = tmp_path / "e02.mkv"
+    video.write_bytes(b"fake")
+
+    register_episode(cfg, episode=2, srt=None, video=video)
+
+    after = yaml_path.read_text(encoding="utf-8")
+    assert _removed_lines(before, after) == []
+    assert "      video: " + str(video.resolve()) in after.splitlines()
+    assert load_project(yaml_path).episodes[0].ed_range == (1300.0, 1420.0)
+
+
+def test_reregister_episode_preserves_nonempty_flow_sequence(tmp_path):
+    root = tmp_path / "saijo"
+    root.mkdir()
+    yaml_path = root / "project.yaml"
+    before = """\
+show: 才女的侍从
+slug: saijo
+episodes: [{number: 2, srt: srt/E02.srt}, {number: 3, ed_range: [1300, 1420]}]
+glossary: {伊月: 伊月}
+"""
+    yaml_path.write_text(before, encoding="utf-8")
+    cfg = load_project(yaml_path)
+    video = tmp_path / "e02.mkv"
+    video.write_bytes(b"fake")
+
+    register_episode(cfg, episode=2, srt=None, video=video)
+
+    after = yaml_path.read_text(encoding="utf-8")
+    assert after == before.replace(
+        "{number: 2, srt: srt/E02.srt}",
+        f"{{number: 2, video: {video.resolve()}}}",
+    )
+    assert load_project(yaml_path).episodes[1].ed_range == (1300.0, 1420.0)
+
+
 def test_the_write_back_parser_rejects_duplicate_keys_like_load_project(tmp_path):
     """两处对重复键的态度必须一致。"""
     from ruamel.yaml import YAML

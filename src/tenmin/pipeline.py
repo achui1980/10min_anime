@@ -6,6 +6,7 @@ import asyncio
 import io
 import json
 from collections.abc import Sequence
+from itertools import pairwise
 from pathlib import Path
 
 from ruamel.yaml import YAML
@@ -653,10 +654,28 @@ def _write_back_episode(yaml_path: Path, entry: EpisodeConfig) -> None:
     """
     text = yaml_path.read_text(encoding="utf-8")
     _, sequence_indent, sequence_offset = load_yaml_guess_indent(text)
+    # The helper's indent counts spaces up to the first item after `- `, not
+    # the mapping step. With `episodes:\n    - number: 2` it returns (6, 4),
+    # while the nested mapping step is 4. Use a nested map as evidence when
+    # present; otherwise the list's first item is one dash and space deeper.
+    lines = text.splitlines()
+    mapping_indent = next(
+        (
+            len(line) - len(line.lstrip(" "))
+            for parent, line in pairwise(lines)
+            if parent.endswith(":") and not parent.startswith(" ")
+            and line.startswith(" ") and not line.lstrip().startswith("- ")
+        ),
+        (sequence_indent - 2) if sequence_indent and sequence_offset else sequence_indent,
+    )
     round_trip = YAML()
     round_trip.preserve_quotes = True
     round_trip.width = 4096
-    round_trip.indent(mapping=2, sequence=sequence_indent or 2, offset=sequence_offset or 0)
+    round_trip.indent(
+        mapping=mapping_indent or 2,
+        sequence=sequence_indent or 2,
+        offset=sequence_offset or 0,
+    )
     data = round_trip.load(text)
     if data is None:
         data = CommentedMap()
@@ -664,8 +683,6 @@ def _write_back_episode(yaml_path: Path, entry: EpisodeConfig) -> None:
     if episodes is None:
         episodes = CommentedSeq()
         data["episodes"] = episodes
-    # init 的 episodes: [] 是 flow style；新增映射时必须改回块式。
-    episodes.fa.set_block_style()
     target = next(
         (
             item
@@ -675,6 +692,9 @@ def _write_back_episode(yaml_path: Path, entry: EpisodeConfig) -> None:
         None,
     )
     if target is None:
+        # init 的 episodes: [] 是 flow style；新增映射时必须改回块式。
+        if not episodes:
+            episodes.fa.set_block_style()
         target = CommentedMap()
         target["number"] = entry.number
         episodes.append(target)
