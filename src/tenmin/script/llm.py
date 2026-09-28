@@ -37,8 +37,8 @@ BACKOFF_JITTER_RATIO = 0.25
 # Retry-After 说多久就等多久，但要夹住：服务端（或中间的代理）给一个离谱的值时，
 # 一次 429 能把整条流水线钉死几小时。
 RETRY_AFTER_MAX_SECONDS = 120.0
-# 429 = 限流，5xx = 服务端/网关侧的瞬时故障。其余 4xx（401/403/400/404）重试是纯
-# 浪费：key 不会在 1 秒后自己变对，请求体也不会自己变合法。
+# OpenAI 兼容路径现有的退避状态码；Gemini 单独覆盖完整 500–599 区间。
+# 其余 4xx（401/403/400/404）重试是纯浪费：key 与请求体不会自己变对。
 RETRYABLE_STATUS_CODES = frozenset({429, 500, 502, 503, 504})
 # HTTP 200 + base_resp.status_code 的业务错误码里，只有限流值得重试：它就是 429 的
 # 业务码版本。1008（余额不足）、2013（参数错）重试三遍只是把同一个必错的请求发三遍。
@@ -670,7 +670,7 @@ class GeminiProvider:
                 cause: BaseException = exc
                 http_error = _gemini_http_error(exc, self.model)
                 error: Exception = http_error
-                retryable = http_error.status_code in RETRYABLE_STATUS_CODES
+                retryable = http_error.status_code == 429 or 500 <= http_error.status_code <= 599
                 retry_after = http_error.retry_after
             except _GEMINI_TRANSPORT_ERRORS as exc:
                 cause = exc

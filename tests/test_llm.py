@@ -1876,6 +1876,37 @@ async def test_gemini_gives_up_on_5xx_after_transport_max_attempts(monkeypatch, 
     assert sleeps == [1.0, 2.0]
 
 
+@pytest.mark.parametrize("status_code", [501, 505])
+@pytest.mark.asyncio
+async def test_gemini_retries_every_5xx_status(monkeypatch, sleeps, status_code):
+    provider = GeminiProvider(api_key="fake-key", transport_max_attempts=2)
+    calls = _fake_gemini_sequence(
+        monkeypatch, provider, [_api_error(status_code), '{"value": 5}']
+    )
+
+    assert await provider.complete("SYS", "USR", Toy) == Toy(value=5)
+    assert len(calls) == 2
+    assert sleeps == [1.0]
+
+
+@pytest.mark.parametrize("status_code", [501, 505])
+@pytest.mark.asyncio
+async def test_openai_compatible_keeps_existing_5xx_retry_policy(
+    monkeypatch, sleeps, status_code
+):
+    log = _mock_httpx(monkeypatch, [(status_code, "unsupported")])
+    provider = OpenAICompatibleProvider(
+        api_key="k", model="m", base_url="https://x.test/v1"
+    )
+
+    with pytest.raises(LLMHTTPError) as excinfo:
+        await provider.complete("SYS", "USR", Toy)
+
+    assert excinfo.value.status_code == status_code
+    assert len([request for request in log if "url" in request]) == 1
+    assert sleeps == []
+
+
 @pytest.mark.asyncio
 async def test_gemini_retries_an_httpx_connection_error_then_wraps_it(monkeypatch, sleeps):
     import httpx

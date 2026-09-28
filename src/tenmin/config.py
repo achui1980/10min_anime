@@ -172,10 +172,9 @@ class LLMConfig(StrictModel):
     #
     # **默认 1 是刻意的**，三条依据，一条比一条硬：
     # 1. **并发最容易撞 429**。三条 provider 路径现在都有我们自己的传输层退避
-    #    （GeminiProvider._generate_with_retries 与 OpenAICompatibleProvider
-    #    ._stream_with_retries 同一套判据：429/5xx/连接类异常，transport_max_attempts=4
-    #    + 抖动 + Retry-After），但退避只兜得住秒级的限流窗，一个把 RPM 配额打满的并发度
-    #    照样是整批失败。
+    #    （GeminiProvider 覆盖 429/全部 5xx/连接类异常；OpenAICompatibleProvider
+    #    保持 429/选定的 5xx/连接类异常；两者都有 transport_max_attempts=4、抖动和
+    #    Retry-After），但退避只兜得住秒级的限流窗，把 RPM 配额打满照样是整批失败。
     # 2. **并发会花掉可能白花的钱**。预取窗口里在飞的那几集，一旦前面某集的任何阶段
     #    失败就会被取消，那几次调用的 token 已经花了。串行下它们压根不会发出去。
     # 3. **run_audio / run_render 是同步的 ffmpeg 调用，会把事件循环整个堵住**，在飞的
