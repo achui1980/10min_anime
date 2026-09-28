@@ -294,7 +294,9 @@ def run(
     provider = None
     # translate 也吃 provider（它是第二个要 LLM 的阶段）。漏掉它的话
     # `--only translate` 会带着 provider=None 进 run_pipeline，炸在翻译那一层。
-    if {"script", "translate"} & set(stages):
+    if {"script", "translate"} & set(stages) and (
+        episode is not None or any(ep.has_source for ep in cfg.episodes)
+    ):
         try:
             provider = build_provider(cfg.llm, Settings())
         except RuntimeError as error:

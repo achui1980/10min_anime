@@ -920,6 +920,23 @@ def test_batch_run_tells_the_user_it_skipped_a_prefilled_episode(work, golden_sr
     assert not (root / "01_dialogue" / "E03.dialogue.json").exists()
 
 
+def test_default_batch_with_only_prefilled_episodes_needs_no_api_key(work, monkeypatch):
+    monkeypatch.delenv("TENMIN_GEMINI_API_KEY", raising=False)
+    root = work / "saijo"
+    root.mkdir(parents=True)
+    (root / "project.yaml").write_text(
+        "show: 才女的侍从\nslug: saijo\nepisodes:\n"
+        "- number: 3\n  op_range: [10.0, 100.0]\n",
+        encoding="utf-8",
+    )
+
+    result = runner.invoke(app, ["run", "saijo", "--work-dir", str(work)])
+
+    assert result.exit_code == 0, out(result)
+    assert "第 3 集还没有 video，已跳过" in out(result)
+    assert "TENMIN_GEMINI_API_KEY" not in out(result)
+
+
 def test_batch_run_does_not_list_stale_deliverables_for_prefilled_episode(
     work, golden_srt_path
 ):
