@@ -3302,3 +3302,123 @@ def test_invalid_nonlegacy_stamp_is_not_treated_as_completed(tmp_path):
     stamp = _file(tmp_path / "stage.done", '{"partial":')
     _shift_mtime(stamp, 20.0)
     assert _is_fresh_stamped([out], [src], stamp) is False
+
+
+# --- 端到端：每次改动只有预期的阶段重跑 ---------------------------------------
+
+
+def _full_run_project(project, monkeypatch) -> None:
+    """让 voice → render 在测试里跑得起来：空壳视频、假 ffprobe、假 ffmpeg。"""
+    _prepare_video(project)
+    monkeypatch.setattr("tenmin.pipeline.probe_duration", lambda path, **_: 1400.0)
+    monkeypatch.setattr("tenmin.pipeline.probe_frame_rate", lambda path, **_: 25.0)
+    monkeypatch.setattr("tenmin.pipeline.preflight", lambda video, encoder, **_: 1400.0)
+    monkeypatch.setattr("tenmin.render.tts.probe_duration", lambda path: 80.0)
+    monkeypatch.setattr("tenmin.render.audio.run_with_progress", _touch_output)
+    monkeypatch.setattr("tenmin.render.video.run_with_progress", _touch_output_with_progress)
+
+
+async def _first_full_run(project) -> None:
+    # 80 秒一个 chunk：这份 fixture 的旁白真实会有的长度（理由见
+    # test_run_pipeline_batch_mode_runs_full_pipeline_for_all_episodes）。
+    await run_pipeline(
+        project, FakeProvider([fake_script_response()]), tts_engine=FakeTTSEngine([80.0] * 20)
+    )
+
+
+async def _stages_rerun(project) -> set[str]:
+    """再跑一遍全流程，返回真正重跑了的阶段。
+
+    FakeProvider([]) 与 FakeTTSEngine([])：谁要是真去调 LLM 或合成语音，当场
+    AssertionError。translate 刻意扣掉：繁中片源上它的产物永远不存在，所以每次都「开跑」
+    然后在 run_translate 里零动作早退（见 run_translate 的 docstring），它出现在这里不代表
+    任何配置被判过期。
+    """
+    reporter = FakeReporter()
+    await run_pipeline(
+        project, FakeProvider([]), tts_engine=FakeTTSEngine([]), reporter=reporter
+    )
+    started = {call[1] for call in reporter.calls if call[0] == "stage_start"}
+    return started - {"translate"}
+
+
+@pytest.mark.asyncio
+async def test_an_untouched_project_reruns_nothing(project, monkeypatch):
+    _full_run_project(project, monkeypatch)
+    await _first_full_run(project)
+    assert await _stages_rerun(project) == set()
+
+
+@pytest.mark.asyncio
+async def test_changing_crf_reruns_only_render(project, monkeypatch):
+    _full_run_project(project, monkeypatch)
+    await _first_full_run(project)
+
+    project.render.crf = "18"
+
+    assert await _stages_rerun(project) == {"render"}
+
+
+@pytest.mark.asyncio
+async def test_changing_font_size_reruns_only_the_subtitle_consumers(project, monkeypatch):
+    """字号进的是 timeline 写的 .ass：timeline 重跑 → timeline.json 刷新 → audio 跟着
+    重跑 → render 重跑。script（LLM）与 voice（TTS）一个都不许动。"""
+    _full_run_project(project, monkeypatch)
+    await _first_full_run(project)
+
+    project.render.font_size = 60
+
+    assert await _stages_rerun(project) == {"timeline", "audio", "render"}
+
+
+@pytest.mark.asyncio
+async def test_operational_knobs_rerun_nothing_end_to_end(project, monkeypatch):
+    _full_run_project(project, monkeypatch)
+    await _first_full_run(project)
+
+    project.llm.timeout_seconds = 5.0
+    project.llm.transport_max_attempts = 2
+    project.render.tts_concurrency = 8
+    project.render.ffprobe_path = "/opt/custom/bin/ffprobe"
+
+    assert await _stages_rerun(project) == set()
+
+
+@pytest.mark.asyncio
+async def test_registering_a_new_episode_leaves_the_existing_one_untouched(
+    project, golden_srt_path, tmp_path, monkeypatch
+):
+    """登记第 1 集：ingest / signals 会把全部集重跑一遍，但第 2 集的产物一个字节、
+    一个 mtime 都不许变，它的 LLM 一次都不许再调。"""
+    await run_pipeline(project, FakeProvider([fake_script_response()]), only=V1_STAGES)
+    paths = Paths(project.root)
+    watched = [
+        paths.dialogue(2),
+        paths.signals(2),
+        paths.script(2),
+        paths.table(2),
+        paths.narration(2),
+    ]
+    before = [(p.read_bytes(), p.stat().st_mtime_ns) for p in watched]
+    slice_dir = project.root / ".config"
+    slices_before = {
+        p.name: (p.read_bytes(), p.stat().st_mtime_ns) for p in slice_dir.glob("E02.*.json")
+    }
+
+    video = tmp_path / "e01.mkv"
+    video.write_bytes(b"fake")
+    # 新集的源片是个假文件：别让 ingest 去真跑 ffprobe。
+    monkeypatch.setattr("tenmin.pipeline.probe_duration", lambda path, **_: 1500.0)
+    register_episode(project, episode=1, srt=golden_srt_path, video=video)
+
+    provider = FakeProvider([fake_script_response(episode=1)])
+    await run_pipeline(project, provider, only=V1_STAGES)
+
+    assert len(provider.calls) == 1
+    assert "集数：第 1 集" in provider.calls[0]["user"]
+    assert paths.script(1).exists()
+    assert [(p.read_bytes(), p.stat().st_mtime_ns) for p in watched] == before
+    slices_after = {
+        p.name: (p.read_bytes(), p.stat().st_mtime_ns) for p in slice_dir.glob("E02.*.json")
+    }
+    assert slices_after == slices_before
