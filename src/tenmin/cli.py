@@ -206,8 +206,8 @@ def init(slug: str, work_dir: Path = WORK_DIR_OPTION) -> None:
     # 01_dialogue/…07_render/ 中间只会让人以为源片该放那儿。
     (root / "srt").mkdir(parents=True, exist_ok=True)
     payload = build_project_template(slug)
-    # 原子写，跟 register_episode 改写同一个文件时用的是同一层：project.yaml 是**每个
-    # 阶段**的隐式输入（pipeline._is_fresh 把它加进 inputs），所以它属于「产物」。
+    # 原子写，跟 register_episode 改写同一个文件时用的是同一层：project.yaml 是全部
+    # 配置切片的来源、也是已登记集数的唯一记录，所以它属于「产物」。
     # 后果本身有限（上面刚查过 exists()，半截 YAML 会让 load_project 响亮报 parse
     # error），但它是「原子写覆盖全部产物写入点」这条不变量的唯一缺口，而那条不变量
     # 现在由 tests/test_source_hygiene.py 的 test_artifact_writes_go_through_atomic 守着。

@@ -207,8 +207,8 @@ def test_is_fresh_true_when_no_input_exists(tmp_path):
     """输入一个都不存在时视为最新（跳过）。
 
     这是刻意的选择，不是漏判：重跑一个没有任何输入的阶段只可能崩（build_track
-    读不到 SRT）或产出垃圾，而跳过至少保住了磁盘上已有的产物。加了 project.yaml
-    进 inputs 之后，真实项目里这个分支已经走不到（project.yaml 一定存在）。
+    读不到 SRT）或产出垃圾，而跳过至少保住了磁盘上已有的产物。加了配置切片
+    进 inputs 之后，真实项目里这个分支已经走不到（切片开跑前就已落盘）。
     """
     out = _file(tmp_path / "out.txt")
     assert _is_fresh([out], [tmp_path / "never.txt"]) is True
@@ -579,37 +579,102 @@ async def test_run_pipeline_from_signals_keeps_dialogue(project):
 
 
 @pytest.mark.asyncio
-async def test_run_pipeline_reruns_every_stage_when_project_yaml_changes(project):
-    """project.yaml 是每个阶段的隐式输入：改了阈值/glossary/render 必须让产物失效。
-
-    大量经验阈值住在 project.yaml 里，而 _is_fresh 的 inputs 里曾经根本没有它，
-    于是「改 credits.op_span_min 再重跑」会被全部 stage_skip，用户看到的产物跟
-    改动前一模一样，且没有任何提示。
-    """
+async def test_run_pipeline_reruns_the_stage_whose_config_changed(project):
+    """改了 validate_script 只有读它的 script 重跑（docgen 因为 script.json 变了跟着
+    重跑）；ingest / signals 一个字都没读它，必须跳过。"""
     provider = FakeProvider([fake_script_response(), fake_script_response()])
     await run_pipeline(project, provider, only=V1_STAGES)
 
-    _shift_mtime(project.config_path, 10.0)
-
+    project.validate_script.max_beats = 7
     reporter = FakeReporter()
     await run_pipeline(project, provider, only=V1_STAGES, reporter=reporter)
-    for stage in V1_STAGES:
-        assert ("stage_start", stage) in reporter.calls, stage
-        assert ("stage_skip", stage) not in reporter.calls, stage
+    assert ("stage_skip", "ingest") in reporter.calls
+    assert ("stage_skip", "signals") in reporter.calls
+    assert ("stage_start", "script") in reporter.calls
+    assert ("stage_start", "docgen") in reporter.calls
+    assert len(provider.calls) == 2
 
 
 @pytest.mark.asyncio
-async def test_run_pipeline_reruns_render_stages_when_project_yaml_changes(
+async def test_run_pipeline_reruns_ingest_when_its_config_changes(project):
+    await run_pipeline(project, FakeProvider([]), only=["ingest"])
+
+    project.credits.op_span_min = 30.0
+    reporter = FakeReporter()
+    await run_pipeline(project, FakeProvider([]), only=["ingest"], reporter=reporter)
+
+    assert ("stage_start", "ingest") in reporter.calls
+
+
+@pytest.mark.asyncio
+async def test_touching_project_yaml_no_longer_reruns_anything(project):
+    await run_pipeline(project, FakeProvider([fake_script_response()]), only=V1_STAGES)
+
+    _shift_mtime(project.config_path, 10.0)
+    reporter = FakeReporter()
+    await run_pipeline(project, FakeProvider([]), only=V1_STAGES, reporter=reporter)
+
+    for stage in V1_STAGES:
+        assert ("stage_skip", stage) in reporter.calls, stage
+
+
+@pytest.mark.asyncio
+async def test_an_operational_knob_reruns_nothing(project):
+    await run_pipeline(project, FakeProvider([fake_script_response()]), only=V1_STAGES)
+
+    project.llm.timeout_seconds = 999.0
+    project.llm.script_concurrency = 3
+    reporter = FakeReporter()
+    await run_pipeline(project, FakeProvider([]), only=V1_STAGES, reporter=reporter)
+
+    for stage in V1_STAGES:
+        assert ("stage_skip", stage) in reporter.calls, stage
+
+
+@pytest.mark.asyncio
+async def test_comment_and_default_value_edits_in_project_yaml_rerun_nothing(
+    tmp_path, golden_srt_path
+):
+    root = tmp_path / "saijo"
+    (root / "srt").mkdir(parents=True)
+    (root / "srt" / "E02.srt").write_bytes(golden_srt_path.read_bytes())
+    yaml_path = root / "project.yaml"
+    yaml_path.write_text(
+        "show: 才女的侍从\nslug: saijo\ntarget_seconds: 240\n"
+        "episodes:\n- number: 2\n  srt: srt/E02.srt\n",
+        encoding="utf-8",
+    )
+    await run_pipeline(
+        load_project(yaml_path), FakeProvider([fake_script_response()]), only=V1_STAGES
+    )
+
+    edited = "# 加一行注释\n" + yaml_path.read_text(encoding="utf-8").replace(
+        "target_seconds: 240", "target_seconds: 240.0  # 显式写一遍\nmode: single_episode"
+    )
+    yaml_path.write_text(edited, encoding="utf-8")
+    _shift_mtime(yaml_path, 10.0)
+    reporter = FakeReporter()
+    await run_pipeline(
+        load_project(yaml_path), FakeProvider([]), only=V1_STAGES, reporter=reporter
+    )
+
+    for stage in V1_STAGES:
+        assert ("stage_skip", stage) in reporter.calls, stage
+
+
+@pytest.mark.asyncio
+async def test_run_pipeline_reruns_the_render_stages_when_the_voice_changes(
     project, monkeypatch
 ):
-    """voice 之后的阶段同样吃 project.yaml（render.font_size / duck_db / 编码器…）。"""
+    """voice 之后的阶段吃的是各自的切片与上游产物：换配音音色 → voice 重跑 →
+    voice.json 刷新 → timeline / audio / render 跟着重跑。"""
     paths = Paths(project.root)
     _write_script(paths.script(2), render_script())
     _prepare_video(project)
     monkeypatch.setattr("tenmin.pipeline.probe_duration", lambda path, **_: 1400.0)
     monkeypatch.setattr("tenmin.pipeline.probe_frame_rate", lambda path, **_: 25.0)
     monkeypatch.setattr("tenmin.pipeline.preflight", lambda video, encoder, **_: 1400.0)
-    # voice 重跑时 synthesize_track 会复用上一轮落盘的 chunk 并用真 ffprobe 量时长，
+    # voice 重跑时 synthesize_track 会复用上一轮落盘的 chunk 并用 ffprobe 量时长，
     # 而 FakeTTSEngine 写的是假 mp3 字节。
     monkeypatch.setattr("tenmin.render.tts.probe_duration", lambda path: 8.0)
     monkeypatch.setattr("tenmin.render.audio.run_with_progress", _touch_output)
@@ -620,8 +685,7 @@ async def test_run_pipeline_reruns_render_stages_when_project_yaml_changes(
         project, FakeProvider([]), only=stages, tts_engine=FakeTTSEngine([8.0] * 3)
     )
 
-    _shift_mtime(project.config_path, 10.0)
-
+    project.render.voice = "zh-CN-XiaoxiaoNeural"
     reporter = FakeReporter()
     await run_pipeline(
         project,
@@ -633,6 +697,16 @@ async def test_run_pipeline_reruns_render_stages_when_project_yaml_changes(
     for stage in stages:
         assert ("stage_start", stage) in reporter.calls, stage
         assert ("stage_skip", stage) not in reporter.calls, stage
+
+
+@pytest.mark.asyncio
+async def test_run_pipeline_backdates_freshly_created_slices(project):
+    await run_pipeline(project, FakeProvider([]), only=["ingest"])
+
+    slices = project.root / ".config"
+    assert (slices / "signals.json").stat().st_mtime_ns == 0
+    assert (slices / "E02.ingest.json").stat().st_mtime_ns == 0
+    assert (slices / "E02.script.json").stat().st_mtime_ns == 0
 
 
 def test_run_docgen_without_script_raises(project):

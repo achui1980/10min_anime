@@ -12,7 +12,7 @@ from ruamel.yaml import YAML
 from ruamel.yaml.comments import CommentedMap, CommentedSeq
 from ruamel.yaml.util import load_yaml_guess_indent
 
-from tenmin import atomic
+from tenmin import atomic, config_slices
 from tenmin.config import EpisodeConfig, ProjectConfig, _parse_project_yaml
 from tenmin.docgen.narration import render_narration
 from tenmin.docgen.table import render_table
@@ -293,8 +293,9 @@ def _is_fresh(outputs: list[Path], inputs: list[Path]) -> bool:
        这里另外还留着一条最低成本的兜底：**0 字节产物一律视为不新鲜**。本流水线没有
        任何一个阶段会合法地产出空文件（json/md/txt/m4a/mp4 都有内容），所以这条规则
        不会误伤；它挡的是「刚 open 就被打断」这一类，跟原子写是两层独立的保险。
-    2. **inputs 必须包含 project.yaml**（调用点用 cfg.config_path 传进来）。所有阶段
-       的行为都由它决定，漏了它就等于所有配置旋钮改了都不生效。
+    2. **inputs 必须包含这个阶段的配置切片**（run_pipeline 里的 is_fresh 包装自动加上，
+       见 tenmin.config_slices）。漏了它就等于这个阶段的配置旋钮改了都不生效。原来这里
+       放的是整个 project.yaml，结果是改任何一个旋钮、登记任何一集，全部阶段一起过期。
     3. **inputs 一个都不存在时返回 True（跳过）**，见下面的注释。
     """
     if not outputs:
@@ -309,9 +310,9 @@ def _is_fresh(outputs: list[Path], inputs: list[Path]) -> bool:
     existing_inputs = [p for p in inputs if p.exists()]
     if not existing_inputs:
         # 刻意跳过而不是重跑：一个输入都不存在时重跑只可能崩（run_ingest 读不到 SRT）
-        # 或产出垃圾，而跳过至少保住磁盘上已有的产物。加了 project.yaml 进 inputs 之后
-        # 这个分支在真实项目里已经走不到（project.yaml 必然存在，否则 load_project 就
-        # 报错了），留着只为不给库调用方/单测埋 FileNotFoundError。
+        # 或产出垃圾，而跳过至少保住磁盘上已有的产物。配置切片进了 inputs 之后这个分支在
+        # run_pipeline 里已经走不到（切片在开跑前必然已落盘），留着只为不给库调用方/单测
+        # 埋 FileNotFoundError。
         return True
     newest_input = max(p.stat().st_mtime_ns for p in existing_inputs)
     oldest_output = min(p.stat().st_mtime_ns for p in outputs)
@@ -365,7 +366,7 @@ def _ingest_inputs(cfg: ProjectConfig) -> list[Path]:
     压根不查文件在不在（存在性过滤在 _is_fresh 里做：`[p for p in inputs if p.exists()]`）。
     原来只取字幕，对一个只有视频的集会得到空列表 —— 而空输入在新鲜度判据里等于
     「跳过」，于是换了片源也不会重跑。
-    反过来也别顺手把整份列表滤空：那样 ingest 就只盯 project.yaml，「改了字幕再重跑」
+    反过来也别顺手把整份列表滤空：那样 ingest 就只盯配置切片，「改了字幕再重跑」
     会被静默 stage_skip，下游各阶段因为 dialogue.json 没变而跟着一起跳过。
     两条不变量各有一条测试守着。
 
@@ -1077,15 +1078,6 @@ async def run_pipeline(
     ingest_inputs = _ingest_inputs(cfg)
     warnings: list[str] = []
 
-    def is_fresh(outputs: list[Path], inputs: list[Path]) -> bool:
-        """每个阶段的判据都自动带上 project.yaml。
-
-        它是所有阶段的隐式输入：ingest/credits/signals 的全部阈值、glossary、
-        render 的字号与编码器都住在那里。漏掉它的话「改配置再重跑」会被全部
-        stage_skip，用户拿到的产物跟改动前一模一样且没有任何提示。
-        """
-        return _is_fresh(outputs, [cfg.config_path, *inputs])
-
     if episode is None:
         # 预填条目在批处理里跳过，但不能静默：用户会以为那一集跑过了。只在批处理模式下
         # 提示 —— 单集模式跑的是别的集，报一句无关的集号只是噪音。
@@ -1099,11 +1091,32 @@ async def run_pipeline(
         _find_episode(cfg, episode)  # 找不到会抛 ValueError（"没有注册"）
         target_numbers = [episode]
 
+    # 开跑前把每个阶段读到的那部分配置落成切片（内容没变不碰文件）。放在集号解析之后：
+    # --episode 指到一个没注册 / 预填的集时应该先报错，而不是先往磁盘上写东西。
+    config_slices.write_slices(cfg, active)
+
+    def is_fresh(
+        stage: str, number: int | None, outputs: list[Path], inputs: list[Path]
+    ) -> bool:
+        """每个阶段的判据都自动带上它自己的配置切片（替换原来的整个 project.yaml）。
+
+        漏掉切片的话「改配置再重跑」会被 stage_skip，用户拿到的产物跟改动前一模一样且
+        没有任何提示；反过来把整个 project.yaml 放进来，则是改任何一个旋钮都整季重跑。
+        """
+        return _is_fresh(
+            outputs, [config_slices.slice_path(cfg.root, stage, number), *inputs]
+        )
+
     number_to_index = {number: idx for idx, number in enumerate(target_numbers, start=1)}
 
     if "ingest" in wanted:
         outputs = [paths.dialogue(n) for n in numbers]
-        if force or not is_fresh(outputs, ingest_inputs):
+        # ingest 是全局阶段，但切片按集：每一集的切片都是它的输入。
+        inputs = [
+            *ingest_inputs,
+            *(config_slices.slice_path(cfg.root, "ingest", n) for n in numbers),
+        ]
+        if force or not _is_fresh(outputs, inputs):
             reporter.stage_start("ingest")
             warnings.extend(ingest_warnings(run_ingest(cfg)))
             reporter.stage_done("ingest")
@@ -1113,7 +1126,7 @@ async def run_pipeline(
     if "signals" in wanted:
         outputs = [paths.signals(n) for n in numbers]
         inputs = [paths.dialogue(n) for n in numbers]
-        if force or not is_fresh(outputs, inputs):
+        if force or not is_fresh("signals", None, outputs, inputs):
             reporter.stage_start("signals")
             run_signals(cfg)
             reporter.stage_done("signals")
@@ -1178,7 +1191,7 @@ async def run_pipeline(
 
         新鲜度在**起 task 的时刻**判，比原来早了几集。这只在「这一集的判据与产物没有
         任何别的集能动」时才等价：dialogue/signals 都由循环之前的全局阶段写完了，
-        project.yaml 不变，paths.script(n) 也只会被第 n 集自己的 task 写。
+        配置切片在开跑前就写完了，paths.script(n) 也只会被第 n 集自己的 task 写。
 
         累积术语表是这条等价性唯一的破口 —— 它在 _script_inputs 里，却是**纵向循环里**
         的 translate 写的。所以本次运行含 translate 时窗口被钳到 1（见调用处）：不钳的话
@@ -1189,7 +1202,7 @@ async def run_pipeline(
             if number in script_tasks:
                 continue
             inputs = _script_inputs(paths, number)
-            if force or not is_fresh([paths.script(number)], inputs):
+            if force or not is_fresh("script", number, [paths.script(number)], inputs):
                 script_tasks[number] = asyncio.create_task(
                     run_script(
                         cfg,
@@ -1219,7 +1232,9 @@ async def run_pipeline(
                 # 写完累积术语表、第 2 集才读到含第 1 集的版本，并发会让累积失去意义，
                 # 而且两个 task 会同时回写同一个文件。
                 outputs = [paths.zh_lines(number), paths.zh_subtitles(number)]
-                if force or not is_fresh(outputs, _translate_inputs(paths, number)):
+                if force or not is_fresh(
+                    "translate", number, outputs, _translate_inputs(paths, number)
+                ):
                     reporter.stage_start("translate")
                     await run_translate(cfg, provider, number)
                     reporter.stage_done("translate")
@@ -1239,7 +1254,7 @@ async def run_pipeline(
 
             if "docgen" in wanted:
                 outputs = [paths.table(number), paths.narration(number)]
-                if force or not is_fresh(outputs, [paths.script(number)]):
+                if force or not is_fresh("docgen", number, outputs, [paths.script(number)]):
                     reporter.stage_start("docgen")
                     run_docgen(cfg, episode=number)
                     reporter.stage_done("docgen")
@@ -1248,7 +1263,7 @@ async def run_pipeline(
 
             if "voice" in wanted:
                 outputs = [paths.voice(number)]
-                if force or not is_fresh(outputs, [paths.script(number)]):
+                if force or not is_fresh("voice", number, outputs, [paths.script(number)]):
                     reporter.stage_start("voice")
                     if tts_engine is None:
                         # 刻意不用 assert：python -O 下 assert 整句被剥离，None 会一路漂
@@ -1271,7 +1286,7 @@ async def run_pipeline(
             if "timeline" in wanted:
                 outputs = [paths.timeline(number), paths.subtitles(number)]
                 inputs = [paths.script(number), paths.voice(number)]
-                if force or not is_fresh(outputs, inputs):
+                if force or not is_fresh("timeline", number, outputs, inputs):
                     reporter.stage_start("timeline")
                     _, stage_warnings = run_timeline(cfg, episode=number)
                     warnings.extend(stage_warnings)
@@ -1282,7 +1297,7 @@ async def run_pipeline(
             if "audio" in wanted:
                 outputs = [paths.mixed_audio(number)]
                 inputs = [paths.timeline(number), paths.voice(number)]
-                if force or not is_fresh(outputs, inputs):
+                if force or not is_fresh("audio", number, outputs, inputs):
                     reporter.stage_start("audio")
                     run_audio(cfg, episode=number, reporter=reporter)
                     reporter.stage_done("audio")
@@ -1296,7 +1311,7 @@ async def run_pipeline(
                     paths.subtitles(number),
                     paths.timeline(number),
                 ]
-                if force or not is_fresh(outputs, inputs):
+                if force or not is_fresh("render", number, outputs, inputs):
                     reporter.stage_start("render")
                     run_render(cfg, episode=number, reporter=reporter)
                     reporter.stage_done("render")

@@ -187,8 +187,8 @@ _ATOMIC_RECEIVERS = frozenset({"atomic"})
 # 「已知非产物」白名单：{(文件名, 方法名): 理由}。
 #
 # **目前是空的。** 往里加之前先问一句：这个文件真的不是任何阶段的输入吗？
-# `project.yaml` 就是个反例 —— 它看着像「配置」，实际是**每个阶段**的隐式输入
-# （`_is_fresh` 把它加进 inputs），所以 register_episode 与 cli.init 都必须原子写。
+# `project.yaml` 就是个反例 —— 它看着像「配置」，实际是全部配置切片（`.config/*.json`，
+# 每个阶段的新鲜度输入）的来源，所以 register_episode 与 cli.init 都必须原子写。
 _NON_ARTIFACT_WRITES: dict[tuple[str, str], str] = {}
 
 

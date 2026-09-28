@@ -532,9 +532,9 @@ class ProjectConfig(StrictModel):
     def config_path(self) -> Path:
         """project.yaml 自身的路径。
 
-        两个用途：register_episode 要改写它；pipeline._is_fresh 把它当**每个阶段的
-        输入**（全项目的经验阈值、glossary、render 参数都住在这个文件里，
-        改了它却不让任何产物失效，等于旋钮全是哑的）。
+        register_episode 要改写它。它**不再**是任何阶段的新鲜度输入：每个阶段只看
+        tenmin.config_slices 从解析后配置里切出来的那一份，改注释、改无关旋钮、登记新集
+        都不会让别的阶段过期。
 
         文件名写死 "project.yaml"：CLI 的 _project_file 只会去找这个名字，
         register_episode 原本也是这么拼的，这里只是把这份假设收敛到一处。
