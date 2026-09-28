@@ -1270,6 +1270,112 @@ async def test_openai_compatible_usage_sums_across_repair_rounds(monkeypatch):
     assert provider.last_usage.requests == 2
 
 
+@pytest.mark.asyncio
+async def test_minimax_keeps_stream_usage_before_a_later_business_error(monkeypatch):
+    """An error chunk after a usage chunk must not erase tokens already reported."""
+    _mock_httpx(
+        monkeypatch,
+        [
+            _sse(
+                _delta('{"value": 1}'),
+                {"choices": [], "usage": {"prompt_tokens": 20, "total_tokens": 23}},
+                {"base_resp": {"status_code": 1008, "status_msg": "insufficient balance"}},
+            )
+        ],
+    )
+    provider = MiniMaxProvider(api_key="secret")
+
+    with pytest.raises(LLMBusinessError):
+        await provider.complete("SYS", "USR", Toy)
+
+    assert provider.last_usage.prompt_tokens == 20
+    assert provider.last_usage.total_tokens == 23
+    assert provider.last_usage.requests == 1
+
+
+@pytest.mark.asyncio
+async def test_openai_compatible_keeps_stream_usage_before_read_failure(monkeypatch):
+    """A partial streamed response may carry usage before the connection drops."""
+    import httpx
+
+    class BrokenStream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield _sse(
+                _delta('{"value": '),
+                {"choices": [], "usage": {"prompt_tokens": 30, "total_tokens": 32}},
+            ).encode()
+            raise httpx.ReadError("connection closed")
+
+        async def aclose(self):
+            pass
+
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        httpx,
+        "AsyncClient",
+        lambda **kwargs: real_client(
+            transport=httpx.MockTransport(
+                lambda request: httpx.Response(200, stream=BrokenStream())
+            ),
+            **kwargs,
+        ),
+    )
+    provider = OpenAICompatibleProvider(
+        api_key="k", model="m", base_url="https://x.test/v1", transport_max_attempts=1
+    )
+
+    with pytest.raises(LLMTransportError):
+        await provider.complete("SYS", "USR", Toy)
+
+    assert provider.last_usage.prompt_tokens == 30
+    assert provider.last_usage.total_tokens == 32
+    assert provider.last_usage.requests == 1
+
+
+@pytest.mark.asyncio
+async def test_minimax_cumulative_usage_chunks_count_once_per_successful_stream(monkeypatch):
+    _mock_httpx(
+        monkeypatch,
+        [
+            _sse(
+                {"choices": [], "usage": {"prompt_tokens": 10, "total_tokens": 12}},
+                _delta('{"value": 1}'),
+                {"choices": [], "usage": {"prompt_tokens": 20, "total_tokens": 23}},
+            )
+        ],
+    )
+    provider = MiniMaxProvider(api_key="secret")
+
+    assert await provider.complete("SYS", "USR", Toy) == Toy(value=1)
+    assert provider.last_usage.prompt_tokens == 20
+    assert provider.last_usage.total_tokens == 23
+    assert provider.last_usage.requests == 1
+
+
+@pytest.mark.asyncio
+async def test_minimax_sums_failed_stream_and_retry_usage(monkeypatch, sleeps):
+    _mock_httpx(
+        monkeypatch,
+        [
+            _sse(
+                {"choices": [], "usage": {"prompt_tokens": 10, "total_tokens": 12}},
+                {"base_resp": {"status_code": 1002, "status_msg": "rate limit"}},
+            ),
+            _sse(
+                _delta('{"value": 1}'),
+                {"choices": [], "usage": {"prompt_tokens": 20, "total_tokens": 23}},
+            ),
+        ],
+    )
+    provider = MiniMaxProvider(api_key="secret")
+
+    assert await provider.complete("SYS", "USR", Toy) == Toy(value=1)
+    assert provider.last_usage.prompt_tokens == 30
+    assert provider.last_usage.total_tokens == 35
+    assert provider.last_usage.requests == 2
+    assert sleeps == [1.0]
+
+
 # --- MiniMax 流式 ---
 
 

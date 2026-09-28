@@ -953,8 +953,6 @@ class OpenAICompatibleProvider:
                         # 而个别实现会在**每个** chunk 上带一个 null。
                         finish_reason = _finish_reason(event) or finish_reason
                         parts.append(_event_delta(event))
-                    if stream_usage is not None:
-                        tally.usages.append(stream_usage)
         except TimeoutError as exc:
             # asyncio.timeout 到点抛的是内置 TimeoutError（httpx 自己的超时是
             # httpx.TimeoutException，两者没有继承关系，不会互相误吞）。
@@ -962,6 +960,10 @@ class OpenAICompatibleProvider:
                 f"一次 LLM 请求超过了总时长上限 {self._total_timeout_seconds} 秒"
                 f"（{self._endpoint}）。确实需要更久的话调高 llm.total_timeout_seconds。"
             ) from exc
+        finally:
+            # 流中已收到的累计用量在后续业务报错、断流或超时时仍然有效；每条流只记一次。
+            if stream_usage is not None:
+                tally.usages.append(stream_usage)
         # 判在读完整条流之后：这样 `parts` 已经收全，报错里能带上「收到多少字符」。
         if _is_truncated_finish(finish_reason):
             raise LLMFinishReasonError(
