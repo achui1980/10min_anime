@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 from collections.abc import Sequence
 from pathlib import Path
 
-import yaml
+from ruamel.yaml import YAML
+from ruamel.yaml.comments import CommentedMap, CommentedSeq
+from ruamel.yaml.util import load_yaml_guess_indent
 
 from tenmin import atomic
 from tenmin.config import EpisodeConfig, ProjectConfig
@@ -642,6 +645,49 @@ def _find_episode(cfg: ProjectConfig, episode_number: int) -> EpisodeConfig:
     )
 
 
+def _write_back_episode(yaml_path: Path, entry: EpisodeConfig) -> None:
+    """只更新这一集的来源字段，保留其它 YAML 节点的注释、顺序与格式。
+
+    从原文件猜序列缩进，兼容 init 的顶格列表和手写的缩进列表；
+    长路径不折行。整份结果经原子写替换，避免中断损坏已登记的集数。
+    """
+    text = yaml_path.read_text(encoding="utf-8")
+    _, sequence_indent, sequence_offset = load_yaml_guess_indent(text)
+    round_trip = YAML()
+    round_trip.preserve_quotes = True
+    round_trip.width = 4096
+    round_trip.indent(mapping=2, sequence=sequence_indent or 2, offset=sequence_offset or 0)
+    data = round_trip.load(text)
+    if data is None:
+        data = CommentedMap()
+    episodes = data.get("episodes")
+    if episodes is None:
+        episodes = CommentedSeq()
+        data["episodes"] = episodes
+    # init 的 episodes: [] 是 flow style；新增映射时必须改回块式。
+    episodes.fa.set_block_style()
+    target = next(
+        (
+            item
+            for item in episodes
+            if isinstance(item, dict) and item.get("number") == entry.number
+        ),
+        None,
+    )
+    if target is None:
+        target = CommentedMap()
+        target["number"] = entry.number
+        episodes.append(target)
+    if entry.srt is None:
+        target.pop("srt", None)
+    else:
+        target["srt"] = entry.srt.as_posix()
+    target["video"] = str(entry.video)
+    buffer = io.StringIO()
+    round_trip.dump(data, buffer)
+    atomic.write_text(yaml_path, buffer.getvalue())
+
+
 def register_episode(
     cfg: ProjectConfig, *, episode: int, srt: Path | None, video: Path
 ) -> ProjectConfig:
@@ -670,9 +716,10 @@ def register_episode(
       而 symlink 只会留下一个悬空链接、错误信息指向 work/ 里那个假身份。
     - 用户在 project.yaml 里直接看到源片真实位置，可查可改。
 
-    向后兼容：只有**本次登记的这一集**会被写成绝对路径。其余集的 srt/video 原样
-    走各自 EpisodeConfig 的 model_dump 落盘，存量的相对路径（work/saijo/ 下 10 个
-    已经拷好的 mp4）逐字节不变，video_path() 照旧按 project.yaml 所在目录解析。
+    向后兼容：只有**本次登记的这一集**的 srt/video 两个字段会被改写（video 写成绝对路径）。
+    其余集、以及 yaml 里别的一切（注释、键序、引号）都由 _write_back_episode 原样保留，
+    存量的相对路径（work/saijo/ 下 10 个已经拷好的 mp4）逐字节不变，video_path() 照旧按
+    project.yaml 所在目录解析。
     """
     # 在拷贝字幕或改写配置之前检查输入，给出可读的错误并避免部分登记。
     if srt is not None and not Path(srt).is_file():
@@ -692,25 +739,15 @@ def register_episode(
 
     existing = next((e for e in cfg.episodes if e.number == episode), None)
     if existing is not None:
+        # 预填条目也走这条：只改 srt/video，op_range/ed_range 原样留着。
         existing.srt = relative_srt
         existing.video = video_source
+        entry = existing
     else:
-        cfg.episodes.append(
-            EpisodeConfig(number=episode, srt=relative_srt, video=video_source)
-        )
+        entry = EpisodeConfig(number=episode, srt=relative_srt, video=video_source)
+        cfg.episodes.append(entry)
 
-    yaml_path = cfg.config_path
-    data = yaml.safe_load(yaml_path.read_text(encoding="utf-8"))
-    # 用每个 EpisodeConfig 自己的 model_dump 序列化，而不是手挑 number/srt/video，
-    # 这样 op_range/ed_range 等字段（现有的和未来新增的）都不会在改写 yaml 时被静默丢掉。
-    data["episodes"] = [
-        e.model_dump(exclude_none=True, mode="json") for e in cfg.episodes
-    ]
-    # 原子写：project.yaml 是**每个阶段**的隐式输入（_is_fresh 把它加进 inputs），
-    # 而这里是**改写**一个已有文件 —— 中途被打断会把用户已注册的全部集数毁掉。
-    atomic.write_text(
-        yaml_path, yaml.safe_dump(data, allow_unicode=True, sort_keys=False)
-    )
+    _write_back_episode(cfg.config_path, entry)
 
     return cfg
 

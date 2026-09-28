@@ -1,3 +1,5 @@
+import difflib
+
 import pytest
 import yaml
 from typer.testing import CliRunner
@@ -979,3 +981,36 @@ def test_inspect_lists_a_prefilled_episode_as_unregistered(work, golden_srt_path
     assert result.exit_code == 0, out(result)
     assert "未登记视频" in out(result)
     assert "--video" in out(result)
+
+
+def test_registering_keeps_the_init_header_comments(work, tmp_path, monkeypatch):
+    """init 生成的说明不能被 register_episode 冲掉。"""
+    from tenmin.cli import PROJECT_TEMPLATE_HEADER
+
+    runner.invoke(app, ["init", "saijo", "--work-dir", str(work)])
+    path = work / "saijo" / "project.yaml"
+    before = path.read_text(encoding="utf-8")
+    video = tmp_path / "e02.mkv"
+    video.write_bytes(b"fake")
+
+    async def fake_pipeline(cfg, provider, **kwargs):
+        return []
+
+    monkeypatch.setattr("tenmin.cli.run_pipeline", fake_pipeline)
+    result = runner.invoke(
+        app,
+        [
+            "run", "saijo", "--work-dir", str(work),
+            "--episode", "2", "--video", str(video), "--only", "ingest",
+        ],
+    )
+
+    assert result.exit_code == 0, out(result)
+    after = path.read_text(encoding="utf-8")
+    assert after.startswith(PROJECT_TEMPLATE_HEADER.format(slug="saijo"))
+    removed = [
+        line
+        for line in difflib.ndiff(before.splitlines(), after.splitlines())
+        if line.startswith("- ")
+    ]
+    assert removed == ["- episodes: []"]

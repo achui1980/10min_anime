@@ -1,4 +1,5 @@
 import asyncio
+import difflib
 import json
 import os
 from pathlib import Path
@@ -7,7 +8,7 @@ import pytest
 import yaml
 
 from tenmin.atomic import part_path
-from tenmin.config import EpisodeConfig, ProjectConfig, load_project
+from tenmin.config import EpisodeConfig, ProjectConfig, ProjectConfigError, load_project
 from tenmin.ingest.resolve import SubtitleSource
 from tenmin.models import (
     AudioDirection,
@@ -2855,3 +2856,86 @@ def test_registering_a_prefilled_episode_keeps_its_credit_ranges(tmp_path):
     assert episode.ed_range == (1300.0, 1420.0)
     assert episode.video == video.resolve()
     assert episode.has_source is True
+
+
+# --- 登记写回 project.yaml：只动 episodes 里对应的那一条 --------------------
+
+_COMMENTED_YAML = """\
+# 我的番，这行注释要原样留着
+show: "才女的侍从"   # 行尾注释，引号风格也得留着
+slug: saijo
+render:
+  font_size: 60  # 字号
+episodes:
+  - number: 2
+    srt: srt/E02.srt
+    op_range: [153.5, 224.7]
+  # 第 3 集先把片尾填上，视频还没下好
+  - number: 3
+    ed_range: [1300, 1420]
+glossary:
+  伊月: 伊月
+"""
+
+
+def _removed_lines(before: str, after: str) -> list[str]:
+    return [
+        line
+        for line in difflib.ndiff(before.splitlines(), after.splitlines())
+        if line.startswith("- ")
+    ]
+
+
+def test_register_episode_only_adds_lines_to_a_commented_yaml(tmp_path):
+    root = tmp_path / "saijo"
+    (root / "srt").mkdir(parents=True)
+    yaml_path = root / "project.yaml"
+    yaml_path.write_text(_COMMENTED_YAML, encoding="utf-8")
+    cfg = load_project(yaml_path)
+    video3 = tmp_path / "e03.mkv"
+    video3.write_bytes(b"fake")
+    video4 = tmp_path / "e04.mkv"
+    video4.write_bytes(b"fake")
+
+    register_episode(cfg, episode=3, srt=None, video=video3)
+    register_episode(cfg, episode=4, srt=None, video=video4)
+
+    after = yaml_path.read_text(encoding="utf-8")
+    assert _removed_lines(_COMMENTED_YAML, after) == []
+    assert f"    video: {video3.resolve()}" in after.splitlines()
+    reloaded = load_project(yaml_path)
+    assert [e.number for e in reloaded.episodes] == [2, 3, 4]
+    episode3 = next(e for e in reloaded.episodes if e.number == 3)
+    assert episode3.ed_range == (1300.0, 1420.0)
+    assert episode3.video == video3.resolve()
+
+
+def test_reregistering_changes_only_that_entrys_source_lines(tmp_path, golden_srt_path):
+    root = tmp_path / "saijo"
+    (root / "srt").mkdir(parents=True)
+    yaml_path = root / "project.yaml"
+    yaml_path.write_text(_COMMENTED_YAML, encoding="utf-8")
+    cfg = load_project(yaml_path)
+    video = tmp_path / "e02.mkv"
+    video.write_bytes(b"fake")
+
+    register_episode(cfg, episode=2, srt=None, video=video)
+
+    after = yaml_path.read_text(encoding="utf-8")
+    assert _removed_lines(_COMMENTED_YAML, after) == ["-     srt: srt/E02.srt"]
+    assert "    op_range: [153.5, 224.7]" in after.splitlines()
+
+
+def test_the_write_back_parser_rejects_duplicate_keys_like_load_project(tmp_path):
+    """两处对重复键的态度必须一致。"""
+    from ruamel.yaml import YAML
+    from ruamel.yaml.constructor import DuplicateKeyError as RuamelDuplicateKeyError
+
+    text = "show: 某番\nslug: demo\nrender:\n  crf: '18'\nrender:\n  crf: '20'\n"
+    path = tmp_path / "project.yaml"
+    path.write_text(text, encoding="utf-8")
+
+    with pytest.raises(ProjectConfigError):
+        load_project(path)
+    with pytest.raises(RuamelDuplicateKeyError):
+        YAML().load(text)
