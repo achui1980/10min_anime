@@ -8,15 +8,18 @@
 
 from __future__ import annotations
 
+import difflib
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal, get_args
 
 import yaml
 from pydantic import (
     BaseModel,
+    ConfigDict,
     Field,
     PrivateAttr,
     SecretStr,
+    ValidationError,
     field_validator,
     model_validator,
 )
@@ -61,7 +64,13 @@ def _validate_open_credit_range(
     return _validate_credit_range((start, end))
 
 
-class EpisodeConfig(BaseModel):
+class StrictModel(BaseModel):
+    """project.yaml 里的配置模型拒绝未知字段；Settings 独立保持 extra="ignore"。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class EpisodeConfig(StrictModel):
     number: int
     # 两个来源至少得有一个，由 _require_a_source 守着 —— 但它只在**构造**时跑。
     # register_episode 走的是 `existing.srt = ...` / `existing.video = ...` 属性赋值，
@@ -103,11 +112,11 @@ class EpisodeConfig(BaseModel):
         return self
 
 
-class LocaleConfig(BaseModel):
+class LocaleConfig(StrictModel):
     convert_traditional: bool = True
 
 
-class LLMConfig(BaseModel):
+class LLMConfig(StrictModel):
     provider: Literal["gemini", "minimax", "openai_compatible"] = "gemini"
     model: str = "gemini-3.6-flash"
     base_url: str | None = None
@@ -181,7 +190,7 @@ class LLMConfig(BaseModel):
     script_concurrency: int = Field(default=1, ge=1)
 
 
-class IngestConfig(BaseModel):
+class IngestConfig(StrictModel):
     """ingest 阶段的续行合并阈值（原 ingest/normalize.py 的模块常量）。
 
     只收数值旋钮。TERMINAL_PUNCT 那类字符集合留在 normalize.py：它是"这门语言
@@ -194,7 +203,7 @@ class IngestConfig(BaseModel):
     merge_max_line_seconds: float = Field(default=4.0, gt=0)
 
 
-class CreditsConfig(BaseModel):
+class CreditsConfig(StrictModel):
     """OP/ED 与 staff 行识别的阈值（原 ingest/credits.py 的模块常量）。"""
 
     # 聚簇法找 OP 时，簇起点必须落在 [op_search_start, op_search_end] 内。
@@ -285,7 +294,7 @@ class CreditsConfig(BaseModel):
         return _validate_open_credit_range(value)
 
 
-class SignalsConfig(BaseModel):
+class SignalsConfig(StrictModel):
     """signals 阶段的阈值（原 signals/{gaps,density,aggregate}.py 的模块常量）。
 
     强度字段的上下界跟 models.Signal.strength / models.Highlight.strength 的
@@ -309,7 +318,7 @@ class SignalsConfig(BaseModel):
     summary_max_chars: int = Field(default=30, gt=0)
 
 
-class ValidateConfig(BaseModel):
+class ValidateConfig(StrictModel):
     """script/validate.py 的创作旋钮（原来是那个文件里的四个硬编码字面量）。
 
     分家的判据沿用全项目一致的那一条：**「这部番想要什么」的创作旋钮进 config，
@@ -361,7 +370,7 @@ class ValidateConfig(BaseModel):
     stretch_min: float = Field(default=0.125, gt=0)
 
 
-class RenderConfig(BaseModel):
+class RenderConfig(StrictModel):
     """v2 渲染参数。voice 与 rate 直接喂 Edge-TTS。"""
 
     voice: str = "zh-CN-YunxiNeural"
@@ -487,7 +496,7 @@ class RenderConfig(BaseModel):
     ffprobe_path: str = "ffprobe"
 
 
-class AsrConfig(BaseModel):
+class AsrConfig(StrictModel):
     """语音转写参数。只在「这一集既没有手传 SRT、视频里也没有软字幕轨」时才用得上。
 
     刻意没有 engine 字段：本项目只支持 mlx-whisper 一个引擎（作者只在 Apple Silicon
@@ -515,7 +524,7 @@ class AsrConfig(BaseModel):
     language: str = "ja"
 
 
-class ProjectConfig(BaseModel):
+class ProjectConfig(StrictModel):
     show: str
     slug: str
     mode: Literal["single_episode", "season"] = "single_episode"
@@ -596,12 +605,112 @@ DEFAULT_ASR = AsrConfig()
 DEFAULT_LLM = LLMConfig()
 
 
+class ProjectConfigError(ValueError):
+    """project.yaml 的 YAML、字段或取值不合法。"""
+
+
+class DuplicateKeyError(yaml.YAMLError):
+    """同一层 mapping 重复定义了键，保留两处行号以便定位。"""
+
+    def __init__(self, key: object, first_line: int, second_line: int) -> None:
+        self.key = key
+        self.first_line = first_line
+        self.second_line = second_line
+        super().__init__(
+            f"键 {key} 在同一层出现了两次（第 {first_line} 行与第 {second_line} 行），"
+            "后写的会把先写的整段盖掉，请合并成一处"
+        )
+
+
+class _UniqueKeyLoader(yaml.SafeLoader):
+    """在 SafeLoader 构造 mapping 时拒绝重复键，保留合法的 YAML 合并键。"""
+
+    def construct_mapping(self, node: yaml.MappingNode, deep: bool = False) -> dict[Any, Any]:
+        seen: dict[Any, int] = {}
+        for key_node, _ in node.value:
+            if key_node.tag == "tag:yaml.org,2002:merge":
+                continue
+            key = self.construct_object(key_node, deep=deep)
+            try:
+                first = seen.get(key)
+            except TypeError:
+                continue
+            line = key_node.start_mark.line + 1
+            if first is not None:
+                raise DuplicateKeyError(key, first, line)
+            seen[key] = line
+        return super().construct_mapping(node, deep=deep)
+
+
+def _field_path(loc: tuple[int | str, ...]) -> str:
+    """pydantic 的 loc → `render.font_sise` / `episodes[0].op_rang`。"""
+    out = ""
+    for part in loc:
+        if isinstance(part, int):
+            out += f"[{part}]"
+        else:
+            out = f"{out}.{part}" if out else str(part)
+    return out
+
+
+def _submodel(annotation: Any) -> type[BaseModel] | None:
+    """找到字段注解里的子模型（包括 list[EpisodeConfig]）。"""
+    if isinstance(annotation, type) and issubclass(annotation, BaseModel):
+        return annotation
+    for arg in get_args(annotation):
+        found = _submodel(arg)
+        if found is not None:
+            return found
+    return None
+
+
+def _known_fields(loc: tuple[int | str, ...]) -> list[str]:
+    """出错字段所在模型的字段名，用于生成拼写建议。"""
+    model: type[BaseModel] | None = ProjectConfig
+    for part in loc[:-1]:
+        if isinstance(part, int):
+            continue
+        if model is None or part not in model.model_fields:
+            return []
+        model = _submodel(model.model_fields[part].annotation)
+    return list(model.model_fields) if model is not None else []
+
+
+def _describe_validation_error(name: str, error: ValidationError) -> str:
+    """将每条 pydantic 报错翻成带文件名与完整字段路径的中文。"""
+    lines: list[str] = []
+    for item in error.errors():
+        loc = tuple(item["loc"])
+        where = _field_path(loc) or "顶层"
+        if item["type"] == "extra_forbidden":
+            message = f"{name} 里 {where} 不是已知字段"
+            close = difflib.get_close_matches(str(loc[-1]), _known_fields(loc), n=1)
+            if close:
+                message += f"，是不是想写 {close[0]}？"
+        elif item["type"] == "missing":
+            message = f"{name} 里缺少必填字段 {where}"
+        else:
+            message = f"{name} 里 {where} 的值不合法：{item['msg']}"
+        lines.append(message)
+    return "\n".join(lines)
+
+
 def load_project(path: Path) -> ProjectConfig:
+    """读 project.yaml；保留文件不存在异常，其余格式错误转成中文配置错误。"""
     path = Path(path)
     if not path.exists():
         raise FileNotFoundError(f"找不到项目配置: {path}")
-    data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-    return ProjectConfig.model_validate(data).bind_root(path.parent)
+    try:
+        data = yaml.load(path.read_text(encoding="utf-8"), Loader=_UniqueKeyLoader) or {}
+    except DuplicateKeyError as error:
+        raise ProjectConfigError(f"{path.name} 里{error}") from error
+    except yaml.YAMLError as error:
+        raise ProjectConfigError(f"{path.name} 不是合法的 YAML：{error}") from error
+    try:
+        cfg = ProjectConfig.model_validate(data)
+    except ValidationError as error:
+        raise ProjectConfigError(_describe_validation_error(path.name, error)) from error
+    return cfg.bind_root(path.parent)
 
 
 class Settings(BaseSettings):

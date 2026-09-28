@@ -4,14 +4,18 @@ import pytest
 from pydantic import ValidationError
 
 from tenmin.config import (
+    AsrConfig,
     CreditsConfig,
     EpisodeConfig,
     IngestConfig,
     LLMConfig,
+    LocaleConfig,
     ProjectConfig,
+    ProjectConfigError,
     RenderConfig,
     Settings,
     SignalsConfig,
+    ValidateConfig,
     load_project,
 )
 
@@ -78,8 +82,9 @@ def test_load_project_missing_file(tmp_path):
 def test_load_project_rejects_unknown_mode(tmp_path):
     path = tmp_path / "project.yaml"
     path.write_text(MINIMAL.replace("slug: demo", "slug: demo\nmode: whatever"), encoding="utf-8")
-    with pytest.raises(ValidationError):
+    with pytest.raises(ProjectConfigError) as excinfo:
         load_project(path)
+    assert "project.yaml 里 mode 的值不合法" in str(excinfo.value)
 
 
 def test_episode_srt_path_resolves_against_project_dir(tmp_path):
@@ -619,3 +624,111 @@ def test_srt_path_still_resolves_a_relative_srt(tmp_path):
         episodes=[EpisodeConfig(number=11, srt=Path("srt/E11.srt"))],
     ).bind_root(tmp_path)
     assert cfg.srt_path(cfg.episodes[0]) == tmp_path / "srt" / "E11.srt"
+
+
+# --- 严格校验：拼错的键必须报错，不能静默退回默认值 --------------------------
+
+
+def _write(tmp_path: Path, text: str) -> Path:
+    path = tmp_path / "project.yaml"
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+def test_unknown_field_names_its_full_path_and_a_suggestion(tmp_path):
+    path = _write(tmp_path, MINIMAL + "render:\n  font_sise: 99\n")
+    with pytest.raises(ProjectConfigError) as excinfo:
+        load_project(path)
+    message = str(excinfo.value)
+    assert "project.yaml 里 render.font_sise 不是已知字段" in message
+    assert "是不是想写 font_size" in message
+
+
+def test_unknown_field_inside_an_episode_names_the_list_index(tmp_path):
+    path = _write(
+        tmp_path,
+        "show: 某番\nslug: demo\nepisodes:\n"
+        "  - number: 1\n    srt: srt/E01.srt\n    op_rang: [1, 2]\n",
+    )
+    with pytest.raises(ProjectConfigError) as excinfo:
+        load_project(path)
+    message = str(excinfo.value)
+    assert "episodes[0].op_rang 不是已知字段" in message
+    assert "是不是想写 op_range" in message
+
+
+def test_unknown_top_level_field_is_rejected(tmp_path):
+    path = _write(tmp_path, MINIMAL + "targt_seconds: 200\n")
+    with pytest.raises(ProjectConfigError) as excinfo:
+        load_project(path)
+    assert "targt_seconds 不是已知字段，是不是想写 target_seconds" in str(excinfo.value)
+
+
+def test_a_bad_value_names_the_field(tmp_path):
+    path = _write(tmp_path, MINIMAL + "target_seconds: -1\n")
+    with pytest.raises(ProjectConfigError) as excinfo:
+        load_project(path)
+    assert "project.yaml 里 target_seconds 的值不合法" in str(excinfo.value)
+
+
+def test_a_yaml_syntax_error_is_a_project_config_error(tmp_path):
+    path = _write(tmp_path, "show: [没闭合\nslug: demo\n")
+    with pytest.raises(ProjectConfigError) as excinfo:
+        load_project(path)
+    assert "project.yaml 不是合法的 YAML" in str(excinfo.value)
+
+
+def test_duplicate_top_level_keys_are_rejected(tmp_path):
+    """PyYAML 默认让后写的静默盖掉先写的：两段 render: 只剩第二段生效。"""
+    path = _write(
+        tmp_path,
+        "show: 某番\nslug: demo\nrender:\n  font_size: 40\nrender:\n  crf: '18'\n",
+    )
+    with pytest.raises(ProjectConfigError) as excinfo:
+        load_project(path)
+    message = str(excinfo.value)
+    assert "render" in message
+    assert "出现了两次" in message
+    assert "第 3 行" in message
+    assert "第 5 行" in message
+
+
+def test_duplicate_nested_keys_are_rejected(tmp_path):
+    path = _write(
+        tmp_path, "show: 某番\nslug: demo\nrender:\n  font_size: 40\n  font_size: 50\n"
+    )
+    with pytest.raises(ProjectConfigError) as excinfo:
+        load_project(path)
+    assert "font_size" in str(excinfo.value)
+
+
+def test_project_config_error_is_a_value_error():
+    """cli.PIPELINE_ERRORS 靠 ValueError 那条网兜住它。"""
+    assert issubclass(ProjectConfigError, ValueError)
+
+
+@pytest.mark.parametrize(
+    ("model", "required"),
+    [
+        (ProjectConfig, {"show": "某番", "slug": "demo"}),
+        (EpisodeConfig, {"number": 1, "srt": "srt/E01.srt"}),
+        (LocaleConfig, {}),
+        (LLMConfig, {}),
+        (IngestConfig, {}),
+        (CreditsConfig, {}),
+        (SignalsConfig, {}),
+        (ValidateConfig, {}),
+        (RenderConfig, {}),
+        (AsrConfig, {}),
+    ],
+    ids=lambda value: getattr(value, "__name__", None),
+)
+def test_every_config_model_forbids_extra_fields(model, required):
+    with pytest.raises(ValidationError):
+        model.model_validate({**required, "no_such_field": 1})
+
+
+def test_settings_still_ignores_unrelated_env_vars(monkeypatch):
+    """.env 里常年住着别的程序的变量，Settings 不许跟着变严。"""
+    monkeypatch.setenv("TENMIN_SOMETHING_ELSE", "x")
+    Settings()

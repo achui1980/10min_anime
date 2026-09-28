@@ -327,8 +327,8 @@ def test_init_output_round_trips_through_load_project(work):
 def test_init_output_has_no_keys_the_models_do_not_know(work):
     """独立于 pydantic 的 extra 设置，直接查生成的 yaml 里有没有模型不认识的键。
 
-    config.py 的模型目前是 pydantic 默认的 extra="ignore"，写错的键会被静默吞掉，
-    所以「能 load 回来」并不等于「每个键都真的生效」。这条自己查。
+    config.py 的模型现在是 extra="forbid"（能 load 回来就说明每个键都认识），这条留着
+    做一道不依赖 pydantic 配置的独立检查。
     """
     from tenmin.config import LLMConfig, LocaleConfig, ProjectConfig, RenderConfig
 
