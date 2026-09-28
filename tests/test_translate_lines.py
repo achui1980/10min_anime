@@ -313,3 +313,13 @@ async def test_ids_still_map_back_to_the_original_lines_after_filtering(tmp_path
     srt = render_zh_srt(track, result)
     assert "00:00:10,000 --> 00:00:11,000\n译2" in srt
     assert "00:00:30,000 --> 00:00:31,000\n译4" in srt
+
+
+@pytest.mark.asyncio
+async def test_translate_track_records_each_call_with_its_round(tmp_path):
+    track = _track(_line(1, "はい"), _line(2, "いいえ"))
+    provider = _ScriptedProvider(_payload([1]), _payload([1, 2]))
+    usage = []
+    await tl.translate_track(_cfg(tmp_path), track, provider, accumulated={}, usage=usage)
+    assert [record.round for record in usage] == ["translate", "translate_repair"]
+    assert all(record.ok for record in usage)

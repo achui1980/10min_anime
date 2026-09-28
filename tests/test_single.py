@@ -16,6 +16,7 @@ from tenmin.models import (
     Signal,
     SignalReport,
 )
+from tenmin.script.llm import LLMSchemaError, LLMUsage
 from tenmin.script.single import (
     SYSTEM_PROMPT,
     build_credits_block,
@@ -26,6 +27,7 @@ from tenmin.script.single import (
     generate_script,
     to_script,
 )
+from tenmin.script.usage import UsageRecord
 
 from .fakes import FakeProvider
 
@@ -954,3 +956,76 @@ def test_prompt_errors_name_the_template_file(cfg, track, report, monkeypatch):
         build_user_prompt(cfg, track, report)
     assert "single_episode.md" in str(exc.value)
     assert "typo_here" in str(exc.value)
+
+
+class _MeteredProvider(FakeProvider):
+    def __init__(self, responses, usages):
+        super().__init__(responses)
+        self._usages = list(usages)
+        self.last_usage = None
+
+    async def complete(self, system, user, schema=None):
+        self.last_usage = self._usages.pop(0)
+        return await super().complete(system, user, schema)
+
+
+@pytest.mark.asyncio
+async def test_generate_script_records_the_draft_and_the_budget_rewrite(cfg, track, report):
+    provider = _MeteredProvider(
+        [valid_llm_script(chars_per_beat=(600, 600, 600)), valid_llm_script()],
+        [
+            LLMUsage(
+                prompt_tokens=1000,
+                completion_tokens=200,
+                total_tokens=1200,
+                cached_tokens=800,
+                elapsed_seconds=3.0,
+                requests=1,
+            ),
+            LLMUsage(prompt_tokens=900, completion_tokens=150, total_tokens=1050, requests=2),
+        ],
+    )
+    usage: list[UsageRecord] = []
+    await generate_script(cfg, track, report, provider, usage=usage)
+    assert [record.round for record in usage] == ["draft", "budget_rewrite"]
+    assert usage[0].prompt_tokens == 1000
+    assert usage[0].completion_tokens == 200
+    assert usage[0].cached_tokens == 800
+    assert usage[1].cached_tokens is None
+    assert usage[1].requests == 2
+    assert all(record.provider == "gemini" for record in usage)
+    assert all(record.model == cfg.llm.model for record in usage)
+    assert all(record.ok and record.elapsed_seconds >= 0.0 for record in usage)
+
+
+@pytest.mark.asyncio
+async def test_generate_script_records_a_validation_retry(cfg, track, report):
+    provider = FakeProvider([valid_llm_script(chars_per_beat=(216, 216)), valid_llm_script()])
+    usage: list[UsageRecord] = []
+    await generate_script(cfg, track, report, provider, usage=usage)
+    assert [record.round for record in usage] == ["draft", "validation_retry"]
+    assert usage[0].prompt_tokens is None
+    assert usage[0].requests is None
+
+
+@pytest.mark.asyncio
+async def test_generate_script_records_a_call_that_failed(cfg, track, report):
+    class _Blowup:
+        last_usage = LLMUsage(prompt_tokens=5, requests=3)
+
+        async def complete(self, system, user, schema=None):
+            raise LLMSchemaError("连续 3 次输出不符合 LLMScript", raw_output="x")
+
+    usage: list[UsageRecord] = []
+    with pytest.raises(LLMSchemaError):
+        await generate_script(cfg, track, report, _Blowup(), usage=usage)
+    assert len(usage) == 1
+    assert usage[0].ok is False
+    assert usage[0].prompt_tokens == 5
+    assert usage[0].requests == 3
+
+
+@pytest.mark.asyncio
+async def test_generate_script_without_a_usage_sink_still_works(cfg, track, report):
+    script, _ = await generate_script(cfg, track, report, FakeProvider([valid_llm_script()]))
+    assert script.beats

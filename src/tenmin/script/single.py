@@ -28,6 +28,7 @@ from tenmin.script.budget import (
 )
 from tenmin.script.llm import LLMProvider
 from tenmin.script.prompt import load_prompt, render_prompt
+from tenmin.script.usage import RoundKind, UsageRecord, track_call
 from tenmin.script.validate import ScriptValidationError, validate_script
 from tenmin.timecode import readable_seconds
 
@@ -310,6 +311,7 @@ async def generate_script(
     *,
     reporter: ProgressReporter | None = None,
     glossary: Mapping[str, str] | None = None,
+    usage: list[UsageRecord] | None = None,
 ) -> tuple[Script, list[str]]:
     """生成一集的剧本：首稿 + 最多 N 次校验重试 + 最多 M 轮预算返工。
 
@@ -319,6 +321,8 @@ async def generate_script(
     `glossary` 原样转给 build_user_prompt（含「不传就退回 cfg.glossary」那条回退），
     首轮与返工轮共用同一份 —— 返工轮摘掉的只有 few-shot 范例，而返工改的恰好是旁白
     正文，正是最会把专有名词写飘的那一轮。
+
+    `usage` 给了就按首稿、校验重试、时长返工各记一条 LLM 调用。
     """
     reporter = reporter or NullProgressReporter()
     llm = cfg.llm
@@ -336,11 +340,13 @@ async def generate_script(
     total_rounds = 1 + llm.validation_retries + llm.budget_rewrite_rounds
     round_index = 0
 
-    async def draft(prompt: str, label: str) -> tuple[Script, list[str]]:
+    async def draft(prompt: str, label: str, kind: RoundKind) -> tuple[Script, list[str]]:
         nonlocal round_index
         round_index += 1
         reporter.substep("script", round_index, total_rounds, label)
-        llm_script = await provider.complete(SYSTEM_PROMPT, prompt, LLMScript)
+        llm_script = await track_call(
+            usage, provider, llm, kind, provider.complete(SYSTEM_PROMPT, prompt, LLMScript)
+        )
         result = validate_script(
             to_script(llm_script, cfg, track.episode),
             tracks,
@@ -359,18 +365,20 @@ async def generate_script(
     # 剥掉，见 tests/test_source_hygiene.py），而这个循环只有 break 与 raise 两个出口。
     # 退避重试的同款写法见 render/tts.py 的 synthesize_with_retry。
     prompt, label = first_prompt, "生成初稿"
+    kind: RoundKind = "draft"
     attempts = llm.validation_retries + 1
     attempt = 0
     while True:
         attempt += 1
         try:
-            script, stage_warnings = await draft(prompt, label)
+            script, stage_warnings = await draft(prompt, label, kind)
             break
         except ScriptValidationError as error:
             if attempt >= attempts:
                 raise
             warnings.append(f"第 {attempt} 轮剧本校验失败，重试：{error}")
             label = f"校验失败，第 {attempt} 次重试"
+            kind = "validation_retry"
             # 校验失败的现场（哪些 clip 被丢了）已经在 error.script 里，交回去让模型
             # 只改那几处，而不是整篇重生成。
             prompt = (
@@ -400,6 +408,7 @@ async def generate_script(
             candidate, candidate_warnings = await draft(
                 _followup_prompt(followup_base, script, "时长返工要求", instruction),
                 f"时长返工第 {round_number} 轮",
+                "budget_rewrite",
             )
         except ScriptValidationError as error:
             # 返工轮把稿子写坏了：上一版是通过校验的，留着它比整次失败好。

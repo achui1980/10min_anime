@@ -27,6 +27,7 @@ from tenmin.script.llm import (
     complete_with_schema_repair,
 )
 from tenmin.script.prompt import render_prompt
+from tenmin.script.usage import UsageRecord, track_call
 from tenmin.translate.glossary import effective_glossary
 
 # 走 importlib.resources 而不是 `Path(__file__).parent`，理由跟 script.prompt 的
@@ -140,6 +141,7 @@ async def translate_track(
     provider: LLMProvider,
     *,
     accumulated: Mapping[str, str],
+    usage: list[UsageRecord] | None = None,
 ) -> TranslatedTrack:
     """翻译一集对白。
 
@@ -169,14 +171,22 @@ async def translate_track(
 
     async def send(repair: RepairContext | None) -> str:
         if repair is None:
-            return await provider.complete(system, body)
+            return await track_call(
+                usage, provider, cfg.llm, "translate", provider.complete(system, body)
+            )
         # 纠错轮**照旧重发整份正文**，刻意不学 llm.py 那条「修复轮完全不重发正文」的
         # 省法：那一层修的是纯格式问题，而这里要修的是「第 137、298 条漏了」，模型得
         # 对着原文才补得出那几条的译文。代价是重试一次就多发一份对白轨。
-        return await provider.complete(
-            system,
-            f"{body}\n\n## 上一次的输出有问题\n\n"
-            f"{repair.error}\n\n上一次的输出（可能被截断）：\n\n{repair.bad_output}\n",
+        return await track_call(
+            usage,
+            provider,
+            cfg.llm,
+            "translate_repair",
+            provider.complete(
+                system,
+                f"{body}\n\n## 上一次的输出有问题\n\n"
+                f"{repair.error}\n\n上一次的输出（可能被截断）：\n\n{repair.bad_output}\n",
+            ),
         )
 
     result = await complete_with_schema_repair(

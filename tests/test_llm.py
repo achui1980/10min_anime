@@ -1162,6 +1162,114 @@ def test_llm_business_error_is_an_llm_error():
     assert issubclass(LLMBusinessError, LLMError)
 
 
+# --- 用量：cached token 与一次 complete() 底下全部请求的合计 ---
+
+
+@pytest.mark.asyncio
+async def test_gemini_usage_sums_every_request_and_reads_cached_tokens(monkeypatch):
+    provider = GeminiProvider(api_key="fake-key")
+    first = SimpleNamespace(
+        prompt_token_count=100,
+        candidates_token_count=10,
+        total_token_count=110,
+        cached_content_token_count=60,
+    )
+    second = SimpleNamespace(
+        prompt_token_count=30,
+        candidates_token_count=5,
+        total_token_count=35,
+        cached_content_token_count=None,
+    )
+    _fake_gemini(
+        monkeypatch,
+        provider,
+        [
+            _FakeGeminiResponse('{"val": 1}', usage=first),
+            _FakeGeminiResponse('{"value": 1}', usage=second),
+        ],
+    )
+
+    await provider.complete("SYS", "USR", Toy)
+
+    usage = provider.last_usage
+    assert (usage.prompt_tokens, usage.completion_tokens, usage.total_tokens) == (
+        130,
+        15,
+        145,
+    )
+    assert usage.cached_tokens == 60
+    assert usage.requests == 2
+
+
+@pytest.mark.asyncio
+async def test_gemini_usage_is_all_none_when_the_sdk_reports_nothing(monkeypatch):
+    provider = GeminiProvider(api_key="fake-key")
+    _fake_gemini(monkeypatch, provider, ['{"value": 1}'])
+    await provider.complete("SYS", "USR", Toy)
+    assert provider.last_usage.prompt_tokens is None
+    assert provider.last_usage.cached_tokens is None
+    assert provider.last_usage.requests == 1
+
+
+@pytest.mark.asyncio
+async def test_openai_compatible_usage_reads_cached_tokens(monkeypatch):
+    _mock_httpx(
+        monkeypatch,
+        [
+            _sse(
+                _delta('{"value": 1}'),
+                {"choices": [], "usage": {
+                    "prompt_tokens": 50,
+                    "completion_tokens": 5,
+                    "total_tokens": 55,
+                    "prompt_tokens_details": {"cached_tokens": 32},
+                }},
+            )
+        ],
+    )
+    provider = MiniMaxProvider(api_key="secret")
+    await provider.complete("SYS", "USR", Toy)
+    assert provider.last_usage.cached_tokens == 32
+
+
+@pytest.mark.asyncio
+async def test_deepseek_style_cache_hit_tokens_are_read(monkeypatch):
+    _mock_httpx(
+        monkeypatch,
+        [
+            _sse(
+                _delta('{"value": 1}'),
+                {"choices": [], "usage": {
+                    "prompt_tokens": 50,
+                    "completion_tokens": 5,
+                    "total_tokens": 55,
+                    "prompt_cache_hit_tokens": 40,
+                }},
+            )
+        ],
+    )
+    provider = OpenAICompatibleProvider(api_key="k", model="m", base_url="https://x.test/v1")
+    await provider.complete("SYS", "USR", Toy)
+    assert provider.last_usage.cached_tokens == 40
+
+
+@pytest.mark.asyncio
+async def test_openai_compatible_usage_sums_across_repair_rounds(monkeypatch):
+    usage = {"prompt_tokens": 10, "completion_tokens": 1, "total_tokens": 11}
+    _mock_httpx(
+        monkeypatch,
+        [
+            _sse(_delta('{"val": 1}'), {"choices": [], "usage": usage}),
+            _sse(_delta('{"value": 1}'), {"choices": [], "usage": usage}),
+        ],
+    )
+    provider = MiniMaxProvider(api_key="secret")
+    await provider.complete("SYS", "USR", Toy)
+    assert provider.last_usage.prompt_tokens == 20
+    assert provider.last_usage.total_tokens == 22
+    assert provider.last_usage.requests == 2
+
+
 # --- MiniMax 流式 ---
 
 

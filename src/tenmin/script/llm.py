@@ -8,8 +8,8 @@ import json
 import random
 import re
 import time
-from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from collections.abc import Awaitable, Callable, Iterable
+from dataclasses import dataclass, field
 from typing import Any, Protocol, overload, runtime_checkable
 
 import aiohttp
@@ -438,30 +438,18 @@ def _business_error(event: dict[str, Any]) -> tuple[Any, str] | None:
 
 @dataclass(frozen=True)
 class LLMUsage:
-    """上一次 complete() 的用量与耗时。
+    """上一次 complete() 底下全部 HTTP 请求的合计用量与耗时。
 
-    流里的 usage chunk 原先被整个丢弃。本项目刻意不引入 logging，也不想为了这点
-    信息去改 LLMProvider Protocol 的返回类型（那会牵动 single.py / pipeline.py /
-    FakeProvider 与一大票测试，投入产出不划算），所以只做最小暴露：挂在
-    provider.last_usage 上，谁想看谁读。字段为 None = 服务端没给这个数。
-
-    **`llm.script_concurrency > 1` 时它不可靠**，这是「挂在 provider 上」这个形态的固有
-    代价：批量模式下多集共用**同一个** provider 实例，N 个 `complete()` 并发在飞，
-    `last_usage` 是最后一个完成的那次赋的，所以并发下它只是「某一次调用」的用量，
-    不是总量、也不一定是你关心的那一集。Gemini 的请求次数现在按每次调用独立计数。
-
-    刻意不修，两条依据：
-    1. **它没有生产消费者。** 全项目没有任何代码读 `last_usage`（只有测试读），它就是
-       个诊断字段 —— 拿一次 Protocol 返回类型的大改去换一个没人读的数字不划算。
-    2. **`script_concurrency` 默认 1**，那时压根没有并发（见 config 里那三条依据）。
-
-    真要总量的话正确做法是让 `complete()` 把用量**随返回值一起交出来**，而那要改
-    Protocol —— 属于另一个任务。
+    None 表示服务端没给这个数；cached_tokens 是 prompt 中命中服务端缓存的部分。
+    script/usage.py 的 track_call 在 await complete() 后立即读取，中间没有 await，
+    因而并发任务不会插进来。其它时刻读 last_usage 只能得到最后完成的那次调用，
+    既不是总量，也未必属于当前集。
     """
 
     prompt_tokens: int | None = None
     completion_tokens: int | None = None
     total_tokens: int | None = None
+    cached_tokens: int | None = None
     elapsed_seconds: float = 0.0
     requests: int = 1
 
@@ -472,6 +460,19 @@ def _as_int(value: Any) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def _total(values: Iterable[int | None]) -> int | None:
+    """没有任何请求报告这个字段时返回 None，而不是伪造的零。"""
+    known = [value for value in values if value is not None]
+    return sum(known) if known else None
+
+
+def _cached_tokens(usage: dict[str, Any]) -> int | None:
+    details = usage.get("prompt_tokens_details")
+    if isinstance(details, dict) and details.get("cached_tokens") is not None:
+        return _as_int(details.get("cached_tokens"))
+    return _as_int(usage.get("prompt_cache_hit_tokens"))
 
 
 @dataclass
@@ -485,7 +486,7 @@ class _StreamTally:
     malformed_lines: int = 0
     transport_retries: int = 0
     requests: int = 0
-    usage: dict[str, Any] | None = None
+    usages: list[dict[str, Any]] = field(default_factory=list)
 
     def summary(self) -> str:
         notes = []
@@ -496,11 +497,11 @@ class _StreamTally:
         return "；".join(notes)
 
     def to_usage(self, elapsed_seconds: float) -> LLMUsage:
-        raw = self.usage or {}
         return LLMUsage(
-            prompt_tokens=_as_int(raw.get("prompt_tokens")),
-            completion_tokens=_as_int(raw.get("completion_tokens")),
-            total_tokens=_as_int(raw.get("total_tokens")),
+            prompt_tokens=_total(_as_int(u.get("prompt_tokens")) for u in self.usages),
+            completion_tokens=_total(_as_int(u.get("completion_tokens")) for u in self.usages),
+            total_tokens=_total(_as_int(u.get("total_tokens")) for u in self.usages),
+            cached_tokens=_total(_cached_tokens(u) for u in self.usages),
             elapsed_seconds=elapsed_seconds,
             requests=self.requests,
         )
@@ -660,9 +661,22 @@ class GeminiProvider:
             max_output_tokens=self.max_output_tokens,
         )
         tally.requests += 1
-        return await self._client.aio.models.generate_content(
+        response = await self._client.aio.models.generate_content(
             model=self.model, contents=contents, config=config
         )
+        meta = getattr(response, "usage_metadata", None)
+        if meta is not None:
+            tally.usages.append(
+                {
+                    "prompt_tokens": getattr(meta, "prompt_token_count", None),
+                    "completion_tokens": getattr(meta, "candidates_token_count", None),
+                    "total_tokens": getattr(meta, "total_token_count", None),
+                    "prompt_tokens_details": {
+                        "cached_tokens": getattr(meta, "cached_content_token_count", None)
+                    },
+                }
+            )
+        return response
 
     async def _generate_with_retries(
         self,
@@ -717,16 +731,6 @@ class GeminiProvider:
         _check_gemini_finish(response)
         return response
 
-    def _record_usage(self, response: Any, elapsed_seconds: float, requests: int) -> None:
-        meta = getattr(response, "usage_metadata", None)
-        self.last_usage = LLMUsage(
-            prompt_tokens=_as_int(getattr(meta, "prompt_token_count", None)),
-            completion_tokens=_as_int(getattr(meta, "candidates_token_count", None)),
-            total_tokens=_as_int(getattr(meta, "total_token_count", None)),
-            elapsed_seconds=elapsed_seconds,
-            requests=requests,
-        )
-
     def _repair_contents(self, schema: type[BaseModel], repair: RepairContext) -> str:
         return (
             f"{_REPAIR_HEADER}\n\n"
@@ -750,19 +754,17 @@ class GeminiProvider:
     ) -> Any:
         tally = _StreamTally()
         started = time.monotonic()
-        last_response: Any = None
         try:
             if schema is None:
-                last_response = await self._generate_checked(system, user, None, tally)
-                return last_response.text
+                response = await self._generate_checked(system, user, None, tally)
+                return response.text
 
             async def send(repair: RepairContext | None) -> str:
-                nonlocal last_response
                 contents = (
                     user if repair is None else self._repair_contents(schema, repair)
                 )
-                last_response = await self._generate_checked(system, contents, schema, tally)
-                text = last_response.text
+                response = await self._generate_checked(system, contents, schema, tally)
+                text = response.text
                 if text is None:
                     raise LLMResponseFormatError(
                         "Gemini 一个字都没返回（response.text is None），没有可校验的内容。"
@@ -777,7 +779,7 @@ class GeminiProvider:
                 diagnostics=tally.summary,
             )
         finally:
-            self._record_usage(last_response, time.monotonic() - started, tally.requests)
+            self.last_usage = tally.to_usage(time.monotonic() - started)
 
 
 class OpenAICompatibleProvider:
@@ -911,6 +913,7 @@ class OpenAICompatibleProvider:
         """
         parts: list[str] = []
         finish_reason: str | None = None
+        stream_usage: dict[str, Any] | None = None
         tally.requests += 1
         try:
             async with asyncio.timeout(self._total_timeout_seconds):
@@ -944,11 +947,14 @@ class OpenAICompatibleProvider:
                             code, message = business
                             raise LLMBusinessError(code=code, message=message)
                         if isinstance(event.get("usage"), dict):
-                            tally.usage = event["usage"]
+                            # 个别实现每个 chunk 都报累计值，一条流只留最后一个。
+                            stream_usage = event["usage"]
                         # 最后一个非空的赢：收尾 chunk 带 finish_reason 而 delta 为空，
                         # 而个别实现会在**每个** chunk 上带一个 null。
                         finish_reason = _finish_reason(event) or finish_reason
                         parts.append(_event_delta(event))
+                    if stream_usage is not None:
+                        tally.usages.append(stream_usage)
         except TimeoutError as exc:
             # asyncio.timeout 到点抛的是内置 TimeoutError（httpx 自己的超时是
             # httpx.TimeoutException，两者没有继承关系，不会互相误吞）。

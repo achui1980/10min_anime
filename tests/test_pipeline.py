@@ -223,10 +223,12 @@ FROZEN_LAYOUT = {
     "script_raw": "03_script/E02.raw.txt",
     "script_rejected": "03_script/E02.rejected.json",
     "script_warnings": "03_script/E02.warnings.json",
+    "script_usage": "03_script/E02.usage.json",
     "table": "out/E02.解说方案.md",
     "narration": "out/E02.narration.txt",
     "zh_lines": "zh/E02.zh.json",
     "zh_subtitles": "out/E02.zh.srt",
+    "zh_usage": "zh/E02.usage.json",
     "voice_dir": "04_voice/E02",
     "voice": "04_voice/E02.voice.json",
     "timeline": "05_timeline/E02.timeline.json",
@@ -2762,3 +2764,46 @@ async def test_run_pipeline_still_prefetches_scripts_without_translate(
     # 先后：那取决于三个同长 sleep 的醒来顺序，不是这条用例要保护的性质。
     assert order[:3] == ["script1-start", "script2-start", "script3-start"]
     assert sorted(order[3:]) == ["script1-done", "script2-done", "script3-done"]
+
+
+# --- LLM 用量落盘（只用来观察成本，不是任何阶段的新鲜度输入） ---
+
+
+@pytest.mark.asyncio
+async def test_run_script_writes_a_usage_file(project):
+    await run_pipeline(project, FakeProvider([fake_script_response()]), only=V1_STAGES)
+    data = json.loads(Paths(project.root).script_usage(2).read_text(encoding="utf-8"))
+    assert data["episode"] == 2
+    assert [call["round"] for call in data["calls"]] == ["draft"]
+    call = data["calls"][0]
+    assert call["provider"] == "gemini"
+    assert call["prompt_tokens"] is None
+    assert call["completion_tokens"] is None
+    assert call["cached_tokens"] is None
+    assert call["ok"] is True
+
+
+@pytest.mark.asyncio
+async def test_run_script_writes_the_usage_file_even_when_it_fails(project):
+    await run_pipeline(project, FakeProvider([]), only=["ingest", "signals"])
+    with pytest.raises(LLMSchemaError):
+        await run_script(project, _SchemaBlowupProvider("x"), episode=2)
+    data = json.loads(Paths(project.root).script_usage(2).read_text(encoding="utf-8"))
+    assert [call["ok"] for call in data["calls"]] == [False]
+
+
+@pytest.mark.asyncio
+async def test_run_translate_writes_a_usage_file(tmp_path):
+    cfg, paths = _project_with_dialogue(tmp_path, episode=11, source="asr")
+    await run_translate(cfg, FakeProvider([_translation_response()]), 11)
+    data = json.loads(paths.zh_usage(11).read_text(encoding="utf-8"))
+    assert data["episode"] == 11
+    assert [call["round"] for call in data["calls"]] == ["translate"]
+
+
+@pytest.mark.asyncio
+async def test_a_skipped_translate_writes_no_usage_file(tmp_path):
+    cfg, paths = _project_with_dialogue(tmp_path, episode=2, source="srt")
+    await run_translate(cfg, FakeProvider([]), 2)
+    assert not paths.zh_usage(2).exists()
+    assert not (cfg.root / "zh").exists()

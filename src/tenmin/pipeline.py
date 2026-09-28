@@ -38,6 +38,7 @@ from tenmin.render.tts import TTSEngine, synthesize_track
 from tenmin.render.video import render_video
 from tenmin.script.llm import LLMProvider, LLMSchemaError
 from tenmin.script.single import generate_script
+from tenmin.script.usage import UsageRecord, write_usage
 from tenmin.script.validate import ScriptValidationError
 from tenmin.signals.aggregate import build_report
 from tenmin.translate.glossary import (
@@ -105,6 +106,8 @@ _ARTIFACTS: dict[str, tuple[str, str]] = {
     # 也顺带避免上一跑的警告文件变成过期的谎言。
     # 它不是任何阶段的输入或输出，不参与 _is_fresh。
     "script_warnings": ("03_script", ".warnings.json"),
+    # 诊断产物，不参与 _is_fresh；失败也写下本次已耗的用量。
+    "script_usage": ("03_script", ".usage.json"),
     "table": ("out", ".解说方案.md"),
     "narration": ("out", ".narration.txt"),
     # 翻译阶段。目录刻意不占 0N 编号：现有的 01_dialogue → 07_render 是连续的，
@@ -116,6 +119,8 @@ _ARTIFACTS: dict[str, tuple[str, str]] = {
     # 中文字幕是交付物，跟解说方案、配音文本并排放 out/：那个目录的约定是
     # 「给人看的东西都在这」，标准 SRT 可以直接拖进播放器。
     "zh_subtitles": ("out", ".zh.srt"),
+    # 只有 source=asr 且真正翻译时才写；不是新鲜度输入或输出。
+    "zh_usage": ("zh", ".usage.json"),
     "voice_dir": ("04_voice", ""),
     "voice": ("04_voice", ".voice.json"),
     "timeline": ("05_timeline", ".timeline.json"),
@@ -179,6 +184,9 @@ class Paths:
     def script_warnings(self, episode: int) -> Path:
         return self._artifact("script_warnings", episode)
 
+    def script_usage(self, episode: int) -> Path:
+        return self._artifact("script_usage", episode)
+
     def table(self, episode: int) -> Path:
         return self._artifact("table", episode)
 
@@ -190,6 +198,9 @@ class Paths:
 
     def zh_subtitles(self, episode: int) -> Path:
         return self._artifact("zh_subtitles", episode)
+
+    def zh_usage(self, episode: int) -> Path:
+        return self._artifact("zh_usage", episode)
 
     @property
     def glossary(self) -> Path:
@@ -496,7 +507,13 @@ async def run_translate(
 
     paths = Paths(cfg.root)
     accumulated = load_glossary(paths.glossary)
-    translated = await translate_track(cfg, track, provider, accumulated=accumulated)
+    usage: list[UsageRecord] = []
+    try:
+        translated = await translate_track(
+            cfg, track, provider, accumulated=accumulated, usage=usage
+        )
+    finally:
+        write_usage(paths.zh_usage(episode), episode, usage)
 
     _write_json(paths.zh_lines(episode), translated.model_dump_json(indent=2))
     _write_text(paths.zh_subtitles(episode), render_zh_srt(track, translated))
@@ -543,9 +560,10 @@ async def run_script(
     # 结果是空字典，build_glossary_block 会印「（无术语表）」—— 现有的繁中片源走的就是
     # 这条路（它们压根没有 zh/glossary.json）。
     glossary = effective_glossary(load_glossary(paths.glossary), cfg.glossary)
+    usage: list[UsageRecord] = []
     try:
         script, warnings = await generate_script(
-            cfg, track, report, provider, reporter=reporter, glossary=glossary
+            cfg, track, report, provider, reporter=reporter, glossary=glossary, usage=usage
         )
     except ScriptValidationError as error:
         # 跟下面 LLMSchemaError 的落盘同理：pipeline 是唯一知道产物往哪写的一层。
@@ -570,6 +588,8 @@ async def run_script(
             f"{error}\n最后一次的原始模型输出已存到 {raw_path}",
             raw_output=error.raw_output,
         ) from error
+    finally:
+        write_usage(paths.script_usage(episode), episode, usage)
     _write_json(paths.script(episode), script.model_dump_json(indent=2))
     # 每次跑完都写，哪怕 warnings 是空的（理由见 _ARTIFACTS["script_warnings"]）。
     # 写在 script 落盘之后：warnings 描述的是刚写下去那一份剧本，顺序反了会出现
