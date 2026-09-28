@@ -10,3 +10,4 @@ build/
 work/
 tests/fixtures/generalize/
 graphify-out/
+.worktrees/
