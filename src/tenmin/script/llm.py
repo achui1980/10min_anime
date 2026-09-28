@@ -623,6 +623,7 @@ class GeminiProvider:
         max_output_tokens: int | None = DEFAULT_LLM.max_output_tokens,
     ):
         from google import genai
+        from google.genai import types
 
         self.model = model
         self.max_attempts = max_attempts
@@ -630,7 +631,19 @@ class GeminiProvider:
         self.temperature = temperature
         self.max_output_tokens = max_output_tokens
         self.last_usage: LLMUsage | None = None
-        self._client = genai.Client(api_key=api_key)
+        # SDK 的 aiohttp 路径在 tenacity 的 attempts=1 *内部*仍会对连接错误
+        # sleep(1..10s) 并重发一次。传自持有的 httpx.AsyncClient 禁用 aiohttp
+        # 路径，同时保留 httpx 默认的环境代理；外层次数才是实际 HTTP 请求上限。
+        self._httpx_client = httpx.AsyncClient()
+        self._client = genai.Client(
+            api_key=api_key,
+            http_options=types.HttpOptions(httpx_async_client=self._httpx_client),
+        )
+
+    async def aclose(self) -> None:
+        """显式关闭 SDK 的 async 连接池（CLI 会在流水线结束时调用）。"""
+        await self._client.aio.aclose()
+        await self._httpx_client.aclose()
 
     async def _generate(
         self, system: str, contents: str, schema: type[BaseModel] | None, tally: _StreamTally

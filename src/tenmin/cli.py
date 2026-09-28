@@ -229,8 +229,8 @@ async def _run_pipeline_and_close(
 
     OpenAICompatibleProvider 现在持有一个 httpx.AsyncClient（为的是让同一次运行的
     多轮重试、批量模式的多集共用连接池），所以它的生命周期必须有人收尾。用 getattr
-    探测而不是写死类型：GeminiProvider 没有 aclose（google-genai 自己管连接），
-    而库调用方/测试传进来的假 provider 更不会有。
+    探测而不是写死类型：GeminiProvider 也会关闭它自持有的 httpx 客户端，
+    而库调用方/测试传进来的假 provider 可能没有 aclose。
     """
     try:
         return await run_pipeline(cfg, provider, **kwargs)

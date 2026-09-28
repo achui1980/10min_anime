@@ -1965,3 +1965,56 @@ async def test_gemini_honours_retry_after_header(monkeypatch, sleeps):
 def test_build_provider_wires_transport_max_attempts_into_gemini():
     provider = build_provider(LLMConfig(transport_max_attempts=2), Settings(gemini_api_key="k"))
     assert provider.transport_max_attempts == 2
+
+
+@pytest.mark.asyncio
+async def test_gemini_connection_attempt_cap_counts_actual_sdk_http_requests(
+    monkeypatch, sleeps
+):
+    """真实 SDK 路径：aiohttp 内建的隐式重发不能突破我们配置的 HTTP 请求上限。"""
+    import aiohttp
+    import httpx
+    from google.genai import _api_client
+
+    requests = []
+    clients = []
+    real_async_client = httpx.AsyncClient
+
+    def handler(request):
+        requests.append(request)
+        raise httpx.ConnectError("connection refused")
+
+    def client_factory(*args, **kwargs):
+        assert not args and not kwargs  # 普通 AsyncClient 保留 trust_env / 环境代理
+        client = real_async_client(transport=httpx.MockTransport(handler))
+        clients.append(client)
+        return client
+
+    monkeypatch.setattr(llm.httpx, "AsyncClient", client_factory)
+
+    class BrokenAiohttpSession:
+        async def request(self, **kwargs):
+            requests.append(kwargs)
+            raise aiohttp.ClientOSError("connection refused")
+
+    async def session(_self):
+        return BrokenAiohttpSession()
+
+    async def forbidden_sdk_sleep(_seconds):
+        raise AssertionError("SDK aiohttp transport tried its own retry sleep")
+
+    monkeypatch.setattr(_api_client.BaseApiClient, "_get_aiohttp_session", session)
+    monkeypatch.setattr(_api_client.asyncio, "sleep", forbidden_sdk_sleep)
+
+    provider = GeminiProvider(api_key="fake-key", transport_max_attempts=2)
+    try:
+        with pytest.raises(LLMTransportError, match="已尝试 2 次"):
+            await provider.complete("SYS", "USR")
+        assert len(requests) == 2
+        assert all(isinstance(request, httpx.Request) for request in requests)
+        assert sleeps == [1.0]
+        assert provider.last_usage.requests == 2
+    finally:
+        await provider.aclose()
+    assert len(clients) == 1
+    assert clients[0].is_closed
