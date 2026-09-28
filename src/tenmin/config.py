@@ -171,12 +171,11 @@ class LLMConfig(StrictModel):
     # 跟改动前逐点等价。接线方式见 pipeline.run_pipeline 的「有界预取」那一段。
     #
     # **默认 1 是刻意的**，三条依据，一条比一条硬：
-    # 1. 默认 provider 是 gemini（见上面的 `provider` 字段），而 GeminiProvider 走的是
-    #    google.genai SDK、抛 google.genai.errors.APIError，**根本不经过 llm.py 的
-    #    `_stream_with_retries`**。也就是说这条默认路径上没有我们自己的 429/5xx 指数
-    #    退避，只有 SDK 内建的那一层（不受本项目控制、也没被测过）。并发正是最容易撞
-    #    429 的做法，而撞上就是整批失败。openai_compatible / minimax 那两条路有完整的
-    #    传输层退避（transport_max_attempts=4 + 抖动 + Retry-After），可以放心调到 2–4。
+    # 1. **并发最容易撞 429**。三条 provider 路径现在都有我们自己的传输层退避
+    #    （GeminiProvider._generate_with_retries 与 OpenAICompatibleProvider
+    #    ._stream_with_retries 同一套判据：429/5xx/连接类异常，transport_max_attempts=4
+    #    + 抖动 + Retry-After），但退避只兜得住秒级的限流窗，一个把 RPM 配额打满的并发度
+    #    照样是整批失败。
     # 2. **并发会花掉可能白花的钱**。预取窗口里在飞的那几集，一旦前面某集的任何阶段
     #    失败就会被取消，那几次调用的 token 已经花了。串行下它们压根不会发出去。
     # 3. **run_audio / run_render 是同步的 ffmpeg 调用，会把事件循环整个堵住**，在飞的

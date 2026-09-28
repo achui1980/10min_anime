@@ -12,6 +12,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any, Protocol, overload, runtime_checkable
 
+import aiohttp
 import httpx
 from pydantic import BaseModel, ValidationError
 
@@ -49,6 +50,14 @@ _RETRYABLE_TRANSPORT_ERRORS = (
     httpx.TimeoutException,
     httpx.NetworkError,
     httpx.RemoteProtocolError,
+)
+
+# google-genai 可走 aiohttp 或 httpx；只网连接/读取错误，不网泛 ClientError（含 4xx）。
+_GEMINI_TRANSPORT_ERRORS = (
+    *_RETRYABLE_TRANSPORT_ERRORS,
+    aiohttp.ClientConnectionError,
+    aiohttp.ClientPayloadError,
+    TimeoutError,
 )
 
 # 错误响应体拼进异常消息时的上限。1000 字符足够看清 JSON 错误体里的 code/message，
@@ -438,9 +447,8 @@ class LLMUsage:
 
     **`llm.script_concurrency > 1` 时它不可靠**，这是「挂在 provider 上」这个形态的固有
     代价：批量模式下多集共用**同一个** provider 实例，N 个 `complete()` 并发在飞，
-    `last_usage` 是最后一个完成的那次赋的（`GeminiProvider._requests` 那个计数器也会被
-    后开始的调用重置回 0），所以并发下它只是「某一次调用」的用量，不是总量、也不一定是
-    你关心的那一集。
+    `last_usage` 是最后一个完成的那次赋的，所以并发下它只是「某一次调用」的用量，
+    不是总量、也不一定是你关心的那一集。Gemini 的请求次数现在按每次调用独立计数。
 
     刻意不修，两条依据：
     1. **它没有生产消费者。** 全项目没有任何代码读 `last_usage`（只有测试读），它就是
@@ -576,6 +584,33 @@ def _check_gemini_finish(response: Any) -> None:
     )
 
 
+def _gemini_retry_after(error: Any) -> float | None:
+    """从 SDK 保留的原始响应里读取 Retry-After（httpx/aiohttp 均可）。"""
+    headers = getattr(getattr(error, "response", None), "headers", None)
+    if headers is None:
+        return None
+    try:
+        return _parse_retry_after(headers.get("retry-after"))
+    except (AttributeError, TypeError):
+        return None
+
+
+def _gemini_http_error(error: Any, model: str) -> LLMHTTPError:
+    """把 google-genai 的 APIError 转成 CLI 可展示的错误，保留响应摘要。"""
+    details = getattr(error, "details", None)
+    body = (
+        str(getattr(error, "message", None) or error)
+        if details is None
+        else json.dumps(details, ensure_ascii=False, default=str)
+    )
+    return LLMHTTPError(
+        status_code=int(getattr(error, "code", 0) or 0),
+        body=body,
+        url=f"Gemini {model}",
+        retry_after=_gemini_retry_after(error),
+    )
+
+
 class GeminiProvider:
     def __init__(
         self,
@@ -583,6 +618,7 @@ class GeminiProvider:
         model: str = "gemini-3.6-flash",
         *,
         max_attempts: int = DEFAULT_LLM.max_attempts,
+        transport_max_attempts: int = DEFAULT_LLM.transport_max_attempts,
         temperature: float | None = DEFAULT_LLM.temperature,
         max_output_tokens: int | None = DEFAULT_LLM.max_output_tokens,
     ):
@@ -590,14 +626,14 @@ class GeminiProvider:
 
         self.model = model
         self.max_attempts = max_attempts
+        self.transport_max_attempts = transport_max_attempts
         self.temperature = temperature
         self.max_output_tokens = max_output_tokens
         self.last_usage: LLMUsage | None = None
-        self._requests = 0
         self._client = genai.Client(api_key=api_key)
 
     async def _generate(
-        self, system: str, contents: str, schema: type[BaseModel] | None
+        self, system: str, contents: str, schema: type[BaseModel] | None, tally: _StreamTally
     ) -> Any:
         from google.genai import types
 
@@ -610,26 +646,72 @@ class GeminiProvider:
             temperature=self.temperature,
             max_output_tokens=self.max_output_tokens,
         )
-        self._requests += 1
+        tally.requests += 1
         return await self._client.aio.models.generate_content(
             model=self.model, contents=contents, config=config
         )
 
-    async def _generate_checked(
-        self, system: str, contents: str, schema: type[BaseModel] | None
+    async def _generate_with_retries(
+        self,
+        system: str,
+        contents: str,
+        schema: type[BaseModel] | None,
+        tally: _StreamTally,
     ) -> Any:
-        response = await self._generate(system, contents, schema)
+        """429/5xx 和连接类异常走传输退避；其他 APIError 立即抛出。"""
+        from google.genai import errors as genai_errors
+
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                return await self._generate(system, contents, schema, tally)
+            except genai_errors.APIError as exc:
+                cause: BaseException = exc
+                http_error = _gemini_http_error(exc, self.model)
+                error: Exception = http_error
+                retryable = http_error.status_code in RETRYABLE_STATUS_CODES
+                retry_after = http_error.retry_after
+            except _GEMINI_TRANSPORT_ERRORS as exc:
+                cause = exc
+                error = exc
+                retryable = True
+                retry_after = None
+            if not retryable or attempt >= self.transport_max_attempts:
+                raise self._exhausted(error, attempt) from cause
+            tally.transport_retries += 1
+            await _sleep(_backoff_delay(attempt, retry_after))
+
+    def _exhausted(self, error: Exception, attempt: int) -> LLMError:
+        if isinstance(error, LLMHTTPError):
+            return LLMHTTPError(
+                status_code=error.status_code,
+                body=error.body,
+                url=error.url,
+                retry_after=error.retry_after,
+                attempts=attempt,
+            )
+        detail = str(error) or type(error).__name__
+        return LLMTransportError(
+            f"连接 Gemini 接口失败，已尝试 {attempt} 次仍不通"
+            f"（model={self.model}）：{type(error).__name__}: {detail}"
+        )
+
+    async def _generate_checked(
+        self, system: str, contents: str, schema: type[BaseModel] | None, tally: _StreamTally
+    ) -> Any:
+        response = await self._generate_with_retries(system, contents, schema, tally)
         _check_gemini_finish(response)
         return response
 
-    def _record_usage(self, response: Any, elapsed_seconds: float) -> None:
+    def _record_usage(self, response: Any, elapsed_seconds: float, requests: int) -> None:
         meta = getattr(response, "usage_metadata", None)
         self.last_usage = LLMUsage(
             prompt_tokens=_as_int(getattr(meta, "prompt_token_count", None)),
             completion_tokens=_as_int(getattr(meta, "candidates_token_count", None)),
             total_tokens=_as_int(getattr(meta, "total_token_count", None)),
             elapsed_seconds=elapsed_seconds,
-            requests=self._requests,
+            requests=requests,
         )
 
     def _repair_contents(self, schema: type[BaseModel], repair: RepairContext) -> str:
@@ -653,12 +735,12 @@ class GeminiProvider:
     async def complete(
         self, system: str, user: str, schema: type[BaseModel] | None = None
     ) -> Any:
-        self._requests = 0
+        tally = _StreamTally()
         started = time.monotonic()
         last_response: Any = None
         try:
             if schema is None:
-                last_response = await self._generate_checked(system, user, None)
+                last_response = await self._generate_checked(system, user, None, tally)
                 return last_response.text
 
             async def send(repair: RepairContext | None) -> str:
@@ -666,7 +748,7 @@ class GeminiProvider:
                 contents = (
                     user if repair is None else self._repair_contents(schema, repair)
                 )
-                last_response = await self._generate_checked(system, contents, schema)
+                last_response = await self._generate_checked(system, contents, schema, tally)
                 text = last_response.text
                 if text is None:
                     raise LLMResponseFormatError(
@@ -675,10 +757,14 @@ class GeminiProvider:
                 return text
 
             return await complete_with_schema_repair(
-                send, schema, max_attempts=self.max_attempts, label=type(self).__name__
+                send,
+                schema,
+                max_attempts=self.max_attempts,
+                label=type(self).__name__,
+                diagnostics=tally.summary,
             )
         finally:
-            self._record_usage(last_response, time.monotonic() - started)
+            self._record_usage(last_response, time.monotonic() - started, tally.requests)
 
 
 class OpenAICompatibleProvider:
@@ -1036,6 +1122,7 @@ def build_provider(cfg: LLMConfig, settings: Settings) -> LLMProvider:
             api_key=settings.gemini_api_key.get_secret_value(),
             model=cfg.model,
             max_attempts=cfg.max_attempts,
+            transport_max_attempts=cfg.transport_max_attempts,
             temperature=cfg.temperature,
             max_output_tokens=cfg.max_output_tokens,
         )

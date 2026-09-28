@@ -1800,3 +1800,137 @@ async def test_no_check_means_the_old_behaviour():
     result = await complete_with_schema_repair(send, _Box, max_attempts=3, label="测试")
     assert result.n == 7
     assert calls == 1
+
+
+# --- Gemini：APIError 包装与传输层退避 ---
+
+
+def _fake_gemini_sequence(monkeypatch, provider, script: list) -> list[dict]:
+    calls: list[dict] = []
+    queue = list(script)
+
+    class FakeModels:
+        async def generate_content(self, *, model, contents, config):
+            calls.append({"model": model, "contents": contents})
+            assert queue, "假 Gemini 的脚本已用尽"
+            item = queue.pop(0)
+            if isinstance(item, BaseException):
+                raise item
+            return item if isinstance(item, _FakeGeminiResponse) else _FakeGeminiResponse(item)
+
+    monkeypatch.setattr(
+        provider, "_client", SimpleNamespace(aio=SimpleNamespace(models=FakeModels()))
+    )
+    return calls
+
+
+def _api_error(code: int, message: str = "boom"):
+    from google.genai import errors
+
+    status = {400: "INVALID_ARGUMENT", 429: "RESOURCE_EXHAUSTED", 503: "UNAVAILABLE"}
+    return errors.APIError(
+        code,
+        {"error": {"code": code, "message": message, "status": status.get(code, "UNKNOWN")}},
+    )
+
+
+@pytest.mark.asyncio
+async def test_gemini_wraps_a_client_error_and_does_not_retry_it(monkeypatch, sleeps):
+    provider = GeminiProvider(api_key="fake-key")
+    calls = _fake_gemini_sequence(monkeypatch, provider, [_api_error(400, "API key not valid")])
+
+    with pytest.raises(LLMHTTPError) as excinfo:
+        await provider.complete("SYS", "USR", Toy)
+
+    assert excinfo.value.status_code == 400
+    assert "API key not valid" in str(excinfo.value)
+    assert len(calls) == 1
+    assert sleeps == []
+
+
+@pytest.mark.asyncio
+async def test_gemini_backs_off_on_429_then_succeeds(monkeypatch, sleeps):
+    provider = GeminiProvider(api_key="fake-key")
+    calls = _fake_gemini_sequence(
+        monkeypatch, provider, [_api_error(429), _api_error(429), '{"value": 3}']
+    )
+
+    assert await provider.complete("SYS", "USR", Toy) == Toy(value=3)
+    assert len(calls) == 3
+    assert sleeps == [1.0, 2.0]
+    assert provider.last_usage.requests == 3
+
+
+@pytest.mark.asyncio
+async def test_gemini_gives_up_on_5xx_after_transport_max_attempts(monkeypatch, sleeps):
+    provider = GeminiProvider(api_key="fake-key", transport_max_attempts=3)
+    calls = _fake_gemini_sequence(monkeypatch, provider, [_api_error(503)] * 3)
+
+    with pytest.raises(LLMHTTPError) as excinfo:
+        await provider.complete("SYS", "USR", Toy)
+
+    assert excinfo.value.status_code == 503
+    assert excinfo.value.attempts == 3
+    assert "已尝试 3 次" in str(excinfo.value)
+    assert len(calls) == 3
+    assert sleeps == [1.0, 2.0]
+
+
+@pytest.mark.asyncio
+async def test_gemini_retries_an_httpx_connection_error_then_wraps_it(monkeypatch, sleeps):
+    import httpx
+
+    provider = GeminiProvider(api_key="fake-key", transport_max_attempts=2)
+    error = httpx.ConnectError("connection refused")
+    calls = _fake_gemini_sequence(monkeypatch, provider, [error, error])
+
+    with pytest.raises(LLMTransportError) as excinfo:
+        await provider.complete("SYS", "USR")
+
+    assert "已尝试 2 次" in str(excinfo.value)
+    assert "ConnectError" in str(excinfo.value)
+    assert len(calls) == 2
+    assert sleeps == [1.0]
+
+
+@pytest.mark.asyncio
+async def test_gemini_retries_an_aiohttp_connection_error(monkeypatch, sleeps):
+    import aiohttp
+
+    provider = GeminiProvider(api_key="fake-key")
+    calls = _fake_gemini_sequence(
+        monkeypatch, provider, [aiohttp.ClientConnectionError("reset by peer"), '{"value": 5}']
+    )
+
+    assert await provider.complete("SYS", "USR", Toy) == Toy(value=5)
+    assert len(calls) == 2
+    assert sleeps == [1.0]
+
+
+@pytest.mark.asyncio
+async def test_gemini_does_not_retry_an_unrelated_exception(monkeypatch, sleeps):
+    provider = GeminiProvider(api_key="fake-key")
+    _fake_gemini_sequence(monkeypatch, provider, [KeyError("sdk bug")])
+
+    with pytest.raises(KeyError):
+        await provider.complete("SYS", "USR", Toy)
+    assert sleeps == []
+
+
+@pytest.mark.asyncio
+async def test_gemini_honours_retry_after_header(monkeypatch, sleeps):
+    import httpx
+
+    provider = GeminiProvider(api_key="fake-key")
+    error = _api_error(429)
+    error.response = httpx.Response(429, headers={"Retry-After": "9"})
+    calls = _fake_gemini_sequence(monkeypatch, provider, [error, '{"value": 1}'])
+
+    assert await provider.complete("SYS", "USR", Toy) == Toy(value=1)
+    assert len(calls) == 2
+    assert sleeps == [9.0]
+
+
+def test_build_provider_wires_transport_max_attempts_into_gemini():
+    provider = build_provider(LLMConfig(transport_max_attempts=2), Settings(gemini_api_key="k"))
+    assert provider.transport_max_attempts == 2
