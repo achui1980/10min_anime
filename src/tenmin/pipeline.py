@@ -319,6 +319,26 @@ def _is_fresh(outputs: list[Path], inputs: list[Path]) -> bool:
     return oldest_output >= newest_input
 
 
+def _is_fresh_stamped(outputs: list[Path], inputs: list[Path], stamp: Path) -> bool:
+    """给「内容不变就不写」的全局阶段（ingest / signals）用的新鲜度判据。
+
+    这两个阶段在产出跟盘上逐字节相同时不改写产物、保住旧 mtime，下游才不会因为「内容
+    没变、mtime 变了」被连带判过期（登记一集新番时 ingest 会把全部集重跑一遍，这条就是
+    让已有的集纹丝不动的关键）。代价是产物的 mtime 不再代表「这个阶段上次跑完的时刻」：
+    改一个不影响产出的阈值，重跑之后产物照样比切片旧，纯按产物判就会**每次**都重跑。
+    所以这里按「上次跑完」的戳子判，产物只查齐不齐、空不空（_is_fresh 在没有输入时就是
+    这个语义）。
+
+    戳子不存在（升级前的项目、或者从没成功跑完过）时退回按产物判，升级后第一次运行不会
+    因为缺戳子白跑一遍。
+    """
+    if not _is_fresh(outputs, []):
+        return False
+    if not stamp.is_file():
+        return _is_fresh(outputs, inputs)
+    return _is_fresh([stamp], inputs)
+
+
 def _active_episodes(cfg: ProjectConfig) -> list[EpisodeConfig]:
     """登记过来源（srt 或 video）的集。预填条目（只写了 op/ed）不参与任何阶段。"""
     return [episode for episode in cfg.episodes if episode.has_source]
@@ -452,7 +472,10 @@ def run_ingest(cfg: ProjectConfig) -> list[DialogueTrack]:
             ingest=cfg.ingest,
             credits=cfg.credits,
         )
-        _write_json(paths.dialogue(episode.number), track.model_dump_json(indent=2))
+        # 内容不变就不写：保住旧 mtime，下游 signals/script 才不会被连带判过期。
+        atomic.write_text_if_changed(
+            paths.dialogue(episode.number), track.model_dump_json(indent=2)
+        )
         tracks.append(track)
     return tracks
 
@@ -537,7 +560,10 @@ def run_signals(cfg: ProjectConfig) -> list[SignalReport]:
     reports = []
     for track in _load_tracks(cfg):
         report = build_report(track, cfg=cfg.signals)
-        _write_json(paths.signals(track.episode), report.model_dump_json(indent=2))
+        # 同 run_ingest：内容不变就不写，别让 script 因为 mtime 刷新白跑。
+        atomic.write_text_if_changed(
+            paths.signals(track.episode), report.model_dump_json(indent=2)
+        )
         reports.append(report)
     return reports
 
@@ -1116,19 +1142,26 @@ async def run_pipeline(
             *ingest_inputs,
             *(config_slices.slice_path(cfg.root, "ingest", n) for n in numbers),
         ]
-        if force or not _is_fresh(outputs, inputs):
+        stamp = config_slices.stamp_path(cfg.root, "ingest")
+        if force or not _is_fresh_stamped(outputs, inputs, stamp):
             reporter.stage_start("ingest")
             warnings.extend(ingest_warnings(run_ingest(cfg)))
+            config_slices.touch_stamp(stamp)
             reporter.stage_done("ingest")
         else:
             reporter.stage_skip("ingest")
 
     if "signals" in wanted:
         outputs = [paths.signals(n) for n in numbers]
-        inputs = [paths.dialogue(n) for n in numbers]
-        if force or not is_fresh("signals", None, outputs, inputs):
+        inputs = [
+            config_slices.slice_path(cfg.root, "signals", None),
+            *(paths.dialogue(n) for n in numbers),
+        ]
+        stamp = config_slices.stamp_path(cfg.root, "signals")
+        if force or not _is_fresh_stamped(outputs, inputs, stamp):
             reporter.stage_start("signals")
             run_signals(cfg)
+            config_slices.touch_stamp(stamp)
             reporter.stage_done("signals")
         else:
             reporter.stage_skip("signals")

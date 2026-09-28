@@ -173,3 +173,14 @@ def write_slices(cfg: ProjectConfig, episodes: Sequence[EpisodeConfig]) -> None:
                 slice_path(cfg.root, stage, episode.number),
                 slice_payload(cfg, stage, episode),
             )
+
+
+def stamp_path(root: Path, stage: str) -> Path:
+    """全局阶段（ingest / signals）「上次跑完」的戳子。判据见 pipeline._is_fresh_stamped。"""
+    return Path(root) / SLICE_DIR / f"{stage}.done"
+
+
+def touch_stamp(path: Path) -> None:
+    """阶段成功跑完后调用。要的是它的 mtime；内容非空即可（0 字节会被 _is_fresh 当成
+    被打断的半截产物）。"""
+    atomic.write_text(path, f"{path.stem}\n")

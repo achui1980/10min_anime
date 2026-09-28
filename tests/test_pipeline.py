@@ -30,6 +30,7 @@ from tenmin.pipeline import (
     _find_episode,
     _ingest_inputs,
     _is_fresh,
+    _is_fresh_stamped,
     _script_inputs,
     _translate_inputs,
     ingest_warnings,
@@ -3162,3 +3163,77 @@ def test_the_write_back_parser_rejects_duplicate_keys_like_load_project(tmp_path
         load_project(path)
     with pytest.raises(RuamelDuplicateKeyError):
         YAML().load(text)
+
+
+# --- 全局阶段：内容不变不写 + 按「上次跑完」判新鲜度 -------------------------
+
+
+def test_stamped_freshness_falls_back_to_the_outputs_without_a_stamp(tmp_path):
+    """升级前的项目没有戳子：退回按产物判，不因为缺戳子白跑一遍。"""
+    src = _file(tmp_path / "in.txt")
+    out = _file(tmp_path / "out.txt")
+    stamp = tmp_path / "stage.done"
+    assert _is_fresh_stamped([out], [src], stamp) is True
+    _shift_mtime(src, 10.0)
+    assert _is_fresh_stamped([out], [src], stamp) is False
+
+
+def test_stamped_freshness_judges_by_the_stamp_when_present(tmp_path):
+    """产物内容没变就没重写、mtime 停在旧值，但这个阶段确实刚跑过。"""
+    src = _file(tmp_path / "in.txt")
+    out = _file(tmp_path / "out.txt")
+    stamp = _file(tmp_path / "stage.done", "stage\n")
+    _shift_mtime(src, 10.0)
+    _shift_mtime(stamp, 20.0)
+    assert _is_fresh_stamped([out], [src], stamp) is True
+    _shift_mtime(src, 20.0)
+    assert _is_fresh_stamped([out], [src], stamp) is False
+
+
+def test_stamped_freshness_still_requires_every_output(tmp_path):
+    src = _file(tmp_path / "in.txt")
+    stamp = _file(tmp_path / "stage.done", "stage\n")
+    _shift_mtime(stamp, 20.0)
+    assert _is_fresh_stamped([tmp_path / "gone.json"], [src], stamp) is False
+    empty = tmp_path / "empty.json"
+    empty.write_bytes(b"")
+    assert _is_fresh_stamped([empty], [src], stamp) is False
+
+
+@pytest.mark.asyncio
+async def test_rerunning_ingest_and_signals_on_unchanged_input_keeps_their_mtimes(project):
+    await run_pipeline(project, FakeProvider([]), only=["ingest", "signals"])
+    paths = Paths(project.root)
+    before = (paths.dialogue(2).stat().st_mtime_ns, paths.signals(2).stat().st_mtime_ns)
+
+    await run_pipeline(project, FakeProvider([]), only=["ingest", "signals"], force=True)
+
+    after = (paths.dialogue(2).stat().st_mtime_ns, paths.signals(2).stat().st_mtime_ns)
+    assert after == before
+
+
+@pytest.mark.asyncio
+async def test_a_no_op_ingest_config_change_invalidates_nothing_downstream(project):
+    """没有手填区间时 manual_window_margin 不参与任何判定：ingest 该重跑（它的切片变了），
+    但产出一字不变，下游一个都不许被连带判过期；而且下一次运行 ingest 自己也得是新鲜的
+    （不能因为产物 mtime 停在旧值就每次都重跑）。"""
+    await run_pipeline(project, FakeProvider([fake_script_response()]), only=V1_STAGES)
+
+    project.credits.manual_window_margin = 6.0
+    reporter = FakeReporter()
+    await run_pipeline(project, FakeProvider([]), only=V1_STAGES, reporter=reporter)
+    assert ("stage_start", "ingest") in reporter.calls
+    for stage in ("signals", "script", "docgen"):
+        assert ("stage_skip", stage) in reporter.calls, stage
+
+    again = FakeReporter()
+    await run_pipeline(project, FakeProvider([]), only=V1_STAGES, reporter=again)
+    for stage in V1_STAGES:
+        assert ("stage_skip", stage) in again.calls, stage
+
+
+@pytest.mark.asyncio
+async def test_run_pipeline_writes_the_global_stage_stamps(project):
+    await run_pipeline(project, FakeProvider([]), only=["ingest", "signals"])
+    assert (project.root / ".config" / "ingest.done").is_file()
+    assert (project.root / ".config" / "signals.done").is_file()
