@@ -3355,20 +3355,31 @@ async def test_changing_crf_reruns_only_render(project, monkeypatch):
     await _first_full_run(project)
 
     project.render.crf = "18"
+    render_commands: list[list[str]] = []
+
+    def capture_render(args, **kwargs):
+        render_commands.append(list(args))
+        return _touch_output_with_progress(args, **kwargs)
+
+    monkeypatch.setattr("tenmin.render.video.run_with_progress", capture_render)
 
     assert await _stages_rerun(project) == {"render"}
+    assert len(render_commands) == 1
+    assert render_commands[0][render_commands[0].index("-crf") + 1] == "18"
 
 
 @pytest.mark.asyncio
 async def test_changing_font_size_reruns_only_the_subtitle_consumers(project, monkeypatch):
-    """字号进的是 timeline 写的 .ass：timeline 重跑 → timeline.json 刷新 → audio 跟着
-    重跑 → render 重跑。script（LLM）与 voice（TTS）一个都不许动。"""
+    """当前 mtime 契约：字号让 timeline 重写 .ass 和 timeline.json，audio 读更新后的
+    timeline.json 所以跟着重跑，render 最后重跑；LLM / TTS 都不重跑。"""
     _full_run_project(project, monkeypatch)
     await _first_full_run(project)
 
     project.render.font_size = 60
 
     assert await _stages_rerun(project) == {"timeline", "audio", "render"}
+    ass = Paths(project.root).subtitles(2).read_text(encoding="utf-8")
+    assert f"Style: Narration,{project.render.subtitle_font_name},60," in ass
 
 
 @pytest.mark.asyncio
@@ -3388,8 +3399,8 @@ async def test_operational_knobs_rerun_nothing_end_to_end(project, monkeypatch):
 async def test_registering_a_new_episode_leaves_the_existing_one_untouched(
     project, golden_srt_path, tmp_path, monkeypatch
 ):
-    """登记第 1 集：ingest / signals 会把全部集重跑一遍，但第 2 集的产物一个字节、
-    一个 mtime 都不许变，它的 LLM 一次都不许再调。"""
+    """登记第 1 集：ingest / signals 会把全部集重跑一遍，但第 2 集的产物不能
+    重写（即使字节或 mtime 恰巧没变），它的 LLM 一次都不许再调。"""
     await run_pipeline(project, FakeProvider([fake_script_response()]), only=V1_STAGES)
     paths = Paths(project.root)
     watched = [
@@ -3411,6 +3422,20 @@ async def test_registering_a_new_episode_leaves_the_existing_one_untouched(
     monkeypatch.setattr("tenmin.pipeline.probe_duration", lambda path, **_: 1500.0)
     register_episode(project, episode=1, srt=golden_srt_path, video=video)
 
+    # 观察真正的原子写入口，而不是只比文件元数据：同字节/同 mtime 的覆盖也会被抓到。
+    # 其他集的正常写盘照旧执行；_write_json 和 write_text_if_changed 最终都走这里。
+    from tenmin import atomic
+
+    original_write = atomic.write_text
+
+    def record_write(path, text, *, encoding="utf-8"):
+        if Path(path) in watched or (
+            Path(path).parent == slice_dir and Path(path).name.startswith("E02.")
+        ):
+            pytest.fail(f"登记 E01 时重写了 E02 产物：{path}")
+        return original_write(path, text, encoding=encoding)
+
+    monkeypatch.setattr(atomic, "write_text", record_write)
     provider = FakeProvider([fake_script_response(episode=1)])
     await run_pipeline(project, provider, only=V1_STAGES)
 
