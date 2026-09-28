@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import os
 from collections.abc import Sequence
+from hashlib import sha256
 from pathlib import Path
 from typing import Any
 
@@ -180,7 +181,16 @@ def stamp_path(root: Path, stage: str) -> Path:
     return Path(root) / SLICE_DIR / f"{stage}.done"
 
 
-def touch_stamp(path: Path) -> None:
-    """阶段成功跑完后调用。要的是它的 mtime；内容非空即可（0 字节会被 _is_fresh 当成
-    被打断的半截产物）。"""
-    atomic.write_text(path, f"{path.stem}\n")
+def output_digests(outputs: Sequence[Path]) -> dict[str, str]:
+    """按路径记录产物的字节身份，避免恢复旧备份时旧戳子掩盖变更。"""
+    return {str(path): sha256(path.read_bytes()).hexdigest() for path in outputs}
+
+
+def invalidate_stamp(path: Path) -> None:
+    """开跑前留下不完整标记；失败后不能退回按产物 mtime 判新鲜。"""
+    atomic.write_text(path, "")
+
+
+def touch_stamp(path: Path, outputs: Sequence[Path]) -> None:
+    """阶段成功跑完后原子落盘产物身份；mtime 记录这次运行完成的时间。"""
+    atomic.write_text(path, json.dumps(output_digests(outputs), sort_keys=True) + "\n")

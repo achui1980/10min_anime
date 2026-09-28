@@ -326,16 +326,29 @@ def _is_fresh_stamped(outputs: list[Path], inputs: list[Path], stamp: Path) -> b
     没变、mtime 变了」被连带判过期（登记一集新番时 ingest 会把全部集重跑一遍，这条就是
     让已有的集纹丝不动的关键）。代价是产物的 mtime 不再代表「这个阶段上次跑完的时刻」：
     改一个不影响产出的阈值，重跑之后产物照样比切片旧，纯按产物判就会**每次**都重跑。
-    所以这里按「上次跑完」的戳子判，产物只查齐不齐、空不空（_is_fresh 在没有输入时就是
-    这个语义）。
+    所以这里按「上次跑完」的戳子判输入，同时核对产物的字节身份。失败的运行留下空戳子，
+    不能退回按可能只写了一部分的产物判新鲜。
 
-    戳子不存在（升级前的项目、或者从没成功跑完过）时退回按产物判，升级后第一次运行不会
-    因为缺戳子白跑一遍。
+    戳子不存在（升级前的项目）或是旧版纯文本时退回按产物判，避免升级后白跑一遍。
     """
     if not _is_fresh(outputs, []):
         return False
     if not stamp.is_file():
         return _is_fresh(outputs, inputs)
+    try:
+        payload = stamp.read_text(encoding="utf-8")
+        if not payload:
+            return False
+        recorded = json.loads(payload)
+    except (OSError, UnicodeError):
+        return False
+    except ValueError:
+        # 旧版戳子只有阶段名；仅它们可以按产物 mtime 退回判定。
+        if payload == f"{stamp.stem}\n":
+            return _is_fresh(outputs, inputs)
+        return False
+    if not isinstance(recorded, dict) or recorded != config_slices.output_digests(outputs):
+        return False
     return _is_fresh([stamp], inputs)
 
 
@@ -1145,8 +1158,9 @@ async def run_pipeline(
         stamp = config_slices.stamp_path(cfg.root, "ingest")
         if force or not _is_fresh_stamped(outputs, inputs, stamp):
             reporter.stage_start("ingest")
+            config_slices.invalidate_stamp(stamp)
             warnings.extend(ingest_warnings(run_ingest(cfg)))
-            config_slices.touch_stamp(stamp)
+            config_slices.touch_stamp(stamp, outputs)
             reporter.stage_done("ingest")
         else:
             reporter.stage_skip("ingest")
@@ -1160,8 +1174,9 @@ async def run_pipeline(
         stamp = config_slices.stamp_path(cfg.root, "signals")
         if force or not _is_fresh_stamped(outputs, inputs, stamp):
             reporter.stage_start("signals")
+            config_slices.invalidate_stamp(stamp)
             run_signals(cfg)
-            config_slices.touch_stamp(stamp)
+            config_slices.touch_stamp(stamp, outputs)
             reporter.stage_done("signals")
         else:
             reporter.stage_skip("signals")

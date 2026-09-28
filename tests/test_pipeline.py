@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 import yaml
 
+from tenmin import config_slices
 from tenmin.atomic import part_path
 from tenmin.config import EpisodeConfig, ProjectConfig, ProjectConfigError, load_project
 from tenmin.ingest.resolve import SubtitleSource
@@ -3182,8 +3183,9 @@ def test_stamped_freshness_judges_by_the_stamp_when_present(tmp_path):
     """产物内容没变就没重写、mtime 停在旧值，但这个阶段确实刚跑过。"""
     src = _file(tmp_path / "in.txt")
     out = _file(tmp_path / "out.txt")
-    stamp = _file(tmp_path / "stage.done", "stage\n")
+    stamp = tmp_path / "stage.done"
     _shift_mtime(src, 10.0)
+    config_slices.touch_stamp(stamp, [out])
     _shift_mtime(stamp, 20.0)
     assert _is_fresh_stamped([out], [src], stamp) is True
     _shift_mtime(src, 20.0)
@@ -3192,7 +3194,8 @@ def test_stamped_freshness_judges_by_the_stamp_when_present(tmp_path):
 
 def test_stamped_freshness_still_requires_every_output(tmp_path):
     src = _file(tmp_path / "in.txt")
-    stamp = _file(tmp_path / "stage.done", "stage\n")
+    stamp = tmp_path / "stage.done"
+    config_slices.touch_stamp(stamp, [src])
     _shift_mtime(stamp, 20.0)
     assert _is_fresh_stamped([tmp_path / "gone.json"], [src], stamp) is False
     empty = tmp_path / "empty.json"
@@ -3237,3 +3240,65 @@ async def test_run_pipeline_writes_the_global_stage_stamps(project):
     await run_pipeline(project, FakeProvider([]), only=["ingest", "signals"])
     assert (project.root / ".config" / "ingest.done").is_file()
     assert (project.root / ".config" / "signals.done").is_file()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", ["ingest", "signals"])
+async def test_failed_forced_global_stage_invalidates_its_stamp(project, monkeypatch, stage):
+    await run_pipeline(project, FakeProvider([]), only=["ingest", "signals"])
+    stamp = project.root / ".config" / f"{stage}.done"
+    assert stamp.is_file()
+
+    def interrupted(cfg):
+        # A stage can write some outputs before a later episode fails.
+        output = getattr(Paths(cfg.root), "dialogue" if stage == "ingest" else "signals")(2)
+        _file(output, "bad")
+        raise RuntimeError("stage interrupted")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(f"tenmin.pipeline.run_{stage}", interrupted)
+        with pytest.raises(RuntimeError, match="stage interrupted"):
+            await run_pipeline(project, FakeProvider([]), only=[stage], force=True)
+
+    assert stamp.read_bytes() == b""  # incomplete marker, not a completed stamp
+    reporter = FakeReporter()
+    await run_pipeline(project, FakeProvider([]), only=[stage], reporter=reporter)
+    assert ("stage_start", stage) in reporter.calls
+    assert stamp.is_file()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", ["ingest", "signals"])
+async def test_stamped_stage_reruns_when_output_is_replaced_with_same_size_and_mtime(
+    project, stage
+):
+    await run_pipeline(project, FakeProvider([]), only=["ingest", "signals"])
+    output = getattr(Paths(project.root), "dialogue" if stage == "ingest" else "signals")(2)
+    before = output.stat()
+    original = output.read_bytes()
+    # Restoring an old backup can preserve both size and mtime: metadata alone is insufficient.
+    output.write_bytes(b"!" + original[1:])
+    os.utime(output, ns=(before.st_atime_ns, before.st_mtime_ns))
+
+    reporter = FakeReporter()
+    await run_pipeline(project, FakeProvider([]), only=[stage], reporter=reporter)
+
+    assert ("stage_start", stage) in reporter.calls
+    assert output.read_bytes() == original
+
+
+def test_legacy_text_stamp_falls_back_to_output_mtime(tmp_path):
+    src = _file(tmp_path / "in.txt")
+    out = _file(tmp_path / "out.txt")
+    stamp = _file(tmp_path / "stage.done", "stage\n")
+    _shift_mtime(src, 10.0)
+    _shift_mtime(stamp, 20.0)
+    assert _is_fresh_stamped([out], [src], stamp) is False
+
+
+def test_invalid_nonlegacy_stamp_is_not_treated_as_completed(tmp_path):
+    src = _file(tmp_path / "in.txt")
+    out = _file(tmp_path / "out.txt")
+    stamp = _file(tmp_path / "stage.done", '{"partial":')
+    _shift_mtime(stamp, 20.0)
+    assert _is_fresh_stamped([out], [src], stamp) is False
