@@ -612,6 +612,49 @@ def test_mix_audio_keeps_the_previous_artifact_when_ffmpeg_fails(tmp_path, monke
 # 增益（hold_gains 为空）时图必须逐字节不变。
 
 
+def test_valid_hold_windows_rejects_non_chronological_source_reuse():
+    """`_valid_hold_windows` 的连续性判断必须跟 render/timeline.py 的 `_assess_holds`
+    同口径：**不排序**，只看给定顺序上是否首尾相接。
+
+    这里构造一个「倒叙」剪辑：同一个 beat 的三段画面按时间轴顺序拼在一起，但它们
+    在原片里的位置是 100→90→110（先跳回去、再跳过去），本身并不连续。如果验证时
+    先排序（90,100,110）再看首尾相接，会误判为连续从而接受这个窗口；不排序的话，
+    按 100→90→110 这个真实顺序看，第一段到第二段之间有一个 20 秒的跳跃，必须
+    判定不连续、拒绝这个窗口。
+    """
+    from tenmin.render.audio import _valid_hold_windows
+
+    segments = [
+        TimelineSegment(beat_id="b1", source_start=100.0, source_end=110.0,
+                         timeline_start=8.0, timeline_end=18.0),
+        TimelineSegment(beat_id="b1", source_start=90.0, source_end=100.0,
+                         timeline_start=18.0, timeline_end=28.0),
+        TimelineSegment(beat_id="b1", source_start=110.0, source_end=120.0,
+                         timeline_start=28.0, timeline_end=38.0),
+    ]
+    timeline = Timeline(
+        episode=2,
+        segments=segments,
+        subtitles=[],
+        narration_offsets=[0.0],
+        total_seconds=38.0,
+    )
+    window = HoldWindow(beat_id="b1", hold_index=0, quote="a", episode=2,
+                        source_start=90.0, source_end=120.0, start=8.0, end=38.0)
+    timeline.hold_windows = [window]
+    track = VoiceTrack(
+        episode=2,
+        chunks=[VoiceChunk(beat_id="b1", index=1, text="第一句",
+                            path="chunk_001.mp3", duration=8.0)],
+        total_seconds=38.0,
+    )
+
+    kept, warnings = _valid_hold_windows(timeline, track)
+
+    assert kept == []
+    assert len(warnings) == 1 and "留白窗" in warnings[0]
+
+
 def test_manually_moved_window_is_ignored_and_valid_second_window_keeps_identity():
     from tenmin.render.audio import _valid_hold_windows
 
@@ -635,6 +678,53 @@ def test_window_gain_is_only_inside_silence_and_before_ducking(tmp_path):
     assert "between(t,8.000,10.000)" in graph
     assert "0.501187" in graph  # -6 dB linear amplitude
     assert graph.index("[holdbalanced]") < graph.index("[ducked]")
+
+
+def test_hold_gain_expr_keeps_both_amplitudes_for_two_distinct_windows():
+    """两个不重叠窗口各自的增益必须都出现在表达式里，不能被 reversed() 的嵌套折叠
+    只剩最后一个——这条链路原来只测过单窗口，没测过「两个窗口、两个不同增益」。"""
+    from tenmin.render.audio import hold_gain_expr
+
+    first = HoldWindow(beat_id="b1", hold_index=0, quote="a", episode=2,
+                        source_start=0.0, source_end=1.0, start=0.0, end=2.0)
+    second = HoldWindow(beat_id="b1", hold_index=1, quote="b", episode=2,
+                         source_start=0.0, source_end=1.0, start=5.0, end=8.0)
+    windows = [(0, first), (1, second)]
+    gains = {0: -4.0, 1: 3.0}
+
+    expr = hold_gain_expr(windows, gains, fade=0.0)
+
+    amp_first = 10 ** (-4.0 / 20)
+    amp_second = 10 ** (3.0 / 20)
+    assert f"{amp_first:.6f}" in expr
+    assert f"{amp_second:.6f}" in expr
+    assert "between(t,0.000,2.000)" in expr
+    assert "between(t,5.000,8.000)" in expr
+
+
+def test_hold_gain_expr_ramp_boundaries_match_the_fade_window():
+    """校验淡入/淡出坡道本身的子表达式，不只是常量目标增益——覆盖
+    fade_in_end/fade_out_start 与线性插值公式的具体数值。"""
+    from tenmin.render.audio import hold_gain_expr
+
+    window = HoldWindow(beat_id="b1", hold_index=0, quote="a", episode=2,
+                         source_start=0.0, source_end=1.0, start=10.0, end=20.0)
+    gain_db = -6.0
+    amp = 10 ** (gain_db / 20)
+    fade = 2.0  # 窗口时长 10s 的一半是 5s，2s 不会被夹到更小，fade_eff == fade
+
+    expr = hold_gain_expr([(0, window)], {0: gain_db}, fade)
+
+    fade_in_end = 12.000
+    fade_out_start = 18.000
+    assert f"between(t,10.000,{fade_in_end:.3f})" in expr
+    assert f"between(t,{fade_out_start:.3f},20.000)" in expr
+    assert (
+        f"1.000000+({amp:.6f}-1.000000)*(t-10.000)/{fade:.6f}"
+    ) in expr
+    assert (
+        f"{amp:.6f}+(1.000000-{amp:.6f})*(t-{fade_out_start:.3f})/{fade:.6f}"
+    ) in expr
 
 
 def test_no_hold_gains_leaves_the_graph_byte_identical(tmp_path):

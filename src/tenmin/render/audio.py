@@ -115,6 +115,27 @@ def _valid_hold_windows(
     if len(timeline.narration_offsets) != len(track.chunks):
         return [], ["timeline 与 voice 数量不符，跳过留白窗单独增益"]
 
+    # render/timeline.py 的 _assess_holds 在这一步之前会先判 `ordered_indices ==
+    # range(len(chunks))`：narration_offsets 是按 script.beats 遍历顺序追加的，
+    # 跟 track.chunks 的原始列表顺序未必一致，beat 交错时两者错位，"正确" 的留白
+    # 也可能查到别的 chunk 的音频——那道闸就是防这个。
+    #
+    # 这里**刻意不**照搬同一道闸：本函数的签名只收 timeline/track（模块 docstring
+    # 就是这么设计的——只对着这两份「当前实况」重判，不碰 script），没有
+    # script.beats 可用，也不打算为了这一道闸把 script 塞进签名（这次改动的范围
+    # 明确排除改 _valid_hold_windows 的公开签名）。退一步讲，没有 script.beats
+    # 时，唯一能在这里独立验出的等价条件是「track.chunks 按 beat_id 分组连续且
+    # 分组顺序与 narration_offsets 的构造顺序一致」——但分组顺序是否跟
+    # script.beats 一致这件事本身就需要 script 才能判，检查不到就是检查不到，
+    # 装一个只能防住部分交错情形的「弱闸」只会让人误以为这里已经跟 timeline.py
+    # 同口径。真正兜底的是下面 `chunk_starts[i] == window.start` 的**逐毫秒**匹配
+    # （容差仅 0.001s）+ 唯一性 + 全部片段连续性/覆盖率/边界检查全部独立成立——
+    # 如果 chunk_starts/chunk_ends 因错位而算出一组「garbage」数值，这些独立检查
+    # 同时全部凑巧通过的概率可以忽略。更根本的是：beat 交错导致 chunk 列表顺序
+    # 与 narration_offsets 不对应，是 build_mix_args 下面 adelay 那段代码本来就有
+    # 的同一个假设（同一份 track.chunks/narration_offsets 按位置配对）——不是这次
+    # 改动引入的新风险面，属于既有的、跨越整个模块的系统性前提，不该在这一个
+    # 函数里单独补一道不完整的闸。
     chunk_starts = list(timeline.narration_offsets)
     chunk_ends = [
         start + chunk.duration
@@ -198,7 +219,12 @@ def _hold_window_is_valid(
     if window.episode != timeline.episode:
         return False
 
-    played = sorted(source_intervals(same_beat_segments, window.start, window.end))
+    # 刻意不排序：render/timeline.py 的 _assess_holds 按 segments 的**给定顺序**判连续
+    # （画面按时间轴顺序拼接，原片位置本该跟着单调走；倒叙剪辑等非单调重用是真的
+    # 不连续）。这里排序会把「先跳回去、再跳过去」这种非单调重用误判成连续，让
+    # 混音这一层的再验证比它要复现的那条 continuous 判断（同一函数内的那个 all()
+    # 表达式）更松。
+    played = source_intervals(same_beat_segments, window.start, window.end)
     if not played:
         return False
     if any(
