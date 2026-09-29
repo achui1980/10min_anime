@@ -79,7 +79,13 @@ def _split_display(text: str, cap: int, min_seconds: float, duration: float) -> 
         pieces[-1] += tail
     if len(pieces) == 1 or any(sum(ch.isalnum() for ch in p) <= 2 for p in pieces):
         return [text]
-    if any(duration * len(p) / len(text) < min_seconds for p in pieces):
+    # sentence_cues 用 narration_chars（不计空白）分配时长；预检必须同口径，
+    # 否则尾部空格会让实际不足 min_seconds 的 cue 被误判为安全。
+    total_weight = sum(narration_chars(piece) for piece in pieces)
+    if any(
+        duration * narration_chars(piece) / total_weight < min_seconds
+        for piece in pieces
+    ):
         return [text]
     return pieces
 

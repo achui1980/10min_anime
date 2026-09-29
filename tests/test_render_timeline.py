@@ -157,6 +157,27 @@ def test_display_cues_split_without_loss_or_flash(text, seconds, split):
             cues, max_chars=12, max_lines=0, min_seconds=0))
 
 
+@pytest.mark.parametrize(("seconds", "expected_texts"), [
+    (2.0, ["一二三四五六七八，   九十一"]),
+    (3.2, ["一二三四五六七八，", "   九十一"]),
+])
+def test_display_split_uses_actual_cue_weights_for_minimum_duration(seconds, expected_texts):
+    """空格占字符位置却不占 narration_chars，预检与最终时长必须同口径。"""
+    text = "一二三四五六七八，   九十一"
+    cfg = RenderConfig(subtitle_soft_max_chars=12, subtitle_min_seconds=0.7)
+    chunk = VoiceChunk(beat_id="b1", index=1, text=text, path="c.mp3", duration=seconds)
+
+    cues = sentence_cues(chunk, 3.0, cfg=cfg)
+
+    assert [cue.text for cue in cues] == expected_texts
+    assert "".join(cue.text for cue in cues) == text
+    assert cues[0].start == 3.0 and cues[-1].end == 3.0 + seconds
+    assert all(a.end == b.start for a, b in pairwise(cues))
+    assert all(cue.end - cue.start >= cfg.subtitle_min_seconds for cue in cues)
+    if len(cues) == 2:
+        assert cues[-1].end - cues[-1].start == pytest.approx(seconds * 3 / 12)
+
+
 def test_display_split_respects_existing_sentence_weights_and_exact_end():
     cfg = RenderConfig(subtitle_soft_max_chars=12)
     text = "好。" + "一二三四五六七八，九十一二三四五六。"
