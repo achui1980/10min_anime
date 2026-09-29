@@ -655,6 +655,49 @@ def test_valid_hold_windows_rejects_non_chronological_source_reuse():
     assert len(warnings) == 1 and "留白窗" in warnings[0]
 
 
+def test_valid_hold_windows_rejects_backward_source_overlap_without_forward_gap():
+    """连续性判断必须是**对称**的：不仅要拒绝正向跳跃（gap），也要拒绝反向重叠
+    （下一段的原片起点落在上一段原片终点之前）——跟 render/timeline.py 的
+    `_assess_holds` 保持一致的对称判据（用 `abs(...)` 判差值，而不是只判其中一个
+    方向）。
+
+    这里构造一个只有反向重叠、没有任何补偿性正向跳跃的场景：同一个 beat 的两段
+    画面按时间轴顺序拼在一起，第二段在原片里的起点比第一段的终点早 15 秒（
+    110 → 95），此外序列里再没有别的跳跃能让「净差值」凑巧抵消。如果连续性判断
+    只检查正向跳跃（`played[i+1][0] - played[i][1] > tolerance`），这种反向重叠
+    不会触发任何一侧的判断，会被错误地当成连续、错误地保留这个留白窗。
+    """
+    from tenmin.render.audio import _valid_hold_windows
+
+    segments = [
+        TimelineSegment(beat_id="b1", source_start=100.0, source_end=110.0,
+                         timeline_start=8.0, timeline_end=18.0),
+        TimelineSegment(beat_id="b1", source_start=95.0, source_end=105.0,
+                         timeline_start=18.0, timeline_end=28.0),
+    ]
+    timeline = Timeline(
+        episode=2,
+        segments=segments,
+        subtitles=[],
+        narration_offsets=[0.0],
+        total_seconds=28.0,
+    )
+    window = HoldWindow(beat_id="b1", hold_index=0, quote="a", episode=2,
+                        source_start=95.0, source_end=110.0, start=8.0, end=28.0)
+    timeline.hold_windows = [window]
+    track = VoiceTrack(
+        episode=2,
+        chunks=[VoiceChunk(beat_id="b1", index=1, text="第一句",
+                            path="chunk_001.mp3", duration=8.0)],
+        total_seconds=28.0,
+    )
+
+    kept, warnings = _valid_hold_windows(timeline, track)
+
+    assert kept == []
+    assert len(warnings) == 1 and "留白窗" in warnings[0]
+
+
 def test_manually_moved_window_is_ignored_and_valid_second_window_keeps_identity():
     from tenmin.render.audio import _valid_hold_windows
 

@@ -228,7 +228,7 @@ def _hold_window_is_valid(
     if not played:
         return False
     if any(
-        played[i + 1][0] - played[i][1] > _SOURCE_CONTIGUITY_TOLERANCE
+        abs(played[i + 1][0] - played[i][1]) > _SOURCE_CONTIGUITY_TOLERANCE
         for i in range(len(played) - 1)
     ):
         return False
