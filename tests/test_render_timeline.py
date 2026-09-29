@@ -158,6 +158,33 @@ def test_retraction_rechecks_remaining_hold_after_ratio_change():
     assert track.model_dump_json() == before
 
 
+def test_interleaved_beats_cannot_retain_hold_over_actual_audio_narration():
+    script = Script(show="剧名", episodes=[2], beats=[
+        Beat(id="a", label="a", role="hook", narration="第一句。第二句。",
+             clips=[Clip(episode=2, start=100, end=118)],
+             audio=AudioDirection(holds=[Hold(at=2, duration=2, quote="关键台词")])),
+        Beat(id="b", label="b", role="outro", narration="第三句。",
+             clips=[Clip(episode=2, start=200, end=210)]),
+    ])
+    track = VoiceTrack(episode=2, chunks=[
+        VoiceChunk(beat_id="a", index=1, text="第一句。", path="a1.mp3", duration=8),
+        VoiceChunk(beat_id="b", index=1, text="第三句。", path="b.mp3", duration=10),
+        VoiceChunk(beat_id="a", index=2, text="第二句。", path="a2.mp3",
+                   duration=8, hold_after=2),
+    ])
+    before = track.model_dump_json()
+    timeline, warnings = build_timeline(script, track, 1000,
+                                        dialogue=quote_track(116, 117))
+    # audio.py zips offsets with track.chunks, so b plays at [8, 18]
+    # while the beat-order mapping would have claimed a's hold at [16, 18].
+    b_start = timeline.narration_offsets[1]
+    assert b_start < 16 < b_start + track.chunks[1].duration
+    assert timeline.hold_windows == []
+    assert timeline.total_seconds == pytest.approx(26)
+    assert any("撤销" in warning for warning in warnings)
+    assert track.model_dump_json() == before
+
+
 def test_cross_episode_clip_cannot_supply_current_video_audio():
     script = hold_script()
     script.beats[0].clips[0].episode = 3

@@ -483,6 +483,16 @@ def _assess_holds(
     # The offsets follow beat order, not necessarily the order of track.chunks.
     ordered_indices = [i for beat in script.beats for i, chunk in enumerate(working.chunks)
                        if chunk.beat_id == beat.id]
+    # render.audio pairs these offsets with track.chunks in original order.
+    # If the two orders disagree, even a correctly reconstructed hold would
+    # refer to the wrong chunk's audio; no such window can be trusted.
+    if ordered_indices != list(range(len(working.chunks))):
+        return [], {
+            i: (f"beat {chunk.beat_id} 孤立留白已撤销：找不到该配音 chunk 的节点"
+                if chunk.beat_id not in by_id else
+                f"beat {chunk.beat_id} 配音 chunk 顺序与时间轴不一致，留白已撤销")
+            for i, chunk in enumerate(working.chunks) if chunk.hold_after > 0
+        }
     offsets = dict(zip(ordered_indices, timeline.narration_offsets, strict=False))
     voice_intervals = [
         (offsets[i], offsets[i] + working.chunks[i].duration)
