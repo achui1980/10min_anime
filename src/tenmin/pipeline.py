@@ -839,6 +839,13 @@ def _load_voice(cfg: ProjectConfig, episode: int) -> VoiceTrack:
     return VoiceTrack.model_validate_json(path.read_text(encoding="utf-8"))
 
 
+def _load_dialogue(cfg: ProjectConfig, episode: int) -> DialogueTrack:
+    path = Paths(cfg.root).dialogue(episode)
+    if not path.exists():
+        raise FileNotFoundError(f"缺少对白轨产物 {path}，请先跑 ingest 阶段")
+    return DialogueTrack.model_validate_json(path.read_text(encoding="utf-8"))
+
+
 def _load_timeline(cfg: ProjectConfig, episode: int) -> Timeline:
     path = Paths(cfg.root).timeline(episode)
     if not path.exists():
@@ -931,12 +938,7 @@ def run_timeline(
     episode_cfg = _find_episode(cfg, episode)
     script = _load_script(cfg, episode)
     track = _load_voice(cfg, episode)
-    dialogue_path = paths.dialogue(episode)
-    if not dialogue_path.exists():
-        raise FileNotFoundError(f"缺少对白轨 {dialogue_path}，请先跑 ingest 阶段")
-    dialogue = DialogueTrack.model_validate_json(
-        dialogue_path.read_text(encoding="utf-8")
-    )
+    dialogue = _load_dialogue(cfg, episode)
     if dialogue.episode != episode:
         raise ValueError(f"对白轨集号 {dialogue.episode} 与目标集 {episode} 不一致")
     if source_duration is None:
