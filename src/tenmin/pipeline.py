@@ -1211,6 +1211,20 @@ async def run_pipeline(
                 # logging，warnings 是这类诊断唯一的出口，所以必须把列表递进去。
                 warnings=warnings,
             )
+    elif "timeline" in wanted:
+        # timeline 也读源片（时长和帧率）；只跑 timeline 时不会进上面的 preflight。
+        # 必须在 script/voice 之前检查，并且即使已有新鲜产物也要检查，不能让
+        # _is_fresh 对缺失输入的过滤把坏片源变成 stage_skip。只探一次时长确认可读，
+        # 不重复做音轨/编码器/字体等仅 audio/render 需要的前置检查。
+        for number in target_numbers:
+            episode_cfg = _find_episode(cfg, number)
+            if episode_cfg.video is not None:
+                video = cfg.video_path(episode_cfg)
+                if not video.is_file():
+                    raise FileNotFoundError(
+                        f"找不到源视频 {video}，请检查 project.yaml 的 episodes[].video"
+                    )
+                probe_duration(video, ffprobe=cfg.render.ffprobe_path)
 
     # --- script 阶段的有界预取 ---
     # 值为 None 表示「这一集的 script 已经最新，不用跑」（跟「还没决定」区分开，

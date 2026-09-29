@@ -780,11 +780,64 @@ async def test_srt_only_episode_still_runs_v1_stages_with_a_prefilled_neighbor(p
 
 
 @pytest.mark.asyncio
-async def test_missing_video_still_fails_preflight_before_the_render_stages(project):
+@pytest.mark.parametrize("stage", ["audio", "render"], ids=["audio", "movie"])
+async def test_missing_video_still_fails_preflight_for_media_stages(project, stage):
     project.episodes[0].video = Path("missing.mkv")
 
     with pytest.raises(FileNotFoundError, match=r"missing\.mkv"):
-        await run_pipeline(project, FakeProvider([]), only=["audio"])
+        await run_pipeline(project, FakeProvider([]), only=[stage])
+
+
+@pytest.mark.asyncio
+async def test_timeline_only_rejects_missing_source_after_successful_run(project, monkeypatch):
+    video = _prepare_video(project)
+    video.write_bytes(b"source")
+    paths = Paths(project.root)
+    _write_script(paths.script(2), render_script())
+    await run_voice(project, FakeTTSEngine([8.0, 10.0, 10.0]), episode=2)
+    monkeypatch.setattr("tenmin.pipeline.probe_duration", lambda path, **_: 1400.0)
+    monkeypatch.setattr("tenmin.pipeline.probe_frame_rate", lambda path, **_: 25.0)
+    await run_pipeline(project, FakeProvider([]), only=["timeline"])
+    assert paths.timeline(2).exists()
+    video.unlink()
+
+    reporter = FakeReporter()
+    with pytest.raises(FileNotFoundError, match=r"找不到源视频.*E02\.mkv.*episodes\[\]\.video"):
+        await run_pipeline(project, FakeProvider([]), only=["timeline"], reporter=reporter)
+    assert ("stage_skip", "timeline") not in reporter.calls
+
+
+@pytest.mark.asyncio
+async def test_timeline_only_rejects_unreadable_source_instead_of_skipping(project, monkeypatch):
+    video = _prepare_video(project)
+    video.write_bytes(b"source")
+    paths = Paths(project.root)
+    _write_script(paths.script(2), render_script())
+    await run_voice(project, FakeTTSEngine([8.0, 10.0, 10.0]), episode=2)
+    monkeypatch.setattr("tenmin.pipeline.probe_duration", lambda path, **_: 1400.0)
+    monkeypatch.setattr("tenmin.pipeline.probe_frame_rate", lambda path, **_: 25.0)
+    await run_pipeline(project, FakeProvider([]), only=["timeline"])
+    assert paths.timeline(2).exists()
+
+    def unreadable(path, **_):
+        raise FFmpegError(f"无法读取源视频 {path}")
+
+    monkeypatch.setattr("tenmin.pipeline.probe_duration", unreadable)
+    reporter = FakeReporter()
+    with pytest.raises(FFmpegError, match=r"无法读取源视频.*E02\.mkv"):
+        await run_pipeline(project, FakeProvider([]), only=["timeline"], reporter=reporter)
+    assert ("stage_skip", "timeline") not in reporter.calls
+
+
+@pytest.mark.asyncio
+async def test_missing_timeline_source_fails_before_script_api_call(project):
+    await run_pipeline(project, FakeProvider([]), only=["ingest", "signals"])
+    project.episodes[0].video = Path("missing.mkv")
+    provider = FakeProvider([])
+
+    with pytest.raises(FileNotFoundError, match=r"missing\.mkv"):
+        await run_pipeline(project, provider, only=["script", "timeline"])
+    assert provider.calls == []
 
 
 @pytest.mark.asyncio
