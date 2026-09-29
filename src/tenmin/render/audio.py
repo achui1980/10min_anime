@@ -6,14 +6,15 @@
 from __future__ import annotations
 
 import math
+import re
 from pathlib import Path
 
 from tenmin.atomic import atomic_path
-from tenmin.config import DEFAULT_RENDER
+from tenmin.config import DEFAULT_RENDER, RenderConfig
 from tenmin.intervals import merge_intervals
 from tenmin.models import HoldWindow, SubtitleCue, Timeline, VoiceTrack
 from tenmin.progress import NullProgressReporter, ProgressReporter, percent_reporter
-from tenmin.render.ffmpeg import run_with_progress
+from tenmin.render.ffmpeg import FFmpegError, run, run_with_progress
 from tenmin.render.timeline import (
     HOLD_EDGE_TOLERANCE,
     HOLD_MIN_COVERAGE,
@@ -287,33 +288,79 @@ def hold_gain_expr(
     return expr
 
 
-def build_mix_args(
-    *,
-    video: Path,
-    timeline: Timeline,
-    track: VoiceTrack,
-    voice_dir: Path,
-    out_path: Path,
-    duck_db: float,
-    fade_out_seconds: float = 0.0,
-    outro_seconds: float = 0.0,
-    audio_codec: str = AUDIO_CODEC,
-    audio_bitrate: str = AUDIO_BITRATE,
-    limiter_ceiling: float = LIMITER_CEILING,
-    hold_gains: dict[int, float] | None = None,
-    hold_fade_seconds: float = 0.1,
-) -> list[str]:
-    """拼出混音用的 ffmpeg 参数列表（不含 ffmpeg 本身）。"""
-    if not timeline.segments:
-        raise ValueError("timeline 里没有任何 segment，无法混音")
-    if not track.chunks:
-        raise ValueError("voice track 里没有任何 chunk，无法混音")
-    if len(track.chunks) != len(timeline.narration_offsets):
-        raise ValueError(
-            f"chunk 数 {len(track.chunks)} 与 narration_offsets 数 "
-            f"{len(timeline.narration_offsets)} 不一致，timeline 与 voice 产物不匹配"
-        )
+# --- 留白窗响度实测：决定「调多少」，不负责决定「哪些窗口可信」 -------------
+#
+# hold_gain_expr 只管把一份**已经决定好**的 `{index: gain_db}` 拼成 ffmpeg 表达式；
+# 「这个窗口的原声该不该调、调几 dB」是这里的事，靠 ebur128 滤镜实测响度决定。
+#
+# ffmpeg 的 ebur128（`peak=true`）在 stderr 里按 `-nostats` 之外的固有格式打一段
+# 汇总报告，形如 `I:         -23.5 LUFS`；`-inf LUFS` 是「这段几乎没有能量」的
+# 合法输出（数字静音），不是解析失败，但对我们的用途等价于「测不出」。
+_I_LINE = re.compile(r"^\s*I:\s*([-+]?\d+(?:\.\d+)?|-inf)\s*LUFS\s*$", re.MULTILINE | re.IGNORECASE)
 
+
+def _parse_ebur128_i(stderr: str) -> float | None:
+    """从 ebur128 滤镜的 stderr 里取最后一条 Integrated loudness（`I:` 行）。
+
+    取**最后**一条而不是第一条：`peak=true` 时同一次调用的 stderr 里可能夹着别的
+    以 `I:` 起头的行（比如 Momentary/Short-term 分段汇总不会用这个前缀，但保守起见
+    只信最后出现的这份——那是整段素材测完之后的最终汇总，不是某个中间窗口的快照）。
+
+    一个数字都没解析出来、或者解析出的是 `-inf`（数字静音），一律返回 None 而不是
+    `float("-inf")`：调用方（gain_for_window）要用这个值跟 `hold_silence_floor_lufs`
+    比大小，`-inf` 参与比较在数学上没问题，但它意味着「这段音频里完全没有可测的能量」，
+    跟「量出来是个具体的极低响度」是两件不同的事——前者应该被当成「测不出」，交给
+    调用方走「不调、不撒谎」那条分支，而不是被当成一个可信的、极端的响度数字。
+    """
+    hits = _I_LINE.findall(stderr)
+    if not hits:
+        return None
+    value = float(hits[-1])
+    return value if math.isfinite(value) else None
+
+
+def gain_for_window(
+    source_lufs: float | None, voice_lufs: float | None, *, cfg: RenderConfig
+) -> tuple[float, str | None]:
+    """决定一个留白窗的原声该调几 dB，相对旁白响度的「舒适带」为参照。
+
+    「舒适带」是 `[voice_lufs - hold_relative_lu, voice_lufs + hold_relative_lu]`：
+    落在带内不动，落在带外的话只把它拉到**最近的那条边界**（不是拉到 voice_lufs
+    本身）——这是刻意留出的余量，原声不必跟旁白一样响，只是不能响得盖过旁白、也
+    不能哑得像被切掉了。拉动幅度被 `hold_gain_max_db` 双向夹住，防止一段接近数字
+    静音的窗口被硬拉到跟旁白一样响，把底噪/环境声放大成刺耳的一段。
+
+    两处「测不出就不调」是刻意的，且理由不同：
+    - `source_lufs` 是 None，或低于 `hold_silence_floor_lufs`（近乎数字静音，
+      响度这个量本身在这里已经不可靠——**响度测不出「有没有对白」**，一段被压得
+      很低的人声跟真静音在积分响度上可能长得一样）：原声保持原样，不做任何调整，
+      理由写进 warning 交给调用方汇总。
+    - `voice_lufs` 是 None（旁白参考本身测不出）：没有参照就没有「舒适带」，同样
+      不调、同样警告——但消息不同，别把两种不同的「为什么没调」混成一句话。
+    """
+    if source_lufs is None or source_lufs < cfg.hold_silence_floor_lufs:
+        return 0.0, "留白近乎无声或测不出有效响度，保持原声；响度不能证明有对白"
+    if voice_lufs is None:
+        return 0.0, "旁白参考响度无法测量，跳过留白单窗校准"
+    lower = voice_lufs - cfg.hold_relative_lu
+    upper = voice_lufs + cfg.hold_relative_lu
+    delta = (
+        lower - source_lufs
+        if source_lufs < lower
+        else upper - source_lufs
+        if source_lufs > upper
+        else 0.0
+    )
+    return max(-cfg.hold_gain_max_db, min(cfg.hold_gain_max_db, delta)), None
+
+
+def _origin_parts(timeline: Timeline) -> list[str]:
+    """原声那一路的图片段：按 segment 逐段 atrim，再 concat 成一条 `[orig]`。
+
+    这段图与 hold/duck/voice 都无关，是**唯一真相**——build_mix_args 的正片混音
+    与 `_meter_args` 的留白窗响度实测都从这同一份代码产生这几行，不能各写一份
+    （各写一份的话，量出来的响度可能对应的根本不是真正会被烧进成片的那段声音）。
+    """
     parts: list[str] = []
     for index, segment in enumerate(timeline.segments):
         parts.append(
@@ -322,6 +369,55 @@ def build_mix_args(
         )
     origin_labels = "".join(f"[o{i}]" for i in range(len(timeline.segments)))
     parts.append(f"{origin_labels}concat=n={len(timeline.segments)}:v=0:a=1[orig]")
+    return parts
+
+
+def _voice_parts(track: VoiceTrack, offsets: list[float]) -> tuple[list[str], str]:
+    """旁白那一路的图片段：每个 chunk 按 offset `adelay`，多于一个再 `amix` 合流。
+
+    跟 `_origin_parts` 一样是**唯一真相**：build_mix_args 的正片混音与
+    `_meter_args` 的旁白参考响度实测共用这几行——测的必须是「真正会被叠进成片的
+    那份旁白信号」，不能另起一份看起来等价、实则可能漂开的实现。
+
+    只有一个 chunk 时不必 `amix`（`amix=inputs=1` 这种写法在语义上多余，且原来
+    `EXPECTED_GRAPH` 就没有它），标签直接是那一路自己的 `[n0]`。
+    """
+    parts: list[str] = []
+    for index, offset in enumerate(offsets):
+        parts.append(
+            f"[{index + 1}:a]adelay=delays={int(round(offset * 1000))}:all=1[n{index}]"
+        )
+    if len(track.chunks) == 1:
+        return parts, "[n0]"
+    voice_labels = "".join(f"[n{i}]" for i in range(len(track.chunks)))
+    parts.append(f"{voice_labels}amix=inputs={len(track.chunks)}:normalize=0[voice]")
+    return parts, "[voice]"
+
+
+def _final_mix_parts(
+    timeline: Timeline,
+    track: VoiceTrack,
+    voice_parts: list[str],
+    voice_label: str,
+    *,
+    duck_db: float,
+    hold_gains: dict[int, float] | None,
+    hold_fade_seconds: float,
+    fade_out_seconds: float,
+    outro_seconds: float,
+    limiter_ceiling: float,
+) -> list[str]:
+    """剩下那一段：留白窗增益（可选）+ ducking + 与旁白合流 + 定长 + 淡出 +
+    片尾静音 + 限幅。
+
+    `voice_parts`/`voice_label` 由调用方传入而不是这里再调 `_voice_parts` —— 旁白
+    那一路的图片段必须落在 ducking **之后**、最终 amix **之前**这个具体位置（见
+    下面 EXPECTED_GRAPH 锁住的顺序），拆成三个各自独立、互不调用的函数没法表达
+    这条「谁嵌在谁中间」的顺序约束，所以由这一层负责把它嵌进正确的位置——
+    这样 `_origin_parts`/`_voice_parts` 才能被 `_meter_args` 单独复用而不用
+    多算一遍它们并不需要的 ducking/hold 图。
+    """
+    parts: list[str] = []
 
     # 留白窗单独增益：只在 hold_gains 非空时插这个节点，且插在 ducking **之前**——
     # ducking 按 subtitle cue 分区（有旁白/没旁白两态），留白窗恰好落在「没旁白」
@@ -342,21 +438,7 @@ def build_mix_args(
     expr = duck_volume_expr(timeline.subtitles, duck_gain(duck_db))
     parts.append(f"{duck_input}volume='{expr}':eval=frame[ducked]")
 
-    chunk_paths: list[str] = []
-    for index, (chunk, offset) in enumerate(
-        zip(track.chunks, timeline.narration_offsets, strict=True)
-    ):
-        chunk_paths.append(str(voice_dir / chunk.path))
-        parts.append(
-            f"[{index + 1}:a]adelay=delays={int(round(offset * 1000))}:all=1[n{index}]"
-        )
-
-    if len(track.chunks) == 1:
-        voice_label = "[n0]"
-    else:
-        voice_labels = "".join(f"[n{i}]" for i in range(len(track.chunks)))
-        parts.append(f"{voice_labels}amix=inputs={len(track.chunks)}:normalize=0[voice]")
-        voice_label = "[voice]"
+    parts.extend(voice_parts)
     parts.append(f"[ducked]{voice_label}amix=inputs=2:normalize=0[mix]")
 
     final_label = "[mix]"
@@ -455,17 +537,183 @@ def build_mix_args(
     parts.append(
         f"{final_label}alimiter=limit={limiter_ceiling:g}:level=false:latency=true[limited]"
     )
-    final_label = "[limited]"
+    return parts
+
+
+def _meter_args(
+    video: Path,
+    timeline: Timeline,
+    track: VoiceTrack,
+    voice_dir: Path,
+    *,
+    window: HoldWindow | None,
+) -> list[str]:
+    """拼一段最小的 ffmpeg 参数列表，专门用 `ebur128` 量一段响度，输出到 `-f null -`。
+
+    `window` 给定时量的是**这个留白窗在成片里实际会播放的那段原声**：先走
+    `_origin_parts` 把画面按 segment 拼接、落到 timeline 坐标，再从 `[orig]`
+    上按 `window.start/end` 截一段——**不能**直接对 `[0:a]` 按 window 的坐标
+    trim，那是原片坐标，跟 timeline 坐标只有在没有剪辑重排时才碰巧相等。量的是
+    满量程原声（不经过 ducking），因为 ducking 是另一层独立关注点，这里只想知道
+    「这段原声本身有多响」。
+
+    `window` 是 None 时量的是**旁白自己的响度参考**：走 `_voice_parts` 把全部
+    chunk 按 offset 延迟叠成同一路，再用 `aselect` 只挑出真正落在某个 chunk
+    `[offset, offset+duration]` 区间内的样本——排掉 chunk 之间的留白静音间隙，
+    否则参考响度会被这些静音稀释，偏离「旁白说话时到底有多响」这个真正要问的问题。
+
+    两条分支的 `-i` 输入顺位都跟 `build_mix_args` 一致（视频永远是 `0`，chunk
+    按顺序跟上）——即使旁白分支根本用不到视频输入，也不改这个顺位，理由是
+    别让「哪个分支用了哪些输入」变成一件需要对着代码才能确认的事。
+    """
+    if window is not None:
+        parts = [
+            *_origin_parts(timeline),
+            f"[orig]atrim=start={window.start:.3f}:end={window.end:.3f},"
+            f"asetpts=PTS-STARTPTS,ebur128=peak=true[meter]",
+        ]
+    else:
+        voice_parts, voice_label = _voice_parts(track, timeline.narration_offsets)
+        speech_windows = "+".join(
+            f"between(t,{offset:.3f},{offset + chunk.duration:.3f})"
+            for chunk, offset in zip(track.chunks, timeline.narration_offsets, strict=True)
+        )
+        parts = [
+            *voice_parts,
+            f"{voice_label}aselect='{speech_windows}',asetpts=N/SR/TB,"
+            f"ebur128=peak=true[meter]",
+        ]
+
+    args = ["-i", str(video)]
+    for chunk in track.chunks:
+        args.extend(["-i", str(voice_dir / chunk.path)])
+    args.extend(["-filter_complex", ";".join(parts), "-map", "[meter]", "-f", "null", "-"])
+    return args
+
+
+def _measure_hold_gains(
+    video: Path,
+    timeline: Timeline,
+    track: VoiceTrack,
+    voice_dir: Path,
+    windows: list[tuple[int, HoldWindow]],
+    *,
+    cfg: RenderConfig,
+    ffmpeg: str,
+) -> tuple[dict[int, float], list[str]]:
+    """给每个（已经过 `_valid_hold_windows` 验过的）留白窗量一遍响度，决定增益。
+
+    旁白参考响度**先测一次、只测一次**：没有它就没有 `gain_for_window` 要比的
+    「舒适带」，为每个窗口各测一遍原声、再各自套用同一个失败的参照毫无意义——
+    既浪费一次 ffmpeg 调用，又会把同一句「测不出参照」的 warning 刷 N 遍。所以
+    这里**在进入按窗口的循环之前**就短路：旁白参考测量本身失败（`FFmpegError`）
+    或测出来是不可信的值（`_parse_ebur128_i` 返回 None）都直接返回空 dict + 一条
+    warning，一个窗口都不碰。
+
+    进入循环之后，**每个窗口的失败只影响它自己**：`run()` 抛 `FFmpegError` 时
+    捕获、记一条点名 `beat_id`/`hold_index` 的 warning、`continue` 到下一个窗口——
+    不能因为某一个窗口的素材恰好在某个诡异的时间点上让 ffmpeg 不满，就连累其余
+    完全独立的窗口也拿不到增益。`gain_for_window` 返回的 warning message（比如
+    「近乎无声」）走同样的「跳过这一窗，继续下一个」路径，只是失败原因不同——
+    一个是「测量本身失败」，一个是「测量成功但数值不足以支撑调整」，别把两种
+    warning 文案混成一句话。
+    """
+    if not windows:
+        return {}, []
+
+    try:
+        voice_stderr = run(
+            _meter_args(video, timeline, track, voice_dir, window=None), ffmpeg=ffmpeg
+        )
+    except FFmpegError as error:
+        return {}, [f"旁白参考响度测量失败，跳过全部留白窗单独增益：{error}"]
+    voice_lufs = _parse_ebur128_i(voice_stderr)
+    if voice_lufs is None:
+        return {}, ["旁白参考响度无法测量，跳过全部留白窗单独增益"]
+
+    gains: dict[int, float] = {}
+    warnings: list[str] = []
+    for index, window in windows:
+        try:
+            source_stderr = run(
+                _meter_args(video, timeline, track, voice_dir, window=window),
+                ffmpeg=ffmpeg,
+            )
+        except FFmpegError as error:
+            warnings.append(
+                f"留白窗 {window.beat_id}/{window.hold_index} 响度测量失败，"
+                f"跳过这一窗的单独增益：{error}"
+            )
+            continue
+        source_lufs = _parse_ebur128_i(source_stderr)
+        gain_db, message = gain_for_window(source_lufs, voice_lufs, cfg=cfg)
+        if message is not None:
+            warnings.append(f"留白窗 {window.beat_id}/{window.hold_index}：{message}")
+            continue
+        gains[index] = gain_db
+    return gains, warnings
+
+
+def build_mix_args(
+    *,
+    video: Path,
+    timeline: Timeline,
+    track: VoiceTrack,
+    voice_dir: Path,
+    out_path: Path,
+    duck_db: float,
+    fade_out_seconds: float = 0.0,
+    outro_seconds: float = 0.0,
+    audio_codec: str = AUDIO_CODEC,
+    audio_bitrate: str = AUDIO_BITRATE,
+    limiter_ceiling: float = LIMITER_CEILING,
+    hold_gains: dict[int, float] | None = None,
+    hold_fade_seconds: float = 0.1,
+) -> list[str]:
+    """拼出混音用的 ffmpeg 参数列表（不含 ffmpeg 本身）。
+
+    图本身由三段拼成：`_origin_parts`（原声按 segment 拼接）、`_voice_parts`
+    （旁白按 offset 延迟叠加）、`_final_mix_parts`（留白增益 + ducking + 合流 +
+    定长 + 淡出 + 片尾静音 + 限幅）。拆成三段是为了让 `_meter_args`（留白窗响度
+    实测）能单独复用前两段——测的必须是「真正会被烧进成片的那份原声/旁白」，
+    不能另起一份看起来等价、实则可能漂开的图。
+    """
+    if not timeline.segments:
+        raise ValueError("timeline 里没有任何 segment，无法混音")
+    if not track.chunks:
+        raise ValueError("voice track 里没有任何 chunk，无法混音")
+    if len(track.chunks) != len(timeline.narration_offsets):
+        raise ValueError(
+            f"chunk 数 {len(track.chunks)} 与 narration_offsets 数 "
+            f"{len(timeline.narration_offsets)} 不一致，timeline 与 voice 产物不匹配"
+        )
+
+    voice_parts, voice_label = _voice_parts(track, timeline.narration_offsets)
+    parts = [
+        *_origin_parts(timeline),
+        *_final_mix_parts(
+            timeline,
+            track,
+            voice_parts,
+            voice_label,
+            duck_db=duck_db,
+            hold_gains=hold_gains,
+            hold_fade_seconds=hold_fade_seconds,
+            fade_out_seconds=fade_out_seconds,
+            outro_seconds=outro_seconds,
+            limiter_ceiling=limiter_ceiling,
+        ),
+    ]
 
     args = ["-y", "-i", str(video)]
-    for path in chunk_paths:
-        args.extend(["-i", path])
+    for chunk in track.chunks:
+        args.extend(["-i", str(voice_dir / chunk.path)])
     args.extend(
         [
             "-filter_complex",
             ";".join(parts),
             "-map",
-            final_label,
+            "[limited]",
             "-c:a",
             audio_codec,
             "-b:a",

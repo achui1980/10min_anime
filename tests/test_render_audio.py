@@ -3,6 +3,7 @@ from pathlib import Path
 
 import pytest
 
+from tenmin.config import RenderConfig
 from tenmin.models import (
     HoldWindow,
     SubtitleCue,
@@ -787,6 +788,186 @@ def test_audio_delays_follow_final_timeline_not_original_voice_hold_after(tmp_pa
     args = build(tmp_path, timeline=timeline)
     graph = args[args.index("-filter_complex") + 1]
     assert "adelay=delays=8000" in graph and "adelay=delays=18000" in graph
+
+
+# --- 留白窗单独增益的响度决策 -----------------------------------------------
+# _valid_hold_windows 只判「这个窗口可信不可信」，不判「该不该调音量、调多少」。
+# gain_for_window 是后半段：拿一对实测响度（留白窗原声 / 旁白参考）决定调多少 dB，
+# 边界见 RenderConfig 的 hold_relative_lu/hold_gain_max_db/hold_silence_floor_lufs。
+
+
+@pytest.mark.parametrize(
+    ("source", "voice", "gain", "warn"),
+    [
+        (-25, -32, -4, False),  # upper bound -29, source is 4 above -> reduce 4 dB
+        (-37, -30, 4, False),  # lower bound -33, source is 4 below -> boost 4 dB
+        (-50, -30, 0, True),  # below silence floor -> no boost, warn
+        (None, -30, 0, True),  # unmeasurable source -> no boost, warn
+        (-30, None, 0, True),  # unmeasurable voice reference -> no adjustment, warn
+        (-10, -32, -6, False),  # would need -10 dB reduction, capped at -6
+    ],
+)
+def test_window_gain_meets_nearest_relative_bound_without_amplifying_noise(
+    source, voice, gain, warn
+):
+    from tenmin.render.audio import gain_for_window
+
+    actual, message = gain_for_window(source, voice, cfg=RenderConfig())
+    assert actual == gain
+    assert (message is not None) is warn
+
+
+def test_ebur128_parser_ignores_invalid_and_uses_last_integrated_report():
+    from tenmin.render.audio import _parse_ebur128_i
+
+    assert _parse_ebur128_i("I: -29.0 LUFS\nI: -23.5 LUFS") == -23.5
+    assert _parse_ebur128_i("I: -inf LUFS") is None
+
+
+# --- _meter_args：响度实测用的最小 ffmpeg 图 ---------------------------
+# `_meter_args` 是纯图构造函数（跟 build_mix_args 同一个套路：不碰 subprocess，
+# 只负责拼 argv），所以这里直接调用检查返回值，不需要 monkeypatch audio.run——
+# 那个壳子在 `_measure_hold_gains` 的测试里才真正被调用。两个分支都必须复用
+# `_origin_parts`/`_voice_parts` 产出的**同一份**图片段，不能另起一份实现。
+
+
+def test_meter_args_window_branch_trims_post_concat_orig_not_raw_stream(tmp_path):
+    from tenmin.render.audio import _meter_args
+
+    timeline = make_timeline()
+    track = make_track()
+    window = HoldWindow(
+        beat_id="b1", hold_index=0, quote="a", episode=2,
+        source_start=108, source_end=109, start=8.0, end=10.0,
+    )
+    args = _meter_args(
+        tmp_path / "source.mkv", timeline, track, tmp_path / "voice", window=window
+    )
+    graph = args[args.index("-filter_complex") + 1]
+    assert "[orig]atrim=start=8.000:end=10.000" in graph
+    # 不能是对 [0:a] 直接 trim —— 必须先经过 concat 落到 timeline 坐标。
+    assert "[0:a]atrim=start=8.000" not in graph
+    assert "ebur128=peak=true" in graph
+
+
+def test_meter_args_voice_branch_selects_narration_intervals_via_aselect(tmp_path):
+    from tenmin.render.audio import _meter_args
+
+    timeline = make_timeline()
+    track = make_track()
+    args = _meter_args(
+        tmp_path / "source.mkv", timeline, track, tmp_path / "voice", window=None
+    )
+    graph = args[args.index("-filter_complex") + 1]
+    assert "aselect=" in graph
+    assert "between(t," in graph
+    assert "ebur128=peak=true" in graph
+
+
+def test_meter_args_neither_branch_encodes_or_loudnorms(tmp_path):
+    from tenmin.render.audio import _meter_args
+
+    timeline = make_timeline()
+    track = make_track()
+    window = HoldWindow(
+        beat_id="b1", hold_index=0, quote="a", episode=2,
+        source_start=108, source_end=109, start=8.0, end=10.0,
+    )
+    for candidate_window in (window, None):
+        args = _meter_args(
+            tmp_path / "source.mkv", timeline, track, tmp_path / "voice",
+            window=candidate_window,
+        )
+        graph = args[args.index("-filter_complex") + 1]
+        assert "loudnorm" not in graph
+        assert args[-3:] == ["-f", "null", "-"]
+
+
+def test_meter_args_inputs_video_then_every_chunk_like_the_real_mix(tmp_path):
+    """两条分支都要保持跟 build_mix_args 一致的输入顺位，即便某条分支不需要视频。"""
+    from tenmin.render.audio import _meter_args
+
+    timeline = make_timeline()
+    track = make_track()
+    voice_dir = tmp_path / "voice"
+    args = _meter_args(tmp_path / "source.mkv", timeline, track, voice_dir, window=None)
+    assert args[:3] == ["-i", str(tmp_path / "source.mkv"), "-i"]
+    assert args[3] == str(voice_dir / "chunk_001.mp3")
+
+
+# --- _measure_hold_gains：一窗失败不该拖累其它窗 ---------------------------
+
+
+def test_measure_hold_gains_skips_the_window_whose_meter_fails_but_still_measures_the_rest(
+    tmp_path, monkeypatch
+):
+    from tenmin.render.audio import _measure_hold_gains
+    from tenmin.render.ffmpeg import FFmpegError
+
+    timeline = make_timeline()
+    track = make_track()
+    first = HoldWindow(beat_id="b1", hold_index=0, quote="a", episode=2,
+                        source_start=108, source_end=109, start=8.0, end=10.0)
+    second = HoldWindow(beat_id="b2", hold_index=1, quote="b", episode=2,
+                         source_start=205, source_end=206, start=20.0, end=22.0)
+    windows = [(0, first), (1, second)]
+
+    responses = iter([
+        "I: -30.0 LUFS\n",  # 旁白参考响度，先成功
+        FFmpegError("boom"),  # 第一个窗口的响度测量失败
+        "I: -25.0 LUFS\n",  # 第二个窗口正常测出来
+    ])
+    calls: list[list[str]] = []
+
+    def fake_run(args, *, ffmpeg="ffmpeg"):
+        calls.append(list(args))
+        outcome = next(responses)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    monkeypatch.setattr("tenmin.render.audio.run", fake_run)
+
+    gains, warnings = _measure_hold_gains(
+        tmp_path / "source.mkv", timeline, track, tmp_path / "voice", windows,
+        cfg=RenderConfig(), ffmpeg="ffmpeg",
+    )
+
+    assert len(calls) == 3
+    assert 0 not in gains
+    assert 1 in gains
+    assert any("b1" in w and "0" in w for w in warnings)
+
+
+def test_measure_hold_gains_short_circuits_when_voice_reference_is_unmeasurable(
+    tmp_path, monkeypatch
+):
+    """旁白参考响度测不出时，不该为任何窗口发起测量——没有参照，测了也白测。"""
+    from tenmin.render.audio import _measure_hold_gains
+
+    timeline = make_timeline()
+    track = make_track()
+    windows = [
+        (0, HoldWindow(beat_id="b1", hold_index=0, quote="a", episode=2,
+                        source_start=108, source_end=109, start=8.0, end=10.0)),
+    ]
+
+    calls: list[list[str]] = []
+
+    def fake_run(args, *, ffmpeg="ffmpeg"):
+        calls.append(list(args))
+        return "I: -inf LUFS\n"
+
+    monkeypatch.setattr("tenmin.render.audio.run", fake_run)
+
+    gains, warnings = _measure_hold_gains(
+        tmp_path / "source.mkv", timeline, track, tmp_path / "voice", windows,
+        cfg=RenderConfig(), ffmpeg="ffmpeg",
+    )
+
+    assert gains == {}
+    assert len(warnings) == 1
+    assert len(calls) == 1
 
 
 def test_mix_audio_reports_each_percent_only_once(tmp_path, monkeypatch):
