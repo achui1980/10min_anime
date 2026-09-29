@@ -239,6 +239,44 @@ def test_timeline_freshness_tracks_cached_voice_audio_files(tmp_path):
     assert not _is_fresh([timeline], _timeline_inputs(paths, 2, track, []))
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stages", ["only", "from_timeline"])
+async def test_missing_voice_chunk_cannot_skip_fresh_timeline(project, monkeypatch, stages):
+    from tenmin.models import VoiceTrack
+
+    paths = Paths(project.root)
+    _write_script(paths.script(2), render_script())
+    await run_voice(project, FakeTTSEngine([8.0, 10.0, 10.0]), episode=2)
+    run_timeline(project, episode=2, source_duration=1400.0)
+    track = json.loads(paths.voice(2).read_text(encoding="utf-8"))
+    missing = paths.voice_dir(2) / track["chunks"][0]["path"]
+    missing.unlink()
+
+    # 通用 _is_fresh 刻意忽略缺失输入；只有 timeline 对 voice.json 引用的 MP3 加硬闸。
+    voice = VoiceTrack.model_validate_json(paths.voice(2).read_text(encoding="utf-8"))
+    assert _is_fresh(
+        [paths.timeline(2), paths.subtitles(2)],
+        _timeline_inputs(paths, 2, voice, []),
+    )
+    old_timeline = paths.timeline(2).read_bytes()
+    old_ass = paths.subtitles(2).read_bytes()
+    provider = FakeProvider([])
+    _prepare_video(project)
+    monkeypatch.setattr("tenmin.pipeline.probe_duration", lambda *_args, **_kwargs: 1400.0)
+    monkeypatch.setattr("tenmin.pipeline.probe_frame_rate", lambda *_args, **_kwargs: 25.0)
+    if stages == "from_timeline":
+        monkeypatch.setattr("tenmin.pipeline.preflight", lambda *_args, **_kwargs: 1400.0)
+    options = {"only": ["timeline"]} if stages == "only" else {"from_stage": "timeline"}
+
+    with pytest.raises(FileNotFoundError) as exc:
+        await run_pipeline(project, provider, episode=2, **options)
+    assert str(missing) in str(exc.value)
+    assert "voice" in str(exc.value)
+    assert provider.calls == []
+    assert paths.timeline(2).read_bytes() == old_timeline
+    assert paths.subtitles(2).read_bytes() == old_ass
+
+
 # work/ 下有 11 集的存量产物，产物路径改一个字符就等于全部存量产物失效（流水线会
 # 认为什么都没跑过，重新调 LLM、重新 TTS、重新渲染）。所以这里把每一条路径按字面量
 # 锁死：Paths 的实现怎么重构都行，拼出来的字符串必须逐字节不变。

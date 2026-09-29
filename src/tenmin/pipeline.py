@@ -1385,7 +1385,17 @@ async def run_pipeline(
 
             if "timeline" in wanted:
                 outputs = [paths.timeline(number), paths.subtitles(number)]
-                inputs = _timeline_inputs(paths, number, _load_voice(cfg, number), video_inputs)
+                track = _load_voice(cfg, number)
+                # _is_fresh 刻意忽略不存在的输入；此处的 MP3 却是 voice.json 明确引用的
+                # 必需素材。缺失时既不能沿用旧字幕，也不能假装重新验证过切点。
+                for chunk in track.chunks:
+                    audio = paths.voice_dir(number) / chunk.path
+                    if not audio.is_file():
+                        raise FileNotFoundError(
+                            f"第 {number} 集 voice.json 引用的配音文件不存在：{audio}。"
+                            "请恢复缓存，或重跑 voice 阶段后再跑 timeline。"
+                        )
+                inputs = _timeline_inputs(paths, number, track, video_inputs)
                 if force or not is_fresh("timeline", number, outputs, inputs):
                     reporter.stage_start("timeline")
                     _, stage_warnings = run_timeline(cfg, episode=number)
