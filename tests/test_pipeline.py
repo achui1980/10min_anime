@@ -702,6 +702,92 @@ async def test_run_pipeline_reruns_the_render_stages_when_the_voice_changes(
 
 
 @pytest.mark.asyncio
+async def test_replacing_video_reruns_only_video_dependent_stages(project, monkeypatch):
+    video = _prepare_video(project)
+    video.write_bytes(b"first source")
+    monkeypatch.setattr("tenmin.pipeline.probe_duration", lambda path, **_: 1400.0)
+    monkeypatch.setattr("tenmin.pipeline.probe_frame_rate", lambda path, **_: 25.0)
+    monkeypatch.setattr("tenmin.pipeline.preflight", lambda video, encoder, **_: 1400.0)
+    monkeypatch.setattr("tenmin.render.audio.run_with_progress", _touch_output)
+    monkeypatch.setattr("tenmin.render.video.run_with_progress", _touch_output_with_progress)
+
+    await run_pipeline(
+        project,
+        FakeProvider([fake_script_response()]),
+        tts_engine=FakeTTSEngine([80.0] * 20),
+    )
+    paths = Paths(project.root)
+    before = {
+        stage: getattr(paths, stage)(2).stat().st_mtime_ns
+        for stage in ("script", "voice", "timeline", "mixed_audio", "video")
+    }
+    video.write_bytes(b"replacement source")
+    os.utime(video, ns=(max(before.values()) + 2_000_000_000,) * 2)
+
+    reporter = FakeReporter()
+    await run_pipeline(project, FakeProvider([]), tts_engine=FakeTTSEngine([]), reporter=reporter)
+
+    for stage in ("script", "docgen", "voice"):
+        assert ("stage_skip", stage) in reporter.calls
+    for stage in ("timeline", "audio", "render"):
+        assert ("stage_start", stage) in reporter.calls
+    assert paths.script(2).stat().st_mtime_ns == before["script"]
+    assert paths.voice(2).stat().st_mtime_ns == before["voice"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "stage", ["timeline", "audio", "render"], ids=["timeline", "audio", "movie"]
+)
+async def test_video_replacement_invalidates_each_stage_run_alone(project, monkeypatch, stage):
+    video = _prepare_video(project)
+    video.write_bytes(b"first source")
+    paths = Paths(project.root)
+    _write_script(paths.script(2), render_script())
+    await run_voice(project, FakeTTSEngine([8.0, 10.0, 10.0]), episode=2)
+    monkeypatch.setattr("tenmin.pipeline.probe_duration", lambda path, **_: 1400.0)
+    monkeypatch.setattr("tenmin.pipeline.probe_frame_rate", lambda path, **_: 25.0)
+    monkeypatch.setattr("tenmin.pipeline.preflight", lambda video, encoder, **_: 1400.0)
+    monkeypatch.setattr("tenmin.render.audio.run_with_progress", _touch_output)
+    monkeypatch.setattr("tenmin.render.video.run_with_progress", _touch_output_with_progress)
+    await run_pipeline(project, FakeProvider([]), only=["timeline", "audio", "render"])
+
+    video.write_bytes(b"replacement source")
+    last_output = max(
+        paths.timeline(2).stat().st_mtime_ns,
+        paths.mixed_audio(2).stat().st_mtime_ns,
+        paths.video(2).stat().st_mtime_ns,
+    )
+    os.utime(video, ns=(last_output + 2_000_000_000,) * 2)
+    reporter = FakeReporter()
+    await run_pipeline(project, FakeProvider([]), only=[stage], reporter=reporter)
+
+    assert ("stage_start", stage) in reporter.calls
+
+
+@pytest.mark.asyncio
+async def test_srt_only_episode_still_runs_v1_stages_with_a_prefilled_neighbor(project):
+    project.episodes.append(EpisodeConfig(number=3, op_range=(10.0, 100.0)))
+    reporter = FakeReporter()
+
+    warnings = await run_pipeline(
+        project, FakeProvider([fake_script_response()]), only=V1_STAGES, reporter=reporter
+    )
+
+    assert Paths(project.root).script(2).exists()
+    assert not Paths(project.root).script(3).exists()
+    assert "第 3 集还没有 video，已跳过" in warnings
+
+
+@pytest.mark.asyncio
+async def test_missing_video_still_fails_preflight_before_the_render_stages(project):
+    project.episodes[0].video = Path("missing.mkv")
+
+    with pytest.raises(FileNotFoundError, match=r"missing\.mkv"):
+        await run_pipeline(project, FakeProvider([]), only=["audio"])
+
+
+@pytest.mark.asyncio
 async def test_run_pipeline_backdates_freshly_created_slices(project):
     await run_pipeline(project, FakeProvider([]), only=["ingest"])
 

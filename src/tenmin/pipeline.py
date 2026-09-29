@@ -1275,6 +1275,13 @@ async def run_pipeline(
             if episode is None:
                 reporter.episode_start(number, number_to_index[number], len(target_numbers))
 
+            # 原片可以缺席于只跑 SRT 的旧项目；配置了视频时，各消费它的阶段都要
+            # 独立依赖它（--only audio/render 不一定会先跑 timeline）。
+            episode_cfg = _find_episode(cfg, number)
+            video_inputs = (
+                [cfg.video_path(episode_cfg)] if episode_cfg.video is not None else []
+            )
+
             if "translate" in wanted:
                 # **刻意不做多集并发**（script 上面那个有界预取窗口不往这里搬）：第 1 集
                 # 写完累积术语表、第 2 集才读到含第 1 集的版本，并发会让累积失去意义，
@@ -1333,7 +1340,7 @@ async def run_pipeline(
 
             if "timeline" in wanted:
                 outputs = [paths.timeline(number), paths.subtitles(number)]
-                inputs = [paths.script(number), paths.voice(number)]
+                inputs = [paths.script(number), paths.voice(number), *video_inputs]
                 if force or not is_fresh("timeline", number, outputs, inputs):
                     reporter.stage_start("timeline")
                     _, stage_warnings = run_timeline(cfg, episode=number)
@@ -1344,7 +1351,7 @@ async def run_pipeline(
 
             if "audio" in wanted:
                 outputs = [paths.mixed_audio(number)]
-                inputs = [paths.timeline(number), paths.voice(number)]
+                inputs = [paths.timeline(number), paths.voice(number), *video_inputs]
                 if force or not is_fresh("audio", number, outputs, inputs):
                     reporter.stage_start("audio")
                     run_audio(cfg, episode=number, reporter=reporter)
@@ -1358,6 +1365,7 @@ async def run_pipeline(
                     paths.mixed_audio(number),
                     paths.subtitles(number),
                     paths.timeline(number),
+                    *video_inputs,
                 ]
                 if force or not is_fresh("render", number, outputs, inputs):
                     reporter.stage_start("render")
