@@ -81,6 +81,7 @@ _HANG_MAX_CELLS = 4
 # 可读性检查的默认阈值（见 check_cue_legibility）。从 config 派生，不写第二份字面量。
 DEFAULT_MAX_LINES = DEFAULT_RENDER.subtitle_max_lines
 DEFAULT_MIN_SECONDS = DEFAULT_RENDER.subtitle_min_seconds
+DEFAULT_MAX_CHARS = DEFAULT_RENDER.subtitle_soft_max_chars
 
 
 def format_ass_time(seconds: float) -> str:
@@ -262,15 +263,13 @@ def check_cue_legibility(
     width: int = PLAY_RES_X,
     max_lines: int = DEFAULT_MAX_LINES,
     min_seconds: float = DEFAULT_MIN_SECONDS,
+    max_chars: int = DEFAULT_MAX_CHARS,
 ) -> list[str]:
-    """纯读的可读性检查：太高（行数）与太快（时长）的 cue 各报一条 warning。
+    """纯读检查行数、时长及不能安全软拆的长 cue；只报 warning，不改文本。
 
-    **只报不改**，理由（实测数据在下面）：
+    自然停顿处的显示 cue 软拆在 timeline.sentence_cues 完成；这里对未能安全拆分
+    的长句建议人工改稿，也继续检查行数和过短时长。
 
-    - 拆长 cue 需要句内的时间切点，而句内时间只能靠字数比例估。实测（真 Edge TTS）
-      逐句合成 359 段量过这个估算器：句边界时刻误差 p50 0.365 秒、p90 0.817 秒、
-      max 1.615 秒。用一个已知有 1.6 秒误差的估算去修「字幕挂太久」，换来的是「字幕
-      对不上口型」。而 warning 指向的动作（把这句话写短）同时修好字幕与配音节奏。
     - 合并过短的 cue 在真实数据上 0 次触发（全季最短 0.80 秒），写了也是没被跑过的代码。
 
     实测（work/saijo 10 集、修完 A1/C1/C5 之后的 360 条 cue）：行数分布
@@ -283,12 +282,16 @@ def check_cue_legibility(
     字数)，而 render/tts.py 的时长体检把后者压在 ≈0.11 秒/字以上，所以一两个字的句子
     落在 0.11–0.44 秒 —— 可达，只是这一季没出现。
 
-    两个阈值设成 0 就关掉对应的那一项。
+    各检查阈值设成 0 就关掉对应的那一项。
     """
     max_cells = max_cells_per_line(font_size, width)
     warnings: list[str] = []
     for cue in cues:
         stamp = format_ass_time(cue.start)
+        if max_chars > 0 and len(cue.text) > max_chars:
+            warnings.append(
+                f"字幕 {stamp} 仍有 {len(cue.text)} 字，过长且无法安全软拆，建议人工改稿"
+            )
         if max_lines > 0:
             lines = len(wrap_text(cue.text, max_cells).split("\n"))
             if lines > max_lines:

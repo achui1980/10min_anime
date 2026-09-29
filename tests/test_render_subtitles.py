@@ -318,18 +318,14 @@ def test_wrap_text_backtrack_window_still_excludes_its_lower_bound():
 #   行数分布 {1 行: 233, 2 行: 119, 3 行: 8}
 #   时长 min 0.80s / p50 5.77s / p90 9.60s / max 15.36s；<0.7s 的 **0 条**
 #
-# 那 8 条 3 行的 cue 是 54–79 字的**单句**（10.6–15.4 秒），也就是说它们跟 chunk 粒度
-# 无关（A5 的「每句一 chunk」压根救不了它们），唯一的修法是把句子写短。
+# 那 8 条 3 行的 cue 是 54–79 字的**单句**（10.6–15.4 秒），与 chunk 粒度无关。
+# timeline 的显示 cue 软拆优先在自然停顿处拆开；没有安全切点时仍需人工改稿。
 #
-# **力度选 warning，不改产物**，依据：
-# - 拆长 cue 需要句内的时间切点，而句内时间只能靠字数比例估（B1 实测这个估算在句
-#   边界上的误差 p50 0.365 秒、max 1.615 秒）。拆出来的下半句有可能在念到之前就
-#   出现或念完之后才出现 —— 用一个已知有 1.6 秒误差的估算去修「字幕太长」，换来的
-#   是「字幕对不上口型」。而 warning 指向的动作（把这句写短）同时修好字幕与配音节奏。
+# **可读性检查只报 warning，不改产物**：拆分已在 timeline 的显示层完成，这里报告
+# 仍然超长的 cue 及行数/时长问题；估算切点不能保证逐字对齐。
 # - 合并过短的 cue 在真实数据上 0 次触发，写了也是没被跑过的代码。
 #
-# 两个阈值都是「这部番想要什么」的创作旋钮（判据见 AGENTS.md），所以进 RenderConfig；
-# 设成 0 就是关掉这一项检查。
+# 字数软上限及行数/时长阈值来自 RenderConfig；检查阈值设为 0 可分别关闭。
 
 
 def _cue(start: float, end: float, text: str) -> SubtitleCue:
@@ -346,9 +342,8 @@ def test_check_cue_legibility_warns_when_a_cue_needs_three_lines():
     from tenmin.render.subtitles import check_cue_legibility
 
     warnings = check_cue_legibility([_cue(0.0, 15.0, "一二三四五六七八九十" * 8)])
-    assert len(warnings) == 1
-    assert "3 行" in warnings[0]
-    assert "0:00:00.00" in warnings[0]
+    assert any("3 行" in w and "0:00:00.00" in w for w in warnings)
+    assert any("过长" in w for w in warnings)
 
 
 def test_check_cue_legibility_warns_when_a_cue_flashes_by():
@@ -370,9 +365,9 @@ def test_check_cue_legibility_thresholds_are_configurable_and_zero_disables():
     from tenmin.render.subtitles import check_cue_legibility
 
     cues = [_cue(0.0, 0.2, "好。"), _cue(1.0, 15.0, "一二三四五六七八九十" * 8)]
-    assert len(check_cue_legibility(cues)) == 2
-    assert check_cue_legibility(cues, max_lines=3, min_seconds=0.1) == []
-    assert check_cue_legibility(cues, max_lines=0, min_seconds=0) == []
+    assert len(check_cue_legibility(cues)) == 3
+    assert check_cue_legibility(cues, max_lines=3, min_seconds=0.1, max_chars=0) == []
+    assert check_cue_legibility(cues, max_lines=0, min_seconds=0, max_chars=0) == []
 
 
 def test_check_cue_legibility_counts_lines_with_the_real_font_metrics():
@@ -380,5 +375,15 @@ def test_check_cue_legibility_counts_lines_with_the_real_font_metrics():
     from tenmin.render.subtitles import check_cue_legibility
 
     cues = [_cue(0.0, 15.0, "一二三四五六七八九十" * 5)]
-    assert check_cue_legibility(cues, font_size=52, width=1920) == []
-    assert len(check_cue_legibility(cues, font_size=52, width=640)) == 1
+    assert check_cue_legibility(cues, font_size=52, width=1920, max_chars=0) == []
+    assert len(check_cue_legibility(cues, font_size=52, width=640, max_chars=0)) == 1
+
+
+def test_check_cue_legibility_warns_on_unsplit_long_cue_without_changing_it():
+    from tenmin.render.subtitles import check_cue_legibility
+
+    cue = _cue(3.0, 11.0, "这是一段没有任何停顿的很长很长很长的旁白")
+    warnings = check_cue_legibility([cue], max_chars=12, max_lines=0, min_seconds=0)
+    assert warnings == [f"字幕 0:00:03.00 仍有 {len(cue.text)} 字，过长且无法安全软拆，建议人工改稿"]
+    assert cue.text == "这是一段没有任何停顿的很长很长很长的旁白"
+    assert check_cue_legibility([cue], max_chars=0, max_lines=0, min_seconds=0) == []

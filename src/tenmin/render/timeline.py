@@ -53,7 +53,40 @@ def align_to_frame(seconds: float, frame_rate: float | None) -> float:
     return math.floor(seconds * frame_rate + 0.5) / frame_rate
 
 
-def sentence_cues(chunk: VoiceChunk, start: float) -> list[SubtitleCue]:
+_DISPLAY_STOPS = "，、；,;"
+
+
+def _split_display(text: str, cap: int, min_seconds: float, duration: float) -> list[str]:
+    """只在自然停顿处拆显示文本；不安全时原句返回。"""
+    if len(text) <= cap:
+        return [text]
+    pieces: list[str] = []
+    rest = text
+    while len(rest) > cap:
+        lower = max(1, int(cap * 0.6))
+        cuts = [
+            i for i in range(lower, min(cap, len(rest) - 1) + 1)
+            if rest[i - 1] in _DISPLAY_STOPS
+        ]
+        if not cuts:
+            return [text]
+        cut = cuts[-1]
+        pieces.append(rest[:cut])
+        rest = rest[cut:]
+    pieces.append(rest)
+    while len(pieces) > 1 and sum(ch.isalnum() for ch in pieces[-1]) <= 2:
+        tail = pieces.pop()
+        pieces[-1] += tail
+    if len(pieces) == 1 or any(sum(ch.isalnum() for ch in p) <= 2 for p in pieces):
+        return [text]
+    if any(duration * len(p) / len(text) < min_seconds for p in pieces):
+        return [text]
+    return pieces
+
+
+def sentence_cues(
+    chunk: VoiceChunk, start: float, *, cfg: RenderConfig = DEFAULT_RENDER
+) -> list[SubtitleCue]:
     """把一个 chunk 的字幕按句切开，按字数比例分配 chunk.duration。
 
     一个 chunk 常常是好几句话拼起来一次性合成的（省 TTS 调用次数），
@@ -77,7 +110,15 @@ def sentence_cues(chunk: VoiceChunk, start: float) -> list[SubtitleCue]:
     反过来，插 20–40ms 间隙会让这 298 处**每一处**都多一次字幕闪断，那是真实存在的
     观感损失，换来的是一个测不到的问题。
     """
-    sentences = split_sentences(chunk.text)
+    base = split_sentences(chunk.text)
+    total_weight = sum(narration_chars(sentence) for sentence in base)
+    sentences = [
+        part for sentence in base
+        for part in _split_display(
+            sentence, cfg.subtitle_soft_max_chars, cfg.subtitle_min_seconds,
+            chunk.duration * narration_chars(sentence) / max(1, total_weight),
+        )
+    ]
     if not sentences:
         return [SubtitleCue(start=start, end=start + chunk.duration, text=chunk.text)]
     if len(sentences) == 1:
@@ -227,7 +268,7 @@ def build_timeline(
         # 音频游标：字幕与旁白落点都由它驱动
         for chunk in chunks:
             offsets.append(audio_cursor)
-            subtitles.extend(sentence_cues(chunk, audio_cursor))
+            subtitles.extend(sentence_cues(chunk, audio_cursor, cfg=cfg))
             audio_cursor += chunk.duration + chunk.hold_after
 
         audio_seconds = beat_audio_seconds(chunks)

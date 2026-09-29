@@ -26,7 +26,7 @@ from tenmin.config import (
 )
 from tenmin.ingest.credits import find_credit_ranges, in_credit_window
 from tenmin.ingest.normalize import build_track
-from tenmin.models import DialogueLine, DialogueTrack, SubtitleCue
+from tenmin.models import DialogueLine, DialogueTrack, SubtitleCue, VoiceTrack
 from tenmin.pipeline import (
     Paths,
     run_audio,
@@ -872,7 +872,34 @@ def test_run_timeline_legibility_check_can_be_switched_off(tmp_path):
     cfg = _minimal_project(tmp_path)
     cfg.render.subtitle_max_lines = 0
     cfg.render.subtitle_min_seconds = 0
+    cfg.render.subtitle_soft_max_chars = 1000
     _write_voice_and_script(cfg)
 
     _, warnings = run_timeline(cfg, episode=1, source_duration=100.0)
     assert not any("字幕" in w for w in warnings)
+
+
+def test_run_timeline_passes_soft_cap_to_cues_and_legibility(tmp_path):
+    cfg = _minimal_project(tmp_path)
+    cfg.render.subtitle_soft_max_chars = 12
+    cfg.render.subtitle_max_lines = 0
+    text = "一二三四五六七八，九十一二三四五六。"
+    _write_voice_and_script(cfg)
+    paths = Paths(cfg.root)
+    track = VoiceTrack.model_validate_json(paths.voice(1).read_text(encoding="utf-8"))
+    track.chunks[0].text = text
+    track.chunks[0].duration = 8.0
+    track.chunks[0].hold_after = 0
+    track.chunks = track.chunks[:1]
+    paths.voice(1).write_text(track.model_dump_json(), encoding="utf-8")
+
+    timeline, warnings = run_timeline(cfg, episode=1, source_duration=100.0)
+    assert len(timeline.subtitles) == 2
+    assert "".join(c.text for c in timeline.subtitles) == text
+    assert not any("过长" in w for w in warnings)
+
+    track.chunks[0].text = "这是一段没有任何停顿的很长很长很长的旁白"
+    paths.voice(1).write_text(track.model_dump_json(), encoding="utf-8")
+    timeline, warnings = run_timeline(cfg, episode=1, source_duration=100.0)
+    assert len(timeline.subtitles) == 1
+    assert any("过长且无法安全软拆" in w for w in warnings)

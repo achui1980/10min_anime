@@ -936,6 +936,7 @@ def run_timeline(
             width=cfg.render.width,
             max_lines=cfg.render.subtitle_max_lines,
             min_seconds=cfg.render.subtitle_min_seconds,
+            max_chars=cfg.render.subtitle_soft_max_chars,
         )
     )
     _write_json(paths.timeline(episode), timeline.model_dump_json(indent=2))

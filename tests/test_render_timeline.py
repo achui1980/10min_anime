@@ -2,7 +2,9 @@ from itertools import pairwise
 
 import pytest
 
+from tenmin.config import RenderConfig
 from tenmin.models import AudioDirection, Beat, Clip, Hold, Script, VoiceChunk, VoiceTrack
+from tenmin.render.subtitles import check_cue_legibility
 from tenmin.render.timeline import (
     align_to_frame,
     beat_audio_seconds,
@@ -130,6 +132,57 @@ def test_build_timeline_splits_multi_sentence_chunk_into_per_sentence_cues():
     assert cues[1].end == pytest.approx(12.0)
     # 音频游标只按整个 chunk 的时长推进一次，不受切句影响
     assert timeline.narration_offsets == pytest.approx([0.0])
+
+
+@pytest.mark.parametrize(("text", "seconds", "split"), [
+    ("一二三四五六七八，九十一二三四五六。", 8.0, True),
+    ("这是一段没有任何停顿的很长很长很长的旁白", 8.0, False),
+    ("一二三四五六七八九十一，啊", 8.0, False),
+    ("一二三四五六七八，九十一二三四五六", 1.0, False),
+])
+def test_display_cues_split_without_loss_or_flash(text, seconds, split):
+    cfg = RenderConfig(subtitle_soft_max_chars=12, subtitle_min_seconds=0.7)
+    chunk = VoiceChunk(beat_id="b1", index=1, text=text, path="c.mp3", duration=seconds)
+    cues = sentence_cues(chunk, 3, cfg=cfg)
+    assert (len(cues) > 1) is split
+    assert "".join(c.text for c in cues) == text
+    assert cues[0].start == 3 and cues[-1].end == 3 + seconds
+    assert all(a.end == b.start for a, b in pairwise(cues))
+    if split:
+        assert all(c.end - c.start >= 0.7 for c in cues)
+        assert not any("过长" in w for w in check_cue_legibility(
+            cues, max_chars=12, max_lines=0, min_seconds=0))
+    else:
+        assert any("过长" in w for w in check_cue_legibility(
+            cues, max_chars=12, max_lines=0, min_seconds=0))
+
+
+def test_display_split_respects_existing_sentence_weights_and_exact_end():
+    cfg = RenderConfig(subtitle_soft_max_chars=12)
+    text = "好。" + "一二三四五六七八，九十一二三四五六。"
+    chunk = VoiceChunk(beat_id="b1", index=1, text=text, path="c.mp3", duration=10.0)
+    cues = sentence_cues(chunk, 2.0, cfg=cfg)
+    assert [c.text for c in cues] == ["好。", "一二三四五六七八，", "九十一二三四五六。"]
+    assert "".join(c.text for c in cues) == text
+    assert cues[0].end == pytest.approx(3.0)
+    assert all(a.end == b.start for a, b in pairwise(cues))
+    assert cues[-1].end == 12.0
+
+
+def test_build_timeline_uses_config_for_display_only_splits():
+    cfg = RenderConfig(subtitle_soft_max_chars=12)
+    text = "一二三四五六七八，九十一二三四五六。"
+    chunk = VoiceChunk(beat_id="b1", index=1, text=text, path="c.mp3", duration=8.0)
+    track = VoiceTrack(episode=2, chunks=[chunk], total_seconds=8.0)
+    timeline, warnings = build_timeline(
+        one_beat_script([Clip(episode=2, start=100, end=108)]),
+        track, source_duration=1400.0, cfg=cfg,
+    )
+    assert warnings == []
+    assert len(timeline.subtitles) == 2
+    assert "".join(c.text for c in timeline.subtitles) == text
+    assert timeline.narration_offsets == [0.0]
+    assert timeline.total_seconds == 8.0
 
 
 def test_build_timeline_scales_two_clips_proportionally():
