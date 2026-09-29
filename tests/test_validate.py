@@ -227,6 +227,19 @@ def test_silent_highlight_needs_one_second_overlap():
     assert result.script.beats[0].clips[0].is_silent_highlight is False
 
 
+def test_hold_extension_recomputes_silent_highlight_from_final_clip():
+    s = with_holds(make_script([[clip(10, 20, silent=False)]]), [hold("听我说清楚")])
+    track = make_track(lines=[dline(1, 21, 23, "听我说清楚")])
+    report = make_report(gaps=[(21, 23)])
+    before = s.model_dump_json()
+
+    repaired, _ = repair_script(s, {2: track}, {2: report})
+
+    assert repaired.beats[0].clips[0].end == 23
+    assert repaired.beats[0].clips[0].is_silent_highlight is True
+    assert s.model_dump_json() == before
+
+
 def test_beat_losing_all_clips_raises():
     s = make_script([[clip(10.0, 15.0)], [clip(9000.0, 9005.0)]])
     with pytest.raises(ScriptValidationError) as exc:
@@ -1037,13 +1050,42 @@ def test_too_many_holds_raises():
     s = make_script([[clip(10.0, 15.0)]])
     over = DEFAULT_VALIDATE.max_holds + 1
     s.beats[0].audio.holds = [
-        Hold(at=1.0 + i, duration=2.0, quote="金句") for i in range(over)
+        Hold(at=1.0 + i, duration=2.0, quote="台词") for i in range(over)
     ]
+    track = make_track(lines=[dline(1, 11, 12)])
     with pytest.raises(ScriptValidationError) as exc:
-        run(s)
+        run(s, track=track)
     assert "留白" in str(exc.value)
     # 落盘给 pipeline 用的那一版必须带着（一次真实调用可达 561 秒）。
     assert exc.value.script is not None
+    assert len(exc.value.script.beats[0].audio.holds) == over
+
+
+def test_nine_unlocatable_holds_are_discarded_before_enforcing_limit():
+    s = make_script([[clip(10, 15)]])
+    s.beats[0].audio.holds = [
+        hold(f"不存在的金句{i}") for i in range(DEFAULT_VALIDATE.max_holds + 1)
+    ]
+    before = s.model_dump_json()
+
+    repaired, warnings = repair_script(s, {2: make_track()}, {2: make_report()})
+
+    assert repaired.beats[0].audio.holds == []
+    assert len([w for w in warnings if "已撤销" in w]) == DEFAULT_VALIDATE.max_holds + 1
+    assert s.model_dump_json() == before
+
+
+def test_hold_limit_counts_survivors_across_beats():
+    s = make_script([[clip(10, 15)], [clip(20, 25)]])
+    track = make_track(lines=[dline(1, 11, 12, "第一句"), dline(2, 21, 22, "第二句")])
+    s.beats[0].audio.holds = [hold("第一句") for _ in range(5)]
+    s.beats[1].audio.holds = [hold("第二句") for _ in range(4)] + [hold("不存在")]
+
+    with pytest.raises(ScriptValidationError) as exc:
+        repair_script(s, {2: track}, {2: make_report()})
+
+    assert sum(len(b.audio.holds) for b in exc.value.script.beats) == 9
+    assert all(h.quote != "不存在" for b in exc.value.script.beats for h in b.audio.holds)
 
 
 def test_holds_at_the_cap_do_not_raise():
@@ -1052,20 +1094,21 @@ def test_holds_at_the_cap_do_not_raise():
     按 6 判错第一个被拦的就是自家黄金快照。提示词已同步改成 3–8。"""
     s = make_script([[clip(10.0, 15.0)]])
     s.beats[0].audio.holds = [
-        Hold(at=1.0 + i, duration=2.0, quote="金句")
+        Hold(at=1.0 + i, duration=2.0, quote="台词")
         for i in range(DEFAULT_VALIDATE.max_holds)
     ]
-    assert len(run(s).script.beats) == SPEC_MIN_BEATS
+    result = run(s, track=make_track(lines=[dline(1, 11, 12)]))
+    assert len(result.script.beats[0].audio.holds) == DEFAULT_VALIDATE.max_holds
 
 
 def test_hold_count_is_summed_across_beats():
     """判据是**全片**留白数，不是单节点。提示词写的是「全集给 3–8 处」。"""
     s = make_script([[clip(10.0, 15.0)], [clip(100.0, 105.0)]])
-    per_beat = [Hold(at=1.0 + i, duration=2.0, quote="金句") for i in range(5)]
-    s.beats[0].audio.holds = list(per_beat)
-    s.beats[1].audio.holds = list(per_beat)
+    s.beats[0].audio.holds = [hold("第一句") for _ in range(5)]
+    s.beats[1].audio.holds = [hold("第二句") for _ in range(5)]
+    track = make_track(lines=[dline(1, 11, 12, "第一句"), dline(2, 101, 102, "第二句")])
     with pytest.raises(ScriptValidationError):
-        run(s)
+        run(s, track=track)
 
 
 # --- B2：narration 非空 ---

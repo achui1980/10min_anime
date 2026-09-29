@@ -658,17 +658,6 @@ def repair_script(
             script=script,
         )
 
-    # 全片留白数量：唯一一条会判错重试的创作约定（理由见 ValidateConfig.max_holds）。
-    # 放在这里而不是 _check_structure 里，是因为 check_script 那一半按约定纯读只返
-    # warning，一个字节都不改也一次都不抛。
-    holds = sum(len(beat.audio.holds) for beat in script.beats)
-    if holds > cfg.max_holds:
-        raise ScriptValidationError(
-            f"全片留白 {holds} 处，超过上限 {cfg.max_holds}（提示词要求 3–8 处）："
-            f"每处 2–4 秒旁白静音，还要从旁白字数预算里扣，重试",
-            script=script,
-        )
-
     repaired = script.model_copy(deep=True)
     warnings: list[str] = []
     indexes = _anchor_indexes(tracks)
@@ -706,12 +695,6 @@ def repair_script(
                     f"这一集的 clip 一律不会被标成静音高光；"
                     f"跨集引用请先把那一集也跑过 signals 阶段"
                 )
-            gaps = report.silent_gaps if report else []
-            clip.is_silent_highlight = any(
-                _overlap(clip.start, clip.end, gap.start, gap.end)
-                >= SILENT_OVERLAP_SECONDS
-                for gap in gaps
-            )
             kept.append(clip)
 
         if not kept:
@@ -733,6 +716,24 @@ def repair_script(
             )
         beat.clips = kept
         warnings.extend(_repair_holds(beat, tracks, cfg))
+        for clip in beat.clips:
+            report = reports.get(clip.episode)
+            gaps = report.silent_gaps if report else []
+            clip.is_silent_highlight = any(
+                _overlap(clip.start, clip.end, gap.start, gap.end)
+                >= SILENT_OVERLAP_SECONDS
+                for gap in gaps
+            )
+
+    # 按修复后的留白计数：不能让已经撤销的无出处留白触发整篇重试。
+    # 放在 repair 而非纯读的 check_script，保留有效留白超限时的硬失败语义。
+    holds = sum(len(beat.audio.holds) for beat in repaired.beats)
+    if holds > cfg.max_holds:
+        raise ScriptValidationError(
+            f"全片留白 {holds} 处，超过上限 {cfg.max_holds}（提示词要求 3–8 处）："
+            f"每处 2–4 秒旁白静音，还要从旁白字数预算里扣，重试",
+            script=repaired,
+        )
 
     return repaired, warnings
 
