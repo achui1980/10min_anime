@@ -36,7 +36,7 @@ from tenmin.render.ffmpeg import (
     probe_frame_rate,
 )
 from tenmin.render.subtitles import check_cue_legibility, render_ass
-from tenmin.render.timeline import build_timeline
+from tenmin.render.timeline import build_timeline, detect_voice_pauses, sentence_cues
 from tenmin.render.tts import TTSEngine, synthesize_track
 from tenmin.render.video import render_video
 from tenmin.script.llm import LLMProvider, LLMSchemaError
@@ -317,6 +317,18 @@ def _is_fresh(outputs: list[Path], inputs: list[Path]) -> bool:
     newest_input = max(p.stat().st_mtime_ns for p in existing_inputs)
     oldest_output = min(p.stat().st_mtime_ns for p in outputs)
     return oldest_output >= newest_input
+
+
+def _timeline_inputs(
+    paths: Paths, episode: int, track: VoiceTrack, video_inputs: list[Path]
+) -> list[Path]:
+    """timeline 会读取的 voice 元数据、缓存音频与源片。"""
+    return [
+        paths.script(episode),
+        paths.voice(episode),
+        *(paths.voice_dir(episode) / chunk.path for chunk in track.chunks),
+        *video_inputs,
+    ]
 
 
 def _is_fresh_stamped(outputs: list[Path], inputs: list[Path], stamp: Path) -> bool:
@@ -923,8 +935,26 @@ def run_timeline(
         source_duration = probe_duration(video, ffprobe=cfg.render.ffprobe_path)
         if frame_rate is None:
             frame_rate = probe_frame_rate(video, ffprobe=cfg.render.ffprobe_path)
+    # 无新软拆候选时不探配音；有候选则每个 chunk 至多分析一次，失败只放弃软拆。
+    pause_evidence: dict[int, list[tuple[float, float]]] = {}
+    for chunk in track.chunks:
+        pause_evidence[id(chunk)] = []
+        # 无证据时能拆出的 cue 比“已核验但无停顿”多，才需要分析音轨。
+        if len(sentence_cues(chunk, 0.0, cfg=cfg.render)) == len(
+            sentence_cues(chunk, 0.0, cfg=cfg.render, pauses=[])
+        ):
+            continue
+        audio = paths.voice_dir(episode) / chunk.path
+        try:
+            if audio.is_file():
+                pause_evidence[id(chunk)] = detect_voice_pauses(
+                    audio, ffmpeg=cfg.render.ffmpeg_path
+                )
+        except (FFmpegError, OSError, ValueError):
+            pass  # 缺失/损坏的缓存保留原句；check_cue_legibility 会提示改稿
     timeline, warnings = build_timeline(
-        script, track, source_duration, frame_rate=frame_rate, cfg=cfg.render
+        script, track, source_duration, frame_rate=frame_rate, cfg=cfg.render,
+        pause_evidence=pause_evidence,
     )
     # 可读性检查住在 render/subtitles.py 的 check_cue_legibility —— 只有它知道字号与画布宽度算出来
     # 的行数。接在这里而不是 build_timeline 里：render/timeline.py 压根不认识字体，而
@@ -1355,7 +1385,7 @@ async def run_pipeline(
 
             if "timeline" in wanted:
                 outputs = [paths.timeline(number), paths.subtitles(number)]
-                inputs = [paths.script(number), paths.voice(number), *video_inputs]
+                inputs = _timeline_inputs(paths, number, _load_voice(cfg, number), video_inputs)
                 if force or not is_fresh("timeline", number, outputs, inputs):
                     reporter.stage_start("timeline")
                     _, stage_warnings = run_timeline(cfg, episode=number)

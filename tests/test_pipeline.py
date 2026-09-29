@@ -33,6 +33,7 @@ from tenmin.pipeline import (
     _is_fresh,
     _is_fresh_stamped,
     _script_inputs,
+    _timeline_inputs,
     _translate_inputs,
     ingest_warnings,
     register_episode,
@@ -214,6 +215,28 @@ def test_is_fresh_true_when_no_input_exists(tmp_path):
     """
     out = _file(tmp_path / "out.txt")
     assert _is_fresh([out], [tmp_path / "never.txt"]) is True
+
+
+def test_timeline_freshness_tracks_cached_voice_audio_files(tmp_path):
+    from tenmin.models import VoiceChunk, VoiceTrack
+
+    paths = Paths(tmp_path)
+    audio = paths.voice_dir(2) / "chunk_001.mp3"
+    audio.parent.mkdir(parents=True)
+    audio.write_bytes(b"voice")
+    track = VoiceTrack(episode=2, chunks=[
+        VoiceChunk(beat_id="b1", index=1, text="长句，继续说。", path=audio.name, duration=3.0)
+    ])
+    for path in (paths.script(2), paths.voice(2)):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("input", encoding="utf-8")
+    timeline = paths.timeline(2)
+    timeline.parent.mkdir(parents=True, exist_ok=True)
+    timeline.write_text("output", encoding="utf-8")
+    _shift_mtime(timeline, 10.0)
+    assert _is_fresh([timeline], _timeline_inputs(paths, 2, track, []))
+    _shift_mtime(audio, 20.0)
+    assert not _is_fresh([timeline], _timeline_inputs(paths, 2, track, []))
 
 
 # work/ 下有 11 集的存量产物，产物路径改一个字符就等于全部存量产物失效（流水线会

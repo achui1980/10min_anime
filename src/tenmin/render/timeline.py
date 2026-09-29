@@ -7,7 +7,9 @@ clip 时长按 ratio 缩放（clip.end 是 LLM 猜的，只用来算比例）。
 from __future__ import annotations
 
 import math
+import re
 from collections.abc import Iterable
+from pathlib import Path
 
 from tenmin.config import DEFAULT_RENDER, RenderConfig
 from tenmin.models import (
@@ -21,6 +23,7 @@ from tenmin.models import (
     VoiceTrack,
 )
 from tenmin.render.chunks import split_sentences
+from tenmin.render.ffmpeg import run as run_ffmpeg
 from tenmin.script.budget import narration_chars
 
 # 画面与音频总时长的容忍差。超过就报 warning，不报错。
@@ -54,46 +57,79 @@ def align_to_frame(seconds: float, frame_rate: float | None) -> float:
 
 
 _DISPLAY_STOPS = "，、；,;"
+_PAUSE_MARKER = re.compile(r"silence_(start|end):\s*([0-9.]+)")
+# 实测 saijo E02 / akujo E11 的安全切点距停顿边缘最多约 0.223s；
+# 浴室句的危险切点距离两侧停顿均约 0.68s。容差只用于验收，绝不吸附时间轴。
+_PAUSE_EDGE_TOLERANCE = 0.25
 
 
-def _split_display(text: str, cap: int, min_seconds: float, duration: float) -> list[str]:
-    """只在自然停顿处拆显示文本；不安全时原句返回。"""
+def detect_voice_pauses(path: Path, *, ffmpeg: str = "ffmpeg") -> list[tuple[float, float]]:
+    """一次读取缓存 voice 音频，找出长于 0.12s 且低于 -30dB 的停顿（相对 chunk）。"""
+    stderr = run_ffmpeg(
+        [
+            "-hide_banner", "-i", str(path), "-af", "silencedetect=noise=-30dB:d=0.12",
+            "-f", "null", "-",
+        ],
+        ffmpeg=ffmpeg, timeout=60,
+    )
+    marks = [(kind, float(value)) for kind, value in _PAUSE_MARKER.findall(stderr)]
+    return [
+        (value, marks[index + 1][1])
+        for index, (kind, value) in enumerate(marks[:-1])
+        if kind == "start" and marks[index + 1][0] == "end"
+    ]
+
+
+def _split_display(
+    text: str, cap: int, min_seconds: float, duration: float, *,
+    pauses: list[tuple[float, float]] | None = None, offset: float = 0.0,
+) -> list[str]:
+    """优先较后的自然断点，失败则回溯；给了停顿证据时还须与音频吻合。"""
     if len(text) <= cap:
         return [text]
-    pieces: list[str] = []
-    rest = text
-    while len(rest) > cap:
+    total_weight = narration_chars(text)
+    if total_weight <= 0:
+        return [text]
+
+    def eligible(piece: str) -> bool:
+        return sum(ch.isalnum() for ch in piece) > 2 and (
+            duration * narration_chars(piece) / total_weight >= min_seconds
+        )
+
+    def choose(position: int) -> list[str] | None:
+        rest = text[position:]
+        if len(rest) <= cap:
+            return [rest] if eligible(rest) else None
         lower = max(1, int(cap * 0.6))
-        cuts = [
-            i for i in range(lower, min(cap, len(rest) - 1) + 1)
-            if rest[i - 1] in _DISPLAY_STOPS
-        ]
-        if not cuts:
-            return [text]
-        cut = cuts[-1]
-        pieces.append(rest[:cut])
-        rest = rest[cut:]
-    pieces.append(rest)
-    while len(pieces) > 1 and sum(ch.isalnum() for ch in pieces[-1]) <= 2:
-        tail = pieces.pop()
-        pieces[-1] += tail
-    if len(pieces) == 1 or any(sum(ch.isalnum() for ch in p) <= 2 for p in pieces):
-        return [text]
-    # sentence_cues 用 narration_chars（不计空白）分配时长；预检必须同口径，
-    # 否则尾部空格会让实际不足 min_seconds 的 cue 被误判为安全。
-    total_weight = sum(narration_chars(piece) for piece in pieces)
-    if any(
-        duration * narration_chars(piece) / total_weight < min_seconds
-        for piece in pieces
-    ):
-        return [text]
-    return pieces
+        for cut in range(min(cap, len(rest) - 1), lower - 1, -1):
+            if rest[cut - 1] not in _DISPLAY_STOPS:
+                continue
+            piece = rest[:cut]
+            if not eligible(piece):
+                continue
+            boundary = position + cut
+            predicted = offset + duration * narration_chars(text[:boundary]) / total_weight
+            if pauses is not None and not any(
+                start - _PAUSE_EDGE_TOLERANCE <= predicted <= end + _PAUSE_EDGE_TOLERANCE
+                for start, end in pauses
+            ):
+                continue
+            following = choose(boundary)
+            if following is not None:
+                return [piece, *following]
+        return None
+
+    return choose(0) or [text]
 
 
 def sentence_cues(
-    chunk: VoiceChunk, start: float, *, cfg: RenderConfig = DEFAULT_RENDER
+    chunk: VoiceChunk, start: float, *, cfg: RenderConfig = DEFAULT_RENDER,
+    pauses: list[tuple[float, float]] | None = None,
 ) -> list[SubtitleCue]:
     """把一个 chunk 的字幕按句切开，按字数比例分配 chunk.duration。
+
+    pauses 是 chunk 内相对音频起点的静音窗；None 保留直接调用的纯文本拆分行为，
+    空列表表示已经查过但没有可信静音，因而不得新增软拆显示 cue。
 
     一个 chunk 常常是好几句话拼起来一次性合成的（省 TTS 调用次数），
     但字幕不能整段话挂几十秒不动——观众读完第一句时，画面上该已经是第二句了。
@@ -118,13 +154,17 @@ def sentence_cues(
     """
     base = split_sentences(chunk.text)
     total_weight = sum(narration_chars(sentence) for sentence in base)
-    sentences = [
-        part for sentence in base
-        for part in _split_display(
+    sentences: list[str] = []
+    elapsed_weight = 0
+    for sentence in base:
+        weight = narration_chars(sentence)
+        sentences.extend(_split_display(
             sentence, cfg.subtitle_soft_max_chars, cfg.subtitle_min_seconds,
-            chunk.duration * narration_chars(sentence) / max(1, total_weight),
-        )
-    ]
+            chunk.duration * weight / max(1, total_weight),
+            pauses=pauses,
+            offset=chunk.duration * elapsed_weight / max(1, total_weight),
+        ))
+        elapsed_weight += weight
     if not sentences:
         return [SubtitleCue(start=start, end=start + chunk.duration, text=chunk.text)]
     if len(sentences) == 1:
@@ -229,6 +269,7 @@ def build_timeline(
     *,
     frame_rate: float | None = None,
     cfg: RenderConfig = DEFAULT_RENDER,
+    pause_evidence: dict[int, list[tuple[float, float]]] | None = None,
 ) -> tuple[Timeline, list[str]]:
     """按 beat 逐段重算画面时长，产出成片时间轴。
 
@@ -274,7 +315,10 @@ def build_timeline(
         # 音频游标：字幕与旁白落点都由它驱动
         for chunk in chunks:
             offsets.append(audio_cursor)
-            subtitles.extend(sentence_cues(chunk, audio_cursor, cfg=cfg))
+            subtitles.extend(sentence_cues(
+                chunk, audio_cursor, cfg=cfg,
+                pauses=None if pause_evidence is None else pause_evidence.get(id(chunk), []),
+            ))
             audio_cursor += chunk.duration + chunk.hold_after
 
         audio_seconds = beat_audio_seconds(chunks)

@@ -36,6 +36,7 @@ from tenmin.pipeline import (
     run_timeline,
     run_voice,
 )
+from tenmin.render.ffmpeg import FFmpegError
 from tenmin.render.subtitles import max_cells_per_line, render_ass
 from tenmin.render.tts import build_tts_engine
 from tenmin.render.video import build_render_args, quality_args
@@ -879,7 +880,7 @@ def test_run_timeline_legibility_check_can_be_switched_off(tmp_path):
     assert not any("字幕" in w for w in warnings)
 
 
-def test_run_timeline_passes_soft_cap_to_cues_and_legibility(tmp_path):
+def test_run_timeline_passes_soft_cap_to_cues_and_legibility(tmp_path, monkeypatch):
     cfg = _minimal_project(tmp_path)
     cfg.render.subtitle_soft_max_chars = 12
     cfg.render.subtitle_max_lines = 0
@@ -892,14 +893,147 @@ def test_run_timeline_passes_soft_cap_to_cues_and_legibility(tmp_path):
     track.chunks[0].hold_after = 0
     track.chunks = track.chunks[:1]
     paths.voice(1).write_text(track.model_dump_json(), encoding="utf-8")
+    audio = paths.voice_dir(1) / track.chunks[0].path
+    audio.parent.mkdir(parents=True, exist_ok=True)
+    audio.write_bytes(b"fake mp3")
+    seen = []
+
+    def fake_pauses(path, *, ffmpeg):
+        seen.append((path, ffmpeg))
+        return [(3.8, 4.2)]
+
+    monkeypatch.setattr("tenmin.pipeline.detect_voice_pauses", fake_pauses)
 
     timeline, warnings = run_timeline(cfg, episode=1, source_duration=100.0)
     assert len(timeline.subtitles) == 2
     assert "".join(c.text for c in timeline.subtitles) == text
     assert not any("过长" in w for w in warnings)
+    assert seen == [(audio, cfg.render.ffmpeg_path)]
 
     track.chunks[0].text = "这是一段没有任何停顿的很长很长很长的旁白"
     paths.voice(1).write_text(track.model_dump_json(), encoding="utf-8")
     timeline, warnings = run_timeline(cfg, episode=1, source_duration=100.0)
     assert len(timeline.subtitles) == 1
     assert any("过长且无法安全软拆" in w for w in warnings)
+    assert seen == [(audio, cfg.render.ffmpeg_path)]
+
+
+def test_run_timeline_missing_audio_keeps_long_sentence_and_warns(tmp_path):
+    cfg = _minimal_project(tmp_path)
+    cfg.render.subtitle_soft_max_chars = 12
+    _write_voice_and_script(cfg)
+    paths = Paths(cfg.root)
+    track = VoiceTrack.model_validate_json(paths.voice(1).read_text(encoding="utf-8"))
+    track.chunks[0].text = "一二三四五六七八，九十一二三四五六。"
+    track.chunks[0].duration = 8.0
+    track.chunks = track.chunks[:1]
+    paths.voice(1).write_text(track.model_dump_json(), encoding="utf-8")
+
+    timeline, warnings = run_timeline(cfg, episode=1, source_duration=100.0)
+    assert [cue.text for cue in timeline.subtitles] == [track.chunks[0].text]
+    assert any("过长" in w for w in warnings)
+
+
+def test_run_timeline_failed_analysis_keeps_long_sentence_and_warns(tmp_path, monkeypatch):
+    cfg = _minimal_project(tmp_path)
+    cfg.render.subtitle_soft_max_chars = 12
+    _write_voice_and_script(cfg)
+    paths = Paths(cfg.root)
+    track = VoiceTrack.model_validate_json(paths.voice(1).read_text(encoding="utf-8"))
+    track.chunks[0].text = "一二三四五六七八，九十一二三四五六。"
+    track.chunks[0].duration = 8.0
+    track.chunks = track.chunks[:1]
+    paths.voice(1).write_text(track.model_dump_json(), encoding="utf-8")
+    audio = paths.voice_dir(1) / track.chunks[0].path
+    audio.parent.mkdir(parents=True, exist_ok=True)
+    audio.write_bytes(b"broken mp3")
+
+    def fail(*args, **kwargs):
+        raise FFmpegError("无法分析")
+
+    monkeypatch.setattr("tenmin.pipeline.detect_voice_pauses", fail)
+    timeline, warnings = run_timeline(cfg, episode=1, source_duration=100.0)
+    assert [cue.text for cue in timeline.subtitles] == [track.chunks[0].text]
+    assert any("过长" in w for w in warnings)
+
+
+def test_run_timeline_skips_audio_analysis_without_proposed_soft_cuts(tmp_path, monkeypatch):
+    cfg = _minimal_project(tmp_path)
+    cfg.render.subtitle_soft_max_chars = 12
+    _write_voice_and_script(cfg)
+    paths = Paths(cfg.root)
+    track = VoiceTrack.model_validate_json(paths.voice(1).read_text(encoding="utf-8"))
+    track.chunks[0].text = "没有可拆分标点的一段很长很长的旁白"
+    track.chunks = track.chunks[:1]
+    paths.voice(1).write_text(track.model_dump_json(), encoding="utf-8")
+    audio = paths.voice_dir(1) / track.chunks[0].path
+    audio.parent.mkdir(parents=True, exist_ok=True)
+    audio.write_bytes(b"fake mp3")
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("没有新软拆候选不应探测配音")
+
+    monkeypatch.setattr("tenmin.pipeline.detect_voice_pauses", forbidden)
+    timeline, warnings = run_timeline(cfg, episode=1, source_duration=100.0)
+    assert len(timeline.subtitles) == 1
+    assert any("过长" in w for w in warnings)
+
+
+def test_run_timeline_verifies_generated_voice_pause_before_soft_split(tmp_path):
+    import shutil
+    import subprocess
+
+    if shutil.which("ffmpeg") is None:
+        pytest.skip("需要 ffmpeg 生成并分析本地测试音频")
+    cfg = _minimal_project(tmp_path)
+    cfg.render.subtitle_soft_max_chars = 12
+    _write_voice_and_script(cfg)
+    paths = Paths(cfg.root)
+    track = VoiceTrack.model_validate_json(paths.voice(1).read_text(encoding="utf-8"))
+    text = "一二三四五六七八，九十一二三四五六。"
+    track.chunks[0].text = text
+    track.chunks[0].path = "chunk_001.wav"
+    track.chunks[0].duration = 8.0
+    track.chunks = track.chunks[:1]
+    paths.voice(1).write_text(track.model_dump_json(), encoding="utf-8")
+    audio = paths.voice_dir(1) / track.chunks[0].path
+    audio.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run([
+        "ffmpeg", "-v", "error", "-f", "lavfi", "-i", "sine=frequency=440:duration=3.8",
+        "-f", "lavfi", "-i", "anullsrc=r=44100:cl=mono:d=0.4",
+        "-f", "lavfi", "-i", "sine=frequency=440:duration=3.8",
+        "-filter_complex", "[0:a][1:a][2:a]concat=n=3:v=0:a=1[a]",
+        "-map", "[a]", str(audio),
+    ], check=True, capture_output=True)
+
+    timeline, warnings = run_timeline(cfg, episode=1, source_duration=100.0)
+    assert [cue.text for cue in timeline.subtitles] == ["一二三四五六七八，", "九十一二三四五六。"]
+    assert timeline.subtitles[0].end == pytest.approx(4.0)
+    assert not any("过长" in warning for warning in warnings)
+
+
+def test_run_timeline_analyzes_multi_cut_chunk_only_once(tmp_path, monkeypatch):
+    cfg = _minimal_project(tmp_path)
+    cfg.render.subtitle_soft_max_chars = 12
+    _write_voice_and_script(cfg)
+    paths = Paths(cfg.root)
+    track = VoiceTrack.model_validate_json(paths.voice(1).read_text(encoding="utf-8"))
+    text = "甲" * 7 + "，" + "乙" * 3 + "，" + "丙" * 4 + "，" + "丁" * 11
+    track.chunks[0].text = text
+    track.chunks[0].duration = 28.0
+    track.chunks = track.chunks[:1]
+    paths.voice(1).write_text(track.model_dump_json(), encoding="utf-8")
+    audio = paths.voice_dir(1) / track.chunks[0].path
+    audio.parent.mkdir(parents=True, exist_ok=True)
+    audio.write_bytes(b"fake mp3")
+    calls: list[Path] = []
+
+    def fake_pauses(path, *, ffmpeg):
+        calls.append(path)
+        return [(7.9, 8.1), (16.9, 17.1)]
+
+    monkeypatch.setattr("tenmin.pipeline.detect_voice_pauses", fake_pauses)
+    timeline, _ = run_timeline(cfg, episode=1, source_duration=100.0)
+    assert calls == [audio]
+    assert [cue.end for cue in timeline.subtitles] == pytest.approx([8.0, 17.0, 28.0])
+    assert "".join(cue.text for cue in timeline.subtitles) == text

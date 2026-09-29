@@ -1,4 +1,8 @@
+import json
+import shutil
+import subprocess
 from itertools import pairwise
+from pathlib import Path
 
 import pytest
 
@@ -11,6 +15,7 @@ from tenmin.render.timeline import (
     beat_clip_seconds,
     build_timeline,
     chunks_by_beat,
+    detect_voice_pauses,
     scale_ratio,
     sentence_cues,
 )
@@ -176,6 +181,87 @@ def test_display_split_uses_actual_cue_weights_for_minimum_duration(seconds, exp
     assert all(cue.end - cue.start >= cfg.subtitle_min_seconds for cue in cues)
     if len(cues) == 2:
         assert cues[-1].end - cues[-1].start == pytest.approx(seconds * 3 / 12)
+
+
+def test_display_split_tries_earlier_stop_when_greedy_choice_strands_remainder():
+    text = "甲" * 7 + "，" + "乙" * 3 + "，" + "丙" * 4 + "，" + "丁" * 11
+    chunk = VoiceChunk(beat_id="b1", index=1, text=text, path="c.mp3", duration=14.0)
+    cues = sentence_cues(chunk, 0.0, cfg=RenderConfig(subtitle_soft_max_chars=12))
+    assert [cue.text for cue in cues] == [
+        "甲" * 7 + "，", "乙" * 3 + "，" + "丙" * 4 + "，", "丁" * 11,
+    ]
+    assert "".join(cue.text for cue in cues) == text
+    assert all(a.end == b.start for a, b in pairwise(cues))
+    assert cues[-1].end == 14.0
+
+
+def test_display_split_rejects_unverified_boundary_without_snapping():
+    text = "一二三四五六七八，九十一二三四五六。"
+    chunk = VoiceChunk(beat_id="b1", index=1, text=text, path="c.mp3", duration=8.0)
+    cfg = RenderConfig(subtitle_soft_max_chars=12)
+    assert [c.text for c in sentence_cues(chunk, 0.0, cfg=cfg, pauses=[])] == [text]
+    # 预测切点是 4 秒；0.25s 以内才允许，时间仍是预测值而非停顿边界。
+    accepted = sentence_cues(chunk, 0.0, cfg=cfg, pauses=[(4.20, 4.50)])
+    assert len(accepted) == 2
+    assert accepted[0].end == pytest.approx(4.0)
+    assert [c.text for c in sentence_cues(chunk, 0.0, cfg=cfg, pauses=[(4.251, 4.50)])] == [text]
+
+
+def test_build_timeline_passes_per_chunk_pause_evidence_to_display_only():
+    cfg = RenderConfig(subtitle_soft_max_chars=12)
+    text = "一二三四五六七八，九十一二三四五六。"
+    chunk = VoiceChunk(beat_id="b1", index=1, text=text, path="c.mp3", duration=8.0)
+    track = VoiceTrack(episode=2, chunks=[chunk], total_seconds=8.0)
+    script = one_beat_script([Clip(episode=2, start=100, end=108)])
+    timeline, _ = build_timeline(
+        script, track, 1400.0, cfg=cfg, pause_evidence={id(chunk): []}
+    )
+    assert [cue.text for cue in timeline.subtitles] == [text]
+    assert timeline.narration_offsets == [0.0]
+    assert timeline.total_seconds == 8.0
+
+
+def test_display_split_can_fall_back_to_earlier_audio_verified_cut():
+    text = "甲" * 7 + "，" + "乙" * 3 + "，" + "丙" * 4 + "，" + "丁" * 11
+    chunk = VoiceChunk(beat_id="b1", index=1, text=text, path="c.mp3", duration=28.0)
+    cfg = RenderConfig(subtitle_soft_max_chars=12)
+    # 最后可选断点 12s 无静音；较早的 8s + 后续 17s 可用。
+    cues = sentence_cues(chunk, 0.0, cfg=cfg, pauses=[(7.9, 8.1), (16.9, 17.1)])
+    assert [c.end for c in cues] == pytest.approx([8.0, 17.0, 28.0])
+
+
+def test_cached_real_chunk_rejects_the_unverified_bathroom_cut():
+    original = Path(__file__).resolve().parents[3] / "work/saijo/04_voice/E02"
+    audio = original / "chunk_009.mp3"
+    meta = original.parent / "E02.voice.json"
+    if not audio.is_file() or not meta.is_file() or shutil.which("ffmpeg") is None:
+        pytest.skip("原仓真实缓存配音不在当前环境")
+    chunk = VoiceChunk(**next(
+        item for item in json.loads(meta.read_text(encoding="utf-8"))["chunks"]
+        if item["path"] == audio.name
+    ))
+    pauses = detect_voice_pauses(audio)
+    cues = sentence_cues(chunk, 0, pauses=pauses)
+    assert any(c.text.endswith("浴室，") for c in sentence_cues(chunk, 0)[:-1])
+    assert all(not c.text.endswith("浴室，") for c in cues[:-1])
+    assert "".join(c.text for c in cues) == chunk.text
+    assert cues[-1].end == chunk.duration
+
+
+def test_detect_voice_pauses_from_generated_wav(tmp_path):
+    if shutil.which("ffmpeg") is None:
+        pytest.skip("需要 ffmpeg 生成并分析本地测试音频")
+    wav = tmp_path / "voice.wav"
+    subprocess.run([
+        "ffmpeg", "-v", "error", "-f", "lavfi", "-i",
+        "sine=frequency=440:duration=0.5", "-f", "lavfi", "-i",
+        "anullsrc=r=44100:cl=mono:d=0.35", "-f", "lavfi", "-i",
+        "sine=frequency=440:duration=0.5", "-filter_complex",
+        "[0:a][1:a][2:a]concat=n=3:v=0:a=1[a]", "-map", "[a]", str(wav),
+    ], check=True, capture_output=True)
+    pauses = detect_voice_pauses(wav)
+    assert any(start == pytest.approx(0.5, abs=0.03) and end == pytest.approx(0.85, abs=0.03)
+               for start, end in pauses)
 
 
 def test_display_split_respects_existing_sentence_weights_and_exact_end():
