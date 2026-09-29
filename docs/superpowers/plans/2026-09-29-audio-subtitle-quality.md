@@ -916,17 +916,21 @@ Required tests use monkeypatched `audio.run` to assert origin meter graph has `[
 
 **Files:** Modify `src/tenmin/render/audio.py:255-302`; Test `tests/test_render_audio.py`, `tests/test_audio_quality.py`.
 
-**Interfaces:** `_loudnorm_stats(stderr: str)->dict[str,float]|None` parses finite `input_i,input_tp,input_lra,input_thresh,target_offset`; `_loudnorm_filter(cfg:RenderConfig, measured:dict[str,float]|None)->str`. `mix_audio(..., cfg:RenderConfig=DEFAULT_RENDER, warnings:list[str]|None=None, ffprobe:str=DEFAULT_RENDER.ffprobe_path) -> Path` retains existing parameters. First pass full finalized graph → loudnorm to null (no lossy intermediate); second pass same inputs/graph + measured params → AAC in atomic `.part.m4a`. Final meter probes *encoded part*, not graph output, including TP. Fatal failure does not replace previous file. All-silent stats → encode unnormalized full graph with warning, skip invalid measured params. On impossible I/TP combination keep TP and warn measured I deviation (>1 LU). Duration tolerance 0.1s and TP tolerance 0.1 dB (e.g. max measured TP = −1.4 for configured −1.5).
+**Interfaces:** `_loudnorm_stats(stderr: str)->dict[str,float]|None` parses finite `input_i,input_tp,input_lra,input_thresh,target_offset`; `_loudnorm_explicit_silence(stderr: str)->bool` accepts only valid loudnorm JSON with both `input_i` and `input_tp` equal to `-inf`; `_loudnorm_filter(cfg:RenderConfig, measured:dict[str,float]|None)->str`. `mix_audio(..., cfg:RenderConfig=DEFAULT_RENDER, warnings:list[str]|None=None, ffprobe:str=DEFAULT_RENDER.ffprobe_path) -> Path` retains existing parameters. First pass full finalized graph → loudnorm to null (no lossy intermediate); second pass same inputs/graph + measured params → AAC in atomic `.part.m4a`. Final meter probes *encoded part*, not graph output, including TP. Fatal failure does not replace previous file. Explicit all-silent stats → encode unnormalized full graph with warning, skip invalid measured params; absent/malformed stats → fail without replacing output. On impossible I/TP combination keep TP and warn measured I deviation (>1 LU). Duration tolerance 0.1s and TP tolerance 0.1 dB (e.g. max measured TP = −1.4 for configured −1.5).
 
 - [ ] **Step 1: Red tests** append in `tests/test_render_audio.py`:
 
 ```python
 def test_loudnorm_stats_ignores_nonfinite_and_reads_final_json():
-    from tenmin.render.audio import _loudnorm_stats
+    from tenmin.render.audio import _loudnorm_explicit_silence, _loudnorm_stats
     good = ('{"input_i":"-23.9","input_tp":"-3","input_lra":"4",'
             '"input_thresh":"-34","target_offset":"0.1"}')
     assert _loudnorm_stats("header\n" + good)["input_i"] == -23.9
     assert _loudnorm_stats(good.replace('"-23.9"', '"-inf"')) is None
+    assert not _loudnorm_explicit_silence("")
+    assert not _loudnorm_explicit_silence(good.replace('"-23.9"', '"-inf"'))
+    silent = good.replace('"-23.9"', '"-inf"').replace('"-3"', '"-inf"')
+    assert _loudnorm_explicit_silence(silent)
 
 
 def test_input_changed_between_two_passes_keeps_old_audio(tmp_path, monkeypatch):
@@ -951,6 +955,23 @@ def test_input_changed_between_two_passes_keeps_old_audio(tmp_path, monkeypatch)
     assert out.read_bytes() == b"good old audio"
     assert out.stat().st_mtime_ns == before
     assert not part_path(out).exists()
+
+
+@pytest.mark.parametrize("bad_report", ["", "not loudnorm json", '{"input_i":"-inf"}'])
+def test_bad_first_meter_never_replaces_audio(tmp_path, monkeypatch, bad_report):
+    from tenmin.render import audio as module
+    from tenmin.render.ffmpeg import FFmpegError
+    video, voice_dir, out = tmp_path / "video.mkv", tmp_path / "voice", tmp_path / "out.m4a"
+    video.write_bytes(b"original")
+    voice_dir.mkdir()
+    for chunk in make_track().chunks:
+        (voice_dir / chunk.path).write_bytes(b"voice")
+    out.write_bytes(b"good old audio")
+    monkeypatch.setattr(module, "run", lambda args, **kwargs: bad_report)
+    with pytest.raises(FFmpegError, match="首遍响度测量"):
+        module.mix_audio(video=video, timeline=make_timeline(), track=make_track(),
+                         voice_dir=voice_dir, out_path=out, duck_db=-12)
+    assert out.read_bytes() == b"good old audio"
 ```
 
 Expand `tests/test_audio_quality.py` to generate source `sine` WAV and voice WAV, create `Timeline(episode=2, segments=[TimelineSegment(beat_id="b1", source_start=0, source_end=3, timeline_start=0, timeline_end=3)], narration_offsets=[0], total_seconds=3)` and `VoiceTrack(episode=2,chunks=[VoiceChunk(beat_id="b1",index=1,text="配音",path="voice.wav",duration=3)])`. Invoke `mix_audio(video=source, timeline=..., track=..., voice_dir=tmp_path, out_path=tmp_path/"out.m4a", duck_db=-12, fade_out_seconds=0, outro_seconds=0)`; meter final file using `loudnorm=I=-14:TP=-1.5:LRA=11:print_format=json` to parse **input** values: integrated within ±1 LU when tone is feasible; TP ≤−1.4 dBTP; `probe_duration` within 0.1s. Generate silent source/voice using `anullsrc`, assert warning and resulting silence; generate high-crest pulse (mix short high-amplitude tone into low sine) to check TP still capped and I discrepancy warns. Inject failure at each subprocess boundary (meter, encode, encoded recheck, duration probe), assert previous bytes/mtime and no `.part` file. Tests run by default, do not mark `render` (marker would skip them).
@@ -973,6 +994,20 @@ def _loudnorm_stats(stderr: str) -> dict[str, float] | None:
     return None
 
 
+def _loudnorm_explicit_silence(stderr: str) -> bool:
+    decoder = json.JSONDecoder()
+    for pos in range(len(stderr) - 1, -1, -1):
+        if stderr[pos] != "{":
+            continue
+        try:
+            item, _ = decoder.raw_decode(stderr[pos:])
+            return (isinstance(item, dict) and item.get("input_i") == "-inf"
+                    and item.get("input_tp") == "-inf")
+        except ValueError:
+            continue
+    return False
+
+
 def _loudnorm_filter(cfg: RenderConfig, measured: dict[str, float] | None = None) -> str:
     base = f"loudnorm=I={cfg.loudness_i:g}:TP={cfg.loudness_tp:g}:LRA={cfg.loudness_lra:g}"
     if measured is None:
@@ -986,7 +1021,7 @@ def _input_identity(paths: list[Path]) -> tuple[tuple[str, int, int], ...]:
     return tuple((str(p.resolve()), p.stat().st_size, p.stat().st_mtime_ns) for p in paths)
 ```
 
-Construct first/second args from the *same* shared `_origin_parts + _voice_parts + _final_mix_parts` used by `build_mix_args`; append loudnorm after `[limited]` with `;[limited]{filter}[normalized]`, map `[normalized]` for encode. First pass run `ffmpeg.run([...,'-f','null','-'])`; stats from stderr. If no finite stats, append all-silence warning and encode the unnormalized `[limited]` branch. Source and every chunk identity before first pass, after first pass, and after encode before publication; on mismatch `raise FFmpegError("混音输入在两遍之间发生变化，拒绝发布")`. All actual encode args write to `atomic_path(out_path)` through existing `run_with_progress(... total_seconds=timeline.output_seconds(outro_seconds))`. For final encoded measurement use `run(['-hide_banner','-i',str(part),'-af',_loudnorm_filter(cfg),'-f','null','-'])`; check `input_tp` <= `cfg.loudness_tp + 0.1`; warn when `abs(input_i-cfg.loudness_i)>1` or none on all silence; check `abs(probe_duration(part,ffprobe=ffprobe)-timeline.output_seconds(outro_seconds))<=0.1`. If measurement output malformed and audio is **not** all silent, fail with `FFmpegError` instead of publishing unverified peak. Wrap all final checks INSIDE `atomic_path`. `linear=false` means dynamic loudnorm respects TP if linear gain impossible; keep existing `alimiter` before loudnorm, never clamp after it and lie about TP.
+Construct first/second args from the *same* shared `_origin_parts + _voice_parts + _final_mix_parts` used by `build_mix_args`; append loudnorm after `[limited]` with `;[limited]{filter}[normalized]`, map `[normalized]` for encode. First pass run `ffmpeg.run([...,'-f','null','-'])`; stats from stderr. If no finite stats, accept silence only when `_loudnorm_explicit_silence(first_report)` is true; otherwise raise `FFmpegError` before encoding. Source and every chunk identity before first pass, after first pass, and after encode before publication; on mismatch `raise FFmpegError("混音输入在两遍之间发生变化，拒绝发布")`. All actual encode args write to `atomic_path(out_path)` through existing `run_with_progress(... total_seconds=timeline.output_seconds(outro_seconds))`. For final encoded measurement use `run(['-hide_banner','-i',str(part),'-af',_loudnorm_filter(cfg),'-f','null','-'])`; check `input_tp` <= `cfg.loudness_tp + 0.1`; warn when `abs(input_i-cfg.loudness_i)>1` or explicitly silent; check `abs(probe_duration(part,ffprobe=ffprobe)-timeline.output_seconds(outro_seconds))<=0.1`. Missing/malformed final stats fail even when the first pass reported silence; only explicit silence in the final report permits the silent fallback. Wrap all final checks INSIDE `atomic_path`. `linear=false` means dynamic loudnorm respects TP if linear gain impossible; keep existing `alimiter` before loudnorm, never clamp after it and lie about TP.
 
 The concrete flow for the body of `mix_audio` is (insert *after* the signature's existing `reporter`, `ffmpeg` parameters the new `cfg`, `warnings`, `ffprobe` keyword parameters from the Interfaces block; `full_args` is a local helper):
 
@@ -1020,10 +1055,13 @@ def full_args(dest: str, *, measured: dict[str, float] | None,
 # Include all meter runs in input guard, not just the main two passes.
 if _input_identity(sources) != identity:
     raise FFmpegError("混音输入在测量期间发生变化，拒绝发布")
-stats = _loudnorm_stats(run(full_args("-", measured=None), ffmpeg=ffmpeg))
+first_report = run(full_args("-", measured=None), ffmpeg=ffmpeg)
+stats = _loudnorm_stats(first_report)
 if _input_identity(sources) != identity:
     raise FFmpegError("混音输入在两遍之间发生变化，拒绝发布")
 if stats is None:
+    if not _loudnorm_explicit_silence(first_report):
+        raise FFmpegError("首遍响度测量结果缺失或格式错误，拒绝发布")
     notices.append("整片无有效响度统计（全静音），按原静音编码")
 with atomic_path(out_path) as part:
     args = full_args(str(part), measured=stats, silent=stats is None)
@@ -1031,10 +1069,10 @@ with atomic_path(out_path) as part:
                       on_progress=percent_reporter(reporter, "audio"), ffmpeg=ffmpeg)
     if _input_identity(sources) != identity:
         raise FFmpegError("混音输入在编码期间发生变化，拒绝发布")
-    measured_out = _loudnorm_stats(run(["-hide_banner", "-i", str(part), "-af",
-                                        _loudnorm_filter(cfg), "-f", "null", "-"],
-                                       ffmpeg=ffmpeg))
-    if measured_out is None and stats is not None:
+    final_report = run(["-hide_banner", "-i", str(part), "-af",
+                        _loudnorm_filter(cfg), "-f", "null", "-"], ffmpeg=ffmpeg)
+    measured_out = _loudnorm_stats(final_report)
+    if measured_out is None and not (stats is None and _loudnorm_explicit_silence(final_report)):
         raise FFmpegError("编码后响度/真峰值读不出，拒绝发布")
     if measured_out is not None:
         if measured_out["input_tp"] > cfg.loudness_tp + 0.1:
@@ -1051,7 +1089,7 @@ if warnings is not None:
 return out_path
 ```
 
-`full_args("-", ...)` must not include an earlier `-c:a/-b:a` before `-f null`; when building the list slice, use the first `-c:a` index as in the code. `run_with_progress`'s output argument remains the same-directory `.part.m4a`, preserving ffmpeg muxer inference. A zero-signal final `loudnorm` JSON can contain `-inf`: in that one case treat absent measured_out as expected, not an error. `_input_identity` uses size+nanosecond mtime and checks again before replace (an input changed with identical size+reset mtime is outside this practical guard; do not claim it detects such tampering). The first-pass `loudnorm` with no `measured_` parameters is a **meter**: append `[normalized]` to null, parse the `input_*` fields; the second pass alone encodes.
+`full_args("-", ...)` must not include an earlier `-c:a/-b:a` before `-f null`; when building the list slice, use the first `-c:a` index as in the code. `run_with_progress`'s output argument remains the same-directory `.part.m4a`, preserving ffmpeg muxer inference. A zero-signal final `loudnorm` JSON can contain `-inf`: only a valid JSON report explicitly showing both `input_i` and `input_tp` as `-inf` may bypass finite-stats checks when the first pass was also explicitly silent. `_input_identity` uses size+nanosecond mtime and checks again before replace (an input changed with identical size+reset mtime is outside this practical guard; do not claim it detects such tampering). The first-pass `loudnorm` with no `measured_` parameters is a **meter**: append `[normalized]` to null, parse the `input_*` fields; the second pass alone encodes.
 - [ ] **Step 4: Adapt old mock tests** in `tests/test_render_audio.py` / `tests/test_pipeline.py`: current mock ffmpeg writes a byte and has no real loudnorm JSON, so inject fake `run` returning finite JSON, `probe_duration` returning `timeline.output_seconds(...)`, and `run_with_progress` writing fake part bytes. Assert two graph passes use identical `-i` inputs and exactly the same base mix graph before appended loudnorm; check final measurement reads `.part` and previous file survives injected failures.
 - [ ] **Step 5: Green.** `uv run pytest tests/test_render_audio.py tests/test_audio_quality.py tests/test_pipeline.py tests/test_config_wiring.py -q`; expected PASS. If AAC overshoots configured TP, use a small *internal* safety margin for loudnorm target and retain hard verification of configured ceiling; never publish over-limit file.
 - [ ] **Step 6: Commit.** `git add src/tenmin/render/audio.py tests/test_render_audio.py tests/test_audio_quality.py tests/test_pipeline.py tests/test_config_wiring.py && git commit -m "feat: normalize final mix with encoded true-peak verification"`.
