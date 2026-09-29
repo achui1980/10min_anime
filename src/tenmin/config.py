@@ -336,6 +336,7 @@ class ValidateConfig(StrictModel):
     # 取一半留两倍余量。做成旋钮是因为「最短能用的镜头有多长」本身是剪辑风格
     # （快切风格的番会想调低）。
     min_clip_seconds: float = Field(default=1.5, gt=0)
+    hold_clip_max_gap_seconds: float = Field(default=3.0, ge=0)
 
     # A1 时间轴单调性：本节点画面起点比上一节点倒退超过这么多秒才报 warning。
     # 倒叙是合法创作手法，所以只报不拦。实测 13 份样本按「beat 内 clip 起点最小值」
@@ -382,6 +383,7 @@ class RenderConfig(StrictModel):
     # (chunk 时长 / chunk 字数)，而 render/tts.py 的时长体检把后者压在 ≈0.11 秒/字以上，
     # 所以一两个字的句子落在 0.11–0.44 秒 —— 可达，只是这一季没出现（默认报 0 条）。
     subtitle_min_seconds: float = Field(default=0.7, ge=0)
+    subtitle_soft_max_chars: int = Field(default=36, gt=0)
 
     # --- 已接线：视频编码质量（render/video.py 的 quality_args）---
     crf: str = "20"
@@ -420,6 +422,13 @@ class RenderConfig(StrictModel):
     # alimiter 的天花板（线性幅度，1.0 = 满刻度）。1.0 时对没超标的信号完全透明，
     # 见 render/audio.py 里那段听感验证。想留 headroom 的项目可以调到 0.891（-1dB）。
     limiter_ceiling: float = Field(default=1.0, gt=0, le=1)
+    hold_relative_lu: float = Field(default=3.0, ge=0)
+    hold_gain_max_db: float = Field(default=6.0, ge=0)
+    hold_silence_floor_lufs: float = Field(default=-40.0, le=0)
+    hold_fade_seconds: float = Field(default=0.1, ge=0)
+    loudness_i: float = Field(default=-14.0, lt=0)
+    loudness_tp: float = Field(default=-1.5, le=0)
+    loudness_lra: float = Field(default=11.0, gt=0)
 
     # --- 已接线：片尾黑卡、TTS 与外部二进制 ---
     # 片尾黑卡 drawtext 用的字体（走 pipeline.run_render → render/video.py 的

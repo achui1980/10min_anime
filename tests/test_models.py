@@ -12,6 +12,7 @@ from tenmin.models import (
     DialogueTrack,
     Highlight,
     Hold,
+    HoldWindow,
     LLMBeat,
     LLMClip,
     LLMScript,
@@ -316,6 +317,24 @@ def test_timeline_roundtrips_json():
     )
     restored = Timeline.model_validate_json(timeline.model_dump_json())
     assert restored == timeline
+
+
+def test_old_timeline_has_no_windows_and_new_timeline_round_trips():
+    assert Timeline.model_validate_json('{"episode":2}').hold_windows == []
+    window = HoldWindow(
+        beat_id="b", hold_index=0, quote="金句", episode=2,
+        source_start=10, source_end=11, start=2, end=3,
+    )
+    item = Timeline(episode=2, hold_windows=[window])
+    assert Timeline.model_validate_json(item.model_dump_json()).hold_windows == [window]
+
+
+def test_hold_window_rejects_negative_index():
+    with pytest.raises(ValidationError):
+        HoldWindow(
+            beat_id="b", hold_index=-1, quote="金句", episode=2,
+            source_start=10, source_end=11, start=2, end=3,
+        )
 
 
 def test_timeline_output_seconds_is_the_body_plus_the_outro_card():

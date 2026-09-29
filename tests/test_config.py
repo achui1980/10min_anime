@@ -209,6 +209,38 @@ def test_render_config_defaults():
     assert cfg.outro_message == "解说结束，谢谢观看"
 
 
+def test_quality_knob_defaults():
+    assert ValidateConfig().hold_clip_max_gap_seconds == 3.0
+    cfg = RenderConfig()
+    assert (
+        cfg.subtitle_soft_max_chars,
+        cfg.hold_relative_lu,
+        cfg.hold_gain_max_db,
+        cfg.hold_silence_floor_lufs,
+        cfg.hold_fade_seconds,
+    ) == (36, 3.0, 6.0, -40.0, 0.1)
+    assert (cfg.loudness_i, cfg.loudness_tp, cfg.loudness_lra) == (-14.0, -1.5, 11.0)
+
+
+@pytest.mark.parametrize(
+    ("model", "field", "value"),
+    [
+        (ValidateConfig, "hold_clip_max_gap_seconds", -1),
+        (RenderConfig, "subtitle_soft_max_chars", 0),
+        (RenderConfig, "hold_relative_lu", -1),
+        (RenderConfig, "hold_gain_max_db", -1),
+        (RenderConfig, "hold_silence_floor_lufs", 1),
+        (RenderConfig, "hold_fade_seconds", -1),
+        (RenderConfig, "loudness_i", 0),
+        (RenderConfig, "loudness_tp", 1),
+        (RenderConfig, "loudness_lra", 0),
+    ],
+)
+def test_quality_knobs_reject_out_of_bounds(model, field, value):
+    with pytest.raises(ValidationError):
+        model.model_validate({field: value})
+
+
 def test_project_config_has_render_defaults():
     cfg = ProjectConfig(show="剧名", slug="slug")
     assert cfg.render.voice == "zh-CN-YunxiNeural"

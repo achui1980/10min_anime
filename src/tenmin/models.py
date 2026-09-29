@@ -414,6 +414,17 @@ class SubtitleCue(_StageModel):
     text: str
 
 
+class HoldWindow(_StageModel):
+    beat_id: str
+    hold_index: int = Field(ge=0)
+    quote: str
+    episode: int
+    source_start: float
+    source_end: float
+    start: float
+    end: float
+
+
 class Timeline(_StageModel):
     """v2 的人工编辑面。改完它跑 --from audio 就能重出片。"""
 
@@ -421,6 +432,7 @@ class Timeline(_StageModel):
     segments: list[TimelineSegment] = Field(default_factory=list)
     subtitles: list[SubtitleCue] = Field(default_factory=list)
     narration_offsets: list[float] = Field(default_factory=list)
+    hold_windows: list[HoldWindow] = Field(default_factory=list)
     total_seconds: float = 0.0
     # 源片帧率（fps）。**None = 上游没探到**（只有 SRT 没有视频的降级路径，或者调用方
     # 自己注入了 source_duration 却没给帧率），不是「帧率是 0」。

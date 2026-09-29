@@ -204,6 +204,25 @@ def test_a_config_change_reaches_exactly_the_stages_that_read_it(
     assert _changed(cfg, _with(cfg, field, value)) == expected
 
 
+@pytest.mark.parametrize(
+    ("field", "value", "expected"),
+    [
+        ("validate_script.hold_clip_max_gap_seconds", 4.0, {"script"}),
+        ("render.subtitle_soft_max_chars", 30, {"timeline"}),
+        ("render.hold_relative_lu", 2, {"audio"}),
+        ("render.hold_gain_max_db", 5, {"audio"}),
+        ("render.hold_silence_floor_lufs", -42, {"audio"}),
+        ("render.hold_fade_seconds", 0.2, {"audio"}),
+        ("render.loudness_i", -16, {"audio"}),
+        ("render.loudness_tp", -2, {"audio"}),
+        ("render.loudness_lra", 9, {"audio"}),
+    ],
+)
+def test_quality_field_affects_its_first_consumer(tmp_path, field, value, expected):
+    cfg = _cfg(tmp_path)
+    assert _changed(cfg, _with(cfg, field, value)) == expected
+
+
 def test_an_episode_change_reaches_ingest_and_the_source_video_stages(tmp_path):
     cfg = _cfg(tmp_path)
     moved = cfg.episodes[0].model_copy(update={"op_range": (140.0, 220.0)})
