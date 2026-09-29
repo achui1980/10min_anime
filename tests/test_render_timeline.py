@@ -7,7 +7,19 @@ from pathlib import Path
 import pytest
 
 from tenmin.config import RenderConfig
-from tenmin.models import AudioDirection, Beat, Clip, Hold, Script, VoiceChunk, VoiceTrack
+from tenmin.models import (
+    AudioDirection,
+    Beat,
+    Clip,
+    DialogueLine,
+    DialogueTrack,
+    Hold,
+    Script,
+    Timeline,
+    TimelineSegment,
+    VoiceChunk,
+    VoiceTrack,
+)
 from tenmin.render.subtitles import check_cue_legibility
 from tenmin.render.timeline import (
     align_to_frame,
@@ -16,8 +28,10 @@ from tenmin.render.timeline import (
     build_timeline,
     chunks_by_beat,
     detect_voice_pauses,
+    hold_coverage,
     scale_ratio,
     sentence_cues,
+    source_intervals,
 )
 
 
@@ -49,6 +63,218 @@ def two_chunk_track() -> VoiceTrack:
         ),
     ]
     return VoiceTrack(episode=2, chunks=chunks, total_seconds=20.0)
+
+
+def quote_track(start=108.0, end=109.0):
+    return DialogueTrack(episode=2, duration=1000, lines=[
+        DialogueLine(idx=1, start=start, end=end, text="关键台词", raw="关键台词")])
+
+
+def hold_script():
+    return one_beat_script([Clip(episode=2, start=100, end=120)],
+                           [Hold(at=1, duration=2, quote="关键台词")])
+
+
+def test_quote_in_actual_silence_is_retained():
+    track = two_chunk_track()
+    before = track.model_dump_json()
+    script = hold_script()
+    script_before = script.model_dump_json()
+    timeline, warnings = build_timeline(script, track, 1000, dialogue=quote_track())
+    assert warnings == []
+    assert [(w.beat_id, w.hold_index, w.episode, w.start, w.end) for w in
+            timeline.hold_windows] == [("b1", 0, 2, 8, 10)]
+    assert timeline.hold_windows[0].source_start == 108
+    assert track.model_dump_json() == before
+    assert script.model_dump_json() == script_before
+
+
+def test_quote_outside_actual_silence_retracts_and_recalculates():
+    track = two_chunk_track()
+    before = track.model_dump_json()
+    timeline, warnings = build_timeline(hold_script(), track, 1000,
+                                        dialogue=quote_track(114, 115))
+    assert timeline.hold_windows == []
+    assert timeline.narration_offsets == pytest.approx([0, 8])
+    assert timeline.total_seconds == pytest.approx(18)
+    assert timeline.subtitles[-1].end == pytest.approx(18)
+    assert timeline.segments[-1].timeline_end == pytest.approx(18)
+    assert any("撤销" in w for w in warnings)
+    assert track.model_dump_json() == before
+
+
+def test_two_holds_merged_in_one_voice_chunk_revoke_entire_silence():
+    script = one_beat_script([Clip(episode=2, start=100, end=120)], [
+        Hold(at=1, duration=1, quote="关键台词"), Hold(at=1, duration=1, quote="关键台词")])
+    timeline, warnings = build_timeline(script, two_chunk_track(), 1000, dialogue=quote_track())
+    assert timeline.total_seconds == pytest.approx(18)
+    assert timeline.hold_windows == []
+    assert any("合并" in w and "撤销" in w for w in warnings)
+
+
+@pytest.mark.parametrize(("start", "end", "keep"), [
+    (108, 109, True), (107.76, 109.76, True),
+    (107.74, 109.74, False), (109, 111, False),
+])
+def test_coverage_threshold_is_inclusive_without_counting_tolerance(start, end, keep):
+    timeline, _ = build_timeline(hold_script(), two_chunk_track(), 1000,
+                                 dialogue=quote_track(start, end))
+    assert bool(timeline.hold_windows) is keep
+
+
+def test_coverage_merges_overlapping_source_intervals_without_double_counting():
+    assert hold_coverage([(0, 7)], 0, 10) == pytest.approx(.7)
+    assert hold_coverage([(0, 6.99)], 0, 10) < .7
+    assert hold_coverage([(0, 6), (2, 8)], 0, 10) == pytest.approx(.8)
+    assert hold_coverage([], 1, 1) == 0
+
+
+def test_source_intervals_use_played_segment_coordinates():
+    segments = [TimelineSegment(beat_id="b1", source_start=100, source_end=120,
+                                timeline_start=0, timeline_end=10)]
+    assert source_intervals(segments, 3, 6) == pytest.approx([(106, 112)])
+
+
+def test_retraction_rechecks_remaining_hold_after_ratio_change():
+    first = Beat(id="a", label="a", role="hook", narration="第一句。第二句。",
+                 clips=[Clip(episode=2, start=100, end=120)],
+                 audio=AudioDirection(holds=[Hold(at=1, duration=2, quote="关键台词")]))
+    second = Beat(id="b", label="b", role="outro", narration="第三句。第四句。",
+                  clips=[Clip(episode=2, start=200, end=220)],
+                  audio=AudioDirection(holds=[Hold(at=1, duration=2, quote="不存在的句子")]))
+    script = Script(show="剧名", episodes=[2], beats=[first, second])
+    track = VoiceTrack(episode=2, chunks=[
+        VoiceChunk(beat_id="a", index=1, text="第一句。", path="1.mp3", duration=8, hold_after=2),
+        VoiceChunk(beat_id="a", index=2, text="第二句。", path="2.mp3", duration=10),
+        VoiceChunk(beat_id="b", index=1, text="第三句。", path="3.mp3", duration=8, hold_after=2),
+        VoiceChunk(beat_id="b", index=2, text="第四句。", path="4.mp3", duration=10),
+    ])
+    before = track.model_dump_json()
+    timeline, warnings = build_timeline(script, track, 1000, dialogue=quote_track())
+    assert timeline.narration_offsets == pytest.approx([0, 10, 20, 28])
+    assert timeline.total_seconds == pytest.approx(38)
+    assert [w.beat_id for w in timeline.hold_windows] == ["a"]
+    assert sum("撤销" in w for w in warnings) == 1
+    assert track.model_dump_json() == before
+
+
+def test_cross_episode_clip_cannot_supply_current_video_audio():
+    script = hold_script()
+    script.beats[0].clips[0].episode = 3
+    timeline, warnings = build_timeline(script, two_chunk_track(), 1000, dialogue=quote_track())
+    assert timeline.hold_windows == []
+    assert timeline.total_seconds == pytest.approx(18)
+    assert any("跨集" in w for w in warnings)
+
+
+def test_orphan_voice_silence_is_removed_without_quote_guess():
+    timeline, warnings = build_timeline(
+        one_beat_script([Clip(episode=2, start=100, end=120)]),
+        two_chunk_track(), 1000, dialogue=quote_track())
+    assert timeline.total_seconds == pytest.approx(18)
+    assert any("孤立" in w for w in warnings)
+
+
+def test_unknown_beat_silence_is_retracted_without_key_error():
+    track = two_chunk_track()
+    track.chunks[0].beat_id = "missing"
+    timeline, warnings = build_timeline(hold_script(), track, 1000, dialogue=quote_track())
+    assert timeline.hold_windows == []
+    assert any("孤立" in w for w in warnings)
+
+
+def test_speech_overlapping_hold_window_retracts_silence():
+    track = two_chunk_track()
+    # Inject an overlapping offset to test the safety gate independently of the
+    # normally serial timeline constructor.
+    from tenmin.render.timeline import _assess_holds
+    timeline = Timeline(episode=2, narration_offsets=[0, 8.5], segments=[
+        TimelineSegment(beat_id="b1", source_start=100, source_end=121,
+                        timeline_start=0, timeline_end=21)])
+    windows, rejected = _assess_holds(hold_script(), track, track, quote_track(),
+                                      timeline, RenderConfig(), [2])
+    assert windows == []
+    assert 0 in rejected
+
+
+def test_valid_hold_window_survives_timeline_serialization():
+    timeline, _ = build_timeline(hold_script(), two_chunk_track(), 1000,
+                                 dialogue=quote_track())
+    restored = Timeline.model_validate_json(timeline.model_dump_json())
+    assert restored.hold_windows == timeline.hold_windows
+
+
+def test_discontinuous_source_playback_retracts_even_with_coverage():
+    script = one_beat_script([Clip(episode=2, start=100, end=109),
+                              Clip(episode=2, start=200, end=211)],
+                             [Hold(at=1, duration=2, quote="关键台词")])
+    timeline, warnings = build_timeline(script, two_chunk_track(), 1000,
+                                        dialogue=quote_track(200, 201))
+    assert timeline.hold_windows == []
+    assert any("撤销" in w for w in warnings)
+
+
+def test_two_holds_in_one_beat_converge_after_scale_changes():
+    script = one_beat_script([Clip(episode=2, start=100, end=120)], [
+        Hold(at=1, duration=2, quote="不存在的句子"),
+        Hold(at=2, duration=2, quote="关键台词")])
+    script.beats[0].narration = "第一句。第二句。第三句。"
+    track = VoiceTrack(episode=2, chunks=[
+        VoiceChunk(beat_id="b1", index=1, text="第一句。", path="1.mp3", duration=4, hold_after=2),
+        VoiceChunk(beat_id="b1", index=2, text="第二句。", path="2.mp3", duration=4, hold_after=2),
+        VoiceChunk(beat_id="b1", index=3, text="第三句。", path="3.mp3", duration=8),
+    ])
+    # Initially second hold maps to source [110,112]; after removing first,
+    # the beat scale shrinks, mapping it to [108.89,111.11]. The quote
+    # survives the first pass and is rejected only on the second pass.
+    timeline, warnings = build_timeline(script, track, 1000,
+                                        dialogue=quote_track(111.7, 111.9))
+    assert timeline.hold_windows == []
+    assert timeline.narration_offsets == pytest.approx([0, 4, 8])
+    assert timeline.total_seconds == pytest.approx(16)
+    assert sum("撤销" in w for w in warnings) == 2
+
+
+def test_dialogue_path_preserves_cached_pause_evidence_for_display_cues():
+    text = "一二三四五六七八，九十一二三四五六。"
+    chunk = VoiceChunk(beat_id="b1", index=1, text=text, path="c.mp3", duration=8)
+    track = VoiceTrack(episode=2, chunks=[chunk])
+    script = one_beat_script([Clip(episode=2, start=100, end=108)])
+    timeline, warnings = build_timeline(script, track, 1000, dialogue=quote_track(),
+                                        cfg=RenderConfig(subtitle_soft_max_chars=12),
+                                        pause_evidence={id(chunk): []})
+    assert warnings == []
+    assert [cue.text for cue in timeline.subtitles] == [text]
+
+
+def test_mismatched_chunk_hold_identity_retracts_without_mutating_voice():
+    track = two_chunk_track()
+    track.chunks[0].text = "不同的句子。"
+    before = track.model_dump_json()
+    timeline, warnings = build_timeline(hold_script(), track, 1000, dialogue=quote_track())
+    assert timeline.hold_windows == []
+    assert timeline.total_seconds == pytest.approx(18)
+    assert any("句界不符" in w and "撤销" in w for w in warnings)
+    assert track.model_dump_json() == before
+
+
+def test_dialogue_must_match_voice_episode():
+    dialogue = quote_track()
+    dialogue.episode = 3
+    with pytest.raises(ValueError, match="集号"):
+        build_timeline(hold_script(), two_chunk_track(), 1000, dialogue=dialogue)
+
+
+def test_intermediate_hold_boundary_hidden_inside_chunk_is_retracted():
+    script = one_beat_script([Clip(episode=2, start=100, end=120)], [
+        Hold(at=1, duration=2, quote="关键台词")])
+    track = VoiceTrack(episode=2, chunks=[VoiceChunk(
+        beat_id="b1", index=1, text="第一句。第二句。", path="merged.mp3",
+        duration=18, hold_after=2)])
+    timeline, warnings = build_timeline(script, track, 1000, dialogue=quote_track())
+    assert timeline.hold_windows == []
+    assert timeline.total_seconds == pytest.approx(18)
+    assert any("中间留白边界" in w for w in warnings)
 
 
 def test_beat_audio_seconds_includes_holds():

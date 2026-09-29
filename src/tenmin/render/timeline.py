@@ -12,9 +12,12 @@ from collections.abc import Iterable
 from pathlib import Path
 
 from tenmin.config import DEFAULT_RENDER, RenderConfig
+from tenmin.intervals import merge_intervals
 from tenmin.models import (
     Beat,
     Clip,
+    DialogueTrack,
+    HoldWindow,
     Script,
     SubtitleCue,
     Timeline,
@@ -22,12 +25,37 @@ from tenmin.models import (
     VoiceChunk,
     VoiceTrack,
 )
-from tenmin.render.chunks import split_sentences
+from tenmin.render.chunks import assign_holds, split_sentences
 from tenmin.render.ffmpeg import run as run_ffmpeg
 from tenmin.script.budget import narration_chars
 
 # 画面与音频总时长的容忍差。超过就报 warning，不报错。
 DRIFT_TOLERANCE = DEFAULT_RENDER.drift_tolerance
+HOLD_MIN_COVERAGE = 0.70
+HOLD_EDGE_TOLERANCE = 0.25
+
+
+def source_intervals(
+    segments: list[TimelineSegment], start: float, end: float
+) -> list[tuple[float, float]]:
+    """Map a timeline window onto the actual played source pieces."""
+    intervals: list[tuple[float, float]] = []
+    for seg in segments:
+        lo, hi = max(start, seg.timeline_start), min(end, seg.timeline_end)
+        if hi <= lo or seg.timeline_end <= seg.timeline_start:
+            continue
+        ratio = (seg.source_end - seg.source_start) / (seg.timeline_end - seg.timeline_start)
+        intervals.append((seg.source_start + (lo - seg.timeline_start) * ratio,
+                          seg.source_start + (hi - seg.timeline_start) * ratio))
+    return intervals
+
+
+def hold_coverage(intervals: list[tuple[float, float]], start: float, end: float) -> float:
+    """Fraction of the quoted source interval actually played (no tolerance padding)."""
+    if end <= start:
+        return 0.0
+    return sum(max(0, min(hi, end) - max(lo, start))
+               for lo, hi in merge_intervals(intervals)) / (end - start)
 
 
 def align_to_frame(seconds: float, frame_rate: float | None) -> float:
@@ -262,7 +290,47 @@ def chunks_by_beat(track: VoiceTrack) -> dict[str, list[VoiceChunk]]:
     return grouped
 
 
-def build_timeline(
+def _chunk_holds(
+    script: Script, track: VoiceTrack, cfg: RenderConfig
+) -> dict[int, tuple[list[int], str | None]]:
+    """Reconstruct hold identity from sentence boundaries and original chunk order."""
+    result: dict[int, tuple[list[int], str | None]] = {}
+    for beat in script.beats:
+        sentences = split_sentences(beat.narration)
+        if not sentences:
+            continue
+        assigned = assign_holds(sentences, beat.audio.holds, rate=cfg.rate)
+        owners: dict[int, list[int]] = {}
+        for index, item in enumerate(beat.audio.holds):
+            boundary = next(iter(assign_holds(sentences, [item], rate=cfg.rate)))
+            owners.setdefault(boundary, []).append(index)
+        cursor = 0
+        indices = [i for i, chunk in enumerate(track.chunks) if chunk.beat_id == beat.id]
+        for global_index in indices:
+            chunk = track.chunks[global_index]
+            begin = cursor
+            while cursor < len(sentences) and "".join(sentences[begin:cursor + 1]) != chunk.text:
+                cursor += 1
+            if cursor == len(sentences):
+                result[global_index] = ([], "chunk 文本与剧本句界不符")
+                continue
+            cursor += 1
+            boundary = cursor - 1
+            group = owners.get(boundary, [])
+            expected = assigned.get(boundary, 0.0)
+            hidden = any(owners.get(k) for k in range(begin, boundary))
+            error = ("chunk 跳过了中间留白边界" if hidden else
+                     "合并的留白身份不唯一" if len(group) > 1 else
+                     "留白身份或时长不一致" if abs(chunk.hold_after - expected) > 0.001 or
+                     (chunk.hold_after > 0 and not group) else None)
+            result[global_index] = (group, error)
+    for i, chunk in enumerate(track.chunks):
+        if chunk.hold_after > 0 and i not in result:
+            result[i] = ([], "找不到该配音 chunk 的留白身份")
+    return result
+
+
+def _build_once(
     script: Script,
     track: VoiceTrack,
     source_duration: float,
@@ -270,6 +338,7 @@ def build_timeline(
     frame_rate: float | None = None,
     cfg: RenderConfig = DEFAULT_RENDER,
     pause_evidence: dict[int, list[tuple[float, float]]] | None = None,
+    segment_episodes: list[int] | None = None,
 ) -> tuple[Timeline, list[str]]:
     """按 beat 逐段重算画面时长，产出成片时间轴。
 
@@ -361,6 +430,8 @@ def build_timeline(
                     timeline_end=picture_cursor + length,
                 )
             )
+            if segment_episodes is not None:
+                segment_episodes.append(clip.episode)
             picture_cursor += length
             emitted += 1
 
@@ -396,3 +467,101 @@ def build_timeline(
         frame_rate=frame_rate,
     )
     return timeline, warnings
+
+
+def _assess_holds(
+    script: Script, original: VoiceTrack, working: VoiceTrack,
+    dialogue: DialogueTrack, timeline: Timeline, cfg: RenderConfig,
+    segment_episodes: list[int],
+) -> tuple[list[HoldWindow], dict[int, str]]:
+    from tenmin.script.validate import locate_hold_line
+
+    by_id = {beat.id: beat for beat in script.beats}
+    identities = _chunk_holds(script, original, cfg)
+    windows: list[HoldWindow] = []
+    rejected: dict[int, str] = {}
+    # The offsets follow beat order, not necessarily the order of track.chunks.
+    ordered_indices = [i for beat in script.beats for i, chunk in enumerate(working.chunks)
+                       if chunk.beat_id == beat.id]
+    offsets = dict(zip(ordered_indices, timeline.narration_offsets, strict=False))
+    voice_intervals = [
+        (offsets[i], offsets[i] + working.chunks[i].duration)
+        for i in ordered_indices if i in offsets
+    ]
+    for i, chunk in enumerate(working.chunks):
+        if chunk.hold_after <= 0:
+            continue
+        owners, error = identities.get(i, ([], "找不到留白身份"))
+        beat = by_id.get(chunk.beat_id)
+        if error or len(owners) != 1 or i not in offsets or beat is None:
+            rejected[i] = f"beat {chunk.beat_id} 合并/孤立留白已撤销：{error or '数量不唯一'}"
+            continue
+        index = owners[0]
+        quote = beat.audio.holds[index].quote
+        located = locate_hold_line({dialogue.episode: dialogue}, [working.episode], quote)
+        if located is None:
+            rejected[i] = f"beat {chunk.beat_id} 留白「{quote}」同集原声无法定位，已撤销"
+            continue
+        _, line = located
+        begin = offsets[i] + chunk.duration
+        end = begin + chunk.hold_after
+        touched = [(seg, ep) for seg, ep in
+                   zip(timeline.segments, segment_episodes, strict=True)
+                   if seg.timeline_start < end and seg.timeline_end > begin]
+        played = source_intervals([seg for seg, _ in touched], begin, end)
+        source_ok = bool(touched) and all(ep == working.episode and
+                                           seg.beat_id == beat.id for seg, ep in touched)
+        continuous = len(played) == 1 or all(
+            abs(played[k][1] - played[k + 1][0]) <= 1e-6
+            for k in range(len(played) - 1))
+        if (not source_ok or not played or not continuous or
+                any(begin < b and end > a for j, (a, b) in enumerate(voice_intervals)
+                    if ordered_indices[j] != i) or
+                hold_coverage(played, line.start, line.end) < HOLD_MIN_COVERAGE):
+            rejected[i] = (
+                f"beat {chunk.beat_id} 留白「{quote}」静音窗内原声覆盖不足/串音/跨集，已撤销"
+            )
+            continue
+        if (min(lo for lo, _ in played) > line.start + HOLD_EDGE_TOLERANCE or
+                max(hi for _, hi in played) < line.end - HOLD_EDGE_TOLERANCE):
+            rejected[i] = f"beat {chunk.beat_id} 留白「{quote}」原声端点偏差过大，已撤销"
+            continue
+        windows.append(HoldWindow(beat_id=beat.id, hold_index=index, quote=quote,
+                                  episode=working.episode, source_start=line.start,
+                                  source_end=line.end, start=begin, end=end))
+    return windows, rejected
+
+
+def build_timeline(
+    script: Script, track: VoiceTrack, source_duration: float, *,
+    dialogue: DialogueTrack | None = None, frame_rate: float | None = None,
+    cfg: RenderConfig = DEFAULT_RENDER,
+    pause_evidence: dict[int, list[tuple[float, float]]] | None = None,
+) -> tuple[Timeline, list[str]]:
+    """Build a timeline; with dialogue, verify and retract unplayable holds."""
+    if dialogue is None:
+        return _build_once(script, track, source_duration, frame_rate=frame_rate,
+                           cfg=cfg, pause_evidence=pause_evidence)
+    if dialogue.episode != track.episode:
+        raise ValueError(f"对白轨集号 {dialogue.episode} 与配音集号 {track.episode} 不一致")
+    working = track.model_copy(deep=True)
+    working_pauses = None if pause_evidence is None else {
+        id(copy): pause_evidence.get(id(original), [])
+        for original, copy in zip(track.chunks, working.chunks, strict=True)
+    }
+    removed: list[str] = []
+    for _ in range(1 + sum(c.hold_after > 0 for c in track.chunks)):
+        episodes: list[int] = []
+        timeline, warnings = _build_once(script, working, source_duration,
+                                         frame_rate=frame_rate, cfg=cfg,
+                                         pause_evidence=working_pauses,
+                                         segment_episodes=episodes)
+        windows, rejected = _assess_holds(script, track, working, dialogue,
+                                          timeline, cfg, episodes)
+        for index, reason in sorted(rejected.items()):
+            working.chunks[index].hold_after = 0.0
+            removed.append(reason)
+        if not rejected:
+            timeline.hold_windows = windows
+            return timeline, removed + warnings
+    raise ValueError("留白固定点未收敛")
