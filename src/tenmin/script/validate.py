@@ -243,27 +243,109 @@ def _quote_matches(
     return found
 
 
+def locate_hold_line(
+    tracks: dict[int, DialogueTrack], episodes: list[int], quote: str
+) -> tuple[int, DialogueLine] | None:
+    """在指定集里找唯一的有效对白出处；同集同时间码的拆行算同一出处。"""
+    hits = [
+        (ep, ln)
+        for ep in episodes
+        for ln in _quote_matches(tracks, [ep], quote)
+        if ln.kind in ("dialogue", "monologue") and ln.end > ln.start
+    ]
+    unique = {(ep, ln.start, ln.end): (ep, ln) for ep, ln in hits}
+    return next(iter(unique.values())) if len(unique) == 1 else None
+
+
+def _hold_location_failure(
+    tracks: dict[int, DialogueTrack], episodes: list[int], quote: str
+) -> str:
+    matches = {
+        (ep, ln.start, ln.end)
+        for ep in episodes
+        for ln in _quote_matches(tracks, [ep], quote)
+        if ln.kind in ("dialogue", "monologue") and ln.end > ln.start
+    }
+    return "多个矛盾出处" if len(matches) > 1 else "无法可靠定位"
+
+
 def _check_hold_quotes(beat: Beat, tracks: dict[int, DialogueTrack]) -> list[str]:
-    """留白金句的原声必须落在本 beat 某个 clip 的时间窗内，否则剪辑师放不出来。"""
-    if not beat.clips:
-        return []
+    """纯读检查：唯一的对白出处必须被本节点同集镜头完整覆盖。"""
     episodes = list(dict.fromkeys(clip.episode for clip in beat.clips))
     warnings: list[str] = []
     for hold in beat.audio.holds:
-        matches = _quote_matches(tracks, episodes, hold.quote)
-        if not matches:
+        located = locate_hold_line(tracks, episodes, hold.quote)
+        if located is None:
+            failure = _hold_location_failure(tracks, episodes, hold.quote)
+            warnings.append(
+                f"{beat.label}：留白金句「{hold.quote}」{failure}"
+            )
             continue
+        episode, line = located
         if any(
-            _overlap(ln.start, ln.end, clip.start, clip.end) > 0
-            for ln in matches
+            clip.episode == episode and clip.start <= line.start and line.end <= clip.end
             for clip in beat.clips
         ):
             continue
         warnings.append(
-            f"{beat.label}：留白金句「{hold.quote}」的原声在 "
-            f"{matches[0].start:.1f} 秒，不在本节点任何 clip 的时间窗内，"
-            f"剪辑时放不出这句原声"
+            f"{beat.label}：留白金句「{hold.quote}」的原声在 {line.start:.1f} 秒，"
+            "未被本节点同集 clip 完整覆盖，剪辑时放不出这句原声"
         )
+    return warnings
+
+
+def _repair_holds(beat: Beat, tracks: dict[int, DialogueTrack], cfg: ValidateConfig) -> list[str]:
+    """只延长本节点已存在的同集镜头，无法安全覆盖的留白撤销。"""
+    warnings: list[str] = []
+    kept = []
+    episodes = list(dict.fromkeys(c.episode for c in beat.clips))
+    for item in beat.audio.holds:
+        located = locate_hold_line(tracks, episodes, item.quote)
+        if located is None:
+            warnings.append(
+                f"{beat.label}：留白「{item.quote}」"
+                f"{_hold_location_failure(tracks, episodes, item.quote)}，已撤销"
+            )
+            continue
+        episode, line = located
+        choices = [(i, c) for i, c in enumerate(beat.clips) if c.episode == episode]
+        if any(c.start <= line.start and line.end <= c.end for _, c in choices):
+            kept.append(item)
+            continue
+        candidates: list[tuple[float, int, Clip]] = []
+        failures: list[str] = []
+        for index, current in choices:
+            if line.start < current.start:
+                failures.append("金句位于镜头硬起点之前")
+                continue
+            gap = max(0.0, line.start - current.end)
+            if gap > cfg.hold_clip_max_gap_seconds:
+                failures.append("超出邻近距离")
+                continue
+            end = max(current.end, line.end)
+            following = next(
+                (c for c in beat.clips[index + 1:] if c.episode == episode), None
+            )
+            if following is not None and end > following.start:
+                failures.append("会破坏镜头顺序")
+                continue
+            candidate = current.model_copy(update={"end": end})
+            reason = _reject_reason(candidate, tracks[episode], cfg)
+            if reason:
+                failures.append(reason)
+                continue
+            candidates.append((end - current.end, index, candidate))
+        if not candidates:
+            warnings.append(
+                f"{beat.label}：留白「{item.quote}」无法安全修复"
+                f"（{'；'.join(dict.fromkeys(failures)) or '没有同集邻近镜头'}），已撤销"
+            )
+            continue
+        _, index, proposed = min(candidates, key=lambda x: (x[0], x[1]))
+        beat.clips[index] = proposed
+        kept.append(item)
+        warnings.append(f"{beat.label}：为留白「{item.quote}」延长镜头至 {proposed.end:.2f}s")
+    beat.audio.holds = kept
     return warnings
 
 
@@ -650,6 +732,7 @@ def repair_script(
                 script=repaired,
             )
         beat.clips = kept
+        warnings.extend(_repair_holds(beat, tracks, cfg))
 
     return repaired, warnings
 

@@ -26,9 +26,9 @@ def build_llm_payload(highlight_starts: list[float]) -> dict:
     """构造一份合法的 LLMScript JSON，clip 落在真实无字幕高光上。
 
     旁白字数刻意凑到时长预算内：
-    (13 + 300) + (11 + 500) + (7 + 224) = 1055 字，1055 / 4.5 = 234.44s，
-    加上 3.0 + 2.5 = 5.5s 留白 = 239.94s，与 target 240s 偏差 0.02%，
-    因此 needs_rewrite 为假，LLM 只会被调用一次。改动字数会破坏
+    (13 + 300) + (11 + 500) + (7 + 224) = 1055 字，1055 / 4.5 = 234.44s。
+    引用的留白在这几个高光片段里无法可靠定位，修复时撤销，剩余时长仍在
+    target 240s 的容差内，因此 needs_rewrite 为假。改动字数会破坏
     test_offline_pipeline_calls_llm_exactly_once。
     """
     a, b, c = highlight_starts[0], highlight_starts[1], highlight_starts[2]
@@ -168,11 +168,12 @@ async def test_table_marks_silent_highlights(project: Path):
     assert "★ = 该片段命中无字幕演出高光区间，纯字幕方案取不到" in text
 
 
-async def test_table_records_holds_and_audio_direction(project: Path):
+async def test_table_discards_unlocatable_holds_and_records_audio_direction(project: Path):
     await run_offline(project)
     text = Paths(project).table(1).read_text(encoding="utf-8")
     assert "原声压低垫底" in text
-    assert "留白 3.0s：「两个叛徒」" in text
+    assert "留白 3.0s：「两个叛徒」" not in text
+    assert "留白 2.5s：「给我吃」" not in text
     assert "音效 impact @1.0s" in text
 
 
@@ -239,7 +240,7 @@ async def test_estimated_duration_within_tolerance(project: Path):
     script = Script.model_validate_json(Paths(project).script(1).read_text(encoding="utf-8"))
     deviation = abs(script.est_total_seconds - script.target_seconds) / script.target_seconds
     assert deviation <= 0.12, script.est_total_seconds
-    assert script.est_total_seconds == pytest.approx(239.94, abs=0.1)
+    assert script.est_total_seconds == pytest.approx(234.44, abs=0.1)
 
 
 async def test_second_run_skips_completed_stages(project: Path):

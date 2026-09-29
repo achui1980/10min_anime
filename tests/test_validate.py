@@ -1,6 +1,6 @@
 import pytest
 
-from tenmin.config import DEFAULT_VALIDATE
+from tenmin.config import DEFAULT_VALIDATE, ValidateConfig
 from tenmin.models import (
     Beat,
     Clip,
@@ -268,16 +268,15 @@ def with_holds(script, holds, beat_index=0):
     return script
 
 
-def test_hold_quote_outside_every_clip_warns():
+def test_hold_quote_outside_every_clip_is_discarded():
     """真实缺陷 A：金句在 41.1s，clip 却是 0.6-20.0 与 167.8-209.8。"""
     track = make_track(lines=[dline(1, 5.0, 8.0, "别的台词"), dline(17, 41.1, 43.0, QUOTE)])
     s = with_holds(
         make_script([[clip(0.6, 20.0), clip(167.8, 209.8)]]), [hold(QUOTE)]
     )
     result = run(s, track=track)
-    assert len(result.warnings) == 1, result.warnings
-    assert "留白金句" in result.warnings[0]
-    assert "41.1" in result.warnings[0]
+    assert result.script.beats[0].audio.holds == []
+    assert any("留白" in w and "邻近" in w for w in result.warnings)
 
 
 def test_hold_quote_inside_a_clip_does_not_warn():
@@ -287,27 +286,28 @@ def test_hold_quote_inside_a_clip_does_not_warn():
     assert result.warnings == []
 
 
-def test_hold_quote_touching_clip_edge_counts_as_inside():
-    """金句尾巴伸进 clip 起点之后，仍算放得出来。"""
+def test_hold_quote_touching_clip_edge_requires_full_coverage():
     track = make_track(lines=[dline(17, 38.0, 41.0, QUOTE)])
     s = with_holds(make_script([[clip(40.0, 60.0)]]), [hold(QUOTE)])
-    assert run(s, track=track).warnings == []
+    assert run(s, track=track).script.beats[0].audio.holds == []
 
 
-def test_hold_quote_not_found_in_track_is_skipped_silently():
-    """跨 cue 拼接／双轨半句在字幕里找不到完全相等的行，这是已知合法情况。"""
+def test_hold_quote_not_found_in_track_is_discarded():
     track = make_track(lines=[dline(17, 41.1, 43.0, "字幕里真正的那行")])
     s = with_holds(make_script([[clip(0.6, 20.0)]]), [hold("LLM 自己缝出来的半句")])
-    assert run(s, track=track).warnings == []
+    result = run(s, track=track)
+    assert result.script.beats[0].audio.holds == []
+    assert any("定位" in w for w in result.warnings)
 
 
-def test_hold_quote_matches_any_of_multiple_occurrences():
-    """同一句台词出现多次，只要有一次落在 clip 里就不报。"""
+def test_hold_quote_multiple_occurrences_are_ambiguous():
     track = make_track(
         lines=[dline(17, 41.1, 43.0, QUOTE), dline(88, 300.0, 302.0, QUOTE)]
     )
     s = with_holds(make_script([[clip(295.0, 310.0)]]), [hold(QUOTE)])
-    assert run(s, track=track).warnings == []
+    result = run(s, track=track)
+    assert result.script.beats[0].audio.holds == []
+    assert any("多个" in w for w in result.warnings)
 
 
 def test_hold_quote_is_compared_after_stripping():
@@ -315,7 +315,150 @@ def test_hold_quote_is_compared_after_stripping():
     s = with_holds(make_script([[clip(0.6, 20.0)]]), [hold(f"  {QUOTE} ")])
     result = run(s, track=track)
     assert len(result.warnings) == 1, result.warnings
-    assert "留白金句" in result.warnings[0]
+    assert "留白" in result.warnings[0]
+
+
+def test_repair_extends_nearest_clip_without_mutating_script():
+    s = with_holds(make_script([[clip(10, 20), clip(30, 35)]]), [hold("听我说清楚")])
+    before = s.model_dump_json()
+    repaired, warnings = repair_script(s, {2: make_track(lines=[
+        dline(1, 21, 22, "听我说清楚")])}, {2: make_report()})
+    assert [c.end for c in repaired.beats[0].clips] == [22, 35]
+    assert len(repaired.beats[0].audio.holds) == 1
+    assert s.model_dump_json() == before
+    assert any("延长" in w for w in warnings)
+
+
+@pytest.mark.parametrize(("begin", "end", "op", "reason"), [
+    (24.01, 25, None, "邻近"), (9, 11, None, "起点"),
+    (21, 23, (16, 24), "片头"), (21, 27, None, "顺序"),
+])
+def test_repair_discards_unsafe_hold(begin, end, op, reason):
+    s = with_holds(make_script([[clip(10, 20), clip(25, 30)]]), [hold("听我说清楚")])
+    repaired, warnings = repair_script(s, {2: make_track(op=op, lines=[
+        dline(1, begin, end, "听我说清楚")])}, {2: make_report()})
+    assert repaired.beats[0].audio.holds == []
+    assert [(c.start, c.end) for c in repaired.beats[0].clips] == [(10, 20), (25, 30)]
+    assert any(reason in w and "留白" in w for w in warnings)
+
+
+def test_ambiguous_quote_and_missing_quote_are_discarded():
+    s = with_holds(make_script([[clip(10, 20)]]), [hold("听我说清楚"), hold("不存在")])
+    track = make_track(lines=[dline(1, 11, 12, "听我说清楚"),
+                              dline(2, 18, 19, "听我说清楚")])
+    result, warnings = repair_script(s, {2: track}, {2: make_report()})
+    assert result.beats[0].audio.holds == []
+    assert any("多个" in w for w in warnings) and any("定位" in w for w in warnings)
+
+
+def test_locate_hold_line_collapses_duplicate_cues_but_not_distinct_episodes():
+    from tenmin.script import validate as validation
+
+    lines = [dline(1, 11, 12, "听我说清楚"), dline(2, 11, 12, "听我说清楚")]
+    tracks = {
+        2: make_track(lines=lines),
+        3: make_track(lines=lines).model_copy(update={"episode": 3}),
+    }
+    assert validation.locate_hold_line(tracks, [2], "听我说清楚") == (2, lines[-1])
+    assert validation.locate_hold_line(tracks, [2, 3], "听我说清楚") is None
+
+
+def test_repair_discards_identical_quote_in_two_beat_episodes():
+    other = clip(10, 20).model_copy(update={"episode": 3})
+    s = with_holds(make_script([[clip(10, 20), other]]), [hold("听我说清楚")])
+    track = make_track(lines=[dline(1, 11, 12, "听我说清楚")])
+    tracks = {2: track, 3: track.model_copy(update={"episode": 3})}
+    result, warnings = repair_script(s, tracks, {2: make_report(), 3: make_report()})
+    assert result.beats[0].audio.holds == []
+    assert any("多个" in w for w in warnings)
+
+
+def test_check_hold_quote_is_read_only_and_requires_full_same_episode_coverage():
+    other = clip(10, 20).model_copy(update={"episode": 3})
+    s = with_holds(make_script([[clip(10, 20), other]]), [hold("听我说清楚")])
+    tracks = {2: make_track(lines=[dline(1, 19, 22, "听我说清楚")]),
+              3: make_track(lines=[]).model_copy(update={"episode": 3})}
+    before = s.model_dump_json()
+    warnings = check_script(s, tracks, {2: make_report()})
+    assert any("完整覆盖" in w for w in warnings)
+    assert s.model_dump_json() == before
+
+
+@pytest.mark.parametrize("kind", ["credits", "screen_text", "noise"])
+def test_non_speech_quote_is_not_a_reliable_hold_source(kind):
+    s = with_holds(make_script([[clip(10, 20)]]), [hold("听我说清楚")])
+    line = dline(1, 11, 12, "听我说清楚").model_copy(update={"kind": kind})
+    result, warnings = repair_script(s, {2: make_track(lines=[line])}, {2: make_report()})
+    assert result.beats[0].audio.holds == []
+    assert any("定位" in w for w in warnings)
+
+
+def test_configured_gap_controls_hold_extension():
+    s = with_holds(make_script([[clip(10, 20)]]), [hold("听我说清楚")])
+    track = make_track(lines=[dline(1, 22, 23, "听我说清楚")])
+    result, warnings = repair_script(s, {2: track}, {2: make_report()},
+                                     cfg=ValidateConfig(hold_clip_max_gap_seconds=1))
+    assert result.beats[0].audio.holds == []
+    assert any("邻近" in w for w in warnings)
+
+
+def test_repair_chooses_smallest_extension():
+    s = with_holds(make_script([[clip(10, 20), clip(19, 21), clip(22, 30)]]), [hold("听我说清楚")])
+    track = make_track(lines=[dline(1, 21, 22, "听我说清楚")])
+    result, _ = repair_script(s, {2: track}, {2: make_report()})
+    assert [c.end for c in result.beats[0].clips] == [20, 22, 30]
+
+
+def test_repair_rejects_extension_into_ed():
+    s = with_holds(make_script([[clip(10, 20)]]), [hold("听我说清楚")])
+    track = make_track(ed=(16, 24), lines=[dline(1, 21, 23, "听我说清楚")])
+    result, warnings = repair_script(s, {2: track}, {2: make_report()})
+    assert result.beats[0].audio.holds == []
+    assert any("片尾" in w for w in warnings)
+
+
+def test_exactly_configured_gap_is_eligible():
+    s = with_holds(make_script([[clip(10, 20)]]), [hold("听我说清楚")])
+    track = make_track(lines=[dline(1, 23, 24, "听我说清楚")])
+    result, _ = repair_script(s, {2: track}, {2: make_report()})
+    assert result.beats[0].clips[0].end == 24
+
+
+def test_repair_rejects_extension_past_source_duration():
+    s = with_holds(make_script([[clip(10, 20)]]), [hold("听我说清楚")])
+    for beat in s.beats[1:]:
+        beat.clips = [clip(11, 16)]
+    result, warnings = repair_script(s, {2: make_track(duration=22, lines=[
+        dline(1, 21, 23, "听我说清楚")])}, {2: make_report()})
+    assert result.beats[0].audio.holds == []
+    assert any("越界" in w for w in warnings)
+
+
+def test_anchor_corrected_hard_start_cannot_move_back_for_hold():
+    s = with_holds(make_script([[clip(10, 20, anchors=[1])]]), [hold("听我说清楚")])
+    track = make_track(lines=[dline(1, 17, 18, "锚点"), dline(2, 14, 16, "听我说清楚")])
+    result, warnings = repair_script(s, {2: track}, {2: make_report()})
+    assert result.beats[0].clips[0].start == 17
+    assert result.beats[0].audio.holds == []
+    assert any("起点" in w for w in warnings)
+
+
+def test_repair_checks_later_same_episode_across_interleaved_episode():
+    other = clip(100, 105).model_copy(update={"episode": 3})
+    s = with_holds(make_script([[clip(10, 20), other, clip(25, 30)]]), [hold("听我说清楚")])
+    tracks = {2: make_track(lines=[dline(1, 21, 27, "听我说清楚")]),
+              3: make_track().model_copy(update={"episode": 3})}
+    result, warnings = repair_script(s, tracks, {2: make_report(), 3: make_report()})
+    assert result.beats[0].audio.holds == []
+    assert any("顺序" in w for w in warnings)
+
+
+def test_repair_does_not_source_quote_from_another_beat():
+    s = with_holds(make_script([[clip(10, 20)], [clip(40, 50)]]), [hold("听我说清楚")])
+    track = make_track(lines=[dline(1, 41, 43, "听我说清楚")])
+    result, warnings = repair_script(s, {2: track}, {2: make_report()})
+    assert result.beats[0].audio.holds == []
+    assert any("邻近" in w for w in warnings)
 
 
 # --- 校验 B：clip 时间窗必须覆盖自己的 anchor_lines ---
@@ -631,9 +774,11 @@ def test_hold_at_beyond_the_beat_span_warns():
     """at 是相对本 beat 旁白起点的偏移。超过本 beat 的总跨度意味着留白落在旁白之外，
     而 render/chunks.py 的 assign_holds 会静默把它贴到最后一句。"""
     s = make_script([[clip(10.0, 30.0)]])
-    s.beats[0].audio.holds = [Hold(at=300.0, duration=2.0, quote="金句")]
-    hits = [w for w in run(s).warnings if "留白落点" in w]
-    assert len(hits) == 1, run(s).warnings
+    s.beats[0].audio.holds = [Hold(at=300.0, duration=2.0, quote="台词")]
+    track = make_track(lines=[dline(1, 11, 12)])
+    result = run(s, track=track)
+    hits = [w for w in result.warnings if "留白落点" in w]
+    assert len(hits) == 1, result.warnings
 
 
 def test_hold_at_at_the_very_end_of_the_narration_does_not_warn():
@@ -769,8 +914,8 @@ def test_footage_budget_span_follows_the_configured_rate():
 def test_validate_script_and_repair_script_take_rate():
     """三个入口的签名必须一致 —— single.py 手上只有一个 rate，三处都要能收。"""
     s = make_script([[clip(10.0, 30.0)]])
-    s.beats[0].audio.holds = [Hold(at=300.0, duration=2.0, quote="金句")]
-    tracks, reports = {2: make_track()}, {2: make_report()}
+    s.beats[0].audio.holds = [Hold(at=300.0, duration=2.0, quote="台词")]
+    tracks, reports = {2: make_track(lines=[dline(1, 11, 12)])}, {2: make_report()}
     repair_script(s, tracks, reports, rate="+20%")
     result = validate_script(s, tracks, reports, rate="+20%")
     assert any("留白落点" in w for w in result.warnings)
@@ -964,7 +1109,7 @@ def test_quote_is_matched_after_dropping_punctuation():
     s = with_holds(make_script([[clip(0.6, 20.0)]]), [hold("原来您对我的认知只有这种程度")])
     result = run(s, track=track)
     assert len(result.warnings) == 1, result.warnings
-    assert "留白金句" in result.warnings[0]
+    assert "留白" in result.warnings[0]
 
 
 def test_quote_that_is_a_fragment_of_a_longer_line_is_matched():
@@ -991,4 +1136,6 @@ def test_a_one_character_line_does_not_match_every_quote():
     """反向包含必须带长度闸，否则「嗯」这种行会命中任何金句，把检查稀释成噪声。"""
     track = make_track(lines=[dline(17, 41.1, 43.0, "嗯")])
     s = with_holds(make_script([[clip(0.6, 20.0)]]), [hold("原来您对我的认知只有这种程度")])
-    assert run(s, track=track).warnings == []
+    result = run(s, track=track)
+    assert result.script.beats[0].audio.holds == []
+    assert any("定位" in w for w in result.warnings)
