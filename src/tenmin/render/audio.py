@@ -5,14 +5,21 @@
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 
 from tenmin.atomic import atomic_path
 from tenmin.config import DEFAULT_RENDER
 from tenmin.intervals import merge_intervals
-from tenmin.models import SubtitleCue, Timeline, VoiceTrack
+from tenmin.models import HoldWindow, SubtitleCue, Timeline, VoiceTrack
 from tenmin.progress import NullProgressReporter, ProgressReporter, percent_reporter
 from tenmin.render.ffmpeg import run_with_progress
+from tenmin.render.timeline import (
+    HOLD_EDGE_TOLERANCE,
+    HOLD_MIN_COVERAGE,
+    hold_coverage,
+    source_intervals,
+)
 
 AUDIO_CODEC = DEFAULT_RENDER.audio_codec
 AUDIO_BITRATE = DEFAULT_RENDER.audio_bitrate
@@ -81,6 +88,179 @@ def duck_volume_expr(cues: list[SubtitleCue], gain: float) -> str:
     return f"if(gt({windows},0),{gain:.4f},{FULL_VOLUME:.4f})"
 
 
+# 一份 timeline.json 是人能手改的产物（Timeline 类的 docstring 就写着「改完它跑
+# --from audio 就能重出片」），所以 hold_windows 到了混音这一步不能被当成可信输入
+# 直接拿去用：混音要施加的单独增益只对 render/timeline.py 的 _assess_holds 已经
+# 验过一遍的窗口安全，一份被手改挪动过起止点、或者干脆瞎编出来的窗口可能落在别的
+# beat 的画面上、盖住别的旁白、或者根本不对应任何真实的静音间隙。这两个常量与
+# hold_coverage/source_intervals 直接复用 render/timeline.py 那一套——「怎么判一个
+# 留白窗合法」只能有一份定义，这里要做的是**在混音时**照同一套规则再判一遍，不是
+# 发明一套新规则。
+_HOLD_BOUNDARY_TOLERANCE = 0.001
+_SOURCE_CONTIGUITY_TOLERANCE = 1e-6
+
+
+def _valid_hold_windows(
+    timeline: Timeline, track: VoiceTrack
+) -> tuple[list[tuple[int, HoldWindow]], list[str]]:
+    """按 segments/narration offsets 的当前实况重新验一遍 timeline.hold_windows。
+
+    返回 `(kept, warnings)`：`kept` 是 `(原始下标, window)` 对的列表，下标是
+    window 在 `timeline.hold_windows` 里的位置（不是重新编号的 0..n）—— 后续
+    （按每个窗口测出来的响度分配增益）要靠这个下标去查表，编号一变就对不上了。
+
+    这里只负责**判**，不负责修——判不过就跳过单独增益、原样回落到只有 ducking
+    的听感，一个字节都不改 `timeline.hold_windows` 本身。
+    """
+    if len(timeline.narration_offsets) != len(track.chunks):
+        return [], ["timeline 与 voice 数量不符，跳过留白窗单独增益"]
+
+    chunk_starts = list(timeline.narration_offsets)
+    chunk_ends = [
+        start + chunk.duration
+        for start, chunk in zip(chunk_starts, track.chunks, strict=True)
+    ]
+
+    kept: list[tuple[int, HoldWindow]] = []
+    identities: set[tuple[str, int]] = set()
+    warnings: list[str] = []
+    order = sorted(
+        range(len(timeline.hold_windows)),
+        key=lambda i: (timeline.hold_windows[i].start, i),
+    )
+    for index in order:
+        window = timeline.hold_windows[index]
+        if _hold_window_is_valid(window, timeline, track, chunk_starts, chunk_ends,
+                                  identities, kept):
+            kept.append((index, window))
+            identities.add((window.beat_id, window.hold_index))
+        else:
+            warnings.append(
+                f"留白窗 {window.beat_id}/{window.hold_index} "
+                "与片段/旁白空档不一致，跳过单独增益"
+            )
+    kept.sort(key=lambda pair: pair[0])
+    return kept, warnings
+
+
+def _hold_window_is_valid(
+    window: HoldWindow,
+    timeline: Timeline,
+    track: VoiceTrack,
+    chunk_starts: list[float],
+    chunk_ends: list[float],
+    identities: set[tuple[str, int]],
+    kept: list[tuple[int, HoldWindow]],
+) -> bool:
+    if not all(
+        math.isfinite(v)
+        for v in (window.start, window.end, window.source_start, window.source_end)
+    ):
+        return False
+    if (window.beat_id, window.hold_index) in identities:
+        return False
+
+    # window.start 必须恰好落在某个「本 beat 的 chunk 结束点」上：这才证明这个
+    # 窗口紧跟在一段真实配音之后，是 render/timeline.py 认可的静音间隙的起点，
+    # 不是手改挪出来的一个任意时刻。
+    boundary_candidates = [
+        i for i, chunk in enumerate(track.chunks)
+        if chunk.beat_id == window.beat_id
+        and abs(chunk_ends[i] - window.start) <= _HOLD_BOUNDARY_TOLERANCE
+    ]
+    if len(boundary_candidates) != 1:
+        return False
+    boundary = boundary_candidates[0]
+
+    if (
+        boundary + 1 < len(chunk_starts)
+        and chunk_starts[boundary + 1] < window.end - _HOLD_BOUNDARY_TOLERANCE
+    ):
+        return False
+
+    if any(
+        window.start < end and start < window.end
+        for start, end in zip(chunk_starts, chunk_ends, strict=True)
+    ):
+        return False
+
+    same_beat_segments = [seg for seg in timeline.segments if seg.beat_id == window.beat_id]
+    foreign_segments = [seg for seg in timeline.segments if seg.beat_id != window.beat_id]
+    if any(
+        window.start < seg.timeline_end and seg.timeline_start < window.end
+        for seg in foreign_segments
+    ):
+        return False
+
+    covering = merge_intervals((seg.timeline_start, seg.timeline_end) for seg in same_beat_segments)
+    if not any(lo <= window.start and window.end <= hi for lo, hi in covering):
+        return False
+    if window.episode != timeline.episode:
+        return False
+
+    played = sorted(source_intervals(same_beat_segments, window.start, window.end))
+    if not played:
+        return False
+    if any(
+        played[i + 1][0] - played[i][1] > _SOURCE_CONTIGUITY_TOLERANCE
+        for i in range(len(played) - 1)
+    ):
+        return False
+    if hold_coverage(played, window.source_start, window.source_end) < HOLD_MIN_COVERAGE:
+        return False
+    if (
+        min(lo for lo, _ in played) > window.source_start + HOLD_EDGE_TOLERANCE
+        or max(hi for _, hi in played) < window.source_end - HOLD_EDGE_TOLERANCE
+    ):
+        return False
+
+    if any(window.start < kw.end and kw.start < window.end for _, kw in kept):
+        return False
+
+    if not (0 <= window.start < window.end <= timeline.total_seconds):
+        return False
+    if not (window.source_start < window.source_end):
+        return False
+
+    return True
+
+
+def hold_gain_expr(
+    windows: list[tuple[int, HoldWindow]], gains: dict[int, float], fade: float
+) -> str:
+    """拼一段 `volume=...:eval=frame` 用的增益包络表达式。
+
+    只对 `index in gains` 的窗口生效：窗口内部是 `gains[index]`（dB）换算出的
+    线性增益，两侧各花 `fade` 秒线性回落到 1.0（不改变），`fade` 会被夹到不超过
+    窗口时长的一半——否则两段渐变会在窗口中点相撞，算出负增益或不连续的跳变。
+    窗口之外恒为 1.0。按 `reversed(windows)` 折叠出嵌套的 `if(between(...))`，
+    这样列表里靠前的窗口在（理论上不该出现的）重叠场景下优先生效，最终兜底给
+    常量 "1"。
+    """
+    applicable = [(index, window) for index, window in windows if index in gains]
+    expr = f"{FULL_VOLUME:g}"
+    for index, window in reversed(applicable):
+        gain_db = gains[index]
+        amp = 10 ** (gain_db / 20)
+        fade_eff = min(max(fade, 0.0), (window.end - window.start) / 2)
+        if fade_eff > 0:
+            fade_in_end = window.start + fade_eff
+            fade_out_start = window.end - fade_eff
+            envelope = (
+                f"if(between(t,{window.start:.3f},{fade_in_end:.3f}),"
+                f"{FULL_VOLUME:.6f}+({amp:.6f}-{FULL_VOLUME:.6f})*"
+                f"(t-{window.start:.3f})/{fade_eff:.6f},"
+                f"if(between(t,{fade_out_start:.3f},{window.end:.3f}),"
+                f"{amp:.6f}+({FULL_VOLUME:.6f}-{amp:.6f})*"
+                f"(t-{fade_out_start:.3f})/{fade_eff:.6f},"
+                f"{amp:.6f}))"
+            )
+        else:
+            envelope = f"{amp:.6f}"
+        expr = f"if(between(t,{window.start:.3f},{window.end:.3f}),{envelope},{expr})"
+    return expr
+
+
 def build_mix_args(
     *,
     video: Path,
@@ -94,6 +274,8 @@ def build_mix_args(
     audio_codec: str = AUDIO_CODEC,
     audio_bitrate: str = AUDIO_BITRATE,
     limiter_ceiling: float = LIMITER_CEILING,
+    hold_gains: dict[int, float] | None = None,
+    hold_fade_seconds: float = 0.1,
 ) -> list[str]:
     """拼出混音用的 ffmpeg 参数列表（不含 ffmpeg 本身）。"""
     if not timeline.segments:
@@ -115,8 +297,24 @@ def build_mix_args(
     origin_labels = "".join(f"[o{i}]" for i in range(len(timeline.segments)))
     parts.append(f"{origin_labels}concat=n={len(timeline.segments)}:v=0:a=1[orig]")
 
+    # 留白窗单独增益：只在 hold_gains 非空时插这个节点，且插在 ducking **之前**——
+    # ducking 按 subtitle cue 分区（有旁白/没旁白两态），留白窗恰好落在「没旁白」
+    # 那一态里，两层滤镜互不冲突，谁先谁后本该没有听感差别；放前面纯粹是为了让
+    # `[orig]` 到 `[ducked]` 之间只多一层，不用去改 ducking 自己的输入/输出标签。
+    #
+    # 没有 hold_gains（默认 None/空 dict）时 duck_input 恒为 "[orig]"，图与
+    # 加这层之前逐字节相同——这是硬约束，测试用同一份 EXPECTED_GRAPH 锁住。
+    duck_input = "[orig]"
+    if hold_gains:
+        kept, _ = _valid_hold_windows(timeline, track)
+        relevant = [(index, window) for index, window in kept if index in hold_gains]
+        if relevant:
+            gain_expr = hold_gain_expr(relevant, hold_gains, hold_fade_seconds)
+            parts.append(f"[orig]volume='{gain_expr}':eval=frame[holdbalanced]")
+            duck_input = "[holdbalanced]"
+
     expr = duck_volume_expr(timeline.subtitles, duck_gain(duck_db))
-    parts.append(f"[orig]volume='{expr}':eval=frame[ducked]")
+    parts.append(f"{duck_input}volume='{expr}':eval=frame[ducked]")
 
     chunk_paths: list[str] = []
     for index, (chunk, offset) in enumerate(

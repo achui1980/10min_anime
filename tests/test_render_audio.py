@@ -3,7 +3,14 @@ from pathlib import Path
 
 import pytest
 
-from tenmin.models import SubtitleCue, Timeline, TimelineSegment, VoiceChunk, VoiceTrack
+from tenmin.models import (
+    HoldWindow,
+    SubtitleCue,
+    Timeline,
+    TimelineSegment,
+    VoiceChunk,
+    VoiceTrack,
+)
 from tenmin.render.audio import (
     SILENCE_CHANNEL_LAYOUT,
     SILENCE_SAMPLE_FMT,
@@ -597,6 +604,56 @@ def test_mix_audio_keeps_the_previous_artifact_when_ffmpeg_fails(tmp_path, monke
     assert out_path.read_bytes() == b"good"
     assert out_path.stat().st_mtime_ns == before
     assert not part_path(out_path).exists()
+
+
+# --- 留白窗单独增益（第 6 项）------------------------------------------------
+# timeline.hold_windows 是人能手改的产物。混音时必须照 render/timeline.py 那套
+# 「静音窗合法性」规则再验一遍，而不是直接信任 timeline.json 里写的数字；没请求
+# 增益（hold_gains 为空）时图必须逐字节不变。
+
+
+def test_manually_moved_window_is_ignored_and_valid_second_window_keeps_identity():
+    from tenmin.render.audio import _valid_hold_windows
+
+    timeline = make_timeline()
+    bad = HoldWindow(beat_id="b1", hold_index=0, quote="a", episode=2,
+                     source_start=108, source_end=109, start=7, end=10)
+    good = HoldWindow(beat_id="b1", hold_index=1, quote="b", episode=2,
+                      source_start=108, source_end=109, start=8, end=10)
+    timeline.hold_windows = [bad, good]
+    kept, warnings = _valid_hold_windows(timeline, make_track())
+    assert kept == [(1, good)]
+    assert len(warnings) == 1 and "留白窗" in warnings[0]
+
+
+def test_window_gain_is_only_inside_silence_and_before_ducking(tmp_path):
+    timeline = make_timeline()
+    timeline.hold_windows = [HoldWindow(beat_id="b1", hold_index=0, quote="a",
+        episode=2, source_start=108, source_end=109, start=8, end=10)]
+    args = build(tmp_path, timeline=timeline, hold_gains={0: -6}, hold_fade_seconds=0.1)
+    graph = args[args.index("-filter_complex") + 1]
+    assert "between(t,8.000,10.000)" in graph
+    assert "0.501187" in graph  # -6 dB linear amplitude
+    assert graph.index("[holdbalanced]") < graph.index("[ducked]")
+
+
+def test_no_hold_gains_leaves_the_graph_byte_identical(tmp_path):
+    """hold_gains 为 None/空 dict 时必须是同一份 EXPECTED_GRAPH——这是硬约束。"""
+    args_default = build(tmp_path)
+    args_none = build(tmp_path, hold_gains=None)
+    args_empty = build(tmp_path, hold_gains={})
+    graph = args_default[args_default.index("-filter_complex") + 1]
+    assert graph == EXPECTED_GRAPH
+    assert args_none == args_default
+    assert args_empty == args_default
+
+
+def test_audio_delays_follow_final_timeline_not_original_voice_hold_after(tmp_path):
+    timeline = make_timeline()
+    timeline.narration_offsets = [0, 8, 18]
+    args = build(tmp_path, timeline=timeline)
+    graph = args[args.index("-filter_complex") + 1]
+    assert "adelay=delays=8000" in graph and "adelay=delays=18000" in graph
 
 
 def test_mix_audio_reports_each_percent_only_once(tmp_path, monkeypatch):
