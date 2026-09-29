@@ -247,6 +247,7 @@ async def test_missing_voice_chunk_cannot_skip_fresh_timeline(project, monkeypat
     paths = Paths(project.root)
     _write_script(paths.script(2), render_script())
     await run_voice(project, FakeTTSEngine([8.0, 10.0, 10.0]), episode=2)
+    _write_dialogue_for_render_script(paths)
     run_timeline(project, episode=2, source_duration=1400.0)
     track = json.loads(paths.voice(2).read_text(encoding="utf-8"))
     missing = paths.voice_dir(2) / track["chunks"][0]["path"]
@@ -742,6 +743,7 @@ async def test_run_pipeline_reruns_the_render_stages_when_the_voice_changes(
     monkeypatch.setattr("tenmin.render.tts.probe_duration", lambda path: 8.0)
     monkeypatch.setattr("tenmin.render.audio.run_with_progress", _touch_output)
     monkeypatch.setattr("tenmin.render.video.run_with_progress", _touch_output_with_progress)
+    _write_dialogue_for_render_script(paths)
 
     stages = ["voice", "timeline", "audio", "render"]
     await run_pipeline(
@@ -806,6 +808,7 @@ async def test_video_replacement_invalidates_each_stage_run_alone(project, monke
     paths = Paths(project.root)
     _write_script(paths.script(2), render_script())
     await run_voice(project, FakeTTSEngine([8.0, 10.0, 10.0]), episode=2)
+    _write_dialogue_for_render_script(paths)
     monkeypatch.setattr("tenmin.pipeline.probe_duration", lambda path, **_: 1400.0)
     monkeypatch.setattr("tenmin.pipeline.probe_frame_rate", lambda path, **_: 25.0)
     monkeypatch.setattr("tenmin.pipeline.preflight", lambda video, encoder, **_: 1400.0)
@@ -856,6 +859,7 @@ async def test_timeline_only_rejects_missing_source_after_successful_run(project
     paths = Paths(project.root)
     _write_script(paths.script(2), render_script())
     await run_voice(project, FakeTTSEngine([8.0, 10.0, 10.0]), episode=2)
+    _write_dialogue_for_render_script(paths)
     monkeypatch.setattr("tenmin.pipeline.probe_duration", lambda path, **_: 1400.0)
     monkeypatch.setattr("tenmin.pipeline.probe_frame_rate", lambda path, **_: 25.0)
     await run_pipeline(project, FakeProvider([]), only=["timeline"])
@@ -875,6 +879,7 @@ async def test_timeline_only_rejects_unreadable_source_instead_of_skipping(proje
     paths = Paths(project.root)
     _write_script(paths.script(2), render_script())
     await run_voice(project, FakeTTSEngine([8.0, 10.0, 10.0]), episode=2)
+    _write_dialogue_for_render_script(paths)
     monkeypatch.setattr("tenmin.pipeline.probe_duration", lambda path, **_: 1400.0)
     monkeypatch.setattr("tenmin.pipeline.probe_frame_rate", lambda path, **_: 25.0)
     await run_pipeline(project, FakeProvider([]), only=["timeline"])
@@ -1020,6 +1025,28 @@ def render_script() -> Script:
     )
 
 
+def _dialogue_for_render_script() -> DialogueTrack:
+    """配 render_script() 用的最小对白轨：定位它唯一的 hold「第一句」。
+
+    render_script() 的 b1 用 FakeTTSEngine([8.0, 10.0, 10.0]) 时第一个 chunk 的播放
+    窗口是 [0, 8]，hold_after=2 落在时间轴 [8, 10]；clip 是 (100, 140)，所以对应源片
+    位置是 [108, 110]。这里给一条落在这段区间内、kind 默认 dialogue 的行，让
+    build_timeline 的留白核验能找到唯一出处、不撤销这个 hold —— 否则所有沿用
+    render_script() 的既有测试断言的 `warnings == []` 会被一条撤销提示打破。
+    """
+    return DialogueTrack(
+        episode=2,
+        duration=1400.0,
+        lines=[
+            DialogueLine(idx=1, start=108.0, end=109.0, text="第一句", raw="第一句"),
+        ],
+    )
+
+
+def _write_dialogue_for_render_script(paths: Paths, episode: int = 2) -> None:
+    _file(paths.dialogue(episode), _dialogue_for_render_script().model_dump_json())
+
+
 def _prepare_video(cfg: ProjectConfig) -> Path:
     """造一个空壳视频文件并写进 config，供需要 video_path 的阶段用。"""
     video = cfg.root / "E02.mkv"
@@ -1106,6 +1133,7 @@ async def test_run_timeline_writes_timeline_and_ass(project):
     paths = Paths(project.root)
     _write_script(paths.script(2), render_script())
     await run_voice(project, FakeTTSEngine([8.0, 10.0, 10.0]), episode=2)
+    _write_dialogue_for_render_script(paths)
 
     timeline, warnings = run_timeline(project, episode=2, source_duration=1400.0)
 
@@ -1125,9 +1153,44 @@ def test_run_timeline_without_voice_raises(project):
         run_timeline(project, episode=2, source_duration=1400.0)
 
 
-def test_run_timeline_probes_source_when_duration_missing(project, monkeypatch):
-    _write_script(Paths(project.root).script(2), render_script())
+def test_run_timeline_requires_current_dialogue(project):
+    paths = Paths(project.root)
+    _write_script(paths.script(2), render_script())
     asyncio.run(run_voice(project, FakeTTSEngine([8.0, 10.0, 10.0]), episode=2))
+    with pytest.raises(FileNotFoundError, match="对白轨"):
+        run_timeline(project, episode=2, source_duration=1400.0)
+
+
+def test_run_timeline_reads_current_dialogue_and_writes_compat_windows(project):
+    """空对白轨定位不到 hold 出处：留白被撤销，但 timeline 仍要正常落盘。"""
+    paths = Paths(project.root)
+    _write_script(paths.script(2), render_script())
+    asyncio.run(run_voice(project, FakeTTSEngine([8.0, 10.0, 10.0]), episode=2))
+    _file(paths.dialogue(2), DialogueTrack(episode=2, duration=1400.0).model_dump_json())
+
+    timeline, _ = run_timeline(project, episode=2, source_duration=1400.0)
+
+    assert "hold_windows" in paths.timeline(2).read_text(encoding="utf-8")
+    assert timeline.hold_windows == []
+
+
+def test_run_timeline_rejects_dialogue_from_another_episode(project):
+    paths = Paths(project.root)
+    _write_script(paths.script(2), render_script())
+    asyncio.run(run_voice(project, FakeTTSEngine([8.0, 10.0, 10.0]), episode=2))
+    _file(paths.dialogue(2), DialogueTrack(episode=3, duration=1400.0).model_dump_json())
+
+    with pytest.raises(ValueError, match="集号"):
+        run_timeline(project, episode=2, source_duration=1400.0)
+
+    assert not paths.timeline(2).exists()
+
+
+def test_run_timeline_probes_source_when_duration_missing(project, monkeypatch):
+    paths = Paths(project.root)
+    _write_script(paths.script(2), render_script())
+    asyncio.run(run_voice(project, FakeTTSEngine([8.0, 10.0, 10.0]), episode=2))
+    _write_dialogue_for_render_script(paths)
     video = _prepare_video(project)
     calls: list[Path] = []
 
@@ -1152,8 +1215,10 @@ def test_run_timeline_probes_source_when_duration_missing(project, monkeypatch):
 
 
 def test_run_timeline_uses_config_font_size(project):
-    _write_script(Paths(project.root).script(2), render_script())
+    paths = Paths(project.root)
+    _write_script(paths.script(2), render_script())
     asyncio.run(run_voice(project, FakeTTSEngine([8.0, 10.0, 10.0]), episode=2))
+    _write_dialogue_for_render_script(paths)
     project.render.font_size = 72
 
     run_timeline(project, episode=2, source_duration=1400.0)
@@ -1166,6 +1231,7 @@ def test_run_audio_invokes_ffmpeg(project, monkeypatch):
     paths = Paths(project.root)
     _write_script(paths.script(2), render_script())
     asyncio.run(run_voice(project, FakeTTSEngine([8.0, 10.0, 10.0]), episode=2))
+    _write_dialogue_for_render_script(paths)
     run_timeline(project, episode=2, source_duration=1400.0)
     _prepare_video(project)
     captured: list[list[str]] = []
@@ -1194,6 +1260,7 @@ def test_run_audio_forwards_the_reporter(project, monkeypatch):
     paths = Paths(project.root)
     _write_script(paths.script(2), render_script())
     asyncio.run(run_voice(project, FakeTTSEngine([8.0, 10.0, 10.0]), episode=2))
+    _write_dialogue_for_render_script(paths)
     run_timeline(project, episode=2, source_duration=1400.0)
     _prepare_video(project)
 
@@ -1222,6 +1289,7 @@ def test_run_render_invokes_ffmpeg(project, monkeypatch):
     paths = Paths(project.root)
     _write_script(paths.script(2), render_script())
     asyncio.run(run_voice(project, FakeTTSEngine([8.0, 10.0, 10.0]), episode=2))
+    _write_dialogue_for_render_script(paths)
     run_timeline(project, episode=2, source_duration=1400.0)
     _prepare_video(project)
     paths.mixed_audio(2).parent.mkdir(parents=True, exist_ok=True)
@@ -1245,8 +1313,10 @@ def test_run_render_invokes_ffmpeg(project, monkeypatch):
 
 
 def test_run_render_without_audio_raises(project):
-    _write_script(Paths(project.root).script(2), render_script())
+    paths = Paths(project.root)
+    _write_script(paths.script(2), render_script())
     asyncio.run(run_voice(project, FakeTTSEngine([8.0, 10.0, 10.0]), episode=2))
+    _write_dialogue_for_render_script(paths)
     run_timeline(project, episode=2, source_duration=1400.0)
     _prepare_video(project)
     with pytest.raises(FileNotFoundError) as exc:
@@ -1258,6 +1328,7 @@ def test_run_render_without_audio_raises(project):
 async def test_run_pipeline_from_voice_runs_render_stages(project, monkeypatch):
     paths = Paths(project.root)
     _write_script(paths.script(2), render_script())
+    _write_dialogue_for_render_script(paths)
     _prepare_video(project)
     monkeypatch.setattr("tenmin.pipeline.probe_duration", lambda path, **_: 1400.0)
     monkeypatch.setattr("tenmin.pipeline.probe_frame_rate", lambda path, **_: 25.0)
@@ -1293,6 +1364,7 @@ async def test_run_pipeline_never_disables_frame_alignment(project, monkeypatch)
 
     paths = Paths(project.root)
     _write_script(paths.script(2), render_script())
+    _write_dialogue_for_render_script(paths)
     _prepare_video(project)
     monkeypatch.setattr("tenmin.pipeline.probe_duration", lambda path, **_: 1400.0)
     monkeypatch.setattr("tenmin.pipeline.probe_frame_rate", lambda path, **_: 23.976)
@@ -1778,6 +1850,7 @@ def test_run_render_reports_substep_progress(project, monkeypatch):
     _write_script(paths.script(2), render_script())
     engine = FakeTTSEngine([8.0, 10.0, 10.0])
     asyncio.run(run_voice(project, engine, episode=2))
+    _write_dialogue_for_render_script(paths)
     run_timeline(project, episode=2, source_duration=1400.0)
     _prepare_video(project)
     paths.mixed_audio(2).parent.mkdir(parents=True, exist_ok=True)
@@ -1802,6 +1875,7 @@ def test_run_timeline_uses_configured_ffprobe_path(project, monkeypatch):
     paths = Paths(project.root)
     _write_script(paths.script(2), render_script())
     asyncio.run(run_voice(project, FakeTTSEngine([8.0, 10.0, 10.0]), episode=2))
+    _write_dialogue_for_render_script(paths)
     _prepare_video(project)
     project.render.ffprobe_path = "/opt/x/ffprobe"
     seen: dict[str, str] = {}
@@ -1824,6 +1898,7 @@ def test_run_audio_uses_configured_ffmpeg_path(project, monkeypatch):
     paths = Paths(project.root)
     _write_script(paths.script(2), render_script())
     asyncio.run(run_voice(project, FakeTTSEngine([8.0, 10.0, 10.0]), episode=2))
+    _write_dialogue_for_render_script(paths)
     run_timeline(project, episode=2, source_duration=1400.0)
     _prepare_video(project)
     project.render.ffmpeg_path = "/opt/x/ffmpeg"
@@ -1842,6 +1917,7 @@ def test_run_render_uses_configured_ffmpeg_path(project, monkeypatch):
     paths = Paths(project.root)
     _write_script(paths.script(2), render_script())
     asyncio.run(run_voice(project, FakeTTSEngine([8.0, 10.0, 10.0]), episode=2))
+    _write_dialogue_for_render_script(paths)
     run_timeline(project, episode=2, source_duration=1400.0)
     _prepare_video(project)
     paths.mixed_audio(2).parent.mkdir(parents=True, exist_ok=True)
@@ -1862,6 +1938,7 @@ def test_preflight_receives_configured_binaries(project, monkeypatch):
     paths = Paths(project.root)
     _write_script(paths.script(2), render_script())
     asyncio.run(run_voice(project, FakeTTSEngine([8.0, 10.0, 10.0]), episode=2))
+    _write_dialogue_for_render_script(paths)
     run_timeline(project, episode=2, source_duration=1400.0)
     _prepare_video(project)
     project.render.ffmpeg_path = "/opt/x/ffmpeg"
@@ -1892,6 +1969,7 @@ async def _run_audio_only(project, monkeypatch):
     paths = Paths(project.root)
     _write_script(paths.script(2), render_script())
     await run_voice(project, FakeTTSEngine([8.0, 10.0, 10.0]), episode=2)
+    _write_dialogue_for_render_script(paths)
     run_timeline(project, episode=2, source_duration=1400.0)
     _prepare_video(project)
     monkeypatch.setattr("tenmin.render.audio.run_with_progress", _touch_output)
@@ -1953,6 +2031,7 @@ def test_run_render_wires_the_outro_font_name_into_drawtext(project, monkeypatch
     paths = Paths(project.root)
     _write_script(paths.script(2), render_script())
     asyncio.run(run_voice(project, FakeTTSEngine([8.0, 10.0, 10.0]), episode=2))
+    _write_dialogue_for_render_script(paths)
     run_timeline(project, episode=2, source_duration=1400.0)
     _prepare_video(project)
     paths.mixed_audio(2).parent.mkdir(parents=True, exist_ok=True)
@@ -3547,6 +3626,26 @@ async def test_an_untouched_project_reruns_nothing(project, monkeypatch):
     _full_run_project(project, monkeypatch)
     await _first_full_run(project)
     assert await _stages_rerun(project) == set()
+
+
+@pytest.mark.asyncio
+async def test_editing_dialogue_invalidates_timeline_but_not_llm_or_tts(project, monkeypatch):
+    """对白轨是 timeline 留白核验的输入，改它不该连带判 script/voice 过期。"""
+    _full_run_project(project, monkeypatch)
+    await _first_full_run(project)
+    path = Paths(project.root).dialogue(2)
+    _shift_mtime(path, 100)
+    reporter = FakeReporter()
+    await run_pipeline(
+        project,
+        FakeProvider([]),
+        only=["timeline", "audio", "render"],
+        tts_engine=FakeTTSEngine([]),
+        reporter=reporter,
+    )
+    starts = {call[1] for call in reporter.calls if call[0] == "stage_start"}
+    assert starts == {"timeline", "audio", "render"}
+    assert all(call[1] != "voice" for call in reporter.calls)
 
 
 @pytest.mark.asyncio

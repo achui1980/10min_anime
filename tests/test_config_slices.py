@@ -182,7 +182,7 @@ def test_changing_an_excluded_knob_changes_no_slice(tmp_path, field):
         ("render.crf", "18", {"render"}),
         ("render.font_size", 60, {"timeline", "render"}),
         ("render.voice", "zh-CN-XiaoxiaoNeural", {"voice"}),
-        ("render.rate", "+10%", {"script", "docgen", "voice"}),
+        ("render.rate", "+10%", {"script", "docgen", "voice", "timeline"}),
         ("render.duck_db", -6.0, {"audio"}),
         ("render.fade_out_seconds", 2.0, {"audio", "render"}),
         ("llm.validation_retries", 5, {"script"}),

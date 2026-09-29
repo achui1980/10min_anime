@@ -63,6 +63,7 @@ STAGE_FIELDS: dict[str, tuple[str, ...]] = {
         "render.subtitle_min_seconds",
         "render.subtitle_soft_max_chars",
         "render.drift_tolerance",
+        "render.rate",
         EPISODE,
     ),
     "audio": (

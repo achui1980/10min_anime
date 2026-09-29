@@ -322,10 +322,11 @@ def _is_fresh(outputs: list[Path], inputs: list[Path]) -> bool:
 def _timeline_inputs(
     paths: Paths, episode: int, track: VoiceTrack, video_inputs: list[Path]
 ) -> list[Path]:
-    """timeline 会读取的 voice 元数据、缓存音频与源片。"""
+    """timeline 会读取的 voice 元数据、缓存音频、对白轨与源片。"""
     return [
         paths.script(episode),
         paths.voice(episode),
+        paths.dialogue(episode),
         *(paths.voice_dir(episode) / chunk.path for chunk in track.chunks),
         *video_inputs,
     ]
@@ -930,6 +931,14 @@ def run_timeline(
     episode_cfg = _find_episode(cfg, episode)
     script = _load_script(cfg, episode)
     track = _load_voice(cfg, episode)
+    dialogue_path = paths.dialogue(episode)
+    if not dialogue_path.exists():
+        raise FileNotFoundError(f"缺少对白轨 {dialogue_path}，请先跑 ingest 阶段")
+    dialogue = DialogueTrack.model_validate_json(
+        dialogue_path.read_text(encoding="utf-8")
+    )
+    if dialogue.episode != episode:
+        raise ValueError(f"对白轨集号 {dialogue.episode} 与目标集 {episode} 不一致")
     if source_duration is None:
         video = cfg.video_path(episode_cfg)
         source_duration = probe_duration(video, ffprobe=cfg.render.ffprobe_path)
@@ -953,8 +962,8 @@ def run_timeline(
         except (FFmpegError, OSError, ValueError):
             pass  # 缺失/损坏的缓存保留原句；check_cue_legibility 会提示改稿
     timeline, warnings = build_timeline(
-        script, track, source_duration, frame_rate=frame_rate, cfg=cfg.render,
-        pause_evidence=pause_evidence,
+        script, track, source_duration, dialogue=dialogue, frame_rate=frame_rate,
+        cfg=cfg.render, pause_evidence=pause_evidence,
     )
     # 可读性检查住在 render/subtitles.py 的 check_cue_legibility —— 只有它知道字号与画布宽度算出来
     # 的行数。接在这里而不是 build_timeline 里：render/timeline.py 压根不认识字体，而

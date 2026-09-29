@@ -729,6 +729,10 @@ def _write_voice_and_script(cfg: ProjectConfig) -> None:
     paths.voice(1).parent.mkdir(parents=True, exist_ok=True)
     paths.voice(1).write_text(voice.model_dump_json(), encoding="utf-8")
 
+    dialogue = DialogueTrack(episode=1, duration=100.0)
+    paths.dialogue(1).parent.mkdir(parents=True, exist_ok=True)
+    paths.dialogue(1).write_text(dialogue.model_dump_json(), encoding="utf-8")
+
 
 # --- render.tts_* 接线 ---
 
