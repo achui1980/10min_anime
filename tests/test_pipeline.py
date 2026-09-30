@@ -3022,7 +3022,7 @@ async def test_run_translate_skips_a_native_subtitle_episode(tmp_path):
     """
     cfg, paths = _project_with_dialogue(tmp_path, episode=2, source="srt")
 
-    result = await run_translate(cfg, FakeProvider([]), 2)
+    result, _ = await run_translate(cfg, FakeProvider([]), 2)
 
     assert not paths.zh_lines(2).exists()
     assert not paths.zh_subtitles(2).exists()
@@ -3030,6 +3030,51 @@ async def test_run_translate_skips_a_native_subtitle_episode(tmp_path):
     # 返回值仍然得是这一集的空轨：库调用方拿它当「这一集翻了什么」的答案。
     assert result.episode == 2
     assert result.lines == []
+
+
+async def test_run_translate_returns_warnings_for_a_trimmed_glossary_entry(tmp_path):
+    """run_translate 把 merge_glossary 剪裁产生的 warning 一并返回。"""
+    cfg, paths = _project_with_dialogue(tmp_path, episode=11, source="asr")
+    provider = FakeProvider([_translation_response({"主ガビオ": "主嘉碑喔"})])
+
+    _, stage_warnings = await run_translate(cfg, provider, 11)
+
+    assert len(stage_warnings) == 1
+    assert "主ガビオ" in stage_warnings[0]
+    stored = json.loads(paths.glossary.read_text(encoding="utf-8"))
+    assert stored == {"主ガビオ": "主嘉碑"}
+
+
+async def test_run_translate_returns_no_warnings_when_glossary_is_clean(tmp_path):
+    cfg, _ = _project_with_dialogue(tmp_path, episode=11, source="asr")
+    provider = FakeProvider([_translation_response({"リディア": "莉迪亚"})])
+
+    _, stage_warnings = await run_translate(cfg, provider, 11)
+
+    assert stage_warnings == []
+
+
+async def test_run_translate_returns_empty_warnings_when_skipped(tmp_path):
+    cfg, _ = _project_with_dialogue(tmp_path, episode=2, source="srt")
+
+    result, stage_warnings = await run_translate(cfg, FakeProvider([]), 2)
+
+    assert result.episode == 2
+    assert result.lines == []
+    assert stage_warnings == []
+
+
+async def test_run_pipeline_surfaces_glossary_trim_warnings_with_episode_prefix(tmp_path):
+    """translate 阶段产生的语气词剪裁 warning 出现在最终 warnings 列表中，
+    且带正确的 E{episode:02d}前缀（与既有惯例一致）。"""
+    cfg, _ = _project_with_dialogue(tmp_path, episode=11, source="asr")
+    provider = FakeProvider([_translation_response({"主ガビオ": "主嘉碑喔"})])
+
+    warnings = await run_pipeline(cfg, provider, only=["translate"])
+
+    matches = [w for w in warnings if "主ガビオ" in w]
+    assert len(matches) == 1
+    assert matches[0].startswith("E11")
 
 
 async def test_run_pipeline_runs_translate_for_a_transcribed_episode(tmp_path):
@@ -3161,7 +3206,7 @@ def _spy_translate_and_script(monkeypatch) -> list[str]:
 
     async def spy_translate(cfg, provider, episode):
         order.append(f"translate{episode}")
-        return TranslatedTrack(episode=episode, lines=[])
+        return TranslatedTrack(episode=episode, lines=[]), []
 
     async def spy_script(cfg, provider, episode, *, reporter=None):
         order.append(f"script{episode}-start")

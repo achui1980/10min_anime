@@ -542,7 +542,7 @@ def _load_tracks(cfg: ProjectConfig) -> list[DialogueTrack]:
 
 async def run_translate(
     cfg: ProjectConfig, provider: LLMProvider, episode: int
-) -> TranslatedTrack:
+) -> tuple[TranslatedTrack, list[str]]:
     """翻译一集：落译文轨、中文字幕，并把新认出的术语并回累积表。
 
     只对听写来的对白动手。手传的字幕与从视频里抽出来的软字幕轨都是片源自带的，本来
@@ -558,10 +558,14 @@ async def run_translate(
 
     已知边界：手传一份日语 SRT（或者软字幕轨恰好是日语）时，这一阶段不会跑，而且那份
     对白还会被繁转简改字。目前的片源都不是这种情况，真碰上了再说。
+
+    返回 `(译文轨, warnings)`，与 `run_voice`/`run_timeline` 同一模式：warnings 目前
+    只来自 `merge_glossary` 的语气词剪裁/丢弃提示，方便人工发现「本集新词被自动修正
+    过」。跳过（非 asr 来源）时返回空列表，不产生任何提示噪音。
     """
     track = next(t for t in _load_tracks(cfg) if t.episode == episode)
     if track.source != "asr":
-        return TranslatedTrack(episode=episode)
+        return TranslatedTrack(episode=episode), []
 
     paths = Paths(cfg.root)
     accumulated = load_glossary(paths.glossary)
@@ -577,8 +581,11 @@ async def run_translate(
     _write_text(paths.zh_subtitles(episode), render_zh_srt(track, translated))
     # merge 的方向是「累积的赢」：已经定下的译名不许被后面某一集改掉。喂给模型的那份表
     # 另有一个方向（手写的赢），那一步在 translate_track 内部做。
-    save_glossary(paths.glossary, merge_glossary(accumulated, translated.glossary))
-    return translated
+    notices: list[str] = []
+    save_glossary(
+        paths.glossary, merge_glossary(accumulated, translated.glossary, warnings=notices)
+    )
+    return translated, notices
 
 
 def run_signals(cfg: ProjectConfig) -> list[SignalReport]:
@@ -1369,7 +1376,8 @@ async def run_pipeline(
                     "translate", number, outputs, _translate_inputs(paths, number)
                 ):
                     reporter.stage_start("translate")
-                    await run_translate(cfg, provider, number)
+                    _, stage_warnings = await run_translate(cfg, provider, number)
+                    warnings.extend(f"E{number:02d}：{w}" for w in stage_warnings)
                     reporter.stage_done("translate")
                 else:
                     reporter.stage_skip("translate")
