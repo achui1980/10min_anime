@@ -3074,7 +3074,7 @@ async def test_run_pipeline_surfaces_glossary_trim_warnings_with_episode_prefix(
 
     matches = [w for w in warnings if "主ガビオ" in w]
     assert len(matches) == 1
-    assert matches[0].startswith("E11")
+    assert matches[0].startswith("E11：")
 
 
 async def test_run_pipeline_runs_translate_for_a_transcribed_episode(tmp_path):
