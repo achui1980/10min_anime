@@ -2,6 +2,7 @@ import asyncio
 import difflib
 import json
 import os
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -741,7 +742,7 @@ async def test_run_pipeline_reruns_the_render_stages_when_the_voice_changes(
     # voice 重跑时 synthesize_track 会复用上一轮落盘的 chunk 并用 ffprobe 量时长，
     # 而 FakeTTSEngine 写的是假 mp3 字节。
     monkeypatch.setattr("tenmin.render.tts.probe_duration", lambda path: 8.0)
-    monkeypatch.setattr("tenmin.render.audio.run_with_progress", _touch_output)
+    _stub_mix_audio_ffmpeg(monkeypatch)
     monkeypatch.setattr("tenmin.render.video.run_with_progress", _touch_output_with_progress)
     _write_dialogue_for_render_script(paths)
 
@@ -771,7 +772,7 @@ async def test_replacing_video_reruns_only_video_dependent_stages(project, monke
     monkeypatch.setattr("tenmin.pipeline.probe_duration", lambda path, **_: 1400.0)
     monkeypatch.setattr("tenmin.pipeline.probe_frame_rate", lambda path, **_: 25.0)
     monkeypatch.setattr("tenmin.pipeline.preflight", lambda video, encoder, **_: 1400.0)
-    monkeypatch.setattr("tenmin.render.audio.run_with_progress", _touch_output)
+    _stub_mix_audio_ffmpeg(monkeypatch)
     monkeypatch.setattr("tenmin.render.video.run_with_progress", _touch_output_with_progress)
 
     await run_pipeline(
@@ -812,7 +813,7 @@ async def test_video_replacement_invalidates_each_stage_run_alone(project, monke
     monkeypatch.setattr("tenmin.pipeline.probe_duration", lambda path, **_: 1400.0)
     monkeypatch.setattr("tenmin.pipeline.probe_frame_rate", lambda path, **_: 25.0)
     monkeypatch.setattr("tenmin.pipeline.preflight", lambda video, encoder, **_: 1400.0)
-    monkeypatch.setattr("tenmin.render.audio.run_with_progress", _touch_output)
+    _stub_mix_audio_ffmpeg(monkeypatch)
     monkeypatch.setattr("tenmin.render.video.run_with_progress", _touch_output_with_progress)
     await run_pipeline(project, FakeProvider([]), only=["timeline", "audio", "render"])
 
@@ -995,6 +996,69 @@ def _touch_output_with_progress(
     if on_progress is not None:
         on_progress(1.0)
     return _touch_output(args)
+
+
+# mix_audio 现在会真的调用 `run()` 做两遍响度体检（外加留白窗单独增益时的
+# ebur128 测量）与编码后的 `probe_duration` 时长体检——这些全流水线测试只关心
+# 「阶段接线对不对」，不该被这几道新守卫绊倒，所以统一假掉。按 filter graph 里
+# 有没有 "loudnorm" 分支返回对应格式：两遍响度归一走 loudnorm 的 JSON 报告，
+# 留白窗单独增益走 ebur128 的 `I: ... LUFS` 文本行。
+_FAKE_LOUDNORM_STDERR = (
+    "[Parsed_loudnorm_0 @ 0x0]\n"
+    "{\n"
+    '"input_i" : "-20.00",\n'
+    '"input_tp" : "-3.00",\n'
+    '"input_lra" : "5.00",\n'
+    '"input_thresh" : "-30.00",\n'
+    '"output_i" : "-14.00",\n'
+    '"output_tp" : "-1.50",\n'
+    '"output_lra" : "5.00",\n'
+    '"output_thresh" : "-24.00",\n'
+    '"normalization_type" : "dynamic",\n'
+    '"target_offset" : "0.10"\n'
+    "}\n"
+)
+
+
+def _fake_ffmpeg_meter(args: list[str], **_) -> str:
+    joined = " ".join(args)
+    if "loudnorm" in joined:
+        return _FAKE_LOUDNORM_STDERR
+    return "I: -23.0 LUFS\n"
+
+
+def _stub_mix_audio_ffmpeg(
+    monkeypatch,
+    *,
+    on_encode: Callable[[list[str]], None] | None = None,
+    progress_fraction: float = 1.0,
+    ffmpeg_seen: dict[str, str] | None = None,
+) -> None:
+    """把 `mix_audio` 接触到的三类 ffmpeg 调用（响度测量两遍/单独增益测量 + 真实
+    编码）都换成假的。`probe_duration`（编码后时长体检）回落到这次编码实际声明的
+    `total_seconds`——从 `run_with_progress` 的调用里现场捞，不需要每个测试各自
+    算一遍期望时长。
+    """
+    state: dict[str, float] = {}
+
+    def fake_run_with_progress(
+        args, *, total_seconds, on_progress=None, ffmpeg="ffmpeg", **_
+    ):
+        state["total_seconds"] = total_seconds
+        if ffmpeg_seen is not None:
+            ffmpeg_seen["ffmpeg"] = ffmpeg
+        if on_progress is not None:
+            on_progress(progress_fraction)
+        if on_encode is not None:
+            on_encode(list(args))
+        return _touch_output(args)
+
+    def fake_probe_duration(path, **_):
+        return state.get("total_seconds", 0.0)
+
+    monkeypatch.setattr("tenmin.render.audio.run_with_progress", fake_run_with_progress)
+    monkeypatch.setattr("tenmin.render.audio.run", _fake_ffmpeg_meter)
+    monkeypatch.setattr("tenmin.render.audio.probe_duration", fake_probe_duration)
 
 
 def render_script() -> Script:
@@ -1236,11 +1300,7 @@ def test_run_audio_invokes_ffmpeg(project, monkeypatch):
     _prepare_video(project)
     captured: list[list[str]] = []
 
-    def fake_run(args, **_):
-        captured.append(list(args))
-        return _touch_output(args)
-
-    monkeypatch.setattr("tenmin.render.audio.run_with_progress", fake_run)
+    _stub_mix_audio_ffmpeg(monkeypatch, on_encode=captured.append)
 
     out = run_audio(project, episode=2)
 
@@ -1264,12 +1324,7 @@ def test_run_audio_forwards_the_reporter(project, monkeypatch):
     run_timeline(project, episode=2, source_duration=1400.0)
     _prepare_video(project)
 
-    def fake_run(args, *, on_progress=None, **_):
-        if on_progress is not None:
-            on_progress(0.25)
-        return _touch_output(args)
-
-    monkeypatch.setattr("tenmin.render.audio.run_with_progress", fake_run)
+    _stub_mix_audio_ffmpeg(monkeypatch, progress_fraction=0.25)
     reporter = FakeReporter()
 
     run_audio(project, episode=2, reporter=reporter)
@@ -1333,7 +1388,7 @@ async def test_run_pipeline_from_voice_runs_render_stages(project, monkeypatch):
     monkeypatch.setattr("tenmin.pipeline.probe_duration", lambda path, **_: 1400.0)
     monkeypatch.setattr("tenmin.pipeline.probe_frame_rate", lambda path, **_: 25.0)
     monkeypatch.setattr("tenmin.pipeline.preflight", lambda video, encoder, **_: 1400.0)
-    monkeypatch.setattr("tenmin.render.audio.run_with_progress", _touch_output)
+    _stub_mix_audio_ffmpeg(monkeypatch)
     monkeypatch.setattr("tenmin.render.video.run_with_progress", _touch_output_with_progress)
 
     warnings = await run_pipeline(
@@ -1369,7 +1424,7 @@ async def test_run_pipeline_never_disables_frame_alignment(project, monkeypatch)
     monkeypatch.setattr("tenmin.pipeline.probe_duration", lambda path, **_: 1400.0)
     monkeypatch.setattr("tenmin.pipeline.probe_frame_rate", lambda path, **_: 23.976)
     monkeypatch.setattr("tenmin.pipeline.preflight", lambda video, encoder, **_: 1400.0)
-    monkeypatch.setattr("tenmin.render.audio.run_with_progress", _touch_output)
+    _stub_mix_audio_ffmpeg(monkeypatch)
     monkeypatch.setattr("tenmin.render.video.run_with_progress", _touch_output_with_progress)
 
     await run_pipeline(
@@ -1400,7 +1455,7 @@ async def test_run_pipeline_batch_mode_runs_full_pipeline_for_all_episodes(
     monkeypatch.setattr("tenmin.pipeline.probe_duration", lambda path, **_: 1400.0)
     monkeypatch.setattr("tenmin.pipeline.probe_frame_rate", lambda path, **_: 25.0)
     monkeypatch.setattr("tenmin.pipeline.preflight", lambda video, encoder, **_: 1400.0)
-    monkeypatch.setattr("tenmin.render.audio.run_with_progress", _touch_output)
+    _stub_mix_audio_ffmpeg(monkeypatch)
     monkeypatch.setattr("tenmin.render.video.run_with_progress", _touch_output_with_progress)
 
     # 处理顺序跟 cfg.episodes 一致：project 先注册了第 2 集，再 append 第 1 集。
@@ -1732,7 +1787,7 @@ async def test_run_pipeline_reports_episode_start_exactly_once_per_episode(
     monkeypatch.setattr("tenmin.pipeline.probe_duration", lambda path, **_: 1400.0)
     monkeypatch.setattr("tenmin.pipeline.probe_frame_rate", lambda path, **_: 25.0)
     monkeypatch.setattr("tenmin.pipeline.preflight", lambda video, encoder, **_: 1400.0)
-    monkeypatch.setattr("tenmin.render.audio.run_with_progress", _touch_output)
+    _stub_mix_audio_ffmpeg(monkeypatch)
     monkeypatch.setattr("tenmin.render.video.run_with_progress", _touch_output_with_progress)
 
     reporter = FakeReporter()
@@ -1822,7 +1877,7 @@ async def test_run_pipeline_preflights_all_episodes_before_any_tts(
         "tenmin.pipeline.preflight",
         lambda video, encoder, **_: (events.append(f"preflight:{Path(video).name}"), 1400.0)[1],
     )
-    monkeypatch.setattr("tenmin.render.audio.run_with_progress", _touch_output)
+    _stub_mix_audio_ffmpeg(monkeypatch)
     monkeypatch.setattr("tenmin.render.video.run_with_progress", _touch_output_with_progress)
 
     provider = FakeProvider([fake_script_response(episode=2), fake_script_response(episode=1)])
@@ -1904,11 +1959,7 @@ def test_run_audio_uses_configured_ffmpeg_path(project, monkeypatch):
     project.render.ffmpeg_path = "/opt/x/ffmpeg"
     seen: dict[str, str] = {}
 
-    def fake_run(args, *, ffmpeg="ffmpeg", **_):
-        seen["ffmpeg"] = ffmpeg
-        return _touch_output(args)
-
-    monkeypatch.setattr("tenmin.render.audio.run_with_progress", fake_run)
+    _stub_mix_audio_ffmpeg(monkeypatch, ffmpeg_seen=seen)
     run_audio(project, episode=2)
     assert seen["ffmpeg"] == "/opt/x/ffmpeg"
 
@@ -1951,7 +2002,7 @@ def test_preflight_receives_configured_binaries(project, monkeypatch):
         return 1400.0
 
     monkeypatch.setattr("tenmin.pipeline.preflight", fake_preflight)
-    monkeypatch.setattr("tenmin.render.audio.run_with_progress", _touch_output)
+    _stub_mix_audio_ffmpeg(monkeypatch)
     asyncio.run(
         run_pipeline(
             project,
@@ -1972,7 +2023,7 @@ async def _run_audio_only(project, monkeypatch):
     _write_dialogue_for_render_script(paths)
     run_timeline(project, episode=2, source_duration=1400.0)
     _prepare_video(project)
-    monkeypatch.setattr("tenmin.render.audio.run_with_progress", _touch_output)
+    _stub_mix_audio_ffmpeg(monkeypatch)
     return await run_pipeline(
         project,
         FakeProvider(render_script()),
@@ -3593,7 +3644,7 @@ def _full_run_project(project, monkeypatch) -> None:
     monkeypatch.setattr("tenmin.pipeline.probe_frame_rate", lambda path, **_: 25.0)
     monkeypatch.setattr("tenmin.pipeline.preflight", lambda video, encoder, **_: 1400.0)
     monkeypatch.setattr("tenmin.render.tts.probe_duration", lambda path: 80.0)
-    monkeypatch.setattr("tenmin.render.audio.run_with_progress", _touch_output)
+    _stub_mix_audio_ffmpeg(monkeypatch)
     monkeypatch.setattr("tenmin.render.video.run_with_progress", _touch_output_with_progress)
 
 

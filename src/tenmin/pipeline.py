@@ -1013,6 +1013,8 @@ def run_audio(
         audio_codec=cfg.render.audio_codec,
         audio_bitrate=cfg.render.audio_bitrate,
         limiter_ceiling=cfg.render.limiter_ceiling,
+        cfg=cfg.render,
+        ffprobe=cfg.render.ffprobe_path,
         reporter=reporter,
         ffmpeg=cfg.render.ffmpeg_path,
     )

@@ -114,6 +114,48 @@ def build(tmp_path, **overrides):
     return build_mix_args(**kwargs)
 
 
+# --- mix_audio 的双遍响度体检：mock 测试用的假响度报告与假素材 -----------------
+# mix_audio 现在会真的调用两次 `run()`（首遍只测 + 编码后复检）并用
+# `_input_identity` 比对源文件，所以这里那些只关心「ffmpeg 参数拼得对不对/进度
+# 报得对不对」的 mock 测试也得把这两件事伺候好，否则会在压根不想测的那道守卫上
+# 摔倒——不是失败模式本身有问题，是这些测试的关注点不在这里。
+
+_FAKE_LOUDNORM_STDERR = (
+    "[Parsed_loudnorm_0 @ 0x0]\n"
+    "{\n"
+    '"input_i" : "-20.00",\n'
+    '"input_tp" : "-3.00",\n'
+    '"input_lra" : "5.00",\n'
+    '"input_thresh" : "-30.00",\n'
+    '"output_i" : "-14.00",\n'
+    '"output_tp" : "-1.50",\n'
+    '"output_lra" : "5.00",\n'
+    '"output_thresh" : "-24.00",\n'
+    '"normalization_type" : "dynamic",\n'
+    '"target_offset" : "0.10"\n'
+    "}\n"
+)
+
+
+def _stub_loudness_checks(monkeypatch, *, total_seconds: float) -> None:
+    """让 `run()` 永远吐一份有效、有限的假响度报告，`probe_duration` 回落到
+    这次编码本该产出的长度——两者都不是这些测试想验的东西。"""
+    from tenmin.render import audio as audio_module
+
+    monkeypatch.setattr(audio_module, "run", lambda *_a, **_k: _FAKE_LOUDNORM_STDERR)
+    monkeypatch.setattr(audio_module, "probe_duration", lambda *_a, **_k: total_seconds)
+
+
+def _prepare_mix_inputs(tmp_path, track) -> None:
+    """`_input_identity` 要 stat 源视频与每个配音 chunk，这些 mock 测试原来
+    压根没造出这些文件——不是没写全，是这道守卫在它们写的时候还不存在。"""
+    (tmp_path / "source.mkv").write_bytes(b"fake video")
+    voice_dir = tmp_path / "04_voice" / "E02"
+    voice_dir.mkdir(parents=True, exist_ok=True)
+    for chunk in track.chunks:
+        (voice_dir / chunk.path).write_bytes(b"fake chunk")
+
+
 def test_duck_gain_zero_db_is_unity():
     assert duck_gain(0.0) == pytest.approx(1.0)
 
@@ -448,6 +490,8 @@ def test_mix_audio_reports_progress_against_the_pinned_length(tmp_path, monkeypa
         Path(args[-1]).write_bytes(b"\x00")
         return ""
 
+    _prepare_mix_inputs(tmp_path, make_track())
+    _stub_loudness_checks(monkeypatch, total_seconds=33.0)
     monkeypatch.setattr(audio_module, "run_with_progress", fake_run_with_progress)
     audio_module.mix_audio(
         video=tmp_path / "source.mkv",
@@ -473,6 +517,8 @@ def test_mix_audio_forwards_progress_to_the_reporter(tmp_path, monkeypatch):
         Path(args[-1]).write_bytes(b"\x00")
         return ""
 
+    _prepare_mix_inputs(tmp_path, make_track())
+    _stub_loudness_checks(monkeypatch, total_seconds=30.0)
     monkeypatch.setattr(audio_module, "run_with_progress", fake_run_with_progress)
     reporter = FakeReporter()
     audio_module.mix_audio(
@@ -499,6 +545,8 @@ def test_mix_audio_runs_ffmpeg_and_returns_path(tmp_path, monkeypatch):
         Path(args[-1]).write_bytes(b"\x00")
         return ""
 
+    _prepare_mix_inputs(tmp_path, make_track())
+    _stub_loudness_checks(monkeypatch, total_seconds=30.0)
     monkeypatch.setattr(audio_module, "run_with_progress", fake_run)
     out_path = tmp_path / "06_audio" / "E02.mixed.m4a"
     result = audio_module.mix_audio(
@@ -532,6 +580,8 @@ def test_mix_audio_passes_configured_ffmpeg_binary(tmp_path, monkeypatch):
         Path(args[-1]).write_bytes(b"\x00")
         return ""
 
+    _prepare_mix_inputs(tmp_path, make_track())
+    _stub_loudness_checks(monkeypatch, total_seconds=30.0)
     monkeypatch.setattr(audio_module, "run_with_progress", fake_run)
     audio_module.mix_audio(
         video=tmp_path / "source.mkv",
@@ -561,6 +611,8 @@ def test_mix_audio_tells_ffmpeg_to_write_a_part_file(tmp_path, monkeypatch):
         Path(args[-1]).write_bytes(b"\x00")
         return ""
 
+    _prepare_mix_inputs(tmp_path, make_track())
+    _stub_loudness_checks(monkeypatch, total_seconds=30.0)
     monkeypatch.setattr(audio_module, "run_with_progress", fake_run)
     out_path = tmp_path / "06_audio" / "E02.mixed.m4a"
     audio_module.mix_audio(
@@ -592,6 +644,8 @@ def test_mix_audio_keeps_the_previous_artifact_when_ffmpeg_fails(tmp_path, monke
         Path(args[-1]).write_bytes(b"truncated")
         raise FFmpegError("boom")
 
+    _prepare_mix_inputs(tmp_path, make_track())
+    _stub_loudness_checks(monkeypatch, total_seconds=30.0)
     monkeypatch.setattr(audio_module, "run_with_progress", fake_run)
     with pytest.raises(FFmpegError):
         audio_module.mix_audio(
@@ -939,6 +993,50 @@ def test_measure_hold_gains_skips_the_window_whose_meter_fails_but_still_measure
     assert any("b1" in w and "0" in w for w in warnings)
 
 
+def test_measure_hold_gains_processes_windows_by_start_regardless_of_input_order(
+    tmp_path, monkeypatch
+):
+    """`windows` 给的顺序（比方说 `kept` 按原始下标排的）跟按 `window.start`
+    排序的处理顺序未必一致——这里故意把「晚」的窗口排在「早」的前面传进去，
+    验证响度测量仍然按时间轴顺序（8.0 在 20.0 之前）走，不是原样照抄输入顺序。
+    `gains` 本身是按原始下标查的 dict，跟遍历顺序无关，唯一能外部观察到顺序的
+    地方是失败发生在哪一个窗口上。
+    """
+    from tenmin.render.audio import _measure_hold_gains
+    from tenmin.render.ffmpeg import FFmpegError
+
+    timeline = make_timeline()
+    track = make_track()
+    early = HoldWindow(beat_id="b1", hold_index=0, quote="a", episode=2,
+                        source_start=108, source_end=109, start=8.0, end=10.0)
+    late = HoldWindow(beat_id="b2", hold_index=1, quote="b", episode=2,
+                       source_start=205, source_end=206, start=20.0, end=22.0)
+    windows = [(1, late), (0, early)]  # 故意反着传：晚的在前。
+
+    responses = iter([
+        "I: -30.0 LUFS\n",  # 旁白参考
+        FFmpegError("boom"),  # 按 start 排序后先处理的应是 start=8.0 的 early
+        "I: -25.0 LUFS\n",  # 然后才是 start=20.0 的 late
+    ])
+
+    def fake_run(args, *, ffmpeg="ffmpeg"):
+        outcome = next(responses)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    monkeypatch.setattr("tenmin.render.audio.run", fake_run)
+
+    gains, warnings = _measure_hold_gains(
+        tmp_path / "source.mkv", timeline, track, tmp_path / "voice", windows,
+        cfg=RenderConfig(), ffmpeg="ffmpeg",
+    )
+
+    assert 0 not in gains
+    assert 1 in gains
+    assert warnings and "b1" in warnings[0] and "0" in warnings[0]
+
+
 def test_measure_hold_gains_short_circuits_when_voice_reference_is_unmeasurable(
     tmp_path, monkeypatch
 ):
@@ -987,6 +1085,8 @@ def test_mix_audio_reports_each_percent_only_once(tmp_path, monkeypatch):
     reporter = FakeReporter()
     voice_dir = tmp_path / "04_voice" / "E02"
     voice_dir.mkdir(parents=True)
+    _prepare_mix_inputs(tmp_path, make_track())
+    _stub_loudness_checks(monkeypatch, total_seconds=30.0)
     mix_audio(
         video=tmp_path / "source.mkv",
         timeline=make_timeline(),
@@ -997,3 +1097,127 @@ def test_mix_audio_reports_each_percent_only_once(tmp_path, monkeypatch):
         reporter=reporter,
     )
     assert [call[2] for call in reporter.calls] == [0, 50, 100]
+
+
+# --- 双遍响度归一：报告解析 --------------------------------------------------
+
+
+def _loudnorm_report(
+    input_i: str = "-23.9",
+    input_tp: str = "-3",
+    input_lra: str = "4",
+    input_thresh: str = "-34",
+    target_offset: str = "0.1",
+) -> str:
+    """拼一份跟真实 ffmpeg `loudnorm=print_format=json` 输出同形的 stderr。"""
+    return (
+        "[Parsed_loudnorm_0 @ 0x0]\n"
+        "{\n"
+        f'"input_i" : "{input_i}",\n'
+        f'"input_tp" : "{input_tp}",\n'
+        f'"input_lra" : "{input_lra}",\n'
+        f'"input_thresh" : "{input_thresh}",\n'
+        '"output_i" : "-14.0",\n'
+        '"output_tp" : "-1.5",\n'
+        '"output_lra" : "5.0",\n'
+        '"output_thresh" : "-24.0",\n'
+        '"normalization_type" : "dynamic",\n'
+        f'"target_offset" : "{target_offset}"\n'
+        "}\n"
+    )
+
+
+def test_loudnorm_stats_ignores_nonfinite_and_reads_final_json():
+    from tenmin.render.audio import _loudnorm_explicit_silence, _loudnorm_stats
+
+    stats = _loudnorm_stats(_loudnorm_report())
+    assert stats is not None
+    assert stats["input_i"] == -23.9
+
+    only_i_silent = _loudnorm_report(input_i="-inf")
+    assert _loudnorm_stats(only_i_silent) is None
+
+    assert _loudnorm_explicit_silence("") is False
+    # 只有 input_i 是 -inf，input_tp 不是——不算「全片确实无声」。
+    assert _loudnorm_explicit_silence(only_i_silent) is False
+
+    both_silent = _loudnorm_report(input_i="-inf", input_tp="-inf")
+    assert _loudnorm_explicit_silence(both_silent) is True
+
+
+# --- 双遍响度归一：mix_audio 的发布前守卫 ------------------------------------
+# 任何一道体检失败都必须让 out_path 一个字节都不变——atomic_path 的保证只在
+# `mix_audio` 只通过它改 out_path、且异常发生在成功 replace 之前时才成立。
+
+
+def test_input_changed_between_two_passes_keeps_old_audio(tmp_path, monkeypatch):
+    """首遍测量期间源视频被换掉：两遍测的不是同一份东西，必须拒绝发布。"""
+    from tenmin.atomic import part_path
+    from tenmin.render import audio as audio_module
+    from tenmin.render.ffmpeg import FFmpegError
+
+    track = make_track()
+    _prepare_mix_inputs(tmp_path, track)
+    video = tmp_path / "source.mkv"
+
+    out_path = tmp_path / "06_audio" / "E02.mixed.m4a"
+    out_path.parent.mkdir(parents=True)
+    out_path.write_bytes(b"good old audio")
+    before_bytes = out_path.read_bytes()
+    before_mtime = out_path.stat().st_mtime_ns
+
+    def fake_run(args, **_):
+        # 模拟另一个并发进程在这次调用期间把源视频换掉了。
+        video.write_bytes(b"mutated mid-flight, not the file we just measured")
+        return _FAKE_LOUDNORM_STDERR
+
+    monkeypatch.setattr(audio_module, "run", fake_run)
+
+    with pytest.raises(FFmpegError, match=r"输入.*变化"):
+        audio_module.mix_audio(
+            video=video,
+            timeline=make_timeline(),
+            track=track,
+            voice_dir=tmp_path / "04_voice" / "E02",
+            out_path=out_path,
+            duck_db=-12.0,
+        )
+
+    assert out_path.read_bytes() == before_bytes
+    assert out_path.stat().st_mtime_ns == before_mtime
+    assert not part_path(out_path).exists()
+
+
+@pytest.mark.parametrize(
+    "bad_report",
+    ["", "not loudnorm json", '{"input_i":"-inf"}'],
+    ids=["empty", "not-json", "only-input-i-silent"],
+)
+def test_bad_first_meter_never_replaces_audio(tmp_path, monkeypatch, bad_report):
+    """首遍响度报告缺失/格式错/半吊子静音，都必须在编码前拒绝，不碰旧产物。"""
+    from tenmin.atomic import part_path
+    from tenmin.render import audio as audio_module
+    from tenmin.render.ffmpeg import FFmpegError
+
+    track = make_track()
+    _prepare_mix_inputs(tmp_path, track)
+
+    out_path = tmp_path / "06_audio" / "E02.mixed.m4a"
+    out_path.parent.mkdir(parents=True)
+    out_path.write_bytes(b"good old audio")
+    before_bytes = out_path.read_bytes()
+
+    monkeypatch.setattr(audio_module, "run", lambda *_a, **_k: bad_report)
+
+    with pytest.raises(FFmpegError, match="首遍响度测量"):
+        audio_module.mix_audio(
+            video=tmp_path / "source.mkv",
+            timeline=make_timeline(),
+            track=track,
+            voice_dir=tmp_path / "04_voice" / "E02",
+            out_path=out_path,
+            duck_db=-12.0,
+        )
+
+    assert out_path.read_bytes() == before_bytes
+    assert not part_path(out_path).exists()

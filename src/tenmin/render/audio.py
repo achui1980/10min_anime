@@ -5,16 +5,18 @@
 
 from __future__ import annotations
 
+import json
 import math
 import re
 from pathlib import Path
+from typing import Any
 
 from tenmin.atomic import atomic_path
 from tenmin.config import DEFAULT_RENDER, RenderConfig
 from tenmin.intervals import merge_intervals
 from tenmin.models import HoldWindow, SubtitleCue, Timeline, VoiceTrack
 from tenmin.progress import NullProgressReporter, ProgressReporter, percent_reporter
-from tenmin.render.ffmpeg import FFmpegError, run, run_with_progress
+from tenmin.render.ffmpeg import FFmpegError, probe_duration, run, run_with_progress
 from tenmin.render.timeline import (
     HOLD_EDGE_TOLERANCE,
     HOLD_MIN_COVERAGE,
@@ -633,7 +635,10 @@ def _measure_hold_gains(
 
     gains: dict[int, float] = {}
     warnings: list[str] = []
-    for index, window in windows:
+    # 按 (window.start, index) 排序：跟 `_valid_hold_windows` 返回 `kept` 时用的
+    # 排序键一致，纯粹是为了让警告顺序跟着时间轴走，不影响 `gains` 本身（它是按
+    # 原始下标查的 dict，跟遍历顺序无关）。
+    for index, window in sorted(windows, key=lambda pair: (pair[1].start, pair[0])):
         try:
             source_stderr = run(
                 _meter_args(video, timeline, track, voice_dir, window=window),
@@ -724,6 +729,109 @@ def build_mix_args(
     return args
 
 
+# --- 双遍响度归一：把最终成片钉在 cfg.loudness_i/tp/lra 附近 -------------------
+#
+# alimiter 那一层（build_mix_args 的 `[limited]`）只管「别削波」，从来没管过「整体
+# 有多响」——ducking + amix normalize=0 的组合天然产不出稳定的响度（每部番的原声
+# 底噪、混响、旁白语速都不一样）。这里在 `[limited]` 之后再挂一层 ffmpeg 官方推荐的
+# 两遍 loudnorm 工作流：第一遍只测（`measured=None`，loudnorm 自己分析出
+# input_i/tp/lra/thresh + target_offset），第二遍拿这份实测值 + `linear=false`
+# 重新过一遍（`linear=false` 才会真的按 true peak 动态压，让 TP 天花板落在配置值
+# 附近；`linear=true` 只是线性缩放整条轨，超标的峰值会原样透过去）。
+_LOUDNORM_STATS_FIELDS = ("input_i", "input_tp", "input_lra", "input_thresh", "target_offset")
+_JSON_BLOCK = re.compile(r"\{[^{}]*\}")
+
+
+def _last_loudnorm_json(stderr: str) -> dict[str, Any] | None:
+    """取 stderr 里**最后**一段能解析成 JSON 对象的 `{...}` 块。
+
+    loudnorm 的 `print_format=json` 只在这段结构是扁平的（没有嵌套对象）时才成立
+    ——真是这样，所以 `[^{}]*` 这个不含嵌套的字符类就够用，不需要一个真正的括号
+    配平解析器。取最后一段是因为同一次调用的 stderr 里可能夹着别的花括号噪音
+    （版本横幅、其他滤镜的诊断），而 loudnorm 自己的报告永远是整段跑完之后才打的
+    那一份，必然排在最后。
+    """
+    matches = _JSON_BLOCK.findall(stderr)
+    if not matches:
+        return None
+    try:
+        data = json.loads(matches[-1])
+    except json.JSONDecodeError:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _loudnorm_stats(stderr: str) -> dict[str, float] | None:
+    """解析 loudnorm 报告里那五个字段，全部转成 float。
+
+    任何一个字段缺失、不是字符串、转不成 float，或者转出来是非有限值
+    （`"-inf"` 是合法的 JSON 取值，但在这个函数眼里跟「读不出」等价——`-inf`
+    参与后续「跟配置目标差多少」的减法在数学上没有意义），一律返回 None，逼调用方
+    走「拒绝发布」那条分支。`_loudnorm_explicit_silence` 才是「这份 -inf 到底算不算
+    一个可以接受的合法状态」的判断，两件事故意分开。
+    """
+    data = _last_loudnorm_json(stderr)
+    if data is None:
+        return None
+    stats: dict[str, float] = {}
+    for field in _LOUDNORM_STATS_FIELDS:
+        raw = data.get(field)
+        if not isinstance(raw, str):
+            return None
+        try:
+            value = float(raw)
+        except ValueError:
+            return None
+        if not math.isfinite(value):
+            return None
+        stats[field] = value
+    return stats
+
+
+def _loudnorm_explicit_silence(stderr: str) -> bool:
+    """`input_i` 与 `input_tp` **都**字面等于 `"-inf"` 才算「全片确实无声」。
+
+    只有一个是 `-inf` 不算：积分响度测不出但真峰值测得出（或者反过来）意味着
+    数据本身不自洽，更可能是别的解析问题，不该被当成「合法的静音」放过去。
+    """
+    data = _last_loudnorm_json(stderr)
+    if data is None:
+        return False
+    return data.get("input_i") == "-inf" and data.get("input_tp") == "-inf"
+
+
+def _loudnorm_filter(cfg: RenderConfig, measured: dict[str, float] | None = None) -> str:
+    """拼一段 `loudnorm=...` 滤镜串。
+
+    `measured is None` = 第一遍（只测，不整形）；`measured` 给定 = 第二遍，把第一遍
+    量出来的五个数喂回去、`linear=false` 让它按 true peak 动态压缩而不是线性缩放
+    （线性缩放不会管超标的峰值，动态压缩才会真的把 TP 落到 `cfg.loudness_tp`
+    附近）。两遍都带 `print_format=json`：第二遍的报告是 `mix_audio` 编码后体检
+    读的那一份，不是白打的。
+    """
+    base = f"loudnorm=I={cfg.loudness_i:g}:TP={cfg.loudness_tp:g}:LRA={cfg.loudness_lra:g}"
+    if measured is None:
+        return f"{base}:print_format=json"
+    return (
+        f"{base}:measured_I={measured['input_i']}:measured_TP={measured['input_tp']}:"
+        f"measured_LRA={measured['input_lra']}:measured_thresh={measured['input_thresh']}:"
+        f"offset={measured['target_offset']}:linear=false:print_format=json"
+    )
+
+
+def _input_identity(paths: list[Path]) -> tuple[tuple[str, int, int], ...]:
+    """一份「这些文件现在长什么样」的快照：绝对路径 + 字节数 + mtime（纳秒）。
+
+    两遍响度测量 + 一次真实编码之间隔着好几次 ffmpeg 调用，跨度可能是几分钟。
+    如果这期间源视频或某个配音 chunk 被换掉（另一个并发进程在重新合成、用户手动
+    换了源片……），第一遍量出来的响度/时长跟真正编码进去的那份素材就不是同一批
+    数据——继续发布只会把一份自己都不知道测的是什么的产物送出去。比对内容哈希更
+    准，但一部番的源视频动辄几百 MB，逐字节比对的代价跟它要防的事件概率不成比例；
+    size + mtime 已经能拦住绝大多数「文件被换过」的场景，且是 O(1) 的 stat 调用。
+    """
+    return tuple((str(p.resolve()), p.stat().st_size, p.stat().st_mtime_ns) for p in paths)
+
+
 def mix_audio(
     *,
     video: Path,
@@ -739,6 +847,9 @@ def mix_audio(
     limiter_ceiling: float = LIMITER_CEILING,
     reporter: ProgressReporter | None = None,
     ffmpeg: str = DEFAULT_RENDER.ffmpeg_path,
+    cfg: RenderConfig = DEFAULT_RENDER,
+    warnings: list[str] | None = None,
+    ffprobe: str = DEFAULT_RENDER.ffprobe_path,
 ) -> Path:
     """真跑 ffmpeg 混音，返回产物路径。
 
@@ -748,27 +859,131 @@ def mix_audio(
 
     走 run_with_progress 而不是 run：这是一次几分钟的真实编码（23 段 atrim + 11 路
     adelay + 两级 amix，全程解码整部源片的音轨），原来跑它的时候界面上什么都不动，
-    跟卡死没有区别。总长取 mixed_total_seconds —— 跟 build_mix_args 钉住的产物长度
-    同源，进度才不会停在别的地方。
+    跟卡死没有区别。总长取 timeline.output_seconds —— 跟 build_mix_args 钉住的产物
+    长度同源，进度才不会停在别的地方。
+
+    编码前后各挂一道守卫，任何一道触发都直接抛 `FFmpegError`——`atomic_path` 保证
+    这不会碰到 `out_path` 一个字节：
+    1. 首遍响度测量（`_loudnorm_filter(measured=None)`）读不出五个字段、又不是
+       合法的「全静音」，说明这份素材本身或者 ffmpeg 输出格式有问题，不能带着一份
+       读不懂的响度报告去编码。
+    2. 前后三次 `_input_identity` 快照（测量前、两遍之间、编码后）一旦不一致，
+       说明源视频或某个配音 chunk 在这次调用期间被换掉了，两遍测量测的不是同一份
+       东西，拒绝发布。
+    3. 编码完成后拿**编码产物自己**再measure 一遍：真峰值超过配置上限
+       （留 0.1dB 的测量噪声容差）直接拒绝；实测响度偏离目标超过 1 LUFS 只降级成
+       warning（alimiter 的天花板有时会压掉 loudnorm 想要的增益，这种情况下「响度
+       没打到目标」是预期的物理限制，不是坏产物）。
+    4. 编码产物的实际时长（`probe_duration`）必须跟 timeline 声明的长度对上，否则
+       audio 阶段悄悄产出一份被截断/拉长的音轨，而 render 阶段的 `-c:a copy` 会把
+       这个错误原样搬进最终 mp4。
     """
     reporter = reporter or NullProgressReporter()
+    notices: list[str] = []
+
+    kept, audit_warnings = _valid_hold_windows(timeline, track)
+    notices.extend(audit_warnings)
+
+    sources = [video, *(voice_dir / chunk.path for chunk in track.chunks)]
+    identity = _input_identity(sources)
+
+    if kept:
+        gains, gain_warnings = _measure_hold_gains(
+            video, timeline, track, voice_dir, kept, cfg=cfg, ffmpeg=ffmpeg
+        )
+        notices.extend(gain_warnings)
+    else:
+        gains = {}
+
+    def full_args(
+        dest: str, *, measured: dict[str, float] | None, silent: bool = False
+    ) -> list[str]:
+        """拼一次完整调用的 argv：`dest` 是真实输出路径，或 `"-"` 表示只测不编码。
+
+        `silent=True`（首遍测量测出「本来就全静音」时的第二遍编码）刻意不追加
+        loudnorm——对着全静音信号硬套 loudnorm 只会把底噪或者压缩器的量化噪声放大
+        成一段能被听见的东西，不调它才是对的。
+        """
+        args = build_mix_args(
+            video=video,
+            timeline=timeline,
+            track=track,
+            voice_dir=voice_dir,
+            out_path=Path(dest),
+            duck_db=duck_db,
+            fade_out_seconds=fade_out_seconds,
+            outro_seconds=outro_seconds,
+            audio_codec=audio_codec,
+            audio_bitrate=audio_bitrate,
+            limiter_ceiling=limiter_ceiling,
+            hold_gains=gains,
+            hold_fade_seconds=cfg.hold_fade_seconds,
+        )
+        if not silent:
+            filter_index = args.index("-filter_complex") + 1
+            args[filter_index] = (
+                f"{args[filter_index]};[limited]{_loudnorm_filter(cfg, measured)}[normalized]"
+            )
+            map_index = args.index("-map") + 1
+            args[map_index] = "[normalized]"
+        if dest == "-":
+            args = [*args[: args.index("-c:a")], "-f", "null", "-"]
+        return args
+
+    if _input_identity(sources) != identity:
+        raise FFmpegError("混音输入在测量期间发生变化，拒绝发布")
+
+    first_report = run(full_args("-", measured=None), ffmpeg=ffmpeg)
+    stats = _loudnorm_stats(first_report)
+
+    if _input_identity(sources) != identity:
+        raise FFmpegError("混音输入在两遍之间发生变化，拒绝发布")
+
+    if stats is None and not _loudnorm_explicit_silence(first_report):
+        raise FFmpegError("首遍响度测量结果缺失或格式错误，拒绝发布")
+    if stats is None:
+        notices.append("整片无有效响度统计（全静音），按原静音编码")
+
     with atomic_path(out_path) as part:
         run_with_progress(
-            build_mix_args(
-                video=video,
-                timeline=timeline,
-                track=track,
-                voice_dir=voice_dir,
-                out_path=part,
-                duck_db=duck_db,
-                fade_out_seconds=fade_out_seconds,
-                outro_seconds=outro_seconds,
-                audio_codec=audio_codec,
-                audio_bitrate=audio_bitrate,
-                limiter_ceiling=limiter_ceiling,
-            ),
-            total_seconds=mixed_total_seconds(timeline, outro_seconds),
+            full_args(str(part), measured=stats, silent=stats is None),
+            total_seconds=timeline.output_seconds(outro_seconds),
             on_progress=percent_reporter(reporter, "audio"),
             ffmpeg=ffmpeg,
         )
+
+        if _input_identity(sources) != identity:
+            raise FFmpegError("混音输入在编码期间发生变化，拒绝发布")
+
+        final_report = run(
+            ["-hide_banner", "-i", str(part), "-af", _loudnorm_filter(cfg), "-f", "null", "-"],
+            ffmpeg=ffmpeg,
+        )
+        measured_out = _loudnorm_stats(final_report)
+        if measured_out is None and not (
+            stats is None and _loudnorm_explicit_silence(final_report)
+        ):
+            raise FFmpegError("编码后响度/真峰值读不出，拒绝发布")
+
+        if measured_out is not None:
+            if measured_out["input_tp"] > cfg.loudness_tp + 0.1:
+                raise FFmpegError("编码后真峰值超出配置上限，拒绝发布")
+            if abs(measured_out["input_i"] - cfg.loudness_i) > 1.0:
+                notices.append(
+                    f"成片实测 {measured_out['input_i']:.1f} LUFS，"
+                    "因峰值限制偏离目标"
+                )
+
+        actual_seconds = probe_duration(part, ffprobe=ffprobe)
+        expected_seconds = timeline.output_seconds(outro_seconds)
+        if abs(actual_seconds - expected_seconds) > 0.1:
+            raise FFmpegError(
+                f"编码后音轨时长 {actual_seconds:.2f}s 与时间轴不符，拒绝发布"
+            )
+
+        if _input_identity(sources) != identity:
+            raise FFmpegError("混音输入在成品体检期间发生变化，拒绝发布")
+
+    if warnings is not None:
+        warnings.extend(notices)
     return out_path
