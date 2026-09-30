@@ -46,6 +46,26 @@ def _clean(entries: Mapping[str, str]) -> dict[str, str]:
     return cleaned
 
 
+_TRAILING_PARTICLES = frozenset("哦呀啊呢吧啦嘛喀哟欸唉")
+"""句尾语气助词/叹词集合。这是"数据坏了"一类的合法性边界，不是创作旋钮，所以不进
+`RenderConfig`/`ValidateConfig`。
+
+只在 `merge_glossary` 回写累积表时对 `fresh` 参数生效，不影响 `_clean`/`load_glossary`/
+`effective_glossary` 的既有行为——那三个入口共享 `_clean`，动 `_clean` 本身会连累历史
+已存条目的解释方式，范围过大。
+"""
+
+
+def _trim_trailing_particle(translation: str) -> tuple[str, bool]:
+    """剪掉译名结尾的一个语气助词字符（只剪一次，不循环）。
+
+    返回 `(剪裁后的字符串, 是否发生了剪裁)`。调用方据此决定要不要发 warning。
+    """
+    if translation and translation[-1] in _TRAILING_PARTICLES:
+        return translation[:-1], True
+    return translation, False
+
+
 def load_glossary(path: Path) -> dict[str, str]:
     """读累积表。文件不存在或坏了都返回空表。
 
@@ -113,7 +133,10 @@ def save_glossary(path: Path, glossary: Mapping[str, str]) -> None:
 
 
 def merge_glossary(
-    accumulated: Mapping[str, str], fresh: Mapping[str, str]
+    accumulated: Mapping[str, str],
+    fresh: Mapping[str, str],
+    *,
+    warnings: list[str] | None = None,
 ) -> dict[str, str]:
     """把这一集新认出来的词并进累积表。
 
@@ -123,10 +146,31 @@ def merge_glossary(
     两边都过 `_clean`：只洗新词的话，一条坏掉的累积条目会永远占着那个键、把后面每一集
     给出的好译名都挡在外面。
 
+    对 `fresh` 里通过 `_clean` 的每一条译名，先剪一次结尾语气助词（ASR 听写误差经翻译
+    放大后常见的垃词，例如"主ガビオ":"主嘉碑哦"）；剪完长度 ≤1 就整条丢弃，不并入
+    返回的表。`accumulated` 侧不重新触发这条规则——历史累积表已经清洗过，不该被反复剪。
+    可选的 `warnings` 出参收集每次剪裁/丢弃的中文提示，`None` 时（默认）不收集，现有
+    调用点无需改动。
+
     返回新字典，不改入参。
     """
     merged = _clean(accumulated)
     for term, translation in _clean(fresh).items():
+        trimmed, did_trim = _trim_trailing_particle(translation)
+        if did_trim:
+            if len(trimmed) <= 1:
+                if warnings is not None:
+                    warnings.append(
+                        f"术语表：{term!r} 的译名 {translation!r} 疑似语气词或过短，"
+                        "已丢弃"
+                    )
+                continue
+            if warnings is not None:
+                warnings.append(
+                    f"术语表：{term!r} 的译名 {translation!r} 结尾疑似语气词，"
+                    f"已修正为 {trimmed!r}"
+                )
+            translation = trimmed
         merged.setdefault(term, translation)
     return merged
 

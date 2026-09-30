@@ -142,6 +142,77 @@ def test_merge_does_not_mutate_its_inputs():
     assert fresh == {"ルーファス": "鲁弗斯"}
 
 
+def test_merge_trims_a_trailing_particle_and_warns():
+    """结尾的语气助词只剪一次、不循环检查新结尾。"""
+    notices: list[str] = []
+    merged = g.merge_glossary(
+        {}, {"主ガビオ": "主嘉碑哦"}, warnings=notices
+    )
+    assert merged == {"主ガビオ": "主嘉碑"}
+    assert len(notices) == 1
+    assert "主ガビオ" in notices[0]
+    assert "主嘉碑哦" in notices[0]
+    assert "主嘉碑" in notices[0]
+
+
+def test_merge_discards_an_entry_that_becomes_too_short_after_trimming():
+    """剪完只剩 0 或 1 个字符，整条丢弃而不是保留单字。"""
+    notices: list[str] = []
+    merged = g.merge_glossary({}, {"帝": "哦"}, warnings=notices)
+    assert merged == {}
+    assert len(notices) == 1
+    assert "帝" in notices[0]
+
+
+def test_merge_discards_a_bare_particle_translation():
+    """译名整个就是语气词（剪完剩 0 字符）也走丢弃分支。"""
+    notices: list[str] = []
+    merged = g.merge_glossary({}, {"x": "啦"}, warnings=notices)
+    assert merged == {}
+    assert len(notices) == 1
+
+
+def test_merge_leaves_homographs_untouched_and_silent():
+    """键等于值的日汉同形词（合法术语）不受影响、不产生 warning。"""
+    notices: list[str] = []
+    merged = g.merge_glossary({}, {"山田": "山田", "帝": "帝"}, warnings=notices)
+    assert merged == {"山田": "山田", "帝": "帝"}
+    assert notices == []
+
+
+def test_merge_does_not_re_trim_accumulated_entries():
+    """已经存在于累积表里的带语气词尾缀历史条目不被重新剪裁——只处理 fresh。"""
+    notices: list[str] = []
+    merged = g.merge_glossary({"主ガビオ": "主嘉碑哦"}, {}, warnings=notices)
+    assert merged == {"主ガビオ": "主嘉碑哦"}
+    assert notices == []
+
+
+def test_merge_without_warnings_param_behaves_exactly_as_before():
+    """不传 warnings 时行为与改动前逐字节一致，现有调用点无需修改。"""
+    merged = g.merge_glossary({}, {"主ガビオ": "主嘉碑哦"})
+    assert merged == {"主ガビオ": "主嘉碑"}
+
+
+def test_merge_trims_only_the_last_character_once():
+    """只剪一次：两个连续语气词只剪掉最后一个字符，不循环剪第二层。"""
+    notices: list[str] = []
+    merged = g.merge_glossary({}, {"x": "好啦啦"}, warnings=notices)
+    assert merged == {"x": "好啦"}
+    assert len(notices) == 1
+
+
+def test_merge_conflict_after_trimming_keeps_accumulated_silently():
+    """剪裁后撞上累积表已有的同一术语，走原有"累积的赢"逻辑，不产生额外 warning。"""
+    notices: list[str] = []
+    merged = g.merge_glossary(
+        {"主ガビオ": "主嘉碑"}, {"主ガビオ": "主嘉碑哦"}, warnings=notices
+    )
+    assert merged == {"主ガビオ": "主嘉碑"}
+    # 剪裁本身仍然发生并警告；只是 setdefault 不会覆盖已存在的键。
+    assert len(notices) == 1
+
+
 def test_manual_entries_override_accumulated_ones():
     """手写表是纠错入口：机器译错了人要能盖掉它。"""
     effective = g.effective_glossary({"リディア": "莉蒂亚"}, {"リディア": "莉迪亚"})
