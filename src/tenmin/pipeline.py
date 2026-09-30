@@ -995,8 +995,20 @@ def run_timeline(
 
 
 def run_audio(
-    cfg: ProjectConfig, episode: int, reporter: ProgressReporter | None = None
+    cfg: ProjectConfig,
+    episode: int,
+    reporter: ProgressReporter | None = None,
+    warnings: list[str] | None = None,
 ) -> Path:
+    """混音一集，返回产物路径。
+
+    `warnings` 是透传给 `mix_audio` 的可变出参——本函数不加任何前缀、不做任何
+    过滤，mix_audio 往里面写什么调用方就原样拿到什么。这跟 run_script/run_voice/
+    run_timeline 的「返回 (result, warnings) 元组」不是同一套接口：那三个阶段的
+    warnings 由 run_pipeline 事后 `.extend()` 进自己的聚合列表，而这里跟 preflight
+    一样直接收一个共享的可变列表——mix_audio 的 notices 本来就是它自己函数体内的
+    局部变量，一次调用只会往传进来的那个列表追加一次，天然不会串到别的集头上。
+    """
     paths = Paths(cfg.root)
     episode_cfg = _find_episode(cfg, episode)
     timeline = _load_timeline(cfg, episode)
@@ -1017,6 +1029,7 @@ def run_audio(
         ffprobe=cfg.render.ffprobe_path,
         reporter=reporter,
         ffmpeg=cfg.render.ffmpeg_path,
+        warnings=warnings,
     )
 
 
@@ -1422,7 +1435,7 @@ async def run_pipeline(
                 inputs = [paths.timeline(number), paths.voice(number), *video_inputs]
                 if force or not is_fresh("audio", number, outputs, inputs):
                     reporter.stage_start("audio")
-                    run_audio(cfg, episode=number, reporter=reporter)
+                    run_audio(cfg, episode=number, reporter=reporter, warnings=warnings)
                     reporter.stage_done("audio")
                 else:
                     reporter.stage_skip("audio")

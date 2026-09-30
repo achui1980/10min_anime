@@ -1003,10 +1003,17 @@ def _touch_output_with_progress(
 # 「阶段接线对不对」，不该被这几道新守卫绊倒，所以统一假掉。按 filter graph 里
 # 有没有 "loudnorm" 分支返回对应格式：两遍响度归一走 loudnorm 的 JSON 报告，
 # 留白窗单独增益走 ebur128 的 `I: ... LUFS` 文本行。
+#
+# `input_i` 刻意等于 DEFAULT_RENDER.loudness_i（-14.0）：run_audio 会把
+# mix_audio 的 warnings 原样透传进 run_pipeline 的聚合列表，这份假 stderr 同一份
+# 文本会被当成「编码后体检」的实测结果去跟 cfg.loudness_i 比——差值超过 1 LU
+# 就会真的产生一条「偏离目标」的 warning。这些全流水线测试要的是「一次健康的
+# 批处理」，该让假素材看起来已经打到目标，不该往 `assert warnings == []` 里加
+# 一条跟阶段接线无关的响度噪音。
 _FAKE_LOUDNORM_STDERR = (
     "[Parsed_loudnorm_0 @ 0x0]\n"
     "{\n"
-    '"input_i" : "-20.00",\n'
+    '"input_i" : "-14.00",\n'
     '"input_tp" : "-3.00",\n'
     '"input_lra" : "5.00",\n'
     '"input_thresh" : "-30.00",\n'
@@ -3743,6 +3750,90 @@ async def test_operational_knobs_rerun_nothing_end_to_end(project, monkeypatch):
     project.render.ffprobe_path = "/opt/custom/bin/ffprobe"
 
     assert await _stages_rerun(project) == set()
+
+
+@pytest.mark.asyncio
+async def test_subtitle_limit_reruns_timeline_audio_render_only(project, monkeypatch):
+    """字幕软上限只是 timeline 的输入；audio/render 跟着重跑是因为它们的产物
+    时间戳落在 timeline 之后，不是因为它们自己的配置切片变了。"""
+    _full_run_project(project, monkeypatch)
+    await _first_full_run(project)
+
+    project.render.subtitle_soft_max_chars = 30
+
+    assert await _stages_rerun(project) == {"timeline", "audio", "render"}
+
+
+@pytest.mark.asyncio
+async def test_loudness_change_reruns_audio_render_only(project, monkeypatch):
+    """响度归一目标只进 audio 的配置切片；timeline 的产物内容与它无关，不该
+    被连带重跑（不同于上一个字幕上限的例子）。"""
+    _full_run_project(project, monkeypatch)
+    await _first_full_run(project)
+
+    project.render.loudness_i = -16.0
+
+    assert await _stages_rerun(project) == {"audio", "render"}
+
+
+@pytest.mark.asyncio
+async def test_clip_gap_change_reruns_script_and_dependent_stages(project, monkeypatch):
+    """留白/clip 间隙的合法阈值住在 validate_script，是 script 阶段读的旋钮；
+    改它必须让 script 真重跑一遍语义校验，并带动下游全部阶段。"""
+    _full_run_project(project, monkeypatch)
+    await _first_full_run(project)
+
+    project.validate_script.hold_clip_max_gap_seconds = 4.0
+
+    reporter = FakeReporter()
+    await run_pipeline(
+        project,
+        FakeProvider([fake_script_response()]),
+        tts_engine=FakeTTSEngine([80.0] * 20),
+        reporter=reporter,
+    )
+    started = {call[1] for call in reporter.calls if call[0] == "stage_start"}
+    started -= {"translate"}
+    assert started == {"script", "docgen", "voice", "timeline", "audio", "render"}
+
+
+@pytest.mark.asyncio
+async def test_batch_audio_warnings_do_not_leak_across_episodes(
+    project, golden_srt_path, monkeypatch
+):
+    """每一集自己的混音警告只应该出现一次，且不会被记到别的集头上——mix_audio
+    自己的 notices 是每次调用的局部变量，这里从 run_pipeline 的公开接口验证
+    这条不变量真的成立，而不是只看 mix_audio 内部实现。"""
+    second_srt = project.root / "srt" / "E01.srt"
+    second_srt.write_text(golden_srt_path.read_text(encoding="utf-8"), encoding="utf-8")
+    project.episodes.append(EpisodeConfig(number=1, srt=Path("srt/E01.srt")))
+
+    for episode_cfg in project.episodes:
+        video_name = f"E{episode_cfg.number:02d}.mkv"
+        (project.root / video_name).write_bytes(b"")
+        episode_cfg.video = Path(video_name)
+
+    monkeypatch.setattr("tenmin.pipeline.probe_duration", lambda path, **_: 1400.0)
+    monkeypatch.setattr("tenmin.pipeline.probe_frame_rate", lambda path, **_: 25.0)
+    monkeypatch.setattr("tenmin.pipeline.preflight", lambda video, encoder, **_: 1400.0)
+    monkeypatch.setattr("tenmin.render.video.run_with_progress", _touch_output_with_progress)
+
+    def fake_mix_audio(*, timeline, out_path, warnings=None, **_):
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_bytes(b"\x00")
+        if warnings is not None:
+            warnings.append(f"E{timeline.episode:02d}：留白原声近乎无声")
+        return out_path
+
+    monkeypatch.setattr("tenmin.pipeline.mix_audio", fake_mix_audio)
+
+    provider = FakeProvider([fake_script_response(episode=2), fake_script_response(episode=1)])
+    tts_engine = FakeTTSEngine([80.0] * 20)
+
+    warnings = await run_pipeline(project, provider, tts_engine=tts_engine)
+
+    audio_notices = [w for w in warnings if "留白原声近乎无声" in w]
+    assert audio_notices == ["E02：留白原声近乎无声", "E01：留白原声近乎无声"]
 
 
 @pytest.mark.asyncio

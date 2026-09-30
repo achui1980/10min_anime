@@ -588,6 +588,24 @@ def test_run_audio_wires_the_audio_knobs(tmp_path, monkeypatch):
     assert seen["limiter_ceiling"] == 0.7
 
 
+def test_run_audio_forwards_mix_audio_warnings_to_the_caller_list(tmp_path, monkeypatch):
+    """run_audio 的 warnings 只是个透传的可变出参：mix_audio 往里面写什么，
+    调用方就原样拿到什么，run_audio 自己不加任何前缀或过滤。"""
+
+    def fake_mix_audio(**kwargs):
+        kwargs["warnings"].append("E01：留白原声近乎无声")
+        return kwargs["out_path"]
+
+    monkeypatch.setattr("tenmin.pipeline.mix_audio", fake_mix_audio)
+    cfg = _minimal_project(tmp_path)
+    _write_timeline_and_inputs(cfg)
+
+    notices: list[str] = []
+    run_audio(cfg, episode=1, warnings=notices)
+
+    assert notices == ["E01：留白原声近乎无声"]
+
+
 # --- helpers ---
 
 

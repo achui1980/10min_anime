@@ -832,6 +832,20 @@ def _input_identity(paths: list[Path]) -> tuple[tuple[str, int, int], ...]:
     return tuple((str(p.resolve()), p.stat().st_size, p.stat().st_mtime_ns) for p in paths)
 
 
+def _assert_identity_unchanged(
+    sources: list[Path], identity: tuple[tuple[str, int, int], ...], stage: str
+) -> None:
+    """`mix_audio` 里反复出现的那道闸：这批文件跟开跑前的快照还一样吗？
+
+    四处调用点（测量前、两遍之间、编码期间、成品体检）只有 `stage` 这一句消息
+    文案不同，判据与拒绝动作逐字不差——抽出来纯粹是去重，不改变任何一处的
+    抛出时机或消息文本的形状（仍然是「混音输入在…发生变化，拒绝发布」，
+    `match=r"输入.*变化"` 的既有测试认得出来）。
+    """
+    if _input_identity(sources) != identity:
+        raise FFmpegError(f"混音输入在{stage}发生变化，拒绝发布")
+
+
 def mix_audio(
     *,
     video: Path,
@@ -930,14 +944,12 @@ def mix_audio(
             args = [*args[: args.index("-c:a")], "-f", "null", "-"]
         return args
 
-    if _input_identity(sources) != identity:
-        raise FFmpegError("混音输入在测量期间发生变化，拒绝发布")
+    _assert_identity_unchanged(sources, identity, "测量期间")
 
     first_report = run(full_args("-", measured=None), ffmpeg=ffmpeg)
     stats = _loudnorm_stats(first_report)
 
-    if _input_identity(sources) != identity:
-        raise FFmpegError("混音输入在两遍之间发生变化，拒绝发布")
+    _assert_identity_unchanged(sources, identity, "两遍之间")
 
     if stats is None and not _loudnorm_explicit_silence(first_report):
         raise FFmpegError("首遍响度测量结果缺失或格式错误，拒绝发布")
@@ -952,8 +964,7 @@ def mix_audio(
             ffmpeg=ffmpeg,
         )
 
-        if _input_identity(sources) != identity:
-            raise FFmpegError("混音输入在编码期间发生变化，拒绝发布")
+        _assert_identity_unchanged(sources, identity, "编码期间")
 
         final_report = run(
             ["-hide_banner", "-i", str(part), "-af", _loudnorm_filter(cfg), "-f", "null", "-"],
@@ -981,8 +992,7 @@ def mix_audio(
                 f"编码后音轨时长 {actual_seconds:.2f}s 与时间轴不符，拒绝发布"
             )
 
-        if _input_identity(sources) != identity:
-            raise FFmpegError("混音输入在成品体检期间发生变化，拒绝发布")
+        _assert_identity_unchanged(sources, identity, "成品体检期间")
 
     if warnings is not None:
         warnings.extend(notices)
