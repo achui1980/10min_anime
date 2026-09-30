@@ -46,7 +46,7 @@ def _clean(entries: Mapping[str, str]) -> dict[str, str]:
     return cleaned
 
 
-_TRAILING_PARTICLES = frozenset("哦呀啊呢吧啦嘛喀哟欸唉")
+_TRAILING_PARTICLES = frozenset("哦呀啊呢吧啦嘛喔哟欸唉")
 """句尾语气助词/叹词集合。这是"数据坏了"一类的合法性边界，不是创作旋钮，所以不进
 `RenderConfig`/`ValidateConfig`。
 

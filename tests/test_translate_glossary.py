@@ -172,6 +172,23 @@ def test_merge_discards_a_bare_particle_translation():
     assert len(notices) == 1
 
 
+def test_merge_discards_an_entry_that_trims_to_exactly_one_character():
+    """两字译名剪完剩恰好 1 个字符也要丢弃，不是只有剪成空字符串才丢弃。"""
+    notices: list[str] = []
+    merged = g.merge_glossary({}, {"山": "山哦"}, warnings=notices)
+    assert merged == {}
+    assert len(notices) == 1
+    assert "山" in notices[0]
+
+
+def test_merge_keeps_a_three_character_translation_trimmed_to_two():
+    """三字译名剪完剩 2 个字符要保留（只是打了修正 warning），不是恰好在丢弃边界。"""
+    notices: list[str] = []
+    merged = g.merge_glossary({}, {"武田": "武田哦"}, warnings=notices)
+    assert merged == {"武田": "武田"}
+    assert len(notices) == 1
+
+
 def test_merge_leaves_homographs_untouched_and_silent():
     """键等于值的日汉同形词（合法术语）不受影响、不产生 warning。"""
     notices: list[str] = []
