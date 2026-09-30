@@ -3803,7 +3803,11 @@ async def test_batch_audio_warnings_do_not_leak_across_episodes(
 ):
     """每一集自己的混音警告只应该出现一次，且不会被记到别的集头上——mix_audio
     自己的 notices 是每次调用的局部变量，这里从 run_pipeline 的公开接口验证
-    这条不变量真的成立，而不是只看 mix_audio 内部实现。"""
+    这条不变量真的成立，而不是只看 mix_audio 内部实现。
+
+    fake_mix_audio 故意不manufacture 自己的集号前缀（那是 run_audio 的职责，见
+    test_batch_audio_warnings_get_episode_prefix_to_stay_distinguishable），这里
+    只验证「同一份 notices 不会跨集重复/串号」这条更基础的不变量。"""
     second_srt = project.root / "srt" / "E01.srt"
     second_srt.write_text(golden_srt_path.read_text(encoding="utf-8"), encoding="utf-8")
     project.episodes.append(EpisodeConfig(number=1, srt=Path("srt/E01.srt")))
@@ -3818,11 +3822,11 @@ async def test_batch_audio_warnings_do_not_leak_across_episodes(
     monkeypatch.setattr("tenmin.pipeline.preflight", lambda video, encoder, **_: 1400.0)
     monkeypatch.setattr("tenmin.render.video.run_with_progress", _touch_output_with_progress)
 
-    def fake_mix_audio(*, timeline, out_path, warnings=None, **_):
+    def fake_mix_audio(*, out_path, warnings=None, **_):
         out_path.parent.mkdir(parents=True, exist_ok=True)
         out_path.write_bytes(b"\x00")
         if warnings is not None:
-            warnings.append(f"E{timeline.episode:02d}：留白原声近乎无声")
+            warnings.append("留白原声近乎无声")
         return out_path
 
     monkeypatch.setattr("tenmin.pipeline.mix_audio", fake_mix_audio)
@@ -3834,6 +3838,52 @@ async def test_batch_audio_warnings_do_not_leak_across_episodes(
 
     audio_notices = [w for w in warnings if "留白原声近乎无声" in w]
     assert audio_notices == ["E02：留白原声近乎无声", "E01：留白原声近乎无声"]
+
+
+@pytest.mark.asyncio
+async def test_batch_audio_warnings_get_episode_prefix_to_stay_distinguishable(
+    project, golden_srt_path, monkeypatch
+):
+    """script beat id（"beat1".."beat7"）在每一集里都原样复用、不带集号，所以
+    mix_audio 产出的警告文案本身也不带集号——两集若命中同一个 beat/hold_index，
+    未加前缀时聚合列表里会出现两条字节相同、分不清是哪一集的警告。run_audio 必须
+    按 ingest_warnings 的同一套 `f"E{episode:02d}：{msg}"` 约定补前缀，本测试在
+    「修复前」应该失败：那时两条警告是完全相同的字符串，断言的集合大小对不上。"""
+    second_srt = project.root / "srt" / "E01.srt"
+    second_srt.write_text(golden_srt_path.read_text(encoding="utf-8"), encoding="utf-8")
+    project.episodes.append(EpisodeConfig(number=1, srt=Path("srt/E01.srt")))
+
+    for episode_cfg in project.episodes:
+        video_name = f"E{episode_cfg.number:02d}.mkv"
+        (project.root / video_name).write_bytes(b"")
+        episode_cfg.video = Path(video_name)
+
+    monkeypatch.setattr("tenmin.pipeline.probe_duration", lambda path, **_: 1400.0)
+    monkeypatch.setattr("tenmin.pipeline.probe_frame_rate", lambda path, **_: 25.0)
+    monkeypatch.setattr("tenmin.pipeline.preflight", lambda video, encoder, **_: 1400.0)
+    monkeypatch.setattr("tenmin.render.video.run_with_progress", _touch_output_with_progress)
+
+    identical_message = "留白窗 beat1/0 与片段/旁白空档不一致，跳过单独增益"
+
+    def fake_mix_audio(*, out_path, warnings=None, **_):
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_bytes(b"\x00")
+        if warnings is not None:
+            warnings.append(identical_message)
+        return out_path
+
+    monkeypatch.setattr("tenmin.pipeline.mix_audio", fake_mix_audio)
+
+    provider = FakeProvider([fake_script_response(episode=2), fake_script_response(episode=1)])
+    tts_engine = FakeTTSEngine([80.0] * 20)
+
+    warnings = await run_pipeline(project, provider, tts_engine=tts_engine)
+
+    beat_notices = [w for w in warnings if identical_message in w]
+    assert set(beat_notices) == {
+        f"E{n:02d}：{identical_message}" for n in (2, 1)
+    }
+    assert len(beat_notices) == 2
 
 
 @pytest.mark.asyncio

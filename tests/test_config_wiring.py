@@ -589,11 +589,12 @@ def test_run_audio_wires_the_audio_knobs(tmp_path, monkeypatch):
 
 
 def test_run_audio_forwards_mix_audio_warnings_to_the_caller_list(tmp_path, monkeypatch):
-    """run_audio 的 warnings 只是个透传的可变出参：mix_audio 往里面写什么，
-    调用方就原样拿到什么，run_audio 自己不加任何前缀或过滤。"""
+    """run_audio 的 warnings 是聚合出参：mix_audio 往里面写的原始文案（不带集号，
+    因为 beat_id 在每一集都原样复用）会被 run_audio 按 `f"E{episode:02d}：{msg}"`
+    补上集号前缀（与 ingest_warnings 同一套约定）后再进调用方的列表。"""
 
     def fake_mix_audio(**kwargs):
-        kwargs["warnings"].append("E01：留白原声近乎无声")
+        kwargs["warnings"].append("留白原声近乎无声")
         return kwargs["out_path"]
 
     monkeypatch.setattr("tenmin.pipeline.mix_audio", fake_mix_audio)

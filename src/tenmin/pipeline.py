@@ -1002,18 +1002,22 @@ def run_audio(
 ) -> Path:
     """混音一集，返回产物路径。
 
-    `warnings` 是透传给 `mix_audio` 的可变出参——本函数不加任何前缀、不做任何
-    过滤，mix_audio 往里面写什么调用方就原样拿到什么。这跟 run_script/run_voice/
-    run_timeline 的「返回 (result, warnings) 元组」不是同一套接口：那三个阶段的
-    warnings 由 run_pipeline 事后 `.extend()` 进自己的聚合列表，而这里跟 preflight
-    一样直接收一个共享的可变列表——mix_audio 的 notices 本来就是它自己函数体内的
-    局部变量，一次调用只会往传进来的那个列表追加一次，天然不会串到别的集头上。
+    `warnings` 是聚合出参，但本函数**不**把它原样传给 `mix_audio`——而是用一个
+    局部列表接住 mix_audio 的 notices，逐条按 `f"E{episode:02d}：{msg}"` 补上集号
+    前缀（与 `ingest_warnings` 同一套约定）后再 `.extend()` 进调用方的聚合列表。
+    动因：mix_audio 的警告文案里带的是 beat_id（`"beat1".."beat7"`），这套 id 在
+    本项目每一集都是原样复用、不带集号，批量跑多集时若不加前缀，两集内容完全一样
+    的警告在扁平化的聚合列表里会变成两条字节相同、无法区分是哪一集的字符串。这跟
+    run_script/run_voice/run_timeline 的「返回 (result, warnings) 元组」也不是
+    同一套接口：那三个阶段的 warnings 由 run_pipeline 事后 `.extend()`，而这里跟
+    preflight 一样直接收一个共享的可变列表，只是多了这一步集号前缀。
     """
     paths = Paths(cfg.root)
     episode_cfg = _find_episode(cfg, episode)
     timeline = _load_timeline(cfg, episode)
     track = _load_voice(cfg, episode)
-    return mix_audio(
+    mix_notices: list[str] = []
+    result = mix_audio(
         video=cfg.video_path(episode_cfg),
         timeline=timeline,
         track=track,
@@ -1029,8 +1033,11 @@ def run_audio(
         ffprobe=cfg.render.ffprobe_path,
         reporter=reporter,
         ffmpeg=cfg.render.ffmpeg_path,
-        warnings=warnings,
+        warnings=mix_notices,
     )
+    if warnings is not None:
+        warnings.extend(f"E{episode:02d}：{msg}" for msg in mix_notices)
+    return result
 
 
 def run_render(
