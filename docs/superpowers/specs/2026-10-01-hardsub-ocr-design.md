@@ -126,7 +126,13 @@ translate 阶段遇到 `source == "ocr"` 的集时，**不调 LLM**：
   - 缩放只固定宽度为 1280，高度按比例取偶数。720p 和 4K 交给 Vision 的都是同一个尺度的图。
 - **输出**：`-f rawvideo` 走 stdout 管道，用 `-fps_mode passthrough` 保证一帧对一帧（不让 ffmpeg 为凑恒定帧率补帧或丢帧）。不在磁盘上写临时图片。
 - 管道读取需要新加一个 ffmpeg 封装，放在 `render/ffmpeg.py` 里，沿用它的错误处理风格，失败时抛 `FFmpegError` 并带上 stderr 尾部。抽帧参数（crop、scale、select 怎么拼）属于业务逻辑，留在 `ocr.py`。
-- **每帧的时间戳**：`t = 帧序号 × step / src_fps`，按序号算，不依赖 ffmpeg 输出的 pts。
+- **每帧的时间戳读真实 pts，不按序号推算。**
+  - 滤镜链末尾接 `showinfo`，它会在 stderr 上为每个输出帧打一行 `pts_time:`，顺序与 stdout 上的帧一一对应。
+  - 不用 `序号 × step / src_fps` 推算的原因：那个公式只对恒定帧率成立。番剧片源基本是恒定帧率，但 120 fps 这类高帧率文件常是录屏或补帧、属于可变帧率，按序号推算会让时间轴越跑越偏。读 pts 对恒定帧率片源没有任何坏处。
+  - 可变帧率片源上，`select` 仍然按帧序号每 `step` 帧取一帧，所以每秒实际取到的帧数会随源帧率波动；投票和归并只看帧的先后，不受影响。
+  - stdout（帧数据）和 stderr（pts）必须同时读，否则任一管道写满都会让 ffmpeg 卡死。实现上用一个线程读 stderr。
+  - pts 行数与收到的帧数对不上时抛 `OCRError`，不猜。
+  - 120 fps 片源每秒仍取 4 帧（步长 30），OCR 次数不变，但 ffmpeg 要解码全部帧，解码量约为 24 fps 的 5 倍。本次未实测，遇到这类片源时再测。
 
 ### 2. 单帧清洗：`frame_text(observations, *, center_tolerance) -> str`
 
@@ -205,7 +211,8 @@ translate 阶段遇到 `source == "ocr"` 的集时，**不调 LLM**：
 全部用替身，不依赖真实视频或 Vision。
 
 - `tests/test_ocr.py`
-  - 步长计算：23.976 / 24 / 30 / 60 fps，以及极低帧率时步长取 1。
+  - 步长计算：23.976 / 24 / 30 / 60 / 120 fps，以及极低帧率时步长取 1。
+  - pts 解析：从 `showinfo` 的 stderr 里按顺序取 `pts_time`；不均匀间隔（可变帧率）原样采用；pts 行数与帧数不一致时抛 `OCRError`。
   - `frame_text`：居中过滤、必须含汉字、多行从上到下拼接（y 轴从下往上）、各种省略号统一、空帧。
   - `merge_frames`：相似帧并成一条；夹 1 个空帧仍连续；连续 2 个空帧断开；多帧投票及平票取最早；少于 `min_frames` 丢弃；重叠截断；终点等于末帧时间加 interval。
   - `recognize`：monkeypatch 抽帧和 `_recognize`；缺依赖时抛 `OCRUnavailableError` 并带 `uv sync --extra ocr` 提示；0 条时报错且 dest 不存在；写盘走 atomic（源码卫生测试已有覆盖）。
