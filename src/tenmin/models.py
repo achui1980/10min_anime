@@ -176,7 +176,7 @@ class DialogueLine(_StageModel):
 
 class DialogueTrack(_StageModel):
     episode: int
-    source: Literal["srt", "asr"] = "srt"
+    source: Literal["srt", "asr", "ocr"] = "srt"
     duration: float
     op_range: tuple[float, float] | None = None
     ed_range: tuple[float, float] | None = None

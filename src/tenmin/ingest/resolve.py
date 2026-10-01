@@ -1,15 +1,18 @@
 """对白轨从哪来。
 
-三条路，按「无损且便宜」排序：
+四条路，按「无损且便宜」排序：
 
 1. 手传的 SRT —— 人明确指定了，不猜。
 2. 视频里的软字幕轨 —— ffmpeg 一条命令抽出来，零成本零误差。**这条分枝的存在是关键**：
-   漏掉它会把一个自带字幕轨的片源白白拉去跑几分钟转写，还把质量换低了。
-3. 语音转写 —— 只有前两条都不成立时才走，而且要先告诉人一声（它是这三条里唯一一条
-   既费时间又有损的）。
+   漏掉它会把一个自带字幕轨的片源白白拉去跑几分钟转写，还把质量换低了。声明了硬字幕的
+   片源也照样先走这条：文本字幕轨是最准的素材。
+3. 画面 OCR —— 只在 project.yaml 声明了「这部番带硬字幕」时才走（不做自动探测）。画面上
+   那份是人工翻译好的中文字幕，比听写好得多。OCR 跑不了（没装 extra、不是 macOS）时
+   **直接报错，不回落到语音转写**：用户明确说了要用画面上那份更好的素材。
+4. 语音转写 —— 只有前三条都不成立时才走，而且要先告诉人一声。
 
-三条路都归一成「一个 SRT 文件的路径」，所以下游 build_track 拿到的东西形态完全不变。
-顺带的好处：转写结果落成 SRT 就等于缓存，也能被人手动修正。
+四条路都归一成「一个 SRT 文件的路径」，所以下游 build_track 拿到的东西形态完全不变。
+顺带的好处：OCR 与转写的结果落成 SRT 就等于缓存，也能被人手动修正。
 """
 
 from __future__ import annotations
@@ -17,15 +20,18 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Literal, NamedTuple
 
-from tenmin.config import DEFAULT_RENDER, AsrConfig
-from tenmin.ingest import asr
+from tenmin.config import DEFAULT_OCR, DEFAULT_RENDER, AsrConfig, OcrConfig
+from tenmin.ingest import asr, ocr
 from tenmin.render import ffmpeg
 
-# 两份 SRT 的文件名后缀。它们**必须不同**：两条路的复用策略刻意相反（转写那份按 mtime
-# 复用、抽出来那份每次重写），共用一个名字既让人分不清手上这份是抽的还是转的，也会让
-# 「复用」那半边的判据落到一份不该被信任的文件上。
+# 三份 SRT 的文件名后缀。它们**必须两两不同**：抽出来那份每次重写，OCR 与转写那两份按
+# mtime 复用，共用一个名字既让人分不清手上这份是怎么来的，也会让「复用」那半边的判据落到
+# 一份不该被信任的文件上。OCR 那份的路径由调用方给（pipeline.Paths.ocr_cache 是那个名字的
+# 唯一权威），这里的后缀只是同一个约定的另一份记录，由
+# tests/test_pipeline.py 的 test_the_ocr_cache_name_ends_with_ocr_srt 核对两边一致。
 _ASR_SUFFIX = ".asr.srt"
 _EMBEDDED_SUFFIX = ".embedded.srt"
+_OCR_SUFFIX = ".ocr.srt"
 
 # ffmpeg 拒绝「位图字幕 → 文本字幕」时 stderr 里的原话（实测 ffmpeg 9.0.1 的二进制里
 # 就是这一句）。认它是为了把一整屏 ffmpeg 报错换成一句能照着做的中文。
@@ -40,13 +46,14 @@ _BITMAP_SUBTITLE_MARKER = "text to text or bitmap to bitmap"
 class SubtitleSource(NamedTuple):
     """选中的对白轨来源。
 
-    kind 不是「文件是什么格式」（三条路给出的都是 SRT），而是「这份对白是原生字幕
-    还是机器听写的」。下游靠它决定要不要繁转简（日语过 OpenCC 会被改字）、要不要
-    跑翻译阶段。
+    kind 不是「文件是什么格式」（四条路给出的都是 SRT），而是「这份对白是怎么来的」：
+    原生字幕（srt）、画面 OCR（ocr）、机器听写（asr）。下游靠它决定要不要繁转简（srt 与
+    ocr 转，日语听写过 OpenCC 会被改字所以不转）、translate 阶段怎么处置（srt 跳过、
+    ocr 不调 LLM 直接交付简体字幕、asr 翻译）。
     """
 
     path: Path
-    kind: Literal["srt", "asr"]
+    kind: Literal["srt", "asr", "ocr"]
 
 
 def _embedded_dest(cache: Path) -> Path:
@@ -73,8 +80,8 @@ def _embedded_dest(cache: Path) -> Path:
     return cache.with_name(f"{stem}{_EMBEDDED_SUFFIX}")
 
 
-def _is_usable_asr_cache(cache: Path, video: Path) -> bool:
-    """这份**转写**结果还能用吗。
+def _is_usable_cache(cache: Path, video: Path) -> bool:
+    """这份**转写或 OCR** 结果还能用吗。两者共用同一个判据，下面以转写为例说明。
 
     0 字节判为不可用：那是上一次被打断留下的残骸，不是产物（跟 pipeline 判断阶段
     新鲜度时的口径一致）。mtime 比源视频旧则判为过期：换了片源（重新压制、换了个
@@ -90,8 +97,10 @@ def _is_usable_asr_cache(cache: Path, video: Path) -> bool:
     按指纹失效就意味着用户改完 `asr.model` 之后那些手改会被**静默冲掉**，
     而那比反过来那个毛病坏得多：「换了模型却没重转」打开文件就看得出来（也能靠删文件
     解决），静默覆盖是无声的。代价说清楚：换模型想重转必须自己删掉那份 `.asr.srt`。
+    OCR 那份 `.ocr.srt` 同理：**刻意不看 OcrConfig**，改了 crop_top / similarity 之类想
+    重认，得自己删掉它。
 
-    只对转写结果成立，**不能**拿去判断抽出来的那份 —— 理由写在
+    只对转写与 OCR 的结果成立，**不能**拿去判断抽出来的那份 —— 理由写在
     resolve_subtitle_source 里那段注释。
     """
     if not cache.is_file():
@@ -110,16 +119,23 @@ def resolve_subtitle_source(
     *,
     cache: Path,
     asr_config: AsrConfig,
+    hardsub: bool = False,
+    ocr_cache: Path | None = None,
+    ocr_config: OcrConfig = DEFAULT_OCR,
     ffmpeg_path: str = DEFAULT_RENDER.ffmpeg_path,
     ffprobe_path: str = DEFAULT_RENDER.ffprobe_path,
 ) -> SubtitleSource:
     """挑一条路，返回一份可解析的 SRT 及其来源类型。
 
     cache 是转写结果的落点（调用方给出，通常是 srt/E{NN}.asr.srt）。从软字幕轨抽出来
-    的那份走同目录的另一个名字，见 _embedded_dest。
+    的那份走同目录的另一个名字，见 _embedded_dest。ocr_cache 是 OCR 结果的落点（通常是
+    srt/E{NN}.ocr.srt），只在 hardsub 为真时才用得上、也才必须给。
 
-    配置参数叫 `asr_config` 而不是跟转写层一致的 `asr=` —— 本模块顶层 `asr` 这个名字
-    已经被导入的模块占了，同名形参会把它在函数体内遮掉。
+    hardsub 是「这一集声明了硬字幕」（调用方用 ProjectConfig.hardsub_enabled 算好再传），
+    这一层不读 project.yaml。
+
+    配置参数叫 `asr_config` / `ocr_config` 而不是跟下层一致的 `asr=` / `ocr=` —— 本模块
+    顶层 `asr`、`ocr` 这两个名字已经被导入的模块占了，同名形参会把它们在函数体内遮掉。
     """
     if srt is not None:
         if not srt.is_file():
@@ -175,7 +191,7 @@ def resolve_subtitle_source(
             # （信息还在），悄悄换成听写是把用户手上更好的那份素材丢了。
             #
             # 也刻意不把这段判断挪进 ffmpeg.py：那一层的 docstring 明写「不含业务判断」，
-            # 而「碰上位图轨该怎么办」（手传 SRT？换片源走听写？）是本模块的三岔职责。
+            # 而「碰上位图轨该怎么办」（手传 SRT？换片源走听写？）是本模块的四岔职责。
             if _BITMAP_SUBTITLE_MARKER not in str(exc):
                 raise
             raise ValueError(
@@ -184,10 +200,26 @@ def resolve_subtitle_source(
             ) from exc
         return SubtitleSource(embedded, "srt")
 
-    if _is_usable_asr_cache(cache, video):
+    if hardsub:
+        if ocr_cache is None:
+            raise ValueError(f"{video.name} 声明了硬字幕，但调用方没给 OCR 结果的落点（ocr_cache）")
+        if _is_usable_cache(ocr_cache, video):
+            return SubtitleSource(ocr_cache, "ocr")
+        # 耗时告知由 recognize 自己打（那一行已经带着「声明了硬字幕」这个理由和预估分钟数），
+        # 这里不再重复一遍。OCR 失败（含没装 extra）原样往外抛，不往下落到语音转写。
+        ocr.recognize(
+            video,
+            ocr_cache,
+            ocr=ocr_config,
+            ffmpeg_path=ffmpeg_path,
+            ffprobe_path=ffprobe_path,
+        )
+        return SubtitleSource(ocr_cache, "ocr")
+
+    if _is_usable_cache(cache, video):
         return SubtitleSource(cache, "asr")
 
-    # 这是三条路里唯一一条既费时间又有损的，所以让它被看见，而且必须打在调用**之前**
+    # 这是剩下几条路里唯一一条既费时间又有损的，所以让它被看见，而且必须打在调用**之前**
     # （几分钟的静默会让人以为卡死了）。刻意不做成一个要用户每次记得传的 flag：软字幕
     # 那条是无损的，不值得为它多打字；值得被看见的只有这一条。
     #

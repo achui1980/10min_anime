@@ -11,6 +11,7 @@ import yaml
 from tenmin import config_slices
 from tenmin.atomic import part_path
 from tenmin.config import EpisodeConfig, ProjectConfig, ProjectConfigError, load_project
+from tenmin.ingest import resolve
 from tenmin.ingest.resolve import SubtitleSource
 from tenmin.models import (
     AudioDirection,
@@ -302,6 +303,7 @@ FROZEN_LAYOUT = {
     "mixed_audio": "06_audio/E02.mixed.m4a",
     "video": "07_render/E02.mp4",
     "asr_cache": "srt/E02.asr.srt",
+    "ocr_cache": "srt/E02.ocr.srt",
 }
 
 
@@ -2702,6 +2704,18 @@ def test_the_transcription_cache_sits_next_to_the_hand_written_srt(tmp_path):
     assert Paths(tmp_path).asr_cache(11).parent == tmp_path / "srt"
 
 
+def test_the_ocr_cache_name_ends_with_ocr_srt(tmp_path):
+    """OCR 缓存的名字由 Paths 一处钉死，并且跟 resolve 那边记的后缀一致。
+
+    它必须跟手传字幕（`E11.srt`）、转写缓存（`.asr.srt`）、软字幕轨抽出来的那份
+    （`.embedded.srt`）都分得开：四份住同一个 srt/ 目录，复用策略各不相同。
+    """
+    path = Paths(tmp_path).ocr_cache(11)
+    assert path.name.endswith(resolve._OCR_SUFFIX)
+    assert path.parent == tmp_path / "srt"
+    assert path != Paths(tmp_path).asr_cache(11)
+
+
 def test_register_episode_without_an_srt_leaves_the_field_empty(tmp_path):
     cfg = _project_config(tmp_path)
     video = tmp_path / "e11.mp4"
@@ -2835,6 +2849,17 @@ def test_ingest_inputs_exclude_the_asr_cache(tmp_path):
     assert all(".asr.srt" not in str(p) for p in _ingest_inputs(cfg))
 
 
+def test_ingest_inputs_exclude_the_ocr_cache(tmp_path):
+    """同上：OCR 缓存也是 ingest 自己的产物，算进输入会让 ingest 每次都重跑。"""
+    cfg = _project_config(tmp_path)
+    video = tmp_path / "e11.mp4"
+    video.write_bytes(b"fake")
+    cfg = register_episode(cfg, episode=11, srt=None, video=video)
+    _file(Paths(cfg.root).ocr_cache(11), "1\n00:00:01,000 --> 00:00:02,000\n你好\n")
+
+    assert all(".ocr.srt" not in str(p) for p in _ingest_inputs(cfg))
+
+
 def _fake_resolve(recorded: list[dict]):
     """替掉 run_ingest 里的来源解析：记下每次调用，按「有没有手传 srt」分两条路。
 
@@ -2889,6 +2914,70 @@ def test_ingest_resolves_a_video_only_episode_through_the_source_layer(
     # 软字幕轨那条路每次调用都会重抽，所以每集只许解析一次。
     assert len(recorded) == len(cfg.episodes)
     assert next(t for t in tracks if t.episode == 11).source == "asr"
+
+
+def _fake_ocr_resolve(recorded: list[dict]):
+    """同 _fake_resolve，但生肉集按 hardsub 分两条路：声明了就给 OCR 缓存、kind="ocr"。"""
+
+    def fake(srt, video, **kwargs):
+        recorded.append({"srt": srt, "video": video, **kwargs})
+        if srt is not None:
+            return SubtitleSource(srt, "srt")
+        if kwargs["hardsub"]:
+            return SubtitleSource(kwargs["ocr_cache"], "ocr")
+        return SubtitleSource(kwargs["cache"], "asr")
+
+    return fake
+
+
+def test_ingest_hands_the_hardsub_declaration_to_the_source_layer(
+    project, tmp_path, monkeypatch
+):
+    """项目级 ocr.enabled 经 hardsub_enabled 递下去，连同 OCR 缓存的落点与 OcrConfig。"""
+    project.ocr.enabled = True
+    cfg = _register_raw_episode(project, tmp_path, "1\n00:00:01,000 --> 00:00:02,000\n你好\n")
+    _file(Paths(cfg.root).ocr_cache(11), "1\n00:00:01,000 --> 00:00:02,000\n你好\n")
+    recorded: list[dict] = []
+    monkeypatch.setattr("tenmin.pipeline.resolve_subtitle_source", _fake_ocr_resolve(recorded))
+
+    tracks = run_ingest(cfg)
+
+    raw = next(call for call in recorded if call["srt"] is None)
+    assert raw["hardsub"] is True
+    assert raw["ocr_cache"] == Paths(cfg.root).ocr_cache(11)
+    assert raw["ocr_config"] is cfg.ocr
+    assert next(t for t in tracks if t.episode == 11).source == "ocr"
+
+
+def test_an_episode_can_opt_out_of_the_project_hardsub_declaration(
+    project, tmp_path, monkeypatch
+):
+    """逐集 hardsub: false 盖过项目级 ocr.enabled: true（同一部番里混着别的字幕组片源）。"""
+    project.ocr.enabled = True
+    cfg = _register_raw_episode(project, tmp_path, "1\n00:00:01,000 --> 00:00:02,000\nはい\n")
+    episode = next(e for e in cfg.episodes if e.number == 11)
+    episode.hardsub = False
+    recorded: list[dict] = []
+    monkeypatch.setattr("tenmin.pipeline.resolve_subtitle_source", _fake_ocr_resolve(recorded))
+
+    tracks = run_ingest(cfg)
+
+    raw = next(call for call in recorded if call["srt"] is None)
+    assert raw["hardsub"] is False
+    assert next(t for t in tracks if t.episode == 11).source == "asr"
+
+
+def test_ingest_converts_an_ocr_track_to_simplified(project, tmp_path, monkeypatch):
+    """OCR 认出来的是繁体字幕，run_ingest 要把 source="ocr" 递给 build_track 让它繁转简。"""
+    project.ocr.enabled = True
+    cfg = _register_raw_episode(project, tmp_path, "unused")
+    _file(Paths(cfg.root).ocr_cache(11), "1\n00:00:01,000 --> 00:00:02,000\n我們說話\n")
+    monkeypatch.setattr("tenmin.pipeline.resolve_subtitle_source", _fake_ocr_resolve([]))
+
+    tracks = run_ingest(cfg)
+
+    track = next(t for t in tracks if t.episode == 11)
+    assert "我们说话" in "".join(line.text for line in track.lines)
 
 
 def test_ingest_never_runs_opencc_on_a_transcribed_track(project, tmp_path, monkeypatch):

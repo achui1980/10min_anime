@@ -566,3 +566,21 @@ def test_an_srt_source_still_goes_through_opencc(tmp_path):
 
     track = build_track(srt, episode=1, convert_traditional=True)
     assert "制作" in "".join(line.text for line in track.lines)
+
+
+def test_an_ocr_source_goes_through_opencc(tmp_path):
+    """画面 OCR 认出来的是繁体中文字幕，跟原生字幕一样要繁转简（不能跟着 asr 一起被关掉）。"""
+    srt = tmp_path / "a.srt"
+    srt.write_text("1\n00:00:01,000 --> 00:00:02,000\n我們說話\n", encoding="utf-8")
+
+    track = build_track(srt, episode=1, source="ocr", convert_traditional=True)
+    assert track.source == "ocr"
+    assert "我们说话" in "".join(line.text for line in track.lines)
+
+
+def test_an_ocr_source_respects_a_disabled_conversion(tmp_path):
+    srt = tmp_path / "a.srt"
+    srt.write_text("1\n00:00:01,000 --> 00:00:02,000\n我們說話\n", encoding="utf-8")
+
+    track = build_track(srt, episode=1, source="ocr", convert_traditional=False)
+    assert "我們說話" in "".join(line.text for line in track.lines)

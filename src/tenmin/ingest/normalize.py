@@ -161,7 +161,7 @@ def build_track(
     episode: int,
     show_title: str = "",
     convert_traditional: bool = True,
-    source: Literal["srt", "asr"] = "srt",
+    source: Literal["srt", "asr", "ocr"] = "srt",
     glossary: dict[str, str] | None = None,
     op_range: tuple[float, float] | None = None,
     ed_range: tuple[float, float] | None = None,
@@ -186,9 +186,10 @@ def build_track(
     ingest / credits 收全部数值阈值。刻意传整个 config 对象而不是散装参数：
     两者加起来有近 20 个旋钮，摊平成关键字参数这个签名就没法看了。
 
-    source 说的是这份对白从哪来（原生字幕 / 机器听写），不是文件格式 —— 三条来源路径
-    给出的都是 SRT。它会被写进产物，下游靠它区分这两者：听写（"asr"）必然是源片的原生
-    语言（日语），所以强制绕开 OpenCC，translate 阶段也按它判要不要跑。
+    source 说的是这份对白从哪来（原生字幕 / 画面 OCR / 机器听写），不是文件格式 —— 四条
+    来源路径给出的都是 SRT。它会被写进产物，下游靠它区分：听写（"asr"）必然是源片的原生
+    语言（日语），所以强制绕开 OpenCC；画面 OCR（"ocr"）认出来的是繁体中文字幕，跟原生
+    字幕一样照常繁转简。translate 阶段也按它判怎么处置。
 
     **反向不成立**，别把 "srt" 读成「这是中文」：它只说明来源是原生字幕轨。
     resolve_subtitle_source 的软字幕轨分枝也返回 "srt"，而那条分枝的适用对象恰好是
@@ -214,7 +215,8 @@ def build_track(
     # 听写来的对白是源片的原生语言（日语），过一遍繁转简会被改字（实测 `製作の話`
     # → `制作の话`）。这里强制关掉而不是要求调用方记得传：source 是「数据是什么」的
     # 事实，而 convert_traditional 是「想怎么处理繁体中文」的创作旋钮，前者该压住后者。
-    convert = convert_traditional and source == "srt"
+    # OCR 认出来的是画面上的繁体中文字幕，跟原生字幕同样处置。
+    convert = convert_traditional and source in ("srt", "ocr")
     lines: list[DialogueLine] = []
 
     for cue in cues:

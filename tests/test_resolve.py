@@ -1,4 +1,4 @@
-"""对白轨来源的三岔判据。ffprobe/ffmpeg/转写全部 fake —— 这一层的职责只是「选哪条路」。"""
+"""对白轨来源的四岔判据。ffprobe/ffmpeg/OCR/转写全部 fake —— 这一层的职责只是「选哪条路」。"""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from tenmin.config import AsrConfig
+from tenmin.config import AsrConfig, OcrConfig
 from tenmin.ingest import resolve
 
 
@@ -27,6 +27,7 @@ def stub(monkeypatch, capsys):
         "probe": [],
         "extract": [],
         "transcribe": [],
+        "recognize": [],
         "kwargs": {},
         "announced_before": [],
     }
@@ -50,9 +51,16 @@ def stub(monkeypatch, capsys):
         Path(dest).parent.mkdir(parents=True, exist_ok=True)
         Path(dest).write_text("1\n00:00:01,000 --> 00:00:02,000\n転写した\n", encoding="utf-8")
 
+    def fake_recognize(video, dest, **kwargs):
+        calls["recognize"].append((Path(video), Path(dest)))
+        calls["kwargs"]["recognize"] = kwargs
+        Path(dest).parent.mkdir(parents=True, exist_ok=True)
+        Path(dest).write_text("1\n00:00:01,000 --> 00:00:02,000\n認出來的\n", encoding="utf-8")
+
     monkeypatch.setattr(resolve.ffmpeg, "has_subtitle_stream", fake_has_subtitle)
     monkeypatch.setattr(resolve.ffmpeg, "extract_subtitle_track", fake_extract)
     monkeypatch.setattr(resolve.asr, "transcribe", fake_transcribe)
+    monkeypatch.setattr(resolve.ocr, "recognize", fake_recognize)
     return calls, state
 
 
@@ -64,6 +72,10 @@ def _video(tmp_path: Path) -> Path:
 
 def _cache(tmp_path: Path) -> Path:
     return tmp_path / "srt" / "E11.asr.srt"
+
+
+def _ocr_cache(tmp_path: Path) -> Path:
+    return tmp_path / "srt" / "E11.ocr.srt"
 
 
 def _touch_relative_to(target: Path, video: Path, delta: float) -> None:
@@ -417,9 +429,9 @@ def test_the_transcription_is_announced_before_it_starts(tmp_path, stub):
     assert "没有字幕轨" in announced
 
 
-def test_the_source_kind_is_only_srt_or_asr():
-    """kind 是下游判「要不要繁转简」的唯一依据（日语过 OpenCC 会被改字），所以它的
-    取值集合必须是封闭的。
+def test_the_source_kind_is_only_srt_asr_or_ocr():
+    """kind 是下游判「要不要繁转简」「translate 怎么处置」的唯一依据（日语过 OpenCC 会被
+    改字），所以它的取值集合必须是封闭的。
 
     走 get_type_hints 而不是 `__annotations__`：resolve 有 `from __future__ import
     annotations`，直接读 `__annotations__` 拿到的是一个**未求值的 `ForwardRef`**
@@ -430,5 +442,180 @@ def test_the_source_kind_is_only_srt_or_asr():
     from typing import Literal, get_args, get_type_hints
 
     field = get_type_hints(resolve.SubtitleSource)["kind"]
-    assert field == Literal["srt", "asr"]
-    assert set(get_args(field)) == {"srt", "asr"}
+    assert field == Literal["srt", "asr", "ocr"]
+    assert set(get_args(field)) == {"srt", "asr", "ocr"}
+
+
+# --- 声明了硬字幕：画面 OCR ----------------------------------------------------
+
+
+def _resolve_hardsub(tmp_path: Path, video: Path, **overrides):
+    kwargs = {
+        "cache": _cache(tmp_path),
+        "asr_config": AsrConfig(),
+        "hardsub": True,
+        "ocr_cache": _ocr_cache(tmp_path),
+        "ocr_config": OcrConfig(),
+        **overrides,
+    }
+    return resolve.resolve_subtitle_source(None, video, **kwargs)
+
+
+def test_a_declared_hardsub_is_recognized_instead_of_transcribed(tmp_path, stub):
+    calls, _ = stub
+    video = _video(tmp_path)
+
+    source = _resolve_hardsub(tmp_path, video)
+
+    assert source == resolve.SubtitleSource(_ocr_cache(tmp_path), "ocr")
+    assert calls["recognize"] == [(video, _ocr_cache(tmp_path))]
+    assert calls["transcribe"] == []
+    assert "認出來的" in source.path.read_text(encoding="utf-8")
+
+
+def test_a_declared_hardsub_still_prefers_an_embedded_subtitle_track(tmp_path, stub):
+    """文本字幕轨是最准的素材：声明了硬字幕也照样先抽它。"""
+    calls, state = stub
+    state["has_subtitle"] = True
+
+    source = _resolve_hardsub(tmp_path, _video(tmp_path))
+
+    assert source.kind == "srt"
+    assert source.path.name.endswith(".embedded.srt")
+    assert calls["recognize"] == []
+
+
+def test_a_handed_srt_still_wins_over_a_declared_hardsub(tmp_path, stub):
+    calls, _ = stub
+    srt = tmp_path / "hand.srt"
+    srt.write_text("1\n00:00:01,000 --> 00:00:02,000\n手传\n", encoding="utf-8")
+
+    source = resolve.resolve_subtitle_source(
+        srt,
+        _video(tmp_path),
+        cache=_cache(tmp_path),
+        asr_config=AsrConfig(),
+        hardsub=True,
+        ocr_cache=_ocr_cache(tmp_path),
+    )
+
+    assert source == resolve.SubtitleSource(srt, "srt")
+    assert calls["probe"] == []
+    assert calls["recognize"] == []
+
+
+def test_without_a_hardsub_declaration_nothing_changes(tmp_path, stub):
+    """没声明就维持原来的行为：哪怕磁盘上恰好躺着一份新鲜的 .ocr.srt 也不看它。"""
+    calls, _ = stub
+    video = _video(tmp_path)
+    leftover = _ocr_cache(tmp_path)
+    leftover.parent.mkdir(parents=True, exist_ok=True)
+    leftover.write_text("1\n00:00:01,000 --> 00:00:02,000\n舊的\n", encoding="utf-8")
+    _touch_relative_to(leftover, video, +10)
+
+    source = resolve.resolve_subtitle_source(
+        None, video, cache=_cache(tmp_path), asr_config=AsrConfig(), ocr_cache=leftover
+    )
+
+    assert source == resolve.SubtitleSource(_cache(tmp_path), "asr")
+    assert calls["recognize"] == []
+    assert calls["transcribe"]
+
+
+def test_a_fresh_ocr_cache_is_reused_instead_of_recognizing_again(tmp_path, stub):
+    """整集识别要几分钟，--force 重跑 ingest 不该重付。"""
+    calls, _ = stub
+    video = _video(tmp_path)
+    cache = _ocr_cache(tmp_path)
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    cache.write_text("1\n00:00:01,000 --> 00:00:02,000\n既存\n", encoding="utf-8")
+    _touch_relative_to(cache, video, +10)
+
+    source = _resolve_hardsub(tmp_path, video)
+
+    assert source == resolve.SubtitleSource(cache, "ocr")
+    assert calls["recognize"] == []
+
+
+def test_a_hand_edited_ocr_cache_survives_an_ocr_config_change(tmp_path, stub):
+    """新鲜度刻意不看 OcrConfig：手改过的 .ocr.srt 不许因为改了一个阈值就被静默冲掉。"""
+    calls, _ = stub
+    video = _video(tmp_path)
+    cache = _ocr_cache(tmp_path)
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    cache.write_text("1\n00:00:01,000 --> 00:00:02,000\n手改過的\n", encoding="utf-8")
+    _touch_relative_to(cache, video, +10)
+
+    source = _resolve_hardsub(tmp_path, video, ocr_config=OcrConfig(crop_top=0.6, similarity=0.8))
+
+    assert calls["recognize"] == []
+    assert "手改過的" in source.path.read_text(encoding="utf-8")
+
+
+def test_a_stale_ocr_cache_is_recognized_again(tmp_path, stub):
+    """换了片源（重新压制、换了个版本）就得重认。"""
+    calls, _ = stub
+    cache = _ocr_cache(tmp_path)
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    cache.write_text("舊的\n", encoding="utf-8")
+    video = _video(tmp_path)
+    _touch_relative_to(cache, video, -10)
+
+    source = _resolve_hardsub(tmp_path, video)
+
+    assert calls["recognize"]
+    assert "認出來的" in source.path.read_text(encoding="utf-8")
+
+
+def test_an_empty_ocr_cache_is_recognized_again(tmp_path, stub):
+    """0 字节的缓存是上一次被打断留下的，不是产物。"""
+    calls, _ = stub
+    video = _video(tmp_path)
+    cache = _ocr_cache(tmp_path)
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    cache.write_text("", encoding="utf-8")
+    _touch_relative_to(cache, video, +10)
+
+    _resolve_hardsub(tmp_path, video)
+
+    assert calls["recognize"]
+
+
+def test_an_ocr_failure_does_not_fall_back_to_transcription(monkeypatch, tmp_path, stub):
+    """用户明确说了要用画面上那份更好的素材，静默换成听写等于把它丢了。"""
+    calls, _ = stub
+
+    def unavailable(video, dest, **kwargs):
+        raise resolve.ocr.OCRUnavailableError("跑一次 `uv sync --extra ocr` 再试。")
+
+    monkeypatch.setattr(resolve.ocr, "recognize", unavailable)
+
+    with pytest.raises(resolve.ocr.OCRUnavailableError):
+        _resolve_hardsub(tmp_path, _video(tmp_path))
+
+    assert calls["transcribe"] == []
+
+
+def test_a_declared_hardsub_needs_an_ocr_cache_path(tmp_path, stub):
+    with pytest.raises(ValueError, match="ocr_cache"):
+        _resolve_hardsub(tmp_path, _video(tmp_path), ocr_cache=None)
+
+
+def test_the_configured_binaries_and_ocr_config_reach_recognize(tmp_path, stub):
+    """跟转写那一路同理：形参叫 `ocr_config`，下层收的是 `ocr=`。转错了会静默退回默认值。"""
+    calls, _ = stub
+    config = OcrConfig(crop_top=0.65, language="zh-Hans")
+
+    _resolve_hardsub(
+        tmp_path,
+        _video(tmp_path),
+        ocr_config=config,
+        ffmpeg_path="/opt/homebrew/bin/ffmpeg",
+        ffprobe_path="/opt/homebrew/bin/ffprobe",
+    )
+
+    assert calls["kwargs"]["recognize"] == {
+        "ocr": config,
+        "ffmpeg_path": "/opt/homebrew/bin/ffmpeg",
+        "ffprobe_path": "/opt/homebrew/bin/ffprobe",
+    }

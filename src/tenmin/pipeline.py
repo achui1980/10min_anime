@@ -130,10 +130,10 @@ _ARTIFACTS: dict[str, tuple[str, str]] = {
     "subtitles": ("05_timeline", ".ass"),
     "mixed_audio": ("06_audio", ".mixed.m4a"),
     "video": ("07_render", ".mp4"),
-    # 语音转写的落点。它是本表里唯一一个落在 srt/（输入目录）里的条目，也是唯一一个
-    # 既不在带序号的阶段目录、也不在 out/ 交付目录里的，刻意的：这份 SRT 是双重身份的
+    # 语音转写的落点。它（连同下面的 ocr_cache）是本表里仅有的落在 srt/（输入目录）里的条目，也是
+    # 仅有的既不在带序号的阶段目录、也不在 out/ 交付目录里的，刻意的：这份 SRT 是双重身份的
     # —— 它是 ingest 自己产出的缓存，同时也是下一次运行的**输入**（转差了就手改，
-    # _is_usable_asr_cache 会按 mtime 认它、照样按 kind="asr" 复用，所以手改的结果仍然
+    # _is_usable_cache 会按 mtime 认它、照样按 kind="asr" 复用，所以手改的结果仍然
     # 被当成机器听写，下游该繁转简还是该翻译不因手改而变，见 resolve 的 SubtitleSource
     # docstring；它**不会**走 resolve 的「手传 SRT」那条分枝 —— 手改一份缓存文件不会
     # 往 project.yaml 的 episodes[].srt 里放任何东西）。放进 srt/ 才让「手传的字幕和
@@ -145,6 +145,10 @@ _ARTIFACTS: dict[str, tuple[str, str]] = {
     # 这种名字，而规范名得到的是干净的 `E11.embedded.srt`），不会撞车 —— 防撞车全靠
     # _embedded_dest 的 `Path(name).stem`。
     "asr_cache": ("srt", ".asr.srt"),
+    # 画面 OCR 的落点。跟 asr_cache 同样的双重身份（ingest 自己产出的缓存 + 下一次运行的
+    # 输入，认错了就手改，按 mtime 复用、照样按 kind="ocr" 处置），同样住 srt/。后缀跟
+    # ingest/resolve.py 的 _OCR_SUFFIX 保持一致，这里是唯一权威。
+    "ocr_cache": ("srt", ".ocr.srt"),
 }
 
 
@@ -241,6 +245,10 @@ class Paths:
     def asr_cache(self, episode: int) -> Path:
         """语音转写结果的落点，也是 resolve_subtitle_source 的 cache 参数。"""
         return self._artifact("asr_cache", episode)
+
+    def ocr_cache(self, episode: int) -> Path:
+        """画面 OCR 结果的落点，也是 resolve_subtitle_source 的 ocr_cache 参数。"""
+        return self._artifact("ocr_cache", episode)
 
 
 def stages_from(stage: str) -> list[str]:
@@ -416,13 +424,14 @@ def _ingest_inputs(cfg: ProjectConfig) -> list[Path]:
     会被静默 stage_skip，下游各阶段因为 dialogue.json 没变而跟着一起跳过。
     两条不变量各有一条测试守着。
 
-    刻意**不**把 ingest 自己落在 srt/ 里的那两份产物算进来 —— 语音转写的缓存
-    （Paths.asr_cache，`E{NN}.asr.srt`）与软字幕轨抽出来的那份（`E{NN}.embedded.srt`，
+    刻意**不**把 ingest 自己落在 srt/ 里的那三份产物算进来 —— 语音转写的缓存
+    （Paths.asr_cache，`E{NN}.asr.srt`）、画面 OCR 的缓存（Paths.ocr_cache，
+    `E{NN}.ocr.srt`）与软字幕轨抽出来的那份（`E{NN}.embedded.srt`，
     见 ingest.resolve 的 _embedded_dest）：算进输入会让「解析完写出这份 SRT」这个动作
     立刻使 ingest 变得不新鲜，每次都重跑。两者各自的失效判据都在 ingest.resolve 里对着
-    源视频判（缓存按 mtime 复用，抽出来那份每次重写）。当前实现两份都进不来（输入只来自
+    源视频判（缓存按 mtime 复用，抽出来那份每次重写）。当前实现三份都进不来（输入只来自
     episodes[].srt），所以这一段不是在描述一层真实过滤，而是给「顺手 glob 一下 srt/
-    目录」这个改法留的警告 —— 两份都得排除，不是只排除缓存那一份。
+    目录」这个改法留的警告 —— 三份都得排除，不是只排除转写缓存那一份。
 
     也别把 None 留在返回值里：唯一的消费者是 run_pipeline 的 ingest 分枝，而
     _is_fresh 对每个输入调 Path.exists，一个 None 会把它崩成 AttributeError ——
@@ -473,7 +482,7 @@ def run_ingest(cfg: ProjectConfig) -> list[DialogueTrack]:
     paths = Paths(cfg.root)
     tracks = []
     for episode in _active_episodes(cfg):
-        # 三条来源路径（手传 SRT / 视频内嵌软字幕轨 / 语音转写）都归一成一份 SRT，
+        # 四条来源路径（手传 SRT / 视频内嵌软字幕轨 / 画面 OCR / 语音转写）都归一成一份 SRT，
         # 所以 build_track 拿到的东西形态不变。这里每集**只解析一次**：软字幕轨那条
         # 分枝每次调用都会重抽一遍（见 ingest/resolve.py 里那段注释），多调一次就多
         # 一次 demux。
@@ -482,6 +491,9 @@ def run_ingest(cfg: ProjectConfig) -> list[DialogueTrack]:
             cfg.video_path(episode) if episode.video is not None else None,
             cache=paths.asr_cache(episode.number),
             asr_config=cfg.asr,
+            hardsub=cfg.hardsub_enabled(episode),
+            ocr_cache=paths.ocr_cache(episode.number),
+            ocr_config=cfg.ocr,
             ffmpeg_path=cfg.render.ffmpeg_path,
             ffprobe_path=cfg.render.ffprobe_path,
         )
