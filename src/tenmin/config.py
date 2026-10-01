@@ -351,6 +351,19 @@ class ValidateConfig(StrictModel):
     stretch_max: float = Field(default=4.0, gt=0)
     stretch_min: float = Field(default=0.125, gt=0)
 
+    # 比 stretch_max 更紧的门槛：超过它值得为这个节点重跑一次 LLM（走
+    # validation_retries，跟 max_holds 同一条路），而不只是发个 warning。
+    # stretch_max（4.0）依然是"数量级配错"的宽松上限，两条阈值刻意分层、互不影响。
+    #
+    # 取值依据真实缺陷案例（B 阶段人工评审 akujo E11 / saijo E02 成片）：akujo 28 段
+    # clip 里 7 段拉伸超过 1.5 倍（最差 2.62 倍，画面被钳到片尾）；saijo beat7 拉伸
+    # 1.88 倍。这些案例全部落在现有 stretch_max=4.0 之内、从未触发过 warning，
+    # 说明"数量级配错"阈值拦不住真实可见的画面变形。
+    #
+    # 只拦拉伸过长方向：画面过剩被截断（stretch 过小）目前没有真实可见缺陷证据，
+    # 继续只发 warning。
+    retry_stretch_max: float = Field(default=1.5, gt=0)
+
 
 class RenderConfig(StrictModel):
     """v2 渲染参数。voice 与 rate 直接喂 Edge-TTS。"""

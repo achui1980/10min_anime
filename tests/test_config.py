@@ -211,6 +211,7 @@ def test_render_config_defaults():
 
 def test_quality_knob_defaults():
     assert ValidateConfig().hold_clip_max_gap_seconds == 3.0
+    assert ValidateConfig().retry_stretch_max == 1.5
     cfg = RenderConfig()
     assert (
         cfg.subtitle_soft_max_chars,
@@ -226,6 +227,7 @@ def test_quality_knob_defaults():
     ("model", "field", "value"),
     [
         (ValidateConfig, "hold_clip_max_gap_seconds", -1),
+        (ValidateConfig, "retry_stretch_max", 0),
         (RenderConfig, "subtitle_soft_max_chars", 0),
         (RenderConfig, "hold_relative_lu", -1),
         (RenderConfig, "hold_gain_max_db", -1),
