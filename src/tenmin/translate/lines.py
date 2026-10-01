@@ -19,7 +19,13 @@ from importlib.resources import files
 from pathlib import Path
 
 from tenmin.config import ProjectConfig
-from tenmin.models import SPEECH_KINDS, DialogueLine, DialogueTrack, TranslatedTrack
+from tenmin.models import (
+    SPEECH_KINDS,
+    DialogueLine,
+    DialogueTrack,
+    TranslatedLine,
+    TranslatedTrack,
+)
 from tenmin.script.llm import (
     LLMProvider,
     LLMResponseFormatError,
@@ -75,6 +81,22 @@ def select_translatable(track: DialogueTrack) -> list[tuple[int, DialogueLine]]:
         for position, line in enumerate(track.lines, start=1)
         if line.kind in SPEECH_KINDS
     ]
+
+
+def passthrough_track(track: DialogueTrack) -> TranslatedTrack:
+    """原文本来就是中文的一集（画面 OCR 来的，ingest 已经繁转简）：不调模型，zh 直接取原文。
+
+    挑哪些行跟送去翻译的完全是同一套（select_translatable），id 也是同一个口径（轨里的
+    1-based 位置），所以下游 render_zh_srt 与 zh.json 的形状跟 ASR 路径一模一样。glossary
+    留空：这条路上没有模型替我们认专有名词，累积表也不该被它碰。
+    """
+    return TranslatedTrack(
+        episode=track.episode,
+        lines=[
+            TranslatedLine(id=position, zh=line.text)
+            for position, line in select_translatable(track)
+        ],
+    )
 
 
 def build_lines_block(selected: Sequence[tuple[int, DialogueLine]]) -> str:

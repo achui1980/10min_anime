@@ -50,7 +50,7 @@ from tenmin.translate.glossary import (
     merge_glossary,
     save_glossary,
 )
-from tenmin.translate.lines import translate_track
+from tenmin.translate.lines import passthrough_track, translate_track
 from tenmin.translate.srt_writer import render_zh_srt
 
 # translate 紧跟 ingest：它吃对白轨，而下游的解说稿要用它回写的累积术语表。
@@ -557,9 +557,16 @@ async def run_translate(
 ) -> tuple[TranslatedTrack, list[str]]:
     """翻译一集：落译文轨、中文字幕，并把新认出的术语并回累积表。
 
-    只对听写来的对白动手。手传的字幕与从视频里抽出来的软字幕轨都是片源自带的，本来
-    就是观众能读的语言。判据用对白轨的 source 字段，刻意不做语言自动检测 —— 那是个
-    会错的猜测，而 source 是一个确定的事实。
+    按对白轨的 source 字段分三路，刻意不做语言自动检测 —— 那是个会错的猜测，而 source
+    是一个确定的事实：
+
+    - "srt"：手传的字幕与从视频里抽出来的软字幕轨都是片源自带的，本来就是观众能读的
+      语言，整个阶段跳过（见下一段）。
+    - "ocr"：画面上认出来的中文字幕，ingest 已经繁转简。**不调 LLM**，按
+      passthrough_track 原样交付 `zh/E{NN}.zh.json` 与简体的 `out/E{NN}.zh.srt`
+      （产物集合与 run_pipeline 里 translate 的 outputs 一致，新鲜度照常）。这条路不碰
+      累积术语表、不写 `zh/E{NN}.usage.json`，也压根不碰 provider —— 传 None 也行。
+    - "asr"：听写来的日语对白，真的翻译。
 
     跳过时连 `zh/` 目录都不建（早退发生在任何写盘之前），所以现有的繁中片源在磁盘上
     看不出这个阶段存在过。代价是这个函数每次运行都会被叫一遍：那一集的产物永远不会出现，
@@ -573,13 +580,18 @@ async def run_translate(
 
     返回 `(译文轨, warnings)`，与 `run_voice`/`run_timeline` 同一模式：warnings 目前
     只来自 `merge_glossary` 的语气词剪裁/丢弃提示，方便人工发现「本集新词被自动修正
-    过」。跳过（非 asr 来源）时返回空列表，不产生任何提示噪音。
+    过」。srt 来源跳过、ocr 来源直通时都返回空列表，不产生任何提示噪音。
     """
     track = next(t for t in _load_tracks(cfg) if t.episode == episode)
-    if track.source != "asr":
+    if track.source == "srt":
         return TranslatedTrack(episode=episode), []
 
     paths = Paths(cfg.root)
+    if track.source == "ocr":
+        translated = passthrough_track(track)
+        _write_json(paths.zh_lines(episode), translated.model_dump_json(indent=2))
+        _write_text(paths.zh_subtitles(episode), render_zh_srt(track, translated))
+        return translated, []
     accumulated = load_glossary(paths.glossary)
     usage: list[UsageRecord] = []
     try:

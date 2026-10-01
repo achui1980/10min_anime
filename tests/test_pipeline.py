@@ -3216,6 +3216,104 @@ async def test_run_pipeline_rebuilds_a_deleted_zh_subtitle(tmp_path):
     assert "是的" in paths.zh_subtitles(11).read_text(encoding="utf-8")
 
 
+def _ocr_project(tmp_path: Path) -> tuple[ProjectConfig, Paths]:
+    """一集画面 OCR 来的对白轨（已繁转简）：两条台词、一条 staff、一条整行括注。"""
+    cfg, paths = _project_with_dialogue(tmp_path, episode=11, source="ocr")
+    track = DialogueTrack(
+        episode=11,
+        source="ocr",
+        duration=100.0,
+        lines=[
+            DialogueLine(idx=1, start=1.0, end=2.0, text="我们走吧", raw="我們走吧"),
+            DialogueLine(
+                idx=2, start=3.0, end=4.0, text="监督 山田", raw="監督 山田", kind="credits"
+            ),
+            DialogueLine(
+                idx=3, start=5.0, end=6.0, text="（数日后）", raw="（數日後）", kind="screen_text"
+            ),
+            DialogueLine(
+                idx=4, start=7.0, end=8.0, text="不要…", raw="不要…", kind="monologue"
+            ),
+        ],
+    )
+    _file(paths.dialogue(11), track.model_dump_json(indent=2))
+    return cfg, paths
+
+
+async def test_run_translate_passes_an_ocr_episode_through_without_the_llm(tmp_path):
+    """画面上本来就是中文：不调模型，zh 直接取对白原文，只收 speech 行。
+
+    FakeProvider 的预置响应给空列表，它被调用就抛。
+    """
+    cfg, paths = _ocr_project(tmp_path)
+    provider = FakeProvider([])
+
+    translated, stage_warnings = await run_translate(cfg, provider, 11)
+
+    assert provider.calls == []
+    assert stage_warnings == []
+    assert [(line.id, line.zh) for line in translated.lines] == [(1, "我们走吧"), (4, "不要…")]
+    stored = json.loads(paths.zh_lines(11).read_text(encoding="utf-8"))
+    assert stored == {
+        "episode": 11,
+        "lines": [{"id": 1, "zh": "我们走吧"}, {"id": 4, "zh": "不要…"}],
+        "glossary": {},
+    }
+    subtitles = paths.zh_subtitles(11).read_text(encoding="utf-8")
+    assert subtitles == (
+        "1\n00:00:01,000 --> 00:00:02,000\n我们走吧\n\n"
+        "2\n00:00:07,000 --> 00:00:08,000\n不要…\n"
+    )
+
+
+async def test_run_translate_needs_no_provider_for_an_ocr_episode(tmp_path):
+    """这条路压根不碰 provider：没配 API key（provider 构造不出来）也不许失败。"""
+    cfg, paths = _ocr_project(tmp_path)
+
+    await run_translate(cfg, None, 11)
+
+    assert paths.zh_subtitles(11).is_file()
+
+
+async def test_run_translate_leaves_the_glossary_and_usage_alone_for_ocr(tmp_path):
+    """累积术语表是 script 的新鲜度输入，OCR 这条路连读带写都不许碰它；用量文件也不写。"""
+    cfg, paths = _ocr_project(tmp_path)
+    _file(paths.glossary, json.dumps({"玲琳": "玲琳"}, ensure_ascii=False))
+    _shift_mtime(paths.glossary, -600.0)
+    stamp = paths.glossary.stat().st_mtime
+
+    await run_translate(cfg, FakeProvider([]), 11)
+
+    assert paths.glossary.stat().st_mtime == stamp
+    assert not paths.zh_usage(11).exists()
+
+
+async def test_run_translate_on_an_ocr_episode_creates_no_glossary(tmp_path):
+    cfg, paths = _ocr_project(tmp_path)
+
+    await run_translate(cfg, FakeProvider([]), 11)
+
+    assert not paths.glossary.exists()
+
+
+async def test_run_pipeline_delivers_and_then_skips_an_ocr_translate(tmp_path):
+    """接线：OCR 集的 translate 照常跑一次、产出两份产物；产物比对白轨新之后就跳过。"""
+    cfg, paths = _ocr_project(tmp_path)
+    reporter = FakeReporter()
+
+    await run_pipeline(cfg, FakeProvider([]), only=["translate"], reporter=reporter)
+
+    assert ("stage_start", "translate") in reporter.calls
+    assert paths.zh_lines(11).is_file()
+    assert paths.zh_subtitles(11).is_file()
+
+    _shift_mtime(paths.zh_lines(11), 60.0)
+    _shift_mtime(paths.zh_subtitles(11), 60.0)
+    again = FakeReporter()
+    await run_pipeline(cfg, FakeProvider([]), only=["translate"], reporter=again)
+    assert ("stage_skip", "translate") in again.calls
+
+
 def test_script_freshness_depends_on_the_glossary(tmp_path):
     """累积术语表是 script 的真输入：run_script 把它喂进 prompt 的术语表那一节，
     所以表变了旧解说稿里的译名就对不上，必须重跑。"""
