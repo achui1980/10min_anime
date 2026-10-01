@@ -165,8 +165,8 @@ ingest 之前有一层来源解析，按「无损且便宜」排序取第一条�
    开跑之前会打一行「没有字幕轨，只能走语音转写」，一集 24 分钟约 3 分钟。
 
 第 1、2 条的对白轨记作 `source: "srt"`，第 3 条记作 `source: "ocr"`，第 4 条记作
-`source: "asr"`（在 `01_dialogue/E{NN}.dialogue.json` 里，`tenmin inspect` 的第二行也会
-打出来）。这个字段决定两件事：**要不要繁转简**（srt 与 ocr 转；日语过 OpenCC 会被改字，
+`source: "asr"`（在 `01_dialogue/E{NN}.dialogue.json` 里，`tenmin inspect` 在对白轨那行
+下面也会打出来）。这个字段决定两件事：**要不要繁转简**（srt 与 ocr 转；日语过 OpenCC 会被改字，
 所以听写路径强制关掉）和 **translate 阶段怎么跑**（见下文）。
 
 ### 两个旋钮
