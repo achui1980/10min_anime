@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import shlex
 import subprocess
 import threading
@@ -23,8 +24,10 @@ from tenmin.render.ffmpeg import (
     preflight,
     probe_duration,
     probe_frame_rate,
+    probe_video_size,
     progress_seconds,
     run,
+    run_raw_frames,
     run_with_progress,
     tail,
 )
@@ -1544,3 +1547,148 @@ def test_extract_helpers_accept_a_string_dest(monkeypatch, tmp_path):
 
     assert (tmp_path / "s" / "out.srt").parent.is_dir()
     assert (tmp_path / "w" / "out.wav").parent.is_dir()
+
+
+# --- probe_video_size ---
+
+
+def test_probe_video_size_reads_width_and_height_of_the_first_video_stream(
+    monkeypatch, tmp_path
+):
+    media = tmp_path / "a.mkv"
+    media.write_bytes(b"fake")
+    seen: dict[str, list[str]] = {}
+
+    def fake_run(args, **kwargs):
+        seen["args"] = list(args)
+        return FakeCompleted(stdout="1920,1080\n")
+
+    monkeypatch.setattr("tenmin.render.ffmpeg.subprocess.run", fake_run)
+    assert probe_video_size(media) == (1920, 1080)
+    assert seen["args"][seen["args"].index("-select_streams") + 1] == "v:0"
+    assert "stream=width,height" in seen["args"]
+
+
+@pytest.mark.parametrize("bad", ["", "N/A", "1920", "1920,1080,1", "0,1080", "1920,-2"])
+def test_probe_video_size_rejects_unusable_values(monkeypatch, tmp_path, bad):
+    media = tmp_path / "a.mkv"
+    media.write_bytes(b"fake")
+    monkeypatch.setattr(
+        "tenmin.render.ffmpeg.subprocess.run",
+        lambda args, **kwargs: FakeCompleted(stdout=f"{bad}\n"),
+    )
+    with pytest.raises(FFmpegError) as exc:
+        probe_video_size(media)
+    assert "a.mkv" in str(exc.value)
+
+
+# --- run_raw_frames ---
+
+
+class FakeBinaryPopen:
+    """假的二进制模式 Popen：stdout / stderr 都是字节流。
+
+    跟上面的 FakePopen 分开：run_raw_frames 不开 text 模式（stdout 是 rawvideo），
+    stderr 由被测代码自己套 TextIOWrapper 解码，所以两条管道都必须是真的字节流对象。
+    """
+
+    def __init__(self, argv, *, stdout: bytes, stderr: bytes = b"", returncode: int = 0):
+        self.argv = list(argv)
+        self.stdout = io.BytesIO(stdout)
+        self.stderr = io.BytesIO(stderr)
+        self._returncode = returncode
+        self.killed = False
+
+    def __enter__(self) -> FakeBinaryPopen:
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        return None
+
+    def kill(self) -> None:
+        self.killed = True
+
+    def wait(self) -> int:
+        return self._returncode
+
+
+def _fake_raw_popen(monkeypatch, **kwargs) -> list[FakeBinaryPopen]:
+    """把 Popen 换成 FakeBinaryPopen，返回一个会记下每次 spawn 的列表。"""
+    spawned: list[FakeBinaryPopen] = []
+
+    def fake_popen(argv, **_popen_kwargs):
+        process = FakeBinaryPopen(argv, **kwargs)
+        spawned.append(process)
+        return process
+
+    monkeypatch.setattr("tenmin.render.ffmpeg.subprocess.Popen", fake_popen)
+    return spawned
+
+
+def test_run_raw_frames_hands_out_one_callback_per_frame(monkeypatch):
+    spawned = _fake_raw_popen(monkeypatch, stdout=b"aaaabbbbcccc", stderr=b"pts_time:0\n")
+    frames: list[bytes] = []
+
+    stderr = run_raw_frames(
+        ["-i", "in.mp4", "-f", "rawvideo", "-"], frame_size=4, on_frame=frames.append
+    )
+
+    assert frames == [b"aaaa", b"bbbb", b"cccc"]
+    assert stderr == "pts_time:0\n"
+    assert spawned[0].argv == [
+        "ffmpeg", "-nostdin", "-nostats", "-i", "in.mp4", "-f", "rawvideo", "-",
+    ]
+
+
+def test_run_raw_frames_uses_the_configured_ffmpeg(monkeypatch):
+    spawned = _fake_raw_popen(monkeypatch, stdout=b"")
+    run_raw_frames(
+        ["-i", "in.mp4"], frame_size=4, on_frame=lambda _f: None, ffmpeg="/opt/x/ffmpeg"
+    )
+    assert spawned[0].argv[0] == "/opt/x/ffmpeg"
+
+
+def test_run_raw_frames_decodes_dirty_stderr_instead_of_crashing(monkeypatch):
+    """老番源文件的容器元数据常年不是合法 UTF-8，跟 run 同一个理由用 errors="replace"。"""
+    _fake_raw_popen(monkeypatch, stdout=b"", stderr=b"title: \xff\xfe\n")
+    stderr = run_raw_frames(["-i", "in.mp4"], frame_size=4, on_frame=lambda _f: None)
+    assert "\ufffd" in stderr
+
+
+def test_run_raw_frames_raises_with_the_stderr_tail_on_failure(monkeypatch):
+    _fake_raw_popen(monkeypatch, stdout=b"", stderr=b"Invalid argument\n", returncode=1)
+    with pytest.raises(FFmpegError) as exc:
+        run_raw_frames(["-i", "in.mp4"], frame_size=4, on_frame=lambda _f: None)
+    assert "Invalid argument" in str(exc.value)
+    assert "in.mp4" in str(exc.value)
+
+
+def test_run_raw_frames_refuses_a_trailing_partial_frame(monkeypatch):
+    """末尾不足一帧 = 帧大小算错了。静默丢掉的话前面每一帧其实都已经错位。"""
+    _fake_raw_popen(monkeypatch, stdout=b"aaaabb")
+    frames: list[bytes] = []
+    with pytest.raises(FFmpegError) as exc:
+        run_raw_frames(["-i", "in.mp4"], frame_size=4, on_frame=frames.append)
+    assert "2 字节" in str(exc.value)
+
+
+def test_run_raw_frames_kills_ffmpeg_when_the_callback_blows_up(monkeypatch):
+    spawned = _fake_raw_popen(monkeypatch, stdout=b"aaaabbbb")
+
+    def boom(_frame: bytes) -> None:
+        raise RuntimeError("识别炸了")
+
+    with pytest.raises(RuntimeError, match="识别炸了"):
+        run_raw_frames(["-i", "in.mp4"], frame_size=4, on_frame=boom)
+    assert spawned[0].killed
+
+
+def test_run_raw_frames_requires_the_binary(monkeypatch):
+    monkeypatch.setattr("tenmin.render.ffmpeg.shutil.which", lambda _name: None)
+    with pytest.raises(FFmpegBinaryError):
+        run_raw_frames(["-i", "in.mp4"], frame_size=4, on_frame=lambda _f: None)
+
+
+def test_run_raw_frames_rejects_a_non_positive_frame_size():
+    with pytest.raises(ValueError):
+        run_raw_frames(["-i", "in.mp4"], frame_size=0, on_frame=lambda _f: None)

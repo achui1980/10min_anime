@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import io
 import re
 import shlex
 import shutil
@@ -306,6 +307,25 @@ def probe_frame_rate(path: Path, *, ffprobe: str = FFPROBE) -> float:
             "帧率会被用来把 timeline 的每一段对齐到帧边界，0 会让每段都变成零长。"
         )
     return rate
+
+
+def probe_video_size(path: Path, *, ffprobe: str = FFPROBE) -> tuple[int, int]:
+    """第一条视频轨的 (宽, 高)，像素。读不出、或不是两个正整数，一律抛错。
+
+    `-select_streams v:0` 的理由同 probe_frame_rate：真实源片常带一条附图「视频」轨，
+    不选流的话取到哪一条纯看运气。
+
+    消费者是硬字幕 OCR 的抽帧（ingest/ocr.py）：它要按真实像素算出裁剪区与缩放后的高度，
+    才知道 rawvideo 管道里一帧有多少字节。
+    """
+    raw = _probe_field(path, "stream=width,height", "画面尺寸", ffprobe=ffprobe, stream="v:0")
+    try:
+        width, height = (int(part) for part in raw.split(","))
+    except ValueError as error:
+        raise FFmpegError(f"ffprobe 读不出 {path} 的画面尺寸，输出是 {raw!r}") from error
+    if width <= 0 or height <= 0:
+        raise FFmpegError(f"ffprobe 报 {path} 的画面尺寸是 {raw!r}，这不可能是条能用的视频轨")
+    return width, height
 
 
 # maxsize 从 1 提到 8：key 是可执行文件路径，而 preflight 在批量模式下每集都调。
@@ -751,5 +771,72 @@ def run_with_progress(
         raise FFmpegError(
             f"ffmpeg 执行失败（退出码 {returncode}）：{shlex.join(argv)}\n"
             f"stderr 末尾 {STDERR_TAIL_LINES} 行：\n{tail(stderr)}"
+        )
+    return stderr
+
+
+def run_raw_frames(
+    args: list[str],
+    *,
+    frame_size: int,
+    on_frame: Callable[[bytes], None],
+    ffmpeg: str = FFMPEG,
+) -> str:
+    """跑一条把 rawvideo 写到 stdout 的 ffmpeg，每凑满 frame_size 字节就回调一次 on_frame。
+
+    返回 stderr 全文（已按 UTF-8 + errors="replace" 解码，理由同 run）。参数怎么拼（滤镜、
+    输出格式、`-` 作为输出）是调用方的事，这一层只管管道与错误处理。
+
+    帧是**流式**交出去的，不在内存里攒：一集 24 分钟按每秒 4 帧取、每帧 1280×202 灰度，
+    合计约 1.5 GB。
+
+    stderr 必须**并发**排空，理由同 run_with_progress：调用方往往开着 showinfo（每帧一行，
+    一集几千行），一旦写满 64KB 的管道，ffmpeg 阻塞在写 stderr、这里阻塞在读 stdout，
+    永久挂死。stdout 是二进制，所以 Popen 不开 text 模式，stderr 单独套一层 TextIOWrapper
+    再交给 _drain。
+
+    stdout 末尾剩下不足一帧的字节时抛 FFmpegError：那是「帧大小算错了」或「输出格式不是
+    调用方以为的那个」，静默丢掉会让后面每一帧都错位。on_frame 抛异常（包括 Ctrl-C）时
+    先 kill 子进程再往外抛，理由同 run_with_progress。
+    """
+    if frame_size <= 0:
+        raise ValueError(f"frame_size 必须是正数，收到 {frame_size}")
+    _require_binary(ffmpeg)
+    argv = [ffmpeg, "-nostdin", "-nostats", *args]
+    with subprocess.Popen(
+        argv,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    ) as process:
+        try:
+            drained: list[str] = []
+            stderr_text = io.TextIOWrapper(process.stderr, encoding="utf-8", errors="replace")
+            drainer = threading.Thread(target=_drain, args=(stderr_text, drained), daemon=True)
+            drainer.start()
+
+            leftover = 0
+            while True:
+                frame = process.stdout.read(frame_size)
+                if len(frame) < frame_size:
+                    leftover = len(frame)
+                    break
+                on_frame(frame)
+
+            returncode = process.wait()
+            drainer.join(STDERR_DRAIN_TIMEOUT_SECONDS)
+            stderr = "".join(drained)
+        except BaseException:
+            process.kill()
+            raise
+    if returncode != 0:
+        raise FFmpegError(
+            f"ffmpeg 执行失败（退出码 {returncode}）：{shlex.join(argv)}\n"
+            f"stderr 末尾 {STDERR_TAIL_LINES} 行：\n{tail(stderr)}"
+        )
+    if leftover:
+        raise FFmpegError(
+            f"ffmpeg 的帧管道末尾剩下 {leftover} 字节，不足一帧（每帧 {frame_size} 字节）。"
+            f"帧大小与输出格式对不上：{shlex.join(argv)}"
         )
     return stderr
