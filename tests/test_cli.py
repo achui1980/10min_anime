@@ -1039,3 +1039,53 @@ def test_registering_keeps_the_init_header_comments(work, tmp_path, monkeypatch)
         if line.startswith("- ")
     ]
     assert removed == ["- episodes: []"]
+
+
+def _ocr_project_with_dialogue(work, *, hardsub_line: str = "") -> None:
+    """一个声明了硬字幕的项目，外加一份已落盘的 OCR 来源对白轨（不跑 ingest）。"""
+    from tenmin.models import DialogueLine, DialogueTrack
+
+    root = work / "akujo"
+    (root / "01_dialogue").mkdir(parents=True)
+    (root / "project.yaml").write_text(
+        "show: 我是不才恶女\nslug: akujo\nocr:\n  enabled: true\n"
+        f"episodes:\n- number: 11\n  video: /v/e11.mp4\n{hardsub_line}",
+        encoding="utf-8",
+    )
+    track = DialogueTrack(
+        episode=11,
+        source="ocr",
+        duration=1430.0,
+        lines=[DialogueLine(idx=1, start=1.0, end=2.0, text="我们走吧", raw="我們走吧")],
+    )
+    (root / "01_dialogue" / "E11.dialogue.json").write_text(
+        track.model_dump_json(indent=2), encoding="utf-8"
+    )
+
+
+def test_inspect_shows_the_dialogue_source_and_the_hardsub_declaration(work):
+    _ocr_project_with_dialogue(work)
+    result = runner.invoke(
+        app, ["inspect", "akujo", "--work-dir", str(work), "--episode", "11", "--suspect"]
+    )
+    assert result.exit_code == 0, out(result)
+    assert "来源：ocr（画面 OCR），硬字幕：已声明" in out(result)
+
+
+def test_inspect_follows_an_episode_level_hardsub_override(work):
+    _ocr_project_with_dialogue(work, hardsub_line="  hardsub: false\n")
+    result = runner.invoke(
+        app, ["inspect", "akujo", "--work-dir", str(work), "--episode", "11", "--suspect"]
+    )
+    assert result.exit_code == 0, out(result)
+    assert "硬字幕：未声明" in out(result)
+
+
+def test_inspect_labels_a_native_subtitle_source(work, golden_srt_path):
+    _bootstrap(work, golden_srt_path)
+    runner.invoke(app, ["run", "saijo", "--work-dir", str(work), "--only", "ingest"])
+    result = runner.invoke(
+        app, ["inspect", "saijo", "--work-dir", str(work), "--episode", "2", "--suspect"]
+    )
+    assert result.exit_code == 0, out(result)
+    assert "来源：srt（原生字幕），硬字幕：未声明" in out(result)

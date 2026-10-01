@@ -351,6 +351,14 @@ def run(
             typer.echo(f"成品视频：{video_path}")
 
 
+# 对白轨来源（DialogueTrack.source）给 inspect 显示用。三种来源下游的处置各不相同
+# （繁转简、translate 怎么跑、OP/ED 推断靠不靠得住），所以值得一眼看见。
+_SOURCE_LABEL = {
+    "srt": "原生字幕",
+    "ocr": "画面 OCR",
+    "asr": "语音转写",
+}
+
 # OP/ED 区间三级回退里实际生效的那一级，给 inspect 显示用。标注的是「这个值
 # 从哪来」：自动推断那一级不可靠（实测 13 集里 2 集 op=None、2 集 ed=None），
 # 而手填那两级还会同时驱动 in_credit_window，两者的后果完全不同。
@@ -406,6 +414,13 @@ def inspect(
         counts[line.kind] = counts.get(line.kind, 0) + 1
 
     typer.echo(f"对白轨 E{episode:02d}：{len(track.lines)} 行，时长 {track.duration:.3f}s")
+    # 「是否声明了硬字幕」读的是**现在**的 project.yaml，来源读的是上次 ingest 的产物；
+    # 两者对不上（刚改了声明还没重跑 ingest、或者有软字幕轨优先）时并排摆着最好查。
+    hardsub = ep_cfg is not None and cfg.hardsub_enabled(ep_cfg)
+    typer.echo(
+        f"  来源：{track.source}（{_SOURCE_LABEL[track.source]}），"
+        f"硬字幕：{'已声明' if hardsub else '未声明'}"
+    )
     typer.echo("  分类：" + "、".join(f"{k}={v}" for k, v in sorted(counts.items())))
     for label, value, filled, default in (
         ("片头曲", track.op_range, ep_cfg and ep_cfg.op_range, cfg.credits.default_op_range),

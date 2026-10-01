@@ -3,10 +3,11 @@
 把番剧字幕 + 视频变成解说成片。输入 SRT 与源片，输出「分段文案与剪辑时间轴对照表」、
 配音纯文本，以及配好音、烧好硬字幕的 mp4。
 
-吃自带字幕的片源，也吃生肉：对白轨有三条来源（手传 SRT / 视频里的软字幕轨 / 语音转写），
-生肉还会额外交付一份中文字幕。设计文档见
+吃自带字幕的片源，也吃生肉：对白轨有四条来源（手传 SRT / 视频里的软字幕轨 / 画面硬字幕 OCR
+/ 语音转写），生肉还会额外交付一份中文字幕。设计文档见
 `docs/superpowers/specs/2026-08-31-10min-anime-design.md`，生肉那部分见
-`docs/superpowers/specs/2026-09-21-tenmin-asr-translate-design.md`。
+`docs/superpowers/specs/2026-09-21-tenmin-asr-translate-design.md`，硬字幕 OCR 见
+`docs/superpowers/specs/2026-10-01-hardsub-ocr-design.md`。
 
 ## 核心思路
 
@@ -32,6 +33,13 @@ uv sync --extra asr
 
 不装也能跑 `tenmin --help` 和全部非转写用法；真需要转写时会报一句「跑一次
 `uv sync --extra asr` 再试」而不是 traceback。只支持 mlx-whisper（Apple Silicon）。
+
+画面上烧着字幕的片源（ANi / Baha 这类 `[CHT]` WEB-DL）走画面 OCR，再装一个只有几 MB 的 extra
+（Apple Vision，只支持 macOS）：
+
+```bash
+uv sync --extra ocr
+```
 
 渲染阶段需要编入 libass 的 ffmpeg（否则烧不了字幕）：
 
@@ -144,19 +152,22 @@ uv run tenmin run akujo2 --from voice
 uv run tenmin run akujo2 --from audio --force
 ```
 
-## 对白轨从哪来（三岔）
+## 对白轨从哪来（四岔）
 
 ingest 之前有一层来源解析，按「无损且便宜」排序取第一条成立的：
 
 1. **手传的 SRT**（`--srt`，或 `project.yaml` 里那一集的 `srt:`）——人明确指定了，不猜。
 2. **视频里的软字幕轨**——`ffmpeg` 一条命令抽成 `work/<slug>/srt/E{NN}.embedded.srt`，
    零成本零误差。**每次重抽**（抽取被打断留下的半份 SRT 在语法上合法，看不出是残骸）。
-3. **语音转写**——前两条都不成立时才走，落成 `work/<slug>/srt/E{NN}.asr.srt`。
+3. **画面硬字幕 OCR**——只在 `project.yaml` 声明了硬字幕时才走（见下文「硬字幕片源」），
+   落成 `work/<slug>/srt/E{NN}.ocr.srt`（繁体原文）。一集 24 分钟约 3–4 分钟。
+4. **语音转写**——前三条都不成立时才走，落成 `work/<slug>/srt/E{NN}.asr.srt`。
    开跑之前会打一行「没有字幕轨，只能走语音转写」，一集 24 分钟约 3 分钟。
 
-第 1、2 条的对白轨记作 `source: "srt"`，第 3 条记作 `source: "asr"`
-（在 `01_dialogue/E{NN}.dialogue.json` 里）。这个字段决定两件事：**要不要繁转简**
-（日语过 OpenCC 会被改字，所以听写路径强制关掉）和**要不要跑 translate 阶段**。
+第 1、2 条的对白轨记作 `source: "srt"`，第 3 条记作 `source: "ocr"`，第 4 条记作
+`source: "asr"`（在 `01_dialogue/E{NN}.dialogue.json` 里，`tenmin inspect` 的第二行也会
+打出来）。这个字段决定两件事：**要不要繁转简**（srt 与 ocr 转；日语过 OpenCC 会被改字，
+所以听写路径强制关掉）和 **translate 阶段怎么跑**（见下文）。
 
 ### 两个旋钮
 
@@ -180,10 +191,39 @@ rm work/<slug>/srt/E11.asr.srt
 下次照样复用）。按配置指纹失效就意味着改一次 `asr.model` 会把那些手改**静默冲掉**，
 而「换了模型却没重转」打开文件就看得出来。
 
+### 硬字幕片源（画面 OCR）
+
+不做自动探测，要在 `project.yaml` 里声明。整部番都带硬字幕时写项目级的，个别集例外时逐集覆盖：
+
+```yaml
+ocr:
+  enabled: true          # 这部番的片源带硬字幕
+episodes:
+  - number: 11
+    video: /path/to/[ANi] 我是不才惡女 - 11 [1080P][Baha][WEB-DL][AAC AVC][CHT].mp4
+  - number: 12
+    video: /path/to/别的字幕组.mkv
+    hardsub: false       # 只管这一集；不写 = 跟随 ocr.enabled
+```
+
+- 声明了硬字幕、但视频同时带软字幕轨时**照样走字幕轨**（文本字幕轨最准）。
+- 声明了硬字幕、但 OCR 跑不了（没 `uv sync --extra ocr`、不是 macOS）时**直接报错**，不会
+  悄悄换成语音转写——你明确说了要用画面上那份更好的素材。
+- 其余旋钮（`sample_fps` / `crop_top` / `center_tolerance` / `similarity` / `min_frames` /
+  `language`）的默认值来自一次实测，含义见 `src/tenmin/config.py` 的 `OcrConfig`。一条字幕都
+  没认出来时会报错并提示检查 `ocr.crop_top`（裁剪区要框住画面底部的字幕）。
+- **`E{NN}.ocr.srt` 跟 `.asr.srt` 一样只按 mtime 复用、不看 `ocr` 配置**：认错的字直接手改
+  那份文件，下次照样复用；改了 `ocr.*` 参数想重认，得自己 `rm work/<slug>/srt/E11.ocr.srt`。
+- **要手填 OP/ED 区间**（见「标注 OP / ED 区间」）：OCR 会把画面**居中**的 staff 字（监督、
+  原作、ED 里的大块名单）一起认进来，左右两侧的才会被自动挡掉；剩下那批靠手填的
+  `op_range` / `ed_range` 或 `credits.default_*` 去剔除。
+
 ## translate 阶段：中文字幕 + 累积术语表
 
-**只对 `source == "asr"` 的集跑**（判据是那个字段，不做语言检测）。自带字幕的片源本来就是
-观众读得懂的语言，这一阶段在磁盘上留不下任何痕迹——连 `zh/` 目录都不会建。
+**只对 `source == "asr"` 的集真的翻译**（判据是那个字段，不做语言检测）。自带字幕的片源
+（`source == "srt"`）本来就是观众读得懂的语言，这一阶段在磁盘上留不下任何痕迹——连 `zh/`
+目录都不会建。画面 OCR 来的集（`source == "ocr"`）**不调 LLM**：认出来的字幕繁转简之后原样
+交付成 `zh/E{NN}.zh.json` 与 `out/E{NN}.zh.srt`，不碰累积术语表，也不需要 API key。
 
 产物：
 
@@ -261,8 +301,8 @@ uv run tenmin inspect akujo --episode 1
 
 | 阶段 | 产物 | 是否调 LLM |
 |---|---|---|
-| ingest | `01_dialogue/E{NN}.dialogue.json` | 否（可能先跑一次语音转写，见上文三岔） |
-| translate | `zh/E{NN}.zh.json`、`out/E{NN}.zh.srt`、`zh/glossary.json` | **是**，且只对 `source == "asr"` 的集跑 |
+| ingest | `01_dialogue/E{NN}.dialogue.json` | 否（可能先跑一次画面 OCR 或语音转写，见上文四岔） |
+| translate | `zh/E{NN}.zh.json`、`out/E{NN}.zh.srt`、`zh/glossary.json` | 只对 `source == "asr"` 的集调 LLM；`ocr` 的集直通交付，不调 |
 | signals | `02_signals/E{NN}.signals.json` | 否 |
 | script | `03_script/E{NN}.script.json` | **是** |
 | docgen | `out/E{NN}.解说方案.md`、`out/E{NN}.narration.txt` | 否 |
@@ -281,6 +321,7 @@ uv run pytest -m llm                          # 真调 LLM 出快照（需 API k
 uv run pytest -m generalize                   # 泛化复验（需自备 SRT）
 uv run pytest -m render     # 真跑渲染链路，需要真视频 + libass 版 ffmpeg
 uv run pytest -m asr        # 真跑语音转写，需要 --extra asr + 真视频
+TENMIN_OCR_SAMPLE_VIDEO=<片源> uv run pytest -m ocr   # 真跑画面 OCR，需要 macOS + --extra ocr + 硬字幕片源
 ```
 
 ## 已知限制

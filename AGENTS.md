@@ -10,8 +10,8 @@ tenmin（10 分钟看番剧）：把番剧字幕（SRT）或生肉视频 + 视�
 ingest → translate → signals → script → docgen → voice → timeline → audio → render
 ```
 
-- `ingest`：解析 SRT，生成对白轨（`01_dialogue/`）。**对白轨从哪来是三岔**（`ingest/resolve.py`）：手传 SRT → 视频里的软字幕轨直抽（`E{NN}.embedded.srt`，每次重抽）→ 语音转写（`E{NN}.asr.srt`，按 mtime 复用）。三条都归一成一个 SRT 路径，所以 `build_track` 的形态不变；`DialogueTrack.source` 记的是 `"srt"` 还是 `"asr"`。
-- `translate`：**只对 `source == "asr"` 的集跑**（判据是那个字段，不做语言检测），把日语对白逐条译成简体中文（`zh/E{NN}.zh.json` + 交付物 `out/E{NN}.zh.srt`），并把新认出的专有名词并进项目级累积表 `zh/glossary.json`（会被 script 的 prompt 读）。跳过时连 `zh/` 目录都不建。
+- `ingest`：解析 SRT，生成对白轨（`01_dialogue/`）。**对白轨从哪来是四岔**（`ingest/resolve.py`）：手传 SRT → 视频里的软字幕轨直抽（`E{NN}.embedded.srt`，每次重抽）→ 声明了硬字幕时画面 OCR（`E{NN}.ocr.srt`，按 mtime 复用；只在 `cfg.hardsub_enabled(episode)` 为真时走，跑不了就报错、**不回落到语音转写**）→ 语音转写（`E{NN}.asr.srt`，按 mtime 复用）。四条都归一成一个 SRT 路径，所以 `build_track` 的形态不变；`DialogueTrack.source` 记的是 `"srt"` / `"ocr"` / `"asr"`（`ocr` 跟 `srt` 一样过 OpenCC 繁转简，`asr` 不过）。
+- `translate`：按 `source` 分三路（判据是那个字段，不做语言检测）。`"srt"` 跳过，连 `zh/` 目录都不建；`"asr"` 把日语对白逐条译成简体中文（`zh/E{NN}.zh.json` + 交付物 `out/E{NN}.zh.srt`），并把新认出的专有名词并进项目级累积表 `zh/glossary.json`（会被 script 的 prompt 读）；`"ocr"` **不调 LLM、不碰 provider**，按 `translate/lines.py` 的 `passthrough_track`（筛选同 `select_translatable`，zh 取 ingest 已繁转简的原文）照样写那两份产物，不读不写累积表、不写 `zh/E{NN}.usage.json`。
 - `signals`：识别静音间隙、语速变化等"高能点"信号（`02_signals/`）。
 - `script`：调用 LLM，把信号转成分幕解说稿（`03_script/`）。
 - `docgen`：把 script.json 渲染成人类可读的对照表 + 纯配音文本（`out/`）。
@@ -52,11 +52,13 @@ cat /path/to/zscaler_ca_bundle.pem >> .venv/lib/python3.14/site-packages/certifi
 
 ## 代码结构
 
-- `src/tenmin/config.py`：`ProjectConfig`（14 个字段）与它的 8 个子 config（`.locale` / `.llm` / `.ingest` / `.credits` / `.signals` / `.validate_script` / `.render` / `.asr`）、`EpisodeConfig`，`Settings`（`BaseSettings`，读 `.env`，`env_prefix="TENMIN_"`）。**全项目所有「经验阈值」的唯一权威来源**；分家的判据是「这部番想要什么」的创作旋钮进 config，「物理上不可能／数据坏了」的合法性边界留在各模块的模块级常量里。各阶段模块只保留 `DEFAULT_XXX.field` 的模块级别名。改了子 config 的个数就来改这句数字（判据是 `ProjectConfig.model_fields` 里注解是 `BaseModel` 子类的那些）。
+- `src/tenmin/config.py`：`ProjectConfig`（15 个字段）与它的 9 个子 config（`.locale` / `.llm` / `.ingest` / `.credits` / `.signals` / `.validate_script` / `.render` / `.asr` / `.ocr`）、`EpisodeConfig`，`Settings`（`BaseSettings`，读 `.env`，`env_prefix="TENMIN_"`）。**全项目所有「经验阈值」的唯一权威来源**；分家的判据是「这部番想要什么」的创作旋钮进 config，「物理上不可能／数据坏了」的合法性边界留在各模块的模块级常量里。各阶段模块只保留 `DEFAULT_XXX.field` 的模块级别名。改了子 config 的个数就来改这句数字（判据是 `ProjectConfig.model_fields` 里注解是 `BaseModel` 子类的那些）。
 
-  这 10 个配置模型（项目、8 个子配置、集配置）继承 `StrictModel`（`extra="forbid"`）；`Settings` 除外，因为 `.env` 可含别的程序的变量。`load_project` 用 `_UniqueKeyLoader`（PyYAML SafeLoader + 同层重复键检查）；YAML 语法/重复键或 pydantic 校验失败都包装为 `ProjectConfigError(ValueError)`，点名文件和完整字段路径（如 `render.font_sise`、`episodes[0].op_rang`），未知字段给拼写建议。`EpisodeConfig` 可预填仅有集号/OP/ED、没有 srt/video 的条目；运行时按 `has_source` 判：批处理跳过并警告，单集运行要求 `--video`，inspect 标「未登记视频」；登记时合并同一条并保留 OP/ED。
+  这 11 个配置模型（项目、9 个子配置、集配置）继承 `StrictModel`（`extra="forbid"`）；`Settings` 除外，因为 `.env` 可含别的程序的变量。`load_project` 用 `_UniqueKeyLoader`（PyYAML SafeLoader + 同层重复键检查）；YAML 语法/重复键或 pydantic 校验失败都包装为 `ProjectConfigError(ValueError)`，点名文件和完整字段路径（如 `render.font_sise`、`episodes[0].op_rang`），未知字段给拼写建议。`EpisodeConfig` 可预填仅有集号/OP/ED、没有 srt/video 的条目；运行时按 `has_source` 判：批处理跳过并警告，单集运行要求 `--video`，inspect 标「未登记视频」；登记时合并同一条并保留 OP/ED。
 
   `AsrConfig` 只有 2 个字段（`model` / `language`），但有一条**不在代码里的操作约束**：`E{NN}.asr.srt` 的新鲜度只比源视频 mtime、**刻意不看 `AsrConfig`**，所以换了 `asr.model` 必须自己删那份 SRT。理由是它是一份人能手改的产物，按指纹失效会把手改静默冲掉。
+
+  `OcrConfig` 有 7 个字段（`enabled` / `sample_fps` / `crop_top` / `center_tolerance` / `similarity` / `min_frames` / `language`），同样有那条**不在代码里的操作约束**：`E{NN}.ocr.srt` 的新鲜度只比源视频 mtime、**刻意不看 `OcrConfig`**，改了 OCR 参数必须自己删那份 SRT（理由同上）。「这一集带不带硬字幕」只有一个判定入口 `ProjectConfig.hardsub_enabled(episode)`：`EpisodeConfig.hardsub` 写了 true/false 就听它的，`None` 跟随 `ocr.enabled`。`config_slices` 在 `hardsub is None` 时**不**把这个键写进 EPISODE 切片——否则升级后 timeline/audio/render 的切片全部被改写、存量集白白重跑。OCR 引擎只有 Apple Vision（pyobjc，optional extra `ocr`，仅 macOS），pyobjc 的 import 只许写在 `ingest/ocr.py` 的 `_recognize` 函数体内。硬字幕片源会把**居中**的 OP/ED staff 字一起认进来（两侧的靠 `center_tolerance` 挡掉），所以这类片源要手填 `op_range` / `ed_range` 或 `credits.default_*`，交给三级回退去剔除。
 
   **OP/ED 区间是三级回退**，改 ingest 的 credits 相关代码前先分清自己在哪一级：`EpisodeConfig.op_range`/`ed_range`（逐集手填）→ `CreditsConfig.default_op_range`/`default_ed_range`（项目级手填，ED 终点允许 `None` = 到片尾，在 `normalize._resolve_manual_range` 里按**这一集**的 duration 解析）→ `credits.find_credit_ranges` 的启发式推断。关键点：**前两级（手填）还会直接驱动 `in_credit_window`** —— 拿到确定区间时窗就是那两段（各留 `manual_window_margin`=5 秒余量），`credit_head_window`/`ed_keyword_window_seconds` 那对盲窗完全不参与；两级都空才走盲窗，且那条路与改动前**逐字节等价**（实测新旧代码各跑一遍，13 份 `01_dialogue/*.json` 哈希全同）。手填模式刻意不受 `credit_window_max_ratio` 约束（那是给盲窗兜底的，静默收缩用户的显式声明比覆盖过宽更难查）。实测收益：接住 3 条落在 300 秒盲窗外的 staff 行、同时救回 5 条落在盲窗内被规则 4/5 误杀的真台词；代价是填错会在**你填的区间内**误判。`normalize.credit_range_source()` 报告实际生效的是哪一级（`tenmin inspect` 用），它刻意复用 `_resolve_manual_range` 而不是自己再判一遍「字段填了没」——项目级默认可能填了却在某一集上解析不出合法区间。
 - `src/tenmin/pipeline.py`：`Paths` 类（每阶段产物路径，全部按集号 `E{episode:02d}` 前缀），`STAGES` 列表（9 项，`translate` 在 index 1），`run_pipeline()` 顶层编排（支持单集/批量两种模式，靠 `episode: int | None` 区分），`register_episode()`（`--episode --video` 注册新集，`--srt` 可省）。
@@ -105,12 +107,13 @@ cat /path/to/zscaler_ca_bundle.pem >> .venv/lib/python3.14/site-packages/certifi
 uv run pytest tests/ -q          # 全量跑，默认跳过需要真实 API key / 素材的标记测试
 ```
 
-`tests/` 目录：`test_config.py`、`test_llm.py`、`test_pipeline.py`、`test_cli.py`、`test_config_slices.py`、`test_render_*.py` 等，共 46 个 Python 文件（含 conftest.py / fakes.py / __init__.py）。pytest markers（`pyproject.toml` 里是**四个**）：
+`tests/` 目录：`test_config.py`、`test_llm.py`、`test_pipeline.py`、`test_cli.py`、`test_config_slices.py`、`test_render_*.py` 等，共 48 个 Python 文件（含 conftest.py / fakes.py / __init__.py）。pytest markers（`pyproject.toml` 里是**五个**）：
 
 - `llm`：需要真实 LLM API key（默认跳过），跑法：`TENMIN_GEMINI_API_KEY=xxx uv run pytest -m llm`。
 - `generalize`：需要额外的番剧 SRT fixture。
 - `render`：需要真实视频 + 装了 libass 的 ffmpeg。
 - `asr`：需要 `uv sync --extra asr`（会拽 torch，几个 G）+ 真实视频。要加载几个 G 的语音模型跑上几分钟。
+- `ocr`：需要 macOS + `uv sync --extra ocr` + 一个真实的硬字幕片源，跑法：`TENMIN_OCR_SAMPLE_VIDEO=<片源路径> uv run pytest -m ocr`。整集识别要跑三四分钟。
 
 改动 provider 相关代码后，务必确认 MiniMax 的现有测试（`test_minimax_*`）**行为不变**——`OpenAICompatibleProvider` 的重构原则是零行为变更，只是代码结构拆分。
 
