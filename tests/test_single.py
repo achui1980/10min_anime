@@ -532,7 +532,13 @@ async def test_generate_script_propagates_validation_warnings(cfg, track, report
 
 @pytest.mark.asyncio
 async def test_generate_script_marks_silent_highlight(cfg, track, report):
-    llm = valid_llm_script()
+    # beat[2] 的字数改小：固定 10 秒 clip（1330-1340，刻意留在 ed_range 1348.18
+    # 之前）配 216 字/48 秒旁白会拉伸 4.8 倍，超过 retry_stretch_max（1.5）触发
+    # repair_script 的新硬失败；这里要验证的是 is_silent_highlight，跟画面/旁白
+    # 预算无关，把这一个节点的字数减到跟 10 秒 clip 同量级（60 字 ≈ 13.3 秒），
+    # 其余四个节点各加 39 字补足总量（原总量 5×216=1080 字，budget_rewrite 轮次
+    # 判据按总时长算，字数变了总量不变才不会意外触发返工）。
+    llm = valid_llm_script(chars_per_beat=(255, 255, 60, 255, 255))
     llm.beats[2].clips = [
         LLMClip(episode=2, start=1330.0, end=1340.0, visual="定格收尾", anchor_lines=[])
     ]

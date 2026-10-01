@@ -735,6 +735,23 @@ def repair_script(
             script=repaired,
         )
 
+    overstretched: list[str] = []
+    for beat in repaired.beats:
+        footage = beat_clip_seconds(beat)
+        span = beat_seconds(beat, rate=rate)
+        if footage <= 0 or span <= 0:
+            continue
+        stretch = span / footage
+        if stretch > cfg.retry_stretch_max:
+            overstretched.append(f"{beat.label}（{stretch:.1f} 倍）")
+    if overstretched:
+        raise ScriptValidationError(
+            f"{len(overstretched)} 个节点画面明显不够、会被拉伸变形："
+            f"{'、'.join(overstretched)}（重试阈值 {cfg.retry_stretch_max:.1f} 倍），"
+            f"重试",
+            script=repaired,
+        )
+
     return repaired, warnings
 
 

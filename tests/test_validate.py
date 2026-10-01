@@ -95,18 +95,19 @@ def make_script(clips_per_beat, *, pad=True):
                 id=f"b{i + 1}",
                 label=(f"收尾：节点{i + 1}" if last else f"节点{i + 1}"),
                 role=role,
-                narration="旁白" * 20,
+                narration="旁白" * 15,
                 clips=list(clips),
             )
         )
     return Script(show="才女的侍从", episodes=[2], beats=beats)
 
 
-def run(script, track=None, report=None):
+def run(script, track=None, report=None, cfg=None):
     return validate_script(
         script,
         tracks={2: track or make_track()},
         reports={2: report or make_report()},
+        cfg=cfg or DEFAULT_VALIDATE,
     )
 
 
@@ -196,7 +197,7 @@ def test_anchor_overwrite_clamped_to_episode_end():
     # 幅度 46 秒，落在 ANCHOR_OVERWRITE_MAX_SECONDS 之内，覆写照做。
     track = make_track(duration=1000.0, lines=[dline(42, 996.0, 999.0)])
     s = make_script([[clip(950.0, 980.0, anchors=[42])]])
-    result = run(s, track=track)
+    result = run(s, track=track, cfg=ValidateConfig(retry_stretch_max=100.0))
     kept = result.script.beats[0].clips[0]
     assert kept.end <= 1000.0
     assert kept.end > kept.start
@@ -223,7 +224,11 @@ def test_silent_highlight_recomputed_false_when_llm_lied():
 def test_silent_highlight_needs_one_second_overlap():
     # 与间隙只重叠 0.633 秒。clip 本身给足 3 秒，避免撞上 min_clip_seconds。
     s = make_script([[clip(1326.0, 1329.0, silent=False)]])
-    result = run(s, report=make_report(gaps=[(1328.367, 1348.18)]))
+    result = run(
+        s,
+        report=make_report(gaps=[(1328.367, 1348.18)]),
+        cfg=ValidateConfig(retry_stretch_max=100.0),
+    )
     assert result.script.beats[0].clips[0].is_silent_highlight is False
 
 
@@ -723,7 +728,8 @@ def test_flash_frame_clip_is_dropped():
 
 def test_clip_at_exactly_the_minimum_is_kept():
     s = make_script([[clip(50.0, 50.0 + DEFAULT_VALIDATE.min_clip_seconds)]])
-    assert len(run(s).script.beats[0].clips) == 1
+    cfg = ValidateConfig(retry_stretch_max=100.0)
+    assert len(run(s, cfg=cfg).script.beats[0].clips) == 1
 
 
 def test_min_clip_seconds_default():
@@ -742,7 +748,7 @@ def timeline_script(starts, roles=None):
                 id=f"t{i + 1}",
                 label=f"阶段{i + 1}",
                 role=(roles[i] if roles else "act"),
-                narration="旁白" * 20,
+                narration="旁白" * 15,
                 clips=[clip(start, start + 10.0)],
             )
         )
@@ -816,11 +822,18 @@ def test_sfx_at_beyond_the_beat_span_warns():
 
 def test_beat_with_far_too_little_footage_warns():
     """clip 太少时 render/timeline.py 会按 ratio = 旁白/画面 把每个 clip 往后延长，
-    延到超出源片长再钳到片尾，成片画面错位。"""
-    # make_script 的旁白是 40 字 ≈ 8.9 秒；1.6 秒画面 → 拉伸 5.6 倍
+    延到超出源片长再钳到片尾，成片画面错位。
+
+    直接调 check_script（纯读），不走 run()/validate_script：这个比例本来就超过了
+    retry_stretch_max（1.5），repair_script 会先抢着报错，这里要单独验证的是
+    check_script 自己的这条 warning 文案，不是两者的先后关系（那条在
+    repair_script 的测试里单独盖）。
+    """
+    # make_script 的旁白是 30 字 ≈ 6.7 秒；1.6 秒画面 → 拉伸 4.2 倍
     s = make_script([[clip(10.0, 11.6)]])
-    hits = [w for w in run(s).warnings if "画面只有" in w]
-    assert len(hits) == 1, run(s).warnings
+    warnings = check_script(s, {2: make_track()}, {2: make_report()})
+    hits = [w for w in warnings if "画面只有" in w]
+    assert len(hits) == 1, warnings
 
 
 def test_beat_with_far_too_much_footage_warns():
@@ -831,17 +844,101 @@ def test_beat_with_far_too_much_footage_warns():
 
 def test_beat_within_the_measured_stretch_range_does_not_warn():
     """实测 85 个真实 beat 的 画面/旁白 比值落在 0.396–5.176（拉伸 0.19–2.53 倍），
-    这整段区间都必须放过。"""
+    这整段区间都必须放过。
+
+    直接调 check_script：ratio=0.40 时拉伸 2.5 倍，超过 retry_stretch_max（1.5），
+    走 run()/validate_script 会被 repair_script 先抢着报错，这里要单独验证的是
+    check_script 自己在 stretch_max/stretch_min 这两条更宽的边界内不报，跟新的
+    retry 检查无关。
+    """
     s = make_script([[clip(10.0, 25.0)]])
     seconds = beat_seconds(s.beats[0])
     for ratio in (0.40, 1.0, 5.0):
         one = make_script([[clip(10.0, 10.0 + seconds * ratio)]])
-        assert [w for w in run(one).warnings if "画面" in w] == [], ratio
+        warnings = check_script(one, {2: make_track()}, {2: make_report()})
+        assert [w for w in warnings if "画面" in w] == [], ratio
 
 
 def test_stretch_bounds_constants():
     assert DEFAULT_VALIDATE.stretch_max == pytest.approx(4.0)
     assert DEFAULT_VALIDATE.stretch_min == pytest.approx(0.125)
+
+
+def test_single_overstretched_beat_raises_for_retry():
+    """stretch 超过 retry_stretch_max（1.5）但仍在 stretch_max（4.0）之内——只有
+    新检查会拦，check_script 的旧 warning 不会跑到（repair_script 先抢着报错）。"""
+    s = make_script([[clip(10.0, 13.0)]])  # 30 字 ≈ 6.667 秒旁白 / 3 秒画面 = 2.2 倍
+    with pytest.raises(ScriptValidationError) as exc:
+        run(s)
+    assert "拉伸变形" in str(exc.value)
+    assert s.beats[0].label in str(exc.value)
+    assert "2.2 倍" in str(exc.value)
+    assert exc.value.script is not None
+
+
+def test_multiple_overstretched_beats_are_all_listed_in_one_message():
+    """跟 max_holds 同一个聚合模式：扫完整篇再报一次，一条消息列出全部违规节点。"""
+    s = make_script([[clip(10.0, 13.0)], [clip(100.0, 102.0)]])
+    # 节点1：6.667/3=2.2 倍；节点2：6.667/2=3.3 倍。两个都超过 1.5。
+    with pytest.raises(ScriptValidationError) as exc:
+        run(s)
+    message = str(exc.value)
+    assert s.beats[0].label in message
+    assert s.beats[1].label in message
+    assert "2 个节点" in message
+
+
+def test_stretch_at_exactly_the_retry_threshold_does_not_raise():
+    """边界：恰好 retry_stretch_max 处不判错（严格 >，不是 >=）。"""
+    s = make_script([[clip(10.0, 14.0)]])
+    s.beats[0].narration = "旁" * 27  # 27 字 / 4.5 = 6.0 秒，footage=4.0 秒 → 恰好 1.5 倍
+    result = run(s)  # 不应该抛错
+    assert result.script.beats[0].clips[0].end == pytest.approx(14.0)
+
+
+def test_lowering_stretch_max_alone_does_not_trigger_the_retry_check():
+    """两条阈值各自独立比较，不是嵌套关系：把 stretch_max 调到低于默认的
+    retry_stretch_max，只会让旧 warning 先报，不会让新检查提前触发。"""
+    s = make_script([[clip(10.0, 15.0)]])
+    s.beats[0].narration = "旁" * 27  # 6.0 秒 / 5.0 秒 = 1.2 倍
+    cfg = ValidateConfig(stretch_max=1.0)  # 低于 retry_stretch_max 默认值 1.5
+    result = run(s, cfg=cfg)  # 1.2 <= 1.5，新检查不触发，不应该抛错
+    assert any("画面只有" in w for w in result.warnings)  # 1.2 > stretch_max(1.0)，旧检查报
+
+
+def test_understretched_beats_never_trigger_the_retry_check():
+    """只拦拉伸过长方向：画面过剩（stretch 很小）无论多小都不触发新检查。"""
+    s = make_script([[clip(10.0, 800.0)]])  # 790 秒画面 vs 6.667 秒旁白，stretch≈0.0084
+    result = run(s)  # 不应该抛错
+    assert any("画面多达" in w for w in result.warnings)  # 旧 warning 仍然照常报
+
+
+def test_empty_narration_beat_does_not_crash_the_retry_check():
+    """span<=0（空旁白、无留白）时新检查要跳过，不报错、不崩。"""
+    s = make_script([[clip(10.0, 15.0)]])
+    s.beats[0].narration = ""
+    result = run(s)  # 不应该抛错、不应该除零
+    assert result.script.beats[0].clips[0].end == pytest.approx(15.0)
+
+
+def test_overstretched_error_carries_the_repaired_script():
+    """跟 max_holds/clip 全灭两条既有失败路径一致：抛出的错误带着修到一半的那份，
+    不是原始输入。"""
+    s = make_script([[clip(10.0, 13.0)]])
+    before = s.model_dump_json()
+    with pytest.raises(ScriptValidationError) as exc:
+        run(s)
+    assert exc.value.script is not None
+    assert exc.value.script.beats[0].label == s.beats[0].label
+    assert s.model_dump_json() == before  # 入参一字不动
+
+
+def test_validate_script_aborts_before_check_script_runs_for_overstretched_beats():
+    """端到端：跟 test_too_many_holds_raises 同构——repair_script 先抛错，
+    check_script 的画面/旁白 warning 根本不会被跑到。"""
+    s = make_script([[clip(10.0, 13.0)]])
+    with pytest.raises(ScriptValidationError):
+        validate_script(s, {2: make_track()}, {2: make_report()})
 
 
 def test_footage_budget_uses_the_render_layer_clip_sum(monkeypatch):
@@ -945,7 +1042,7 @@ def structure_script(roles, labels=None):
                 id=f"s{i + 1}",
                 label=(labels[i] if labels else f"阶段{i + 1}"),
                 role=role,
-                narration="旁白" * 20,
+                narration="旁白" * 15,
                 clips=[clip(300.0 + i * 10, 305.0 + i * 10)],
             )
         )
@@ -1097,7 +1194,11 @@ def test_holds_at_the_cap_do_not_raise():
         Hold(at=1.0 + i, duration=2.0, quote="台词")
         for i in range(DEFAULT_VALIDATE.max_holds)
     ]
-    result = run(s, track=make_track(lines=[dline(1, 11, 12)]))
+    result = run(
+        s,
+        track=make_track(lines=[dline(1, 11, 12)]),
+        cfg=ValidateConfig(retry_stretch_max=100.0),
+    )
     assert len(result.script.beats[0].audio.holds) == DEFAULT_VALIDATE.max_holds
 
 

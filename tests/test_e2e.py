@@ -113,6 +113,11 @@ def project(tmp_path: Path, golden_srt_path: Path) -> Path:
         "episodes": [{"number": 1, "srt": "srt/E02.srt"}],
         "glossary": {},
         "llm": {"provider": "gemini", "model": "gemini-3.6-flash"},
+        # 这份 golden fixture 的 clip 时长是围着真实高光区间手工核对出来的，跟旁白
+        # 字数完全不成比例（画面/旁白预算的 A3 早就超过 stretch_max，只是从没人看过
+        # 那条 warning）。本文件测的是 v1 链路的产物接线，不是画面/旁白预算，
+        # 放宽这一项阈值，别让新的重试检查打断这条早就存在的既有行为。
+        "validate_script": {"retry_stretch_max": 100.0},
     }
     (root / "project.yaml").write_text(
         yaml.safe_dump(config, allow_unicode=True), encoding="utf-8"
