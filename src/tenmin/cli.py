@@ -121,7 +121,7 @@ PROJECT_TEMPLATE_FIELDS: dict[str, Any] = {
 
 为什么不整份 model_dump（那样连字段名都不用挑）：ProjectConfig 底下现在有
 ingest(3) / credits(21) / signals(11) / validate_script(8) / render(30) / llm(15)
-/ asr(2) 九十来个调参旋钮，全吐出来的 project.yaml 没人能读，而这个文件是用户的
+/ asr(2) / ocr(7) 九十来个调参旋钮，全吐出来的 project.yaml 没人能读，而这个文件是用户的
 主要编辑面。
 
 为什么挑漏了不要紧：漏掉的字段照样走模型默认值，行为完全不变，只是「没在模板里

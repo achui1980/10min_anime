@@ -133,3 +133,16 @@ def test_the_gate_opens_one_marker_at_a_time(expression, render_skipped, asr_ski
     conftest.pytest_collection_modifyitems(_FakeConfig(expression), [render_item, asr_item])
     assert bool(render_item.marks) is render_skipped
     assert bool(asr_item.marks) is asr_skipped
+
+
+def test_the_ocr_marker_is_gated_until_named():
+    """ocr 用例要对一整集真实片源逐帧跑 Vision，一次普通 pytest 里不许意外跑到。"""
+    from . import conftest
+
+    default = _FakeItem("ocr")
+    conftest.pytest_collection_modifyitems(_FakeConfig(None), [default])
+    assert default.marks
+
+    named = _FakeItem("ocr")
+    conftest.pytest_collection_modifyitems(_FakeConfig("ocr"), [named])
+    assert named.marks == []

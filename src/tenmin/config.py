@@ -81,6 +81,10 @@ class EpisodeConfig(StrictModel):
     video: Path | None = None
     op_range: tuple[float, float] | None = None
     ed_range: tuple[float, float] | None = None
+    # 这一集的画面上有没有烧进去的字幕。None = 跟随项目级的 ocr.enabled；写 true/false
+    # 就只管这一集（同一部番里混着别的字幕组片源时用）。判定只有一个入口：
+    # ProjectConfig.hardsub_enabled。
+    hardsub: bool | None = None
 
     @field_validator("op_range", "ed_range")
     @classmethod
@@ -527,6 +531,47 @@ class AsrConfig(StrictModel):
     language: str = "ja"
 
 
+class OcrConfig(StrictModel):
+    """硬字幕 OCR 参数。只在「这部番声明了硬字幕、这一集又没有手传 SRT 和软字幕轨」时才用得上。
+
+    跟 AsrConfig 一样刻意没有 engine 字段：只接 Apple Vision 一个引擎（pyobjc 调用，
+    optional extra `uv sync --extra ocr`，只支持 macOS）。调用它的地方同样有两条硬约束：
+    **import 必须写在函数体内**，**ImportError 必须翻成一句「跑 uv sync --extra ocr」**。
+
+    下面的默认值全部出自一次实测：`[ANi] 我是不才惡女 - 11 [1080P][Baha][WEB-DL][CHT]`，
+    h264 1920×1080、23.976 fps、1429.99 秒，macOS 26.6.2 arm64。整集 388 条（同集 ASR
+    371 条）、随机抽 40 条 39 条逐字正确、墙钟 201 秒（约 7 倍实时）。
+
+    不进配置的是物理上的实现细节，留作 ingest/ocr.py 的模块常量：缩放宽度 1280、允许夹在
+    同一句里的空帧数 1、Vision 识别级别 accurate。
+
+    **改了这里的任何参数都不会让已有的 `srt/E{NN}.ocr.srt` 失效**（新鲜度只比源视频
+    mtime，理由见 ingest/resolve.py 的 _is_usable_cache），想重认必须自己删那份 SRT。
+    """
+
+    # 这部番的片源带硬字幕。不做自动探测：画面里本来就有字（片头 staff、招牌、信件），
+    # 误判避免不了，而且每集都要多付一轮抽样。一部番的片源通常来自同一个字幕组，声明一次就够。
+    enabled: bool = False
+    # 目标取样密度（每秒帧数）。实际步长是 round(源帧率 / 这个值)，所以每次取到的都是
+    # 真实存在的帧。实测字幕显示时长最短 0.75 秒、p5 为 1.0 秒；降到 2 fps 丢 6 条、另有
+    # 50 条只被采到 2 帧（离 min_frames 只差一帧），4 fps 是合适的密度。
+    sample_fps: float = Field(default=4.0, gt=0)
+    # 裁剪区上沿占画面高度的比例，一直裁到画面底部。实测字幕纵向落在画面高度的 81%–95%，
+    # 0.72 给上沿留了一整行的余量。
+    crop_top: float = Field(default=0.72, gt=0, lt=1)
+    # 文字框中心离水平中线的最大距离（按画面宽度的比例）。字幕水平居中，而 OP/ED 的日文
+    # staff 字大多在左右两侧；0.08 刚好把两侧那批挡在外面。挡不住的是居中的那部分
+    # staff（监督、原作、ED 的大块），那批交给手填的 op_range / ed_range 去剔除。
+    center_tolerance: float = Field(default=0.08, gt=0, le=0.5)
+    # 相邻帧文本的 difflib 相似度达到多少算同一句。单帧错字（未/末、日/目）只改一两个字，
+    # 0.6 能把它们并进同一条 cue，交给多帧投票修掉。
+    similarity: float = Field(default=0.6, gt=0, le=1)
+    # 一条 cue 至少出现几帧。实测只出现 1 帧的全是噪声（`7000\n找`、`/1/7`、`MIMM`）。
+    min_frames: int = Field(default=2, ge=1)
+    # Vision 的识别语言。ANi / Baha 的片源是繁体中文。
+    language: str = "zh-Hant"
+
+
 class ProjectConfig(StrictModel):
     show: str
     slug: str
@@ -542,6 +587,7 @@ class ProjectConfig(StrictModel):
     validate_script: ValidateConfig = Field(default_factory=ValidateConfig)
     render: RenderConfig = Field(default_factory=RenderConfig)
     asr: AsrConfig = Field(default_factory=AsrConfig)
+    ocr: OcrConfig = Field(default_factory=OcrConfig)
 
     _root: Path = PrivateAttr(default=Path("."))
 
@@ -567,6 +613,16 @@ class ProjectConfig(StrictModel):
         """绑定项目目录（work/<slug>/）。load_project 会自动调用，测试也可直接用。"""
         self._root = Path(root).resolve()
         return self
+
+    def hardsub_enabled(self, episode: EpisodeConfig) -> bool:
+        """这一集是否声明了硬字幕。逐集的 hardsub 写了就听它的，没写（None）跟随 ocr.enabled。
+
+        这是全项目唯一的判定入口：ingest 选对白来源与 inspect 显示「是否声明了硬字幕」
+        都调它，两处各写一遍迟早会分叉。
+        """
+        if episode.hardsub is not None:
+            return episode.hardsub
+        return self.ocr.enabled
 
     def srt_path(self, episode: EpisodeConfig) -> Path | None:
         """这一集的字幕路径；这一集没配字幕就返回 None。
@@ -605,6 +661,7 @@ DEFAULT_SIGNALS = SignalsConfig()
 DEFAULT_VALIDATE = ValidateConfig()
 DEFAULT_RENDER = RenderConfig()
 DEFAULT_ASR = AsrConfig()
+DEFAULT_OCR = OcrConfig()
 DEFAULT_LLM = LLMConfig()
 
 

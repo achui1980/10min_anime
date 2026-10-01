@@ -23,7 +23,7 @@ from tenmin.config import EpisodeConfig, ProjectConfig
 
 SLICE_DIR = ".config"
 
-# 本集的完整 EpisodeConfig（number / srt / video / op_range / ed_range）。
+# 本集的 EpisodeConfig（number / srt / video / op_range / ed_range，以及显式写了的 hardsub）。
 EPISODE = "episode"
 
 # signals 全局执行且配置不含集号；ingest 虽也全局执行，却依赖每集的输入。
@@ -31,7 +31,7 @@ PROJECT_LEVEL_STAGES = frozenset({"signals"})
 
 # 键顺序跟 pipeline.STAGES 一致。整段子配置会自动扣掉 EXCLUDED。
 STAGE_FIELDS: dict[str, tuple[str, ...]] = {
-    "ingest": ("locale", "ingest", "credits", "asr", "glossary", "show", EPISODE),
+    "ingest": ("locale", "ingest", "credits", "asr", "ocr", "glossary", "show", EPISODE),
     # 翻译只读取术语表、provider 构造参数；对白轨是它的上游数据输入。
     "translate": (
         "glossary",
@@ -129,6 +129,21 @@ _SUBCONFIGS = frozenset(
 )
 
 
+def _episode_payload(episode: EpisodeConfig) -> dict[str, Any]:
+    """本集配置的切片内容。`hardsub` 没写（None）时整个键不出现。
+
+    EPISODE 记号挂在 ingest、timeline、audio、render 四个阶段上。hardsub 是后加的字段，
+    如果 None 也照常写成 `"hardsub": null`，升级之后每一集这四份切片都会多出一行而被改写，
+    于是 timeline / audio / render 对全部存量集整套重跑（它们压根不读这个字段）。省掉
+    None 让没用这个字段的项目切片逐字节不变；真写了 true/false 时它照常进切片，ingest
+    因此重跑。「跟随项目级 ocr.enabled」那一半由 ingest 切片里的 ocr 子配置负责。
+    """
+    dumped = episode.model_dump(mode="json")
+    if episode.hardsub is None:
+        del dumped["hardsub"]
+    return dumped
+
+
 def slice_path(root: Path, stage: str, episode: int | None) -> Path:
     """项目级阶段写 `.config/<stage>.json`，其余写 `.config/E{NN}.<stage>.json`。"""
     if stage in PROJECT_LEVEL_STAGES:
@@ -146,7 +161,7 @@ def slice_payload(cfg: ProjectConfig, stage: str, episode: EpisodeConfig | None)
         if entry == EPISODE:
             if episode is None:
                 raise ValueError(f"{stage} 阶段的切片含本集配置，必须给 episode")
-            data[EPISODE] = episode.model_dump(mode="json")
+            data[EPISODE] = _episode_payload(episode)
         elif "." in entry:
             top, leaf = entry.split(".", 1)
             data.setdefault(top, {})[leaf] = dumped[top][leaf]

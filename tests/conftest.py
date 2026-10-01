@@ -11,11 +11,12 @@ _MARKER_TOKEN = re.compile(r"\w+")
 
 # 默认跳过的 marker，以及跳过时给人看的那句话。
 # 共同点是「一次普通 pytest 里意外跑到它会付真实代价」：render 要联网调 Edge-TTS 并
-# 真编一段视频，asr 要一个几 G 的模型跑三分钟。llm 与 generalize 刻意不进这张表 ——
-# 理由见 pytest_collection_modifyitems 的 docstring。
+# 真编一段视频，asr 要一个几 G 的模型跑三分钟，ocr 要对一整集真实片源逐帧跑 Vision。
+# llm 与 generalize 刻意不进这张表 —— 理由见 pytest_collection_modifyitems 的 docstring。
 _GATED_MARKERS = {
     "render": "需要真实素材与 ffmpeg，跑法：uv run pytest -m render",
     "asr": "需要 asr extra 与真实视频，跑法：uv run pytest -m asr",
+    "ocr": "需要 macOS、ocr extra 与真实硬字幕片源，跑法：uv run pytest -m ocr",
 }
 
 

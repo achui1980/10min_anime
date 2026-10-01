@@ -190,6 +190,8 @@ def test_changing_an_excluded_knob_changes_no_slice(tmp_path, field):
         ("llm.model", "gemini-x", {"translate", "script"}),
         ("credits.op_span_min", 30.0, {"ingest"}),
         ("asr.language", "en", {"ingest"}),
+        ("ocr.enabled", True, {"ingest"}),
+        ("ocr.crop_top", 0.7, {"ingest"}),
         ("signals.min_gap_seconds", 5.0, {"signals"}),
         ("validate_script.max_beats", 7, {"script"}),
         ("target_seconds", 200.0, {"script"}),
@@ -232,6 +234,23 @@ def test_an_episode_change_reaches_ingest_and_the_source_video_stages(tmp_path):
         "audio",
         "render",
     }
+
+
+def test_an_unset_hardsub_leaves_the_episode_slice_byte_identical(tmp_path):
+    """hardsub 是后加的字段。没写它（None）的集，切片里不许多出这个键 —— 否则升级之后
+    timeline / audio / render 的切片全部被改写，存量集白白整套重跑。"""
+    cfg = _cfg(tmp_path)
+    data = json.loads(slice_payload(cfg, "render", cfg.episodes[0]))
+    assert "hardsub" not in data[EPISODE]
+
+
+def test_a_declared_hardsub_reaches_ingest(tmp_path):
+    cfg = _cfg(tmp_path)
+    declared = cfg.episodes[0].model_copy(update={"hardsub": True})
+    changed = _changed(cfg, cfg.model_copy(update={"episodes": [declared]}))
+    assert "ingest" in changed
+    data = json.loads(slice_payload(cfg, "ingest", declared))
+    assert data[EPISODE]["hardsub"] is True
 
 
 def test_slice_paths(tmp_path):

@@ -10,6 +10,7 @@ from tenmin.config import (
     IngestConfig,
     LLMConfig,
     LocaleConfig,
+    OcrConfig,
     ProjectConfig,
     ProjectConfigError,
     RenderConfig,
@@ -617,6 +618,97 @@ def test_asr_section_is_overridable_from_yaml_shaped_data():
     assert cfg.asr.model == "tiny"
 
 
+# --- 硬字幕 OCR ---------------------------------------------------------------
+
+
+def test_ocr_config_defaults():
+    """默认值出自 spec 那次实测（ANi《我是不才惡女》第 11 集），改它要有新的实测。"""
+    cfg = OcrConfig()
+    assert (
+        cfg.enabled,
+        cfg.sample_fps,
+        cfg.crop_top,
+        cfg.center_tolerance,
+        cfg.similarity,
+        cfg.min_frames,
+        cfg.language,
+    ) == (False, 4.0, 0.72, 0.08, 0.6, 2, "zh-Hant")
+
+
+def test_project_config_carries_an_ocr_section():
+    cfg = ProjectConfig(show="测试番", slug="test")
+    assert isinstance(cfg.ocr, OcrConfig)
+    assert cfg.ocr.enabled is False
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("crop_top", 0),
+        ("crop_top", 1),
+        ("crop_top", -0.1),
+        ("center_tolerance", 0),
+        ("center_tolerance", 0.51),
+        ("similarity", 0),
+        ("similarity", 1.01),
+        ("sample_fps", 0),
+        ("sample_fps", -4),
+        ("min_frames", 0),
+    ],
+)
+def test_ocr_config_rejects_out_of_range_values(field, value):
+    with pytest.raises(ValidationError):
+        OcrConfig.model_validate({field: value})
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("center_tolerance", 0.5), ("similarity", 1.0), ("min_frames", 1)],
+)
+def test_ocr_config_accepts_its_inclusive_upper_and_lower_bounds(field, value):
+    """`≤ 0.5` / `≤ 1` / `≥ 1` 是闭区间，写成开区间会把合法的边界值拒掉。"""
+    assert getattr(OcrConfig.model_validate({field: value}), field) == value
+
+
+def test_a_bad_ocr_value_names_its_field_path(tmp_path):
+    path = _write(tmp_path, MINIMAL + "ocr:\n  crop_top: 1.5\n")
+    with pytest.raises(ProjectConfigError) as excinfo:
+        load_project(path)
+    assert "project.yaml 里 ocr.crop_top 的值不合法" in str(excinfo.value)
+
+
+def test_episode_hardsub_defaults_to_following_the_project():
+    assert EpisodeConfig(number=1).hardsub is None
+
+
+@pytest.mark.parametrize(
+    ("project_enabled", "episode_hardsub", "expected"),
+    [
+        (False, None, False),
+        (True, None, True),
+        (True, False, False),
+        (False, True, True),
+    ],
+)
+def test_hardsub_enabled_lets_an_episode_override_the_project(
+    project_enabled, episode_hardsub, expected
+):
+    cfg = ProjectConfig(show="测试番", slug="test", ocr=OcrConfig(enabled=project_enabled))
+    episode = EpisodeConfig(number=11, video=Path("/v/e11.mp4"), hardsub=episode_hardsub)
+    assert cfg.hardsub_enabled(episode) is expected
+
+
+def test_hardsub_loads_from_yaml(tmp_path):
+    path = _write(
+        tmp_path,
+        "show: 某番\nslug: demo\nocr:\n  enabled: true\nepisodes:\n"
+        "  - number: 1\n    video: /v/e01.mp4\n"
+        "  - number: 2\n    video: /v/e02.mp4\n    hardsub: false\n",
+    )
+    cfg = load_project(path)
+    assert [cfg.hardsub_enabled(e) for e in cfg.episodes] == [True, False]
+
+
 # --- 生肉入口：一集可以只有视频 -------------------------------------------
 
 
@@ -800,6 +892,7 @@ def test_project_config_error_is_a_value_error():
         (ValidateConfig, {}),
         (RenderConfig, {}),
         (AsrConfig, {}),
+        (OcrConfig, {}),
     ],
     ids=lambda value: getattr(value, "__name__", None),
 )
