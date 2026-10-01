@@ -23,10 +23,15 @@ import itertools
 import math
 import re
 from collections import Counter
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from pathlib import Path
 
+from tenmin import atomic
+from tenmin.config import DEFAULT_RENDER, OcrConfig
+from tenmin.ingest.asr import render_srt
 from tenmin.models import RawCue
+from tenmin.render import ffmpeg
 
 # 交给 Vision 的图固定这么宽，高度按裁剪区的比例取偶数。720p 与 4K 片源交给 Vision 的
 # 是同一个尺度的字；实测用的就是这个宽度（1080p 片源缩到 1280 宽）。
@@ -54,6 +59,11 @@ _TRAILING_DOT = re.compile(r"[.。]$", re.MULTILINE)
 # showinfo 给每个输出帧打的那一行：`n:   3 pts:     18 pts_time:0.75075 duration: ...`。
 # 同一个滤镜实例还会打 `config in time_base` 与 `color_range` 这类行，它们不含这个形状。
 _SHOWINFO_FRAME = re.compile(r"\bn:\s*\d+\s+pts:\s*\S+\s+pts_time:(\S+)")
+
+# 开工前那句耗时估算用的倍率：实测整集墙钟 201 秒 / 片长 1429.99 秒，约 7 倍实时。
+_REALTIME_FACTOR = 7.0
+# 进度每完成这么多分之一打一行。
+_PROGRESS_STEPS = 10
 
 
 class OCRError(RuntimeError):
@@ -217,3 +227,164 @@ def merge_frames(
         if previous.end > following.start:
             previous.end = following.start
     return cues
+
+
+def _recognize(frame: bytes, *, width: int, height: int, language: str) -> list[TextBox]:
+    """真正调用 Apple Vision 的那一下：一帧 8 位灰度 rawvideo → 认出来的文字框。
+
+    import 刻意写在函数体内：pyobjc 在 pyproject 的 ocr extra 里、只装得上 macOS，没装它
+    的人必须能正常跑 `tenmin --help` 和所有不碰 OCR 的用法。单独提成一个函数是为了让
+    测试能换掉它。
+
+    参数：accurate 识别级别、zh-Hant、开语言校正 —— 实测 40 条抽样 39 条逐字正确就是这组。
+    Vision 的 confidence 只有 0.3 / 0.5 / 1.0 几档，太粗，不取。每帧包一层 autorelease
+    pool：这是一个没有 run loop 的长循环，不包的话 Objective-C 的临时对象要到进程结束才释放。
+    """
+    try:
+        import objc
+        import Quartz
+        import Vision
+        from Foundation import NSData
+    except ImportError as exc:
+        raise OCRUnavailableError(
+            "这一集声明了硬字幕（ocr.enabled 或 episodes[].hardsub），需要识别画面字幕，"
+            "但 OCR 依赖没装（只支持 macOS）。跑一次 `uv sync --extra ocr` 再试。"
+        ) from exc
+
+    with objc.autorelease_pool():
+        data = NSData.dataWithBytes_length_(frame, len(frame))
+        provider = Quartz.CGDataProviderCreateWithCFData(data)
+        image = Quartz.CGImageCreate(
+            width,
+            height,
+            8,
+            8,
+            width,
+            Quartz.CGColorSpaceCreateDeviceGray(),
+            Quartz.kCGImageAlphaNone,
+            provider,
+            None,
+            False,
+            Quartz.kCGRenderingIntentDefault,
+        )
+        request = Vision.VNRecognizeTextRequest.alloc().init()
+        request.setRecognitionLevel_(Vision.VNRequestTextRecognitionLevelAccurate)
+        request.setRecognitionLanguages_([language])
+        request.setUsesLanguageCorrection_(True)
+        handler = Vision.VNImageRequestHandler.alloc().initWithCGImage_options_(image, None)
+        ok, error = handler.performRequests_error_([request], None)
+        if not ok:
+            raise OCRError(f"Vision 识别失败：{error}")
+        boxes: list[TextBox] = []
+        for observation in request.results() or []:
+            candidates = observation.topCandidates_(1)
+            if not candidates:
+                continue
+            rect = observation.boundingBox()
+            boxes.append(
+                TextBox(
+                    text=str(candidates[0].string()),
+                    x=float(rect.origin.x),
+                    y=float(rect.origin.y),
+                    width=float(rect.size.width),
+                    height=float(rect.size.height),
+                )
+            )
+        return boxes
+
+
+def _progress_printer(total: int) -> Callable[[int], None]:
+    """返回一个「第 done 帧做完了」的回调，每跨过一个 10% 打一行。total 不可靠时不打。"""
+    printed = {"step": 0}
+
+    def report(done: int) -> None:
+        if total <= 0:
+            return
+        step = min(_PROGRESS_STEPS, done * _PROGRESS_STEPS // total)
+        if step > printed["step"]:
+            printed["step"] = step
+            print(f"  画面字幕识别 {step * 100 // _PROGRESS_STEPS}%（{done}/{total} 帧）")
+
+    return report
+
+
+def recognize(
+    video: Path,
+    dest: Path,
+    *,
+    ocr: OcrConfig,
+    ffmpeg_path: str = DEFAULT_RENDER.ffmpeg_path,
+    ffprobe_path: str = DEFAULT_RENDER.ffprobe_path,
+) -> None:
+    """识别 video 画面底部的硬字幕，把结果写成 dest 这份 SRT（繁体原文）。
+
+    同步阻塞调用，理由同 asr.transcribe：ingest 是全局阶段，跑它时没有别的任务在飞。
+    可执行文件参数叫 `ffmpeg_path` / `ffprobe_path`，理由同 asr.transcribe（模块顶层的
+    `ffmpeg` 名字已被导入的模块占了）。
+
+    一条字幕都没认出来时抛 OCRError、不写出空文件：那多半是裁剪区没框住字幕
+    （ocr.crop_top 不对），空文件会被当成一份「这一集没有对白」的合法缓存复用下去。
+    """
+    src_fps = ffmpeg.probe_frame_rate(video, ffprobe=ffprobe_path)
+    duration = ffmpeg.probe_duration(video, ffprobe=ffprobe_path)
+    width, height = ffmpeg.probe_video_size(video, ffprobe=ffprobe_path)
+    step = sample_step(src_fps, ocr.sample_fps)
+    interval = step / src_fps
+    chain, out_height = frame_filter(width=width, height=height, step=step, crop_top=ocr.crop_top)
+
+    minutes = max(1, round(duration / _REALTIME_FACTOR / 60))
+    print(f"  {video.name} 声明了硬字幕，开始识别画面字幕（约 {minutes} 分钟）")
+
+    texts: list[str] = []
+    report = _progress_printer(math.floor(duration * src_fps / step))
+
+    def on_frame(frame: bytes) -> None:
+        boxes = _recognize(frame, width=OCR_WIDTH, height=out_height, language=ocr.language)
+        texts.append(frame_text(boxes, center_tolerance=ocr.center_tolerance))
+        report(len(texts))
+
+    stderr = ffmpeg.run_raw_frames(
+        [
+            "-hide_banner",
+            "-v",
+            "info",
+            "-i",
+            str(video),
+            "-map",
+            "0:v:0",
+            "-vf",
+            chain,
+            "-fps_mode",
+            "passthrough",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "gray",
+            "-",
+        ],
+        frame_size=OCR_WIDTH * out_height,
+        on_frame=on_frame,
+        ffmpeg=ffmpeg_path,
+    )
+
+    times = parse_showinfo_pts(stderr)
+    if len(times) != len(texts):
+        raise OCRError(
+            f"{video.name} 抽出 {len(texts)} 帧，showinfo 却报了 {len(times)} 个时间戳，"
+            "帧与时间对不上，不猜。"
+        )
+    cues = merge_frames(
+        [FrameText(time=t, text=x) for t, x in zip(times, texts, strict=True)],
+        interval=interval,
+        similarity=ocr.similarity,
+        min_frames=ocr.min_frames,
+    )
+    if not cues:
+        raise OCRError(
+            f"{video.name} 的画面上一条字幕都没认出来。检查 ocr.crop_top（现在是 "
+            f"{ocr.crop_top}，裁剪区要框住字幕所在的画面底部），或者这个片源其实没有硬字幕。"
+        )
+
+    # 走 atomic.write_text，理由同 asr.transcribe（源码卫生审计认不出 atomic_path 的暂存名）。
+    atomic.write_text(dest, render_srt(cues))
+    print(f"  画面字幕识别完成，{len(cues)} 条 → {dest.name}")

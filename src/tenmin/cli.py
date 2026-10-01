@@ -14,6 +14,7 @@ from tenmin import atomic
 from tenmin.config import ProjectConfig, Settings, load_project
 from tenmin.ingest.asr import ASRError
 from tenmin.ingest.normalize import credit_range_source
+from tenmin.ingest.ocr import OCRError
 from tenmin.models import DialogueTrack, SignalReport
 from tenmin.pipeline import (
     STAGES,
@@ -46,6 +47,9 @@ app = typer.Typer(add_completion=False, help="把番剧压成解说方案的流�
 #   没装（子类 ASRUnavailableError，消息里带 `uv sync --extra asr`）或者一条对白都没
 #   转出来。同样是 RuntimeError 子类，不在 ValueError 那条网里。只登记父类就够 ——
 #   ASRUnavailableError 继承它。
+# - OCRError：声明了硬字幕的片源要走画面 OCR，而 OCR 依赖没装（子类
+#   OCRUnavailableError，消息里带 `uv sync --extra ocr`）、帧与时间戳对不上、或者一条
+#   字幕都没认出来。理由与登记方式同 ASRError。
 # - ScriptValidationError：它是 RuntimeError 子类而不是 ValueError 子类，
 #   历史上漏在表外——LLM 出的剧本过不了 validate 时用户看的是裸 traceback。
 # - httpx.HTTPError：provider 里没被包成 LLMError 的传输类异常（比如 base_url 写成
@@ -61,6 +65,7 @@ PIPELINE_ERRORS = (
     ValueError,
     FFmpegError,
     ASRError,
+    OCRError,
     ScriptValidationError,
     httpx.HTTPError,
     LLMError,
