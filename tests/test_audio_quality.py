@@ -336,6 +336,35 @@ def test_mix_audio_rejects_true_peak_over_the_configured_ceiling(tmp_path, monke
     _assert_output_untouched(out_path, before_bytes, before_mtime)
 
 
+def test_mix_audio_accepts_real_world_dynamic_loudnorm_overshoot(tmp_path, monkeypatch):
+    """真实番剧音轨（akujo E11，默认 I=-14/TP=-1.5）实测编码后真峰值 -1.21dBTP，
+    比配置目标超出约 0.29dB——这是 ffmpeg loudnorm `linear=false` 动态模式在真实
+    内容上的固有特性，改 loudness_tp/loudness_i 都压不下去（见
+    `_ENCODED_TP_TOLERANCE` 的注释）。0.5dB 的容差必须放过这个真实超标幅度，
+    不能把正常素材也当成坏产物拒绝。"""
+    from tenmin.render import audio as audio_module
+
+    video, voice_dir, timeline, track = _prepare_fake_inputs(tmp_path)
+    out_path = _seed_existing_output(tmp_path)
+
+    real_world_report = _FAKE_LOUDNORM_STDERR.replace(
+        '"input_tp" : "-3.00"', '"input_tp" : "-1.21"'
+    )
+    reports = iter([_FAKE_LOUDNORM_STDERR, real_world_report])
+    monkeypatch.setattr(audio_module, "run", lambda *_a, **_k: next(reports))
+    monkeypatch.setattr(
+        audio_module, "run_with_progress",
+        _fake_encode,
+    )
+    monkeypatch.setattr(audio_module, "probe_duration", lambda *_a, **_k: 1.0)
+
+    result = mix_audio(
+        video=video, timeline=timeline, track=track, voice_dir=voice_dir,
+        out_path=out_path, duck_db=-12.0,
+    )
+    assert result == out_path
+
+
 def test_mix_audio_rejects_a_duration_mismatch_after_encoding(tmp_path, monkeypatch):
     from tenmin.render import audio as audio_module
 
