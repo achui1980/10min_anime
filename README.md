@@ -4,7 +4,8 @@
 配音纯文本，以及配好音、烧好硬字幕的 mp4。
 
 吃自带字幕的片源，也吃生肉：对白轨有四条来源（手传 SRT / 视频里的软字幕轨 / 画面硬字幕 OCR
-/ 语音转写），生肉还会额外交付一份中文字幕。设计文档见
+/ 语音转写），生肉还会额外交付一份中文字幕。只想把一批视频的硬字幕认成 SRT 的话，
+`tenmin ocr` 不用建项目就能批量跑（见「不建项目，单独批量 OCR」）。设计文档见
 `docs/superpowers/specs/2026-08-31-10min-anime-design.md`，生肉那部分见
 `docs/superpowers/specs/2026-09-21-tenmin-asr-translate-design.md`，硬字幕 OCR 见
 `docs/superpowers/specs/2026-10-01-hardsub-ocr-design.md`。
@@ -143,6 +144,7 @@ uv run tenmin run saijo --episode 2 --only docgen --force   # 改完 script.json
 uv run tenmin inspect saijo --episode 1         # 看无字幕间隙与高能点
 uv run tenmin inspect saijo --episode 1 --suspect  # 看被标记为疑似 OCR 噪声的行
 uv run tenmin run saijo --episode 1 --from signals   # 从指定阶段重跑某一集
+uv run tenmin ocr ~/Downloads/番剧/ -o ~/srt/   # 不建项目，批量把硬字幕认成简体 SRT
 ```
 
 只跑 v2 渲染部分（前 4 个阶段的产物照旧复用）：
@@ -443,6 +445,6 @@ TENMIN_OCR_SAMPLE_VIDEO=<片源> uv run pytest -m ocr   # 真跑画面 OCR，需
 - **v1**（已完成）SRT → 对照表 + 配音文本
 - **v2**（已完成）Edge-TTS 配音 + ffmpeg 切片拼接 + 混音 + 烧硬字幕 → 1920x1080 mp4
 - **v3**（已完成）mlx-whisper 语音转写支持生肉 + `translate` 阶段交付中文字幕
-- **v3.1**（本版）画面硬字幕 OCR（Apple Vision）作为对白轨的第四条来源
+- **v3.1**（本版）画面硬字幕 OCR（Apple Vision）作为对白轨的第四条来源；`tenmin ocr` 脱离项目批量识别，默认繁转简
 - **v4** 本地 Web GUI（`script.json` 可视化编辑器）
 - **v5** PySceneDetect + CLIP 视觉索引，整季 12 集压到 10 分钟
