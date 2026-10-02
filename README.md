@@ -317,6 +317,27 @@ uv run tenmin ocr ep01.mp4 --crop-top 0.65 --force
   有失败时退出码为 1。没装 `ocr` extra 会直接中止。
 - 它**不剔除 OP/ED 的 staff 字**（那要靠项目里的 `op_range` / `ed_range`），居中的 staff 字会留在 SRT 里。
 
+#### 从 OCR 到成片：一条命令
+
+先用 `tenmin ocr` 认出简体字幕，再把它当手传 SRT 交给 `tenmin run` 出片（项目要先 `tenmin init` 建好）。
+下面以《才女的侍从》第 12 集为例，换片源只改 `V`、项目名和集号：
+
+```bash
+V="/Users/portz/Downloads/Video/[ANi] 才女的侍從 在滿是高嶺之花的貴族學校暗中照顧（毫無生活自理能力的）學院第一大小姐 - 12 [1080P][Baha][WEB-DL][AAC AVC][CHT].mp4"
+
+uv run tenmin ocr "$V" -o work/saijo/srt/ \
+  && uv run tenmin run saijo --episode 12 \
+       --srt "work/saijo/srt/$(basename "$V" .mp4).zh-Hans.srt" --video "$V"
+```
+
+- 第一段约 3～4 分钟，产出 `work/saijo/srt/<片源名>.zh-Hans.srt`；第二段登记第 12 集并跑完 9 个阶段，
+  成片在 `work/saijo/07_render/E12.mp4`，解说方案在 `work/saijo/out/E12.解说方案.md`（需要 LLM 的 key）。
+- 整条命令可以重复跑：字幕已存在就跳过 OCR（手改过的不会被冲掉），后面各阶段按新鲜度复用。
+- 跑完用 `uv run tenmin inspect saijo --episode 12` 看片头曲 / 片尾曲区间，不对就在那一集填上
+  `op_range` / `ed_range`，再 `uv run tenmin run saijo --episode 12 --force`。
+- 不想中间落一份 SRT 的话，也可以在那一集写 `hardsub: true`、不传 `--srt`，直接
+  `uv run tenmin run saijo --episode 12 --video "$V"`（见上面「上手：一集带硬字幕的片源」）。
+
 ## translate 阶段：中文字幕 + 累积术语表
 
 **只对 `source == "asr"` 的集真的翻译**（判据是那个字段，不做语言检测）。自带字幕的片源
