@@ -244,7 +244,7 @@ uv run tenmin run akujo --episode 11 --video "/path/to/[ANi] ... - 11 [...][CHT]
 跑的时候会先打一行预计耗时（约等于片长的 1/7，24 分钟一集约 3–4 分钟），之后每 10% 打一次进度：
 
 ```
-  [ANi] 我是不才惡女 - 11 ....mp4 声明了硬字幕，开始识别画面字幕（约 3 分钟）
+  [ANi] 我是不才惡女 - 11 ....mp4 开始识别画面字幕（约 3 分钟）
   画面字幕识别 10%（571/5715 帧）
   ...
   画面字幕识别完成，387 条 → E11.ocr.srt
@@ -282,6 +282,38 @@ uv run tenmin inspect akujo --episode 11
 | `language` | `zh-Hant` | 识别语言（Vision 的语言代码） |
 
 一条字幕都没认出来时会报错并提示检查 `ocr.crop_top`。
+
+### 不建项目，单独批量 OCR：`tenmin ocr`
+
+只想把一批视频的硬字幕认成 SRT、不需要解说成片时，用这个命令。它不读 `project.yaml`、不跑后面任何阶段，
+同样要求 macOS + `uv sync --extra ocr`。
+
+```bash
+# 一个目录里的所有视频（只看这一层，认 .mp4 .mkv .mov .m4v .webm .avi .ts，按文件名排序）
+uv run tenmin ocr ~/Downloads/番剧/
+
+# 多个文件/目录混着传，输出统一放到一个目录（不存在会自动建）
+uv run tenmin ocr a.mp4 b.mkv ~/Downloads/番剧/ -o ~/srt/
+
+# 保留画面上的繁体原文（默认是繁转简）
+uv run tenmin ocr ~/Downloads/番剧/ --traditional
+
+# 字幕位置偏高，把裁剪区往上框；已有结果也重新识别
+uv run tenmin ocr ep01.mp4 --crop-top 0.65 --force
+```
+
+| 参数 | 默认 | 含义 |
+|---|---|---|
+| `-o` / `--output` | 视频旁边 | SRT 输出目录 |
+| `--simplified` / `--traditional` | `--simplified` | 繁转简（OpenCC，与 ingest 同一个转换器）/ 保留繁体 |
+| `--force` | 关 | 输出已存在也重新识别 |
+| `--crop-top` | `0.72` | 同上表的 `crop_top`；其余旋钮用默认值 |
+
+- 输出名带语言后缀：简体 `<文件名>.zh-Hans.srt`，繁体 `<文件名>.zh-Hant.srt`，两种都跑也不会互相覆盖。
+- 输出已存在、非空且不比视频旧就跳过（打「已存在，跳过」），所以手改过的结果不会被冲掉；要重认加 `--force`。
+- 某个视频失败（没认出字幕、ffmpeg 报错等）只记下来、接着跑下一个；最后打「成功 N，跳过 N，失败 N」，
+  有失败时退出码为 1。没装 `ocr` extra 会直接中止。
+- 它**不剔除 OP/ED 的 staff 字**（那要靠项目里的 `op_range` / `ed_range`），居中的 staff 字会留在 SRT 里。
 
 ## translate 阶段：中文字幕 + 累积术语表
 
