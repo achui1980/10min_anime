@@ -6,6 +6,6 @@
 
 {{beat_rows}}
 
-只调整字数，不要改动节点划分、clip 时间戳、留白金句。优先{{verb}}信息密度最低的节点。
+{{clip_guidance}}优先{{verb}}信息密度最低的节点。
 
 {{impossible_note}}

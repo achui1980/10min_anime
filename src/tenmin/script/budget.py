@@ -10,7 +10,7 @@ from __future__ import annotations
 import re
 from collections.abc import Iterable
 
-from tenmin.config import DEFAULT_LLM, DEFAULT_RENDER
+from tenmin.config import DEFAULT_LLM, DEFAULT_RENDER, DEFAULT_VALIDATE
 from tenmin.models import Beat, Hold, Script
 from tenmin.script.prompt import load_prompt, render_prompt
 
@@ -204,6 +204,7 @@ def rewrite_instruction(
     tolerance: float = DEFAULT_TOLERANCE,
     *,
     rate: str = DEFAULT_RATE,
+    retry_stretch_max: float = DEFAULT_VALIDATE.retry_stretch_max,
 ) -> str:
     """时长返工要求。文案本体在 prompts/rewrite.md，这里只负责算数字。"""
     actual = total_estimate(script, rate=rate)
@@ -237,6 +238,14 @@ def rewrite_instruction(
         if verb == "扩写" and chars_budget <= current_chars
         else ""
     )
+    clip_guidance = (
+        "保持节点划分和留白金句不变。扩写旁白时同步检查每个节点的画面总时长："
+        "若不足以承载旁白与留白，可依据本集对白和高能点补充或延长 clip，"
+        "并更新对应的时间戳与锚点行；必须避开片头片尾、落在正片内，"
+        f"使每节点（旁白加留白时长）/（clip 总时长）不超过 {retry_stretch_max:.1f} 倍。"
+        if verb == "扩写"
+        else "只调整字数，不要改动节点划分、clip 时间戳、留白金句。"
+    )
     return render_prompt(
         load_prompt(_REWRITE_TEMPLATE),
         _REWRITE_TEMPLATE,
@@ -251,4 +260,5 @@ def rewrite_instruction(
         hold_seconds=f"{holds:.1f}",
         beat_rows=rows,
         impossible_note=impossible,
+        clip_guidance=clip_guidance,
     )

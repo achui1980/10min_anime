@@ -251,8 +251,8 @@ def _followup_prompt(base: str, previous: Script, heading: str, instruction: str
       撤掉再让它改写散文，正是制造幻觉的做法。所以这里**不能**照搬 llm.py 的
       `complete_with_schema_repair` 那种「schema 修复轮完全不重发正文」的省法：
       那一层的报错是纯格式问题，不需要上下文。
-    - 高能点清单 2067 字（6.0%）：必须重发。「每个节点至少有一个 clip 落在 gap 区间里」
-      这条要求靠它。
+    - 高能点清单 2067 字（6.0%）：必须重发。返工时补充画面仍须根据本集高能点
+      与对白选择合适片段，不能凭空编造时间戳。
     - few-shot 范例 3049 字（8.8%）：**不重发**。它唯一的作用是教「格式、语气、节奏」，
       而走到返工轮时模型已经交出过一份合 schema 的稿子，格式显然学会了；范例自己还带
       着「只用来学格式，不要学它的内容，写出来的画面描述在范例里出现过就是抄错了」的
@@ -400,7 +400,10 @@ async def generate_script(
     for round_number in range(1, llm.budget_rewrite_rounds + 1):
         if not needs_rewrite(script, llm.budget_tolerance, rate=rate):
             break
-        instruction = rewrite_instruction(script, llm.budget_tolerance, rate=rate)
+        instruction = rewrite_instruction(
+            script, llm.budget_tolerance, rate=rate,
+            retry_stretch_max=cfg.validate_script.retry_stretch_max,
+        )
         warnings.append(
             f"第 {round_number} 轮时长超出容差，触发返工：{instruction.splitlines()[0]}"
         )

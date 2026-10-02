@@ -131,6 +131,27 @@ def test_rewrite_instruction_says_expand_when_too_short():
     assert "扩写" in text
 
 
+def test_expand_rewrite_allows_more_footage_without_stretching_clips():
+    s = script([beat("b1", 45 * 10)], target=240.0)
+    text = rewrite_instruction(s)
+    assert "补充或延长" in text
+    assert "1.5 倍" in text
+    assert "不要改动节点划分、clip 时间戳" not in text
+
+
+def test_trim_rewrite_keeps_existing_clip_timestamps():
+    s = script([beat("b1", 45 * 30)], target=240.0)
+    text = rewrite_instruction(s)
+    assert "不要改动节点划分、clip 时间戳" in text
+
+
+def test_expand_rewrite_uses_project_stretch_limit():
+    s = script([beat("b1", 45 * 10)], target=240.0)
+    text = rewrite_instruction(s, retry_stretch_max=1.8)
+    assert "1.8 倍" in text
+    assert "1.5 倍" not in text
+
+
 def test_rewrite_instruction_lists_every_beat():
     s = script([beat("b1", 45 * 30, label="节点甲"), beat("b2", 45 * 5, label="节点乙")])
     text = rewrite_instruction(s)
