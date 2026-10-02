@@ -135,8 +135,10 @@ def _episode_payload(episode: EpisodeConfig) -> dict[str, Any]:
     EPISODE 记号挂在 ingest、timeline、audio、render 四个阶段上。hardsub 是后加的字段，
     如果 None 也照常写成 `"hardsub": null`，升级之后每一集这四份切片都会多出一行而被改写，
     于是 timeline / audio / render 对全部存量集整套重跑（它们压根不读这个字段）。省掉
-    None 让没用这个字段的项目切片逐字节不变；真写了 true/false 时它照常进切片，ingest
-    因此重跑。「跟随项目级 ocr.enabled」那一半由 ingest 切片里的 ocr 子配置负责。
+    None 让没用这个字段的项目切片逐字节不变；真写了 true/false 时它照常进切片，而 EPISODE
+    记号同时挂在 timeline / audio / render 的切片上，所以这一集的 ingest 与这三个阶段都会
+    跟着重跑（后三个是陪跑，代价就是这一集一次）。「跟随项目级 ocr.enabled」那一半由
+    ingest 切片里的 ocr 子配置负责。
     """
     dumped = episode.model_dump(mode="json")
     if episode.hardsub is None:

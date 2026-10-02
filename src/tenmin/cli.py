@@ -144,8 +144,8 @@ PROJECT_TEMPLATE_HEADER = """\
 # 登记一集（推荐，路径会自动填好；源片不会被拷进 work/，只记它的绝对路径）：
 #   tenmin run {slug} --episode 2 --srt <字幕路径> --video <源片路径>
 #
-# 没有字幕的生肉片源省掉 --srt 就行（对白轨靠视频里的软字幕轨或语音转写拿，
-# 后者要先 `uv sync --extra asr`）：
+# 没有字幕的生肉片源省掉 --srt 就行（对白轨靠视频里的软字幕轨、画面 OCR（声明了
+# 硬字幕时，要先 `uv sync --extra ocr`）或语音转写拿，后者要先 `uv sync --extra asr`）：
 #   tenmin run {slug} --episode 2 --video <源片路径>
 #
 # 也可以手写。srt 相对本文件所在目录解析，video 可以是相对路径或绝对路径：
@@ -265,7 +265,8 @@ def run(
 
     # 三条规则（原来是「--srt 与 --video 必须一起传」那一条对称的规则）：
     # - 传 --srt 必须配 --video：视频是 render 阶段的硬需求，只有字幕出不了片。
-    # - 只传 --video 合法，这就是生肉入口（对白轨靠软字幕轨抽取或语音转写拿）。
+    # - 只传 --video 合法，这就是生肉入口（对白轨靠软字幕轨抽取、画面 OCR（声明了
+    #   硬字幕时）或语音转写拿）。
     # - 传了 --video 就必须说这是第几集，否则没法登记进 project.yaml。
     if srt is not None and video is None:
         typer.secho("传 --srt 时必须同时传 --video", fg=typer.colors.RED)
