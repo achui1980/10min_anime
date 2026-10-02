@@ -3275,6 +3275,18 @@ async def test_run_translate_needs_no_provider_for_an_ocr_episode(tmp_path):
     assert paths.zh_subtitles(11).is_file()
 
 
+async def test_run_translate_refuses_an_asr_episode_without_a_provider(tmp_path):
+    """听写来的对白真要调 LLM：没有 provider 就在动任何东西之前点名报错。"""
+    cfg, paths = _project_with_dialogue(tmp_path, episode=11, source="asr")
+
+    with pytest.raises(ValueError, match="provider"):
+        await run_translate(cfg, None, 11)
+
+    assert not paths.zh_lines(11).exists()
+    assert not paths.zh_usage(11).exists()
+    assert not paths.glossary.exists()
+
+
 async def test_run_translate_leaves_the_glossary_and_usage_alone_for_ocr(tmp_path):
     """累积术语表是 script 的新鲜度输入，OCR 这条路连读带写都不许碰它；用量文件也不写。"""
     cfg, paths = _ocr_project(tmp_path)

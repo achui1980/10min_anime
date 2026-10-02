@@ -194,6 +194,15 @@ def resolve_subtitle_source(
             # 而「碰上位图轨该怎么办」（手传 SRT？换片源走听写？）是本模块的四岔职责。
             if _BITMAP_SUBTITLE_MARKER not in str(exc):
                 raise
+            # 声明了硬字幕时那句「换没有字幕轨的片源走语音转写」是错的指路：没有字幕轨的
+            # 片源在这种配置下走的是画面 OCR，不是听写。行为不变（照样不自动换路），只换
+            # 消息，把真实的两条出路说清楚。
+            if hardsub:
+                raise ValueError(
+                    f"{video.name} 带着一条位图字幕轨（PGS / VobSub），软字幕轨那一岔优先，"
+                    "所以声明了硬字幕也没有走到画面 OCR。手传一份 --srt，"
+                    "或者把片源里的字幕轨去掉，让它走画面 OCR。"
+                ) from exc
             raise ValueError(
                 f"{video.name} 的字幕轨是位图格式（PGS / VobSub），抽不成 SRT。"
                 "手传一份 --srt，或者用一个没有字幕轨的片源让它走语音转写。"

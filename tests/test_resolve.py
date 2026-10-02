@@ -199,6 +199,29 @@ def test_a_bitmap_subtitle_track_gets_an_actionable_chinese_error(monkeypatch, t
     assert "bitmap to bitmap" not in message
 
 
+def test_a_bitmap_track_under_a_hardsub_declaration_points_at_ocr_not_transcription(
+    monkeypatch, tmp_path, stub
+):
+    """声明了硬字幕时，去掉字幕轨的片源走的是画面 OCR，消息不许再把人指去语音转写。"""
+    calls, state = stub
+    state["has_subtitle"] = True
+    monkeypatch.setattr(resolve.ffmpeg, "extract_subtitle_track", _raise_bitmap_error)
+
+    with pytest.raises(ValueError) as caught:
+        _resolve_hardsub(tmp_path, _video(tmp_path))
+
+    message = str(caught.value)
+    assert "e11.mp4" in message
+    assert "位图" in message
+    assert "OCR" in message
+    assert "--srt" in message
+    assert "语音转写" not in message
+    assert "bitmap to bitmap" not in message
+    # 只换消息、不换行为：照样不自动换到 OCR 或听写。
+    assert calls["recognize"] == []
+    assert calls["transcribe"] == []
+
+
 def test_an_unrelated_ffmpeg_failure_is_not_rewritten(monkeypatch, tmp_path, stub):
     """只认位图那一条。别的 ffmpeg 失败原样抛出去 —— 换掉消息等于把真因抹了。"""
     _, state = stub

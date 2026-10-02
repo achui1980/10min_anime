@@ -553,7 +553,7 @@ def _load_tracks(cfg: ProjectConfig) -> list[DialogueTrack]:
 
 
 async def run_translate(
-    cfg: ProjectConfig, provider: LLMProvider, episode: int
+    cfg: ProjectConfig, provider: LLMProvider | None, episode: int
 ) -> tuple[TranslatedTrack, list[str]]:
     """翻译一集：落译文轨、中文字幕，并把新认出的术语并回累积表。
 
@@ -592,6 +592,11 @@ async def run_translate(
         _write_json(paths.zh_lines(episode), translated.model_dump_json(indent=2))
         _write_text(paths.zh_subtitles(episode), render_zh_srt(track, translated))
         return translated, []
+    if provider is None:
+        raise ValueError(
+            f"第 {episode} 集的对白轨来自语音转写，translate 阶段要调 LLM 翻译，"
+            "但调用方没给 provider"
+        )
     accumulated = load_glossary(paths.glossary)
     usage: list[UsageRecord] = []
     try:
