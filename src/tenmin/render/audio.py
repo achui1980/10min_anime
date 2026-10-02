@@ -29,7 +29,8 @@ AUDIO_BITRATE = DEFAULT_RENDER.audio_bitrate
 LIMITER_CEILING = DEFAULT_RENDER.limiter_ceiling
 FULL_VOLUME = 1.0
 
-# 编码后真峰值体检的容差。loudnorm 的 `linear=false`（动态压缩）模式不会把真峰值
+# 编码后真峰值体检的容差：超过 loudness_tp + 容差只报 warning，不拒绝发布。
+# loudnorm 的 `linear=false`（动态压缩）模式不会把真峰值
 # 精确钉在 TP 目标上——它优先保证响度打到 I 目标，真峰值只是个软约束。实测
 # akujo E11（真实番剧音轨，AAC 编码）在默认 I=-14/TP=-1.5 下稳定超标约 0.28–0.3dB，
 # 且这个超标幅度跟改 loudness_tp（试过 -1.5 到 -3.0）或 loudness_i（试过 -14 到
@@ -893,10 +894,11 @@ def mix_audio(
     2. 前后三次 `_input_identity` 快照（测量前、两遍之间、编码后）一旦不一致，
        说明源视频或某个配音 chunk 在这次调用期间被换掉了，两遍测量测的不是同一份
        东西，拒绝发布。
-    3. 编码完成后拿**编码产物自己**再measure 一遍：真峰值超过配置上限
-       （留 `_ENCODED_TP_TOLERANCE` 容差）直接拒绝；实测响度偏离目标超过 1 LUFS 只
-       降级成 warning（alimiter 的天花板有时会压掉 loudnorm 想要的增益，这种情况下
-       「响度没打到目标」是预期的物理限制，不是坏产物）。
+    3. 编码完成后拿**编码产物自己**再measure 一遍：读不出响度报告直接拒绝；真峰值
+       超过配置上限（留 `_ENCODED_TP_TOLERANCE` 容差）只报 warning、照常发布（动态
+       loudnorm 在大动态范围的真实素材上压不住峰值，硬拒绝会让整集卡在 audio 阶段）；
+       实测响度偏离目标超过 1 LUFS 同样只报 warning（alimiter 的天花板有时会压掉
+       loudnorm 想要的增益，这是预期的物理限制，不是坏产物）。
     4. 编码产物的实际时长（`probe_duration`）必须跟 timeline 声明的长度对上，否则
        audio 阶段悄悄产出一份被截断/拉长的音轨，而 render 阶段的 `-c:a copy` 会把
        这个错误原样搬进最终 mp4。
@@ -986,8 +988,13 @@ def mix_audio(
             raise FFmpegError("编码后响度/真峰值读不出，拒绝发布")
 
         if measured_out is not None:
-            if measured_out["input_tp"] > cfg.loudness_tp + _ENCODED_TP_TOLERANCE:
-                raise FFmpegError("编码后真峰值超出配置上限，拒绝发布")
+            tp_ceiling = cfg.loudness_tp + _ENCODED_TP_TOLERANCE
+            if measured_out["input_tp"] > tp_ceiling:
+                notices.append(
+                    f"成片真峰值实测 {measured_out['input_tp']:.1f} dBTP，"
+                    f"超出上限 {tp_ceiling:.1f} dBTP，可能轻微削波；"
+                    "可调低 render.loudness_i 后重跑 audio"
+                )
             if abs(measured_out["input_i"] - cfg.loudness_i) > 1.0:
                 notices.append(
                     f"成片实测 {measured_out['input_i']:.1f} LUFS，"

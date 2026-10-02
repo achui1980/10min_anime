@@ -154,7 +154,8 @@ def test_mix_audio_normalizes_real_media_to_the_configured_loudness(tmp_path):
     assert stats is not None
     # 合成正弦波达不到的目标响度就留不出 1 LUFS 的余量，所以给个比较宽的容差。
     assert stats["input_i"] == pytest.approx(-14.0, abs=1.0)
-    # 0.1dB 容差对应 mix_audio 自己那道「TP 超限就拒绝发布」检查的同一个余量。
+    # 合成正弦波动态范围很小，loudnorm 能把 TP 精确压到目标附近，这里比 mix_audio
+    # 自己那道「TP 超限报 warning」的检查收得更紧（0.1dB）。
     assert stats["input_tp"] <= -1.4
 
     assert probe_duration(out_path) == pytest.approx(duration, abs=0.1)
@@ -310,13 +311,16 @@ def test_mix_audio_rejects_a_malformed_final_report(tmp_path, monkeypatch):
     _assert_output_untouched(out_path, before_bytes, before_mtime)
 
 
-def test_mix_audio_rejects_true_peak_over_the_configured_ceiling(tmp_path, monkeypatch):
+def test_mix_audio_warns_but_publishes_true_peak_over_the_configured_ceiling(
+    tmp_path, monkeypatch
+):
+    """真峰值超过 loudness_tp + 容差只报 warning、照常发布：动态 loudnorm 在大动态
+    范围的真实素材上压不住峰值，硬拒绝会让整集卡在 audio 阶段。warning 里要带实测值
+    和上限，用户才知道超了多少、该不该去调 loudness_i。"""
     from tenmin.render import audio as audio_module
 
     video, voice_dir, timeline, track = _prepare_fake_inputs(tmp_path)
     out_path = _seed_existing_output(tmp_path)
-    before_bytes = out_path.read_bytes()
-    before_mtime = out_path.stat().st_mtime_ns
 
     over_ceiling_report = _FAKE_LOUDNORM_STDERR.replace(
         '"input_tp" : "-3.00"', '"input_tp" : "-0.20"'
@@ -327,13 +331,19 @@ def test_mix_audio_rejects_true_peak_over_the_configured_ceiling(tmp_path, monke
         audio_module, "run_with_progress",
         _fake_encode,
     )
+    monkeypatch.setattr(audio_module, "probe_duration", lambda *_a, **_k: 1.0)
 
-    with pytest.raises(FFmpegError, match="真峰值超出配置上限"):
-        mix_audio(
-            video=video, timeline=timeline, track=track, voice_dir=voice_dir,
-            out_path=out_path, duck_db=-12.0,
-        )
-    _assert_output_untouched(out_path, before_bytes, before_mtime)
+    warnings: list[str] = []
+    result = mix_audio(
+        video=video, timeline=timeline, track=track, voice_dir=voice_dir,
+        out_path=out_path, duck_db=-12.0, warnings=warnings,
+    )
+
+    assert result == out_path
+    peak_notices = [w for w in warnings if "真峰值" in w]
+    assert len(peak_notices) == 1
+    assert "-0.2" in peak_notices[0]
+    assert "-1.0" in peak_notices[0]
 
 
 def test_mix_audio_accepts_real_world_dynamic_loudnorm_overshoot(tmp_path, monkeypatch):
