@@ -41,6 +41,10 @@ uv sync --extra asr
 uv sync --extra ocr
 ```
 
+注意 extra 不叠加记忆：之后再跑一次不带参数的 `uv sync` 会把它卸掉。两个都要就写
+`uv sync --extra asr --extra ocr`。不装也能跑 `tenmin --help`，真走到画面 OCR 时会报一句
+「跑一次 `uv sync --extra ocr` 再试」。
+
 渲染阶段需要编入 libass 的 ffmpeg（否则烧不了字幕）：
 
 ```bash
@@ -106,7 +110,8 @@ uv run tenmin run saijo --episode 2 --srt 你的字幕.srt --video 你的视频.
 `episodes:` 里补一条 `number: 2` 的记录，然后跑这一集的全链路。
 `--srt` 必须配 `--video`（视频是渲染阶段的硬需求），且必须同时带 `--episode`。
 
-**没有字幕的片源省掉 `--srt` 就行**，对白轨会自己找来源（见下一节）：
+**没有字幕的片源省掉 `--srt` 就行**，对白轨会自己找来源（见下一节；画面烧了字幕的片源要先在
+`project.yaml` 里声明，见「硬字幕片源」）：
 
 ```bash
 uv run tenmin run akujo --episode 11 --video 你的生肉.mp4
@@ -217,6 +222,66 @@ episodes:
 - **要手填 OP/ED 区间**（见「标注 OP / ED 区间」）：OCR 会把画面**居中**的 staff 字（监督、
   原作、ED 里的大块名单）一起认进来，左右两侧的才会被自动挡掉；剩下那批靠手填的
   `op_range` / `ed_range` 或 `credits.default_*` 去剔除。
+- **那一集不能写 `srt:`**：手传 SRT 排在最前面，写了就不会走到 OCR。
+- 声明了硬字幕、但片源带的是**位图**字幕轨（PGS / VobSub）时会报错：字幕轨分枝排在 OCR
+  前面，抽不出来就停在那里，不会自动换到 OCR。提示会让你手传 `--srt`，或者把片源里的字幕轨
+  去掉（比如 `ffmpeg -i in.mkv -map 0 -map -0:s -c copy out.mkv`），再跑就会走画面 OCR。
+
+#### 上手：一集带硬字幕的片源
+
+```bash
+uv sync --extra ocr                                   # 1. 装 extra（仅 macOS）
+uv run tenmin init akujo                              # 2. 新项目；已有项目跳过
+# 3. 在 work/akujo/project.yaml 里写上 `ocr: {enabled: true}`（或在那一集写 `hardsub: true`），
+#    并填好 op_range / ed_range
+uv run tenmin run akujo --episode 11 --video "/path/to/[ANi] ... - 11 [...][CHT].mp4"
+```
+
+已登记过的集改成 OCR：删掉那一集的 `srt:`、加上 `hardsub: true`，然后
+`uv run tenmin run akujo --episode 11 --force`。批处理（不带 `--episode`）照常可用，
+每集各按自己的声明走。
+
+跑的时候会先打一行预计耗时（约等于片长的 1/7，24 分钟一集约 3–4 分钟），之后每 10% 打一次进度：
+
+```
+  [ANi] 我是不才惡女 - 11 ....mp4 声明了硬字幕，开始识别画面字幕（约 3 分钟）
+  画面字幕识别 10%（571/5715 帧）
+  ...
+  画面字幕识别完成，387 条 → E11.ocr.srt
+```
+
+产物：
+
+| 路径 | 是什么 |
+|---|---|
+| `work/<slug>/srt/E{NN}.ocr.srt` | 识别结果（**繁体原文**），可以手改，按 mtime 复用 |
+| `work/<slug>/01_dialogue/E{NN}.dialogue.json` | 对白轨（已繁转简），`source: "ocr"` |
+| `work/<slug>/out/E{NN}.zh.srt` | 简体中文字幕交付物，不调 LLM、不需要 API key |
+
+之后的 signals → script → … → render 跟自带字幕的片源完全一样。核对来源：
+
+```bash
+uv run tenmin inspect akujo --episode 11
+#   对白轨 E11：... 行，时长 ...s
+#   来源：ocr（画面 OCR），硬字幕：已声明
+```
+
+实测（我是不才恶女 E11，1080p）：认出 387 条，抽 40 条核对 39 条一字不差，剩下 1 条混进了
+居中的 OP staff 字——这就是要手填 OP/ED 的原因。人名比语音转写准得多（不需要术语表纠错）。
+
+#### 旋钮（`ocr:`）
+
+| 字段 | 默认 | 含义 |
+|---|---|---|
+| `enabled` | `false` | 项目级声明这部番带硬字幕；逐集 `hardsub` 优先 |
+| `sample_fps` | `4.0` | 每秒抽几帧去识别（与片源帧率无关，24/30/60/120fps 都是每秒 4 帧） |
+| `crop_top` | `0.72` | 从画面高度的这个比例往下裁去识别；字幕位置偏高就**调小** |
+| `center_tolerance` | `0.08` | 文字框中心离画面中线超过这个比例就丢掉（挡两侧 staff 字） |
+| `similarity` | `0.6` | 相邻帧文字相似度不低于它就算同一条字幕 |
+| `min_frames` | `2` | 少于这么多帧出现的识别结果当噪声丢掉 |
+| `language` | `zh-Hant` | 识别语言（Vision 的语言代码） |
+
+一条字幕都没认出来时会报错并提示检查 `ocr.crop_top`。
 
 ## translate 阶段：中文字幕 + 累积术语表
 
@@ -224,6 +289,8 @@ episodes:
 （`source == "srt"`）本来就是观众读得懂的语言，这一阶段在磁盘上留不下任何痕迹——连 `zh/`
 目录都不会建。画面 OCR 来的集（`source == "ocr"`）**不调 LLM**：认出来的字幕繁转简之后原样
 交付成 `zh/E{NN}.zh.json` 与 `out/E{NN}.zh.srt`，不碰累积术语表，也不需要 API key。
+（例外：`tenmin run` 只要本次要跑的阶段里有 translate，就会先把 LLM 客户端建出来，所以单跑
+`--only translate` 时还是得配好 key；正常跑全链路时 script 阶段本来就要 key，没有区别。）
 
 产物：
 
@@ -329,7 +396,11 @@ TENMIN_OCR_SAMPLE_VIDEO=<片源> uv run pytest -m ocr   # 真跑画面 OCR，需
 - **位图字幕轨（Blu-ray PGS / DVD VobSub）走不通**：上面第 2 条分枝只判「有没有字幕轨」，
   判不了「是不是文本」，于是位图轨会走进抽取路并在 ffmpeg 的跨族转码守卫上失败。会报一句
   中文提示（手传 `--srt`，或换一个没有字幕轨的片源让它走语音转写），但**不会自动回落到
-  语音转写**——位图轨是能 OCR 的，悄悄换成听写等于把更好的素材丢了。
+  语音转写**——位图轨是能 OCR 的，悄悄换成听写等于把更好的素材丢了。声明了硬字幕时提示会改成
+  「手传 `--srt`，或去掉字幕轨让它走画面 OCR」，同样不自动换路。
+- 画面 OCR 只支持 macOS（Apple Vision），只认画面底部、水平居中的字幕；字幕在画面顶部或
+  竖排的片源认不出来。变形宽高比（SAR ≠ 1，比如部分 DVD 源）没有专门处理。
+- 行尾单个 `.` / `。` 会被当成识别错的省略号改成 `…`（Vision 常把 `…` 认成一个点）。
 - 手传一份**日语** SRT（或软字幕轨恰好是日语）时 translate 不会跑，而且那份对白还会被
   繁转简改字。判据是 `source` 字段而不是语言检测。
 - `work/<slug>/project.yaml` 的 `render:` 配置是整个 project 共享的，不支持按集覆盖。
@@ -339,6 +410,7 @@ TENMIN_OCR_SAMPLE_VIDEO=<片源> uv run pytest -m ocr   # 真跑画面 OCR，需
 
 - **v1**（已完成）SRT → 对照表 + 配音文本
 - **v2**（已完成）Edge-TTS 配音 + ffmpeg 切片拼接 + 混音 + 烧硬字幕 → 1920x1080 mp4
-- **v3**（本版）mlx-whisper 语音转写支持生肉 + `translate` 阶段交付中文字幕
+- **v3**（已完成）mlx-whisper 语音转写支持生肉 + `translate` 阶段交付中文字幕
+- **v3.1**（本版）画面硬字幕 OCR（Apple Vision）作为对白轨的第四条来源
 - **v4** 本地 Web GUI（`script.json` 可视化编辑器）
 - **v5** PySceneDetect + CLIP 视觉索引，整季 12 集压到 10 分钟
