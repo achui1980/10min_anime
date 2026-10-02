@@ -333,6 +333,16 @@ def test_recognize_writes_an_srt_of_the_merged_cues(tmp_path, monkeypatch):
     assert first.end == pytest.approx(4 * SAMPLE_INTERVAL, abs=1e-3)
 
 
+def test_recognize_cues_returns_the_cues_and_writes_nothing(tmp_path, monkeypatch):
+    _fake_ffmpeg(monkeypatch, ["", "我們走吧", "我們走吧", "", "不要…", "不要…"])
+    video = _video(tmp_path)
+
+    cues = ocr.recognize_cues(video, ocr=OcrConfig())
+
+    assert [cue.text for cue in cues] == ["我們走吧", "不要…"]
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["e11.mp4"]
+
+
 def test_recognize_uses_the_real_pts_not_the_frame_index(tmp_path, monkeypatch):
     """时间戳读 showinfo 的 pts，不按「序号 × 步长 / 帧率」推算。"""
     _fake_ffmpeg(monkeypatch, ["我們走吧", "我們走吧"], times=[100.0, 100.25])
@@ -409,7 +419,7 @@ def test_recognize_announces_itself_before_the_first_frame(tmp_path, monkeypatch
     ocr.recognize(_video(tmp_path), tmp_path / "E11.ocr.srt", ocr=OcrConfig())
 
     assert calls["recognize"]
-    assert "e11.mp4 声明了硬字幕" in seen_before[0]
+    assert "e11.mp4 开始识别画面字幕" in seen_before[0]
     # 1430 秒 / 7 倍实时 ≈ 204 秒 ≈ 3 分钟
     assert "约 3 分钟" in seen_before[0]
 

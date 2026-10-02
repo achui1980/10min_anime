@@ -325,6 +325,24 @@ def recognize(
     一条字幕都没认出来时抛 OCRError、不写出空文件：那多半是裁剪区没框住字幕
     （ocr.crop_top 不对），空文件会被当成一份「这一集没有对白」的合法缓存复用下去。
     """
+    cues = recognize_cues(video, ocr=ocr, ffmpeg_path=ffmpeg_path, ffprobe_path=ffprobe_path)
+    # 走 atomic.write_text，理由同 asr.transcribe（源码卫生审计认不出 atomic_path 的暂存名）。
+    atomic.write_text(dest, render_srt(cues))
+    print(f"  画面字幕识别完成，{len(cues)} 条 → {dest.name}")
+
+
+def recognize_cues(
+    video: Path,
+    *,
+    ocr: OcrConfig,
+    ffmpeg_path: str = DEFAULT_RENDER.ffmpeg_path,
+    ffprobe_path: str = DEFAULT_RENDER.ffprobe_path,
+) -> list[RawCue]:
+    """识别 video 画面底部的硬字幕，返回归并好的字幕条（繁体原文），不落盘。
+
+    `recognize`（管线用）与 `tenmin ocr`（独立批量命令，要先繁转简再写）共用这一份。
+    一条都没认出来时抛 OCRError，理由见 `recognize`。
+    """
     src_fps = ffmpeg.probe_frame_rate(video, ffprobe=ffprobe_path)
     duration = ffmpeg.probe_duration(video, ffprobe=ffprobe_path)
     width, height = ffmpeg.probe_video_size(video, ffprobe=ffprobe_path)
@@ -333,7 +351,7 @@ def recognize(
     chain, out_height = frame_filter(width=width, height=height, step=step, crop_top=ocr.crop_top)
 
     minutes = max(1, round(duration / _REALTIME_FACTOR / 60))
-    print(f"  {video.name} 声明了硬字幕，开始识别画面字幕（约 {minutes} 分钟）")
+    print(f"  {video.name} 开始识别画面字幕（约 {minutes} 分钟）")
 
     texts: list[str] = []
     report = _progress_printer(math.floor(duration * src_fps / step))
@@ -384,7 +402,4 @@ def recognize(
             f"{video.name} 的画面上一条字幕都没认出来。检查 ocr.crop_top（现在是 "
             f"{ocr.crop_top}，裁剪区要框住字幕所在的画面底部），或者这个片源其实没有硬字幕。"
         )
-
-    # 走 atomic.write_text，理由同 asr.transcribe（源码卫生审计认不出 atomic_path 的暂存名）。
-    atomic.write_text(dest, render_srt(cues))
-    print(f"  画面字幕识别完成，{len(cues)} 条 → {dest.name}")
+    return cues

@@ -11,10 +11,11 @@ import typer
 import yaml
 
 from tenmin import atomic
-from tenmin.config import ProjectConfig, Settings, load_project
+from tenmin.config import DEFAULT_OCR, OcrConfig, ProjectConfig, Settings, load_project
+from tenmin.ingest import ocr_batch
 from tenmin.ingest.asr import ASRError
 from tenmin.ingest.normalize import credit_range_source
-from tenmin.ingest.ocr import OCRError
+from tenmin.ingest.ocr import OCRError, OCRUnavailableError
 from tenmin.models import DialogueTrack, SignalReport
 from tenmin.pipeline import (
     STAGES,
@@ -467,3 +468,56 @@ def inspect(
             f"  {format_timestamp(highlight.start)} | 强度 {highlight.strength} "
             f"| {'、'.join(highlight.triggers)} | {highlight.summary}"
         )
+
+
+OCR_INPUTS_ARGUMENT = typer.Argument(..., help="视频文件或目录（目录只看一层），可传多个")
+OCR_OUTPUT_OPTION = typer.Option(
+    None, "--output", "-o", help="SRT 输出目录（不存在就建）；不传就写在视频旁边"
+)
+OCR_SIMPLIFIED_OPTION = typer.Option(
+    True,
+    "--simplified/--traditional",
+    help="繁转简（默认）；--traditional 保留画面上的繁体原文",
+)
+OCR_FORCE_OPTION = typer.Option(False, "--force", help="输出已存在也重新识别")
+OCR_CROP_TOP_OPTION = typer.Option(
+    DEFAULT_OCR.crop_top,
+    "--crop-top",
+    help="从画面高度的这个比例往下裁出来识别（0~1，越小框得越高）",
+)
+
+
+@app.command()
+def ocr(
+    inputs: list[Path] = OCR_INPUTS_ARGUMENT,
+    output: Path | None = OCR_OUTPUT_OPTION,
+    simplified: bool = OCR_SIMPLIFIED_OPTION,
+    force: bool = OCR_FORCE_OPTION,
+    crop_top: float = OCR_CROP_TOP_OPTION,
+) -> None:
+    """不建项目，批量把视频画面上的硬字幕认成 SRT（需 macOS + `uv sync --extra ocr`）。"""
+    try:
+        ocr_config = OcrConfig(crop_top=crop_top)
+        videos = ocr_batch.collect_videos(inputs)
+    except (FileNotFoundError, ValueError) as error:
+        typer.secho(_error_message(error), fg="red", err=True)
+        raise typer.Exit(code=1) from error
+    typer.echo(f"共 {len(videos)} 个视频")
+    try:
+        summary = ocr_batch.run_batch(
+            videos,
+            out_dir=output,
+            simplified=simplified,
+            force=force,
+            ocr_config=ocr_config,
+        )
+    except OCRUnavailableError as error:
+        typer.secho(_error_message(error), fg="red", err=True)
+        raise typer.Exit(code=1) from error
+    typer.echo(
+        f"成功 {len(summary.done)}，跳过 {len(summary.skipped)}，失败 {len(summary.failed)}"
+    )
+    for video, reason in summary.failed:
+        typer.secho(f"  失败：{video.name}：{reason}", fg="red", err=True)
+    if summary.failed:
+        raise typer.Exit(code=1)
