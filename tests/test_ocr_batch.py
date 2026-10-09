@@ -313,7 +313,7 @@ def test_ai_correct_uses_separate_raw_and_final_and_retries_without_ocr(tmp_path
         [video], provider_factory=Provider, llm_config=LLMConfig(), **kwargs
     ))
     assert second.done == [video]
-    assert len(calls) == 1 and len(requests) == 2
+    assert len(calls) == 1 and len(requests) == 3
     assert [c.text for c in load_srt_detailed(final).cues] == ["我们这里见"] * 2
 
 
@@ -369,7 +369,7 @@ def test_source_update_failure_uses_new_raw_then_retries(tmp_path, monkeypatch):
     class Provider:
         async def complete(self, system, user, schema):
             requests.append(user)
-            if len(requests) == 2:
+            if len(requests) == 3:
                 raise RuntimeError("调用失败")
             return schema.model_validate({"lines": [
                 {"id": line["id"], "text": "修正版", "uncertain": False}
@@ -385,7 +385,7 @@ def test_source_update_failure_uses_new_raw_then_retries(tmp_path, monkeypatch):
     asyncio.run(ocr_batch.run_batch_corrected([video], **kwargs))
     assert "新原稿" in (tmp_path / "a.zh-Hans.srt").read_text()
     asyncio.run(ocr_batch.run_batch_corrected([video], **kwargs))
-    assert len(requests) == 3
+    assert len(requests) == 5
     assert "修正版" in (tmp_path / "a.zh-Hans.srt").read_text()
 
 

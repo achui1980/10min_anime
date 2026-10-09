@@ -44,6 +44,7 @@ class ReviewItem:
     end: float
     text: str
     reason: str
+    candidate: str = ""
 
 
 def _verify(expected: set[int], response: _Correction) -> dict[int, _CorrectedLine]:
@@ -108,6 +109,8 @@ def _identity(cfg: LLMConfig) -> str:
         include={"provider", "model", "base_url", "thinking", "temperature", "max_output_tokens"}
     )
     fields["prompt_sha256"] = hashlib.sha256(_SYSTEM.encode("utf-8")).hexdigest()
+    semantic = (files("tenmin.ingest") / "prompts" / "ocr_semantic.md").read_bytes()
+    fields["semantic_sha256"] = hashlib.sha256(semantic).hexdigest()
     return hashlib.sha256(json.dumps(fields, sort_keys=True).encode("utf-8")).hexdigest()
 
 
@@ -211,6 +214,8 @@ async def select_corrected(
         return raw, [message], True
 
     provider = None
+    messages = []
+    semantic_pending = False
     try:
         parsed = load_srt_detailed(raw)
         if parsed.skipped_blocks or parsed.clamped_cues:
@@ -218,6 +223,15 @@ async def select_corrected(
         try:
             provider = provider_factory()
             cues, items = await correct_cues(parsed.cues, provider, cfg=cfg)
+            from tenmin.ingest.ocr_semantic import semantic_review
+
+            try:
+                cues, items = await semantic_review(
+                    parsed.cues, cues, provider, max_attempts=cfg.max_attempts
+                )
+            except (RuntimeError, ValueError, httpx.HTTPError, TimeoutError) as exc:
+                messages.append(f"OCR 语义复核失败，使用第一轮校对稿：{exc}")
+                semantic_pending = True
         finally:
             if provider is not None:
                 aclose = getattr(provider, "aclose", None)
@@ -230,5 +244,8 @@ async def select_corrected(
     atomic.write_text_if_changed(
         review, json.dumps([item.__dict__ for item in items], ensure_ascii=False, indent=2) + "\n"
     )
-    _write_state(raw, corrected, state, cfg=cfg, source_identity=source_identity, status="success")
-    return corrected, [], False
+    _write_state(
+        raw, corrected, state, cfg=cfg, source_identity=source_identity,
+        status="semantic_pending" if semantic_pending else "success",
+    )
+    return corrected, messages, semantic_pending

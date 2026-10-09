@@ -40,12 +40,12 @@ def test_correction_failure_retries_then_updates_dialogue_and_translation(tmp_pa
     paths = Paths(tmp_path)
     assert "垃圾也杀丢" in paths.dialogue(1).read_text()
     asyncio.run(run_pipeline(cfg, None, **kwargs))
-    assert len(calls) == 2
+    assert len(calls) == 3
     assert "垃圾也没丢" in paths.dialogue(1).read_text()
     assert "垃圾也没丢" in paths.zh_subtitles(1).read_text()
     old_mtime = paths.dialogue(1).stat().st_mtime_ns
     asyncio.run(run_pipeline(cfg, None, **kwargs))
-    assert len(calls) == 2
+    assert len(calls) == 3
     assert paths.dialogue(1).stat().st_mtime_ns == old_mtime
     assert json.loads(paths.dialogue(1).read_text())["source"] == "ocr"
 
