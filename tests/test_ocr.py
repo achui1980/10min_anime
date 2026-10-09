@@ -129,6 +129,45 @@ def test_frame_text_joins_lines_top_to_bottom_with_vision_y_pointing_up():
     assert ocr.frame_text(boxes, center_tolerance=0.08) == "-快過來\n-我才不要"
 
 
+def test_frame_text_keeps_split_same_row_in_left_to_right_order_despite_y_jitter():
+    left = TextBox(text="就是說", x=0.38, y=0.173, width=0.13, height=0.10)
+    right = TextBox(text="賺了就跑", x=0.49, y=0.176, width=0.16, height=0.10)
+    lower = TextBox(text="下一行中文", x=0.36, y=0.04, width=0.28, height=0.09)
+    assert ocr.frame_text([left, right, lower], center_tolerance=0.08) == (
+        "就是說 賺了就跑\n下一行中文"
+    )
+    assert ocr.frame_text([right, left, lower], center_tolerance=0.08) == (
+        "就是說 賺了就跑\n下一行中文"
+    )
+
+
+def test_frame_text_can_exclude_a_lower_japanese_layer_after_recognition():
+    chinese = TextBox(text="而且最應該承擔風險的時機", x=0.31, y=0.168, width=0.38, height=0.228)
+    japanese = TextBox(text="老取3の", x=0.4, y=0.048, width=0.2, height=0.123)
+    # 0.95 屏幕下沿在原有裁剪图里的归一化 y 约 0.18；选文字框中心。
+    assert ocr.frame_text(
+        [chinese, japanese], center_tolerance=0.08, min_center_y=0.18
+    ) == "而且最應該承擔風險的時機"
+    assert ocr.frame_text([chinese, japanese], center_tolerance=0.08) == (
+        "而且最應該承擔風險的時機\n老取3の"
+    )
+
+
+def test_stable_frame_text_merges_an_identical_subtitle_across_y_jitter():
+    frames = []
+    for index in range(6):
+        left = TextBox(
+            text="就是說", x=0.38, y=0.174 + (index % 2) * 0.004, width=0.13, height=0.10
+        )
+        right = TextBox(
+            text="賺了就跑", x=0.49, y=0.178 - (index % 2) * 0.004, width=0.16, height=0.10
+        )
+        frames.append(
+            FrameText(index * INTERVAL, ocr.frame_text([left, right], center_tolerance=0.08))
+        )
+    assert _merge(frames) == [(0.0, 1.5, "就是說 賺了就跑")]
+
+
 @pytest.mark.parametrize(
     ("raw", "expected"),
     [
@@ -379,6 +418,20 @@ def test_recognize_asks_ffmpeg_for_cropped_gray_frames(tmp_path, monkeypatch):
     assert {kwargs["ffprobe"] for _, _, kwargs in calls["probes"]} == {"/opt/x/ffprobe"}
     assert {path for _, path, _ in calls["probes"]} == {video}
     assert calls["recognize"][0] == (ocr.OCR_WIDTH, 202, "zh-Hans")
+
+
+def test_recognize_uses_configured_crop_bottom(tmp_path, monkeypatch):
+    calls = _fake_ffmpeg(monkeypatch, ["我們走吧", "我們走吧"])
+    japanese = TextBox(text="勝 逃埗", x=0.4, y=0.03, width=0.2, height=0.149)
+    chinese = TextBox(text="我們走吧", x=0.35, y=0.178, width=0.3, height=0.218)
+    monkeypatch.setattr(ocr, "_recognize", lambda frame, **_: [chinese, japanese])
+
+    cues = ocr.recognize_cues(_video(tmp_path), ocr=OcrConfig(crop_bottom=0.95))
+
+    args = calls["args"]
+    assert "crop=1920:302:0:778,scale=1280:202," in args[args.index("-vf") + 1]
+    assert calls["frame_size"] == FRAME_SIZE
+    assert [cue.text for cue in cues] == ["我們走吧"]
 
 
 def test_recognize_applies_the_configured_min_frames(tmp_path, monkeypatch):

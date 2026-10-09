@@ -628,11 +628,12 @@ def test_ocr_config_defaults():
         cfg.enabled,
         cfg.sample_fps,
         cfg.crop_top,
+        cfg.crop_bottom,
         cfg.center_tolerance,
         cfg.similarity,
         cfg.min_frames,
         cfg.language,
-    ) == (False, 4.0, 0.72, 0.08, 0.6, 2, "zh-Hant")
+    ) == (False, 4.0, 0.72, None, 0.08, 0.6, 2, "zh-Hant")
 
 
 def test_project_config_carries_an_ocr_section():
@@ -647,6 +648,8 @@ def test_project_config_carries_an_ocr_section():
         ("crop_top", 0),
         ("crop_top", 1),
         ("crop_top", -0.1),
+        ("crop_bottom", 0),
+        ("crop_bottom", 1.1),
         ("center_tolerance", 0),
         ("center_tolerance", 0.51),
         ("similarity", 0),
@@ -659,6 +662,11 @@ def test_project_config_carries_an_ocr_section():
 def test_ocr_config_rejects_out_of_range_values(field, value):
     with pytest.raises(ValidationError):
         OcrConfig.model_validate({field: value})
+
+
+def test_ocr_config_requires_crop_bottom_below_crop_top():
+    with pytest.raises(ValidationError):
+        OcrConfig(crop_top=0.72, crop_bottom=0.72)
 
 
 @pytest.mark.parametrize(

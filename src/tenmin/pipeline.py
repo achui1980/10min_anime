@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import io
 import json
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
 
 from ruamel.yaml import YAML
@@ -17,6 +17,7 @@ from tenmin.config import EpisodeConfig, ProjectConfig, _parse_project_yaml
 from tenmin.docgen.narration import render_narration
 from tenmin.docgen.table import render_table
 from tenmin.ingest.normalize import build_track
+from tenmin.ingest.ocr_correction import select_corrected
 from tenmin.ingest.resolve import resolve_subtitle_source
 from tenmin.models import (
     DialogueTrack,
@@ -516,6 +517,58 @@ def run_ingest(cfg: ProjectConfig) -> list[DialogueTrack]:
         )
         tracks.append(track)
     return tracks
+
+
+async def run_ingest_corrected(
+    cfg: ProjectConfig, *, provider_factory: Callable[[], LLMProvider]
+) -> tuple[list[DialogueTrack], list[str], bool]:
+    """异步校对入口，保留同步 run_ingest 的既有调用契约。"""
+    paths = Paths(cfg.root)
+    tracks = []
+    warnings = []
+    pending = False
+    for episode in _active_episodes(cfg):
+        source = resolve_subtitle_source(
+            cfg.srt_path(episode),
+            cfg.video_path(episode) if episode.video is not None else None,
+            cache=paths.asr_cache(episode.number),
+            asr_config=cfg.asr,
+            hardsub=cfg.hardsub_enabled(episode),
+            ocr_cache=paths.ocr_cache(episode.number),
+            ocr_config=cfg.ocr,
+            ffmpeg_path=cfg.render.ffmpeg_path,
+            ffprobe_path=cfg.render.ffprobe_path,
+        )
+        selected = source.path
+        if source.kind == "ocr":
+            selected, messages, retry = await select_corrected(
+                source.path,
+                source.path.with_suffix(".corrected.srt"),
+                source.path.with_suffix(".ai-state.json"),
+                source.path.with_suffix(".review.json"),
+                provider_factory=provider_factory,
+                cfg=cfg.llm,
+                source_identity=_ocr_source_identity(cfg, episode),
+            )
+            warnings.extend(f"E{episode.number:02d}：{message}" for message in messages)
+            pending |= retry
+        track = build_track(
+            selected, episode=episode.number, source=source.kind,
+            glossary=cfg.glossary, convert_traditional=cfg.locale.convert_traditional,
+            show_title=cfg.show, op_range=episode.op_range, ed_range=episode.ed_range,
+            duration=_source_duration(cfg, episode), ingest=cfg.ingest, credits=cfg.credits,
+        )
+        atomic.write_text_if_changed(
+            paths.dialogue(episode.number), track.model_dump_json(indent=2)
+        )
+        tracks.append(track)
+    return tracks, warnings, pending
+
+
+def _ocr_source_identity(cfg: ProjectConfig, episode: EpisodeConfig) -> str:
+    video = cfg.video_path(episode)
+    stat = video.stat()
+    return f"{video.resolve()}:{stat.st_size}:{stat.st_mtime_ns}"
 
 
 def ingest_warnings(tracks: Sequence[DialogueTrack]) -> list[str]:
@@ -1189,6 +1242,7 @@ async def run_pipeline(
     tts_engine: TTSEngine | None = None,
     episode: int | None = None,
     reporter: ProgressReporter | None = None,
+    correction_provider_factory: Callable[[], LLMProvider] | None = None,
 ) -> list[str]:
     """返回本次运行累积的 warnings。
 
@@ -1256,11 +1310,26 @@ async def run_pipeline(
             *(config_slices.slice_path(cfg.root, "ingest", n) for n in numbers),
         ]
         stamp = config_slices.stamp_path(cfg.root, "ingest")
-        if force or not _is_fresh_stamped(outputs, inputs, stamp):
+        if force or cfg.ocr.ai_correct or not _is_fresh_stamped(outputs, inputs, stamp):
             reporter.stage_start("ingest")
             config_slices.invalidate_stamp(stamp)
-            warnings.extend(ingest_warnings(run_ingest(cfg)))
-            config_slices.touch_stamp(stamp, outputs)
+            pending = False
+            if cfg.ocr.ai_correct:
+                if correction_provider_factory is None:
+                    from tenmin.config import Settings
+                    from tenmin.script.llm import build_provider
+
+                    def correction_provider_factory():
+                        return build_provider(cfg.llm, Settings())
+                tracks, correction_warnings, pending = await run_ingest_corrected(
+                    cfg, provider_factory=correction_provider_factory
+                )
+                warnings.extend(correction_warnings)
+            else:
+                tracks = run_ingest(cfg)
+            warnings.extend(ingest_warnings(tracks))
+            if not pending:
+                config_slices.touch_stamp(stamp, outputs)
             reporter.stage_done("ingest")
         else:
             reporter.stage_skip("ingest")

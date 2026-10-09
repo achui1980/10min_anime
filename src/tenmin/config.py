@@ -21,6 +21,7 @@ from pydantic import (
     SecretStr,
     ValidationError,
     field_validator,
+    model_validator,
 )
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -552,13 +553,26 @@ class OcrConfig(StrictModel):
     # 这部番的片源带硬字幕。不做自动探测：画面里本来就有字（片头 staff、招牌、信件），
     # 误判避免不了，而且每集都要多付一轮抽样。一部番的片源通常来自同一个字幕组，声明一次就够。
     enabled: bool = False
+    # 只做文字校对；调用失败警告并使用原 OCR 字幕，下一次自动重试。
+    ai_correct: bool = False
     # 目标取样密度（每秒帧数）。实际步长是 round(源帧率 / 这个值)，所以每次取到的都是
     # 真实存在的帧。实测字幕显示时长最短 0.75 秒、p5 为 1.0 秒；降到 2 fps 丢 6 条、另有
     # 50 条只被采到 2 帧（离 min_frames 只差一帧），4 fps 是合适的密度。
     sample_fps: float = Field(default=4.0, gt=0)
-    # 裁剪区上沿占画面高度的比例，一直裁到画面底部。实测字幕纵向落在画面高度的 81%–95%，
+    # 裁剪区上沿占画面高度的比例。实测字幕纵向落在画面高度的 81%–95%，
     # 0.72 给上沿留了一整行的余量。
     crop_top: float = Field(default=0.72, gt=0, lt=1)
+    # 可选的字幕带下沿（原片高度比例）：完整裁剪帧依旧交给 Vision，之后按文字框
+    # 中心的位置筛掉下沿以下的下层日文。物理裁掉底部会让靠边的中文漏认。
+    # None 沿用原行为，不按纵向位置过滤。需针对片源抽查字幕位置后再设置。
+    crop_bottom: float | None = Field(default=None, gt=0, le=1)
+
+    @model_validator(mode="after")
+    def check_crop_bounds(self) -> OcrConfig:
+        if self.crop_bottom is not None and self.crop_bottom <= self.crop_top:
+            raise ValueError("ocr.crop_bottom 必须大于 crop_top")
+        return self
+
     # 文字框中心离水平中线的最大距离（按画面宽度的比例）。字幕水平居中，而 OP/ED 的日文
     # staff 字大多在左右两侧；0.08 刚好把两侧那批挡在外面。挡不住的是居中的那部分
     # staff（监督、原作、ED 的大块），那批交给手填的 op_range / ed_range 去剔除。

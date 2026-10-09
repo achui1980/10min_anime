@@ -11,7 +11,15 @@ import typer
 import yaml
 
 from tenmin import atomic
-from tenmin.config import DEFAULT_OCR, OcrConfig, ProjectConfig, Settings, load_project
+from tenmin.config import (
+    DEFAULT_LLM,
+    DEFAULT_OCR,
+    LLMConfig,
+    OcrConfig,
+    ProjectConfig,
+    Settings,
+    load_project,
+)
 from tenmin.ingest import ocr_batch
 from tenmin.ingest.asr import ASRError
 from tenmin.ingest.normalize import credit_range_source
@@ -485,6 +493,19 @@ OCR_CROP_TOP_OPTION = typer.Option(
     "--crop-top",
     help="从画面高度的这个比例往下裁出来识别（0~1，越小框得越高）",
 )
+OCR_CROP_BOTTOM_OPTION = typer.Option(
+    DEFAULT_OCR.crop_bottom,
+    "--crop-bottom",
+    help="字幕带下沿占画面高度的比例（按文字框中心过滤；双语字幕可排除底部日文）",
+)
+OCR_AI_CORRECT_OPTION = typer.Option(
+    False, "--ai-correct", help="用 LLM 校对 OCR 错字；失败时保留原稿"
+)
+OCR_LLM_PROVIDER_OPTION = typer.Option(
+    DEFAULT_LLM.provider, "--llm-provider", help="校对模型的 provider"
+)
+OCR_LLM_MODEL_OPTION = typer.Option(DEFAULT_LLM.model, "--llm-model", help="校对模型名称")
+OCR_LLM_BASE_URL_OPTION = typer.Option(None, "--llm-base-url", help="OpenAI 兼容服务地址")
 
 
 @app.command()
@@ -494,23 +515,42 @@ def ocr(
     simplified: bool = OCR_SIMPLIFIED_OPTION,
     force: bool = OCR_FORCE_OPTION,
     crop_top: float = OCR_CROP_TOP_OPTION,
+    crop_bottom: float | None = OCR_CROP_BOTTOM_OPTION,
+    ai_correct: bool = OCR_AI_CORRECT_OPTION,
+    llm_provider: str = OCR_LLM_PROVIDER_OPTION,
+    llm_model: str = OCR_LLM_MODEL_OPTION,
+    llm_base_url: str | None = OCR_LLM_BASE_URL_OPTION,
 ) -> None:
     """不建项目，批量把视频画面上的硬字幕认成 SRT（需 macOS + `uv sync --extra ocr`）。"""
     try:
-        ocr_config = OcrConfig(crop_top=crop_top)
+        ocr_config = OcrConfig(crop_top=crop_top, crop_bottom=crop_bottom)
         videos = ocr_batch.collect_videos(inputs)
+        llm = LLMConfig(provider=llm_provider, model=llm_model, base_url=llm_base_url)
     except (FileNotFoundError, ValueError) as error:
         typer.secho(_error_message(error), fg="red", err=True)
         raise typer.Exit(code=1) from error
     typer.echo(f"共 {len(videos)} 个视频")
     try:
-        summary = ocr_batch.run_batch(
-            videos,
-            out_dir=output,
-            simplified=simplified,
-            force=force,
-            ocr_config=ocr_config,
-        )
+        if ai_correct:
+            summary = asyncio.run(
+                ocr_batch.run_batch_corrected(
+                    videos,
+                    out_dir=output,
+                    simplified=simplified,
+                    force=force,
+                    ocr_config=ocr_config,
+                    llm_config=llm,
+                    provider_factory=lambda: build_provider(llm, Settings()),
+                )
+            )
+        else:
+            summary = ocr_batch.run_batch(
+                videos,
+                out_dir=output,
+                simplified=simplified,
+                force=force,
+                ocr_config=ocr_config,
+            )
     except OCRUnavailableError as error:
         typer.secho(_error_message(error), fg="red", err=True)
         raise typer.Exit(code=1) from error
@@ -519,5 +559,7 @@ def ocr(
     )
     for video, reason in summary.failed:
         typer.secho(f"  失败：{video.name}：{reason}", fg="red", err=True)
+    for warning in summary.warnings:
+        typer.secho(f"[warn] {warning}", fg="yellow")
     if summary.failed:
         raise typer.Exit(code=1)

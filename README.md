@@ -276,8 +276,10 @@ uv run tenmin inspect akujo --episode 11
 | 字段 | 默认 | 含义 |
 |---|---|---|
 | `enabled` | `false` | 项目级声明这部番带硬字幕；逐集 `hardsub` 优先 |
+| `ai_correct` | `false` | 可选 AI 文字校对；成功稿进入后续流程，失败警告并使用原稿 |
 | `sample_fps` | `4.0` | 每秒抽几帧去识别（与片源帧率无关，24/30/60/120fps 都是每秒 4 帧） |
 | `crop_top` | `0.72` | 从画面高度的这个比例往下裁去识别；字幕位置偏高就**调小** |
+| `crop_bottom` | 不限 | 按文字框中心过滤字幕带下沿；上下双语字幕可用来排除下层文字 |
 | `center_tolerance` | `0.08` | 文字框中心离画面中线超过这个比例就丢掉（挡两侧 staff 字） |
 | `similarity` | `0.6` | 相邻帧文字相似度不低于它就算同一条字幕 |
 | `min_frames` | `2` | 少于这么多帧出现的识别结果当噪声丢掉 |
@@ -310,12 +312,43 @@ uv run tenmin ocr ep01.mp4 --crop-top 0.65 --force
 | `--simplified` / `--traditional` | `--simplified` | 繁转简（OpenCC，与 ingest 同一个转换器）/ 保留繁体 |
 | `--force` | 关 | 输出已存在也重新识别 |
 | `--crop-top` | `0.72` | 同上表的 `crop_top`；其余旋钮用默认值 |
+| `--crop-bottom` | 不限 | 同上表的 `crop_bottom` |
+| `--ai-correct` | 关 | 识别后用 AI 校对文字，失败仍交付原稿 |
+| `--llm-provider` / `--llm-model` | `gemini` / `gemini-3.6-flash` | 独立命令的校对服务和模型 |
+| `--llm-base-url` | 无 | OpenAI 兼容服务地址 |
 
 - 输出名带语言后缀：简体 `<文件名>.zh-Hans.srt`，繁体 `<文件名>.zh-Hant.srt`，两种都跑也不会互相覆盖。
 - 输出已存在、非空且不比视频旧就跳过（打「已存在，跳过」），所以手改过的结果不会被冲掉；要重认加 `--force`。
 - 某个视频失败（没认出字幕、ffmpeg 报错等）只记下来、接着跑下一个；最后打「成功 N，跳过 N，失败 N」，
   有失败时退出码为 1。没装 `ocr` extra 会直接中止。
 - 它**不剔除 OP/ED 的 staff 字**（那要靠项目里的 `op_range` / `ed_range`），居中的 staff 字会留在 SRT 里。
+
+#### 可选 AI 错字校对（两个入口）
+
+```bash
+uv run tenmin ocr ep01.mp4 --crop-bottom 0.95 --ai-correct
+# MiniMax 示例，key 沿用 .env 中的 TENMIN_MINIMAX_API_KEY
+uv run tenmin ocr ep01.mp4 --ai-correct --llm-provider minimax --llm-model MiniMax-M3
+```
+
+项目管线在 `project.yaml` 启用，模型和 key 沿用项目的 `llm:` 与 `.env`：
+
+```yaml
+ocr:
+  enabled: true
+  ai_correct: true
+```
+
+AI 只读 OCR 文字与相邻上下文，修正能确认的错字；不确定的行保留原文并写入
+`.review.json`，不会改变 cue 数量或时间。缺 key、请求失败或逐条对齐失败时打印 warning，
+后续流程使用原稿；下次运行自动重试，无需 `--force`，也无需重新做画面 OCR。
+
+- 独立命令保留 `<stem>.zh-Hans.raw.srt`，最终字幕仍是 `<stem>.zh-Hans.srt`；繁体命名同理。
+- 项目保留 `srt/E{NN}.ocr.srt`，成功稿为 `E{NN}.ocr.corrected.srt`，由 ingest 读取后供翻译直通、解说使用。
+- `.ai-state.json` 记录来源、模型和机器输出摘要。来源未变时人工修改的终稿优先保留；
+  来源变化后使用新原稿，旧人工稿保留（独立命令另存 `.bak.srt`）。
+- 首次启用时，已有且没有原稿缓存的独立字幕会保留并警告；明确要重新识别时用 `--force`，
+  原字幕会先备份。AI 校对不是视频核验，无法保证所有错字都能修好。
 
 #### 从 OCR 到成片：一条命令
 

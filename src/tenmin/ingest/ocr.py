@@ -154,21 +154,39 @@ def normalize_ellipsis(text: str) -> str:
     return _TRAILING_DOT.sub("…", _ELLIPSIS_RUN.sub("…", text))
 
 
-def frame_text(observations: Sequence[TextBox], *, center_tolerance: float) -> str:
+def frame_text(
+    observations: Sequence[TextBox], *, center_tolerance: float, min_center_y: float = 0.0
+) -> str:
     """一帧的文字框 → 这一帧的字幕文本。空串表示这一帧没有字幕。
 
-    1. 只留文字框中心离水平中线不到 center_tolerance 的行（去掉左右两侧的 staff 字）。
+    1. 只留文字框中心离水平中线不到 center_tolerance、且纵向中心高于 min_center_y
+       的行（分别去掉两侧 staff 字及可选的下层字幕）；识别始终基于完整裁剪帧，
+       避免在物理裁剪边缘漏认中文。
     2. 去掉不含汉字的行。
-    3. 从上到下排序后用换行拼接。Vision 的 y 轴从下往上，所以按框中心的 y **降序**排。
+    3. 接近同一高度的框先按 x 从左到右拼成一行，再按 y 从上到下拼接各行。
     4. 统一省略号，去掉首尾空白。
     """
     kept = [
         box
         for box in observations
-        if abs(box.x + box.width / 2 - 0.5) < center_tolerance and _CJK.search(box.text)
+        if abs(box.x + box.width / 2 - 0.5) < center_tolerance
+        and box.y + box.height / 2 >= min_center_y
+        and _CJK.search(box.text)
     ]
     kept.sort(key=lambda box: box.y + box.height / 2, reverse=True)
-    joined = "\n".join(box.text.strip() for box in kept)
+    rows: list[list[TextBox]] = []
+    for box in kept:
+        if (
+            rows
+            and abs((rows[-1][0].y + rows[-1][0].height / 2) - (box.y + box.height / 2))
+            < min(rows[-1][0].height, box.height) / 2
+        ):
+            rows[-1].append(box)
+        else:
+            rows.append([box])
+    joined = "\n".join(
+        " ".join(box.text.strip() for box in sorted(row, key=lambda box: box.x)) for row in rows
+    )
     return normalize_ellipsis(joined).strip()
 
 
@@ -349,6 +367,9 @@ def recognize_cues(
     step = sample_step(src_fps, ocr.sample_fps)
     interval = step / src_fps
     chain, out_height = frame_filter(width=width, height=height, step=step, crop_top=ocr.crop_top)
+    # Vision 的 y 自下而上，换算时要用实际（取偶后）的裁剪高度，而不是 1-crop_top。
+    crop_height = max(2, int(height * (1 - ocr.crop_top)) // 2 * 2)
+    min_center_y = 0.0 if ocr.crop_bottom is None else height * (1 - ocr.crop_bottom) / crop_height
 
     minutes = max(1, round(duration / _REALTIME_FACTOR / 60))
     print(f"  {video.name} 开始识别画面字幕（约 {minutes} 分钟）")
@@ -358,7 +379,9 @@ def recognize_cues(
 
     def on_frame(frame: bytes) -> None:
         boxes = _recognize(frame, width=OCR_WIDTH, height=out_height, language=ocr.language)
-        texts.append(frame_text(boxes, center_tolerance=ocr.center_tolerance))
+        texts.append(
+            frame_text(boxes, center_tolerance=ocr.center_tolerance, min_center_y=min_center_y)
+        )
         report(len(texts))
 
     stderr = ffmpeg.run_raw_frames(

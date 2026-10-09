@@ -192,6 +192,7 @@ def test_changing_an_excluded_knob_changes_no_slice(tmp_path, field):
         ("asr.language", "en", {"ingest"}),
         ("ocr.enabled", True, {"ingest"}),
         ("ocr.crop_top", 0.7, {"ingest"}),
+        ("ocr.crop_bottom", 0.95, {"ingest"}),
         ("signals.min_gap_seconds", 5.0, {"signals"}),
         ("validate_script.max_beats", 7, {"script"}),
         ("target_seconds", 200.0, {"script"}),

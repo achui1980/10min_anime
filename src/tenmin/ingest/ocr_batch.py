@@ -10,17 +10,24 @@ ingest 同一个转换器），`--traditional` 保留原文。
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from tenmin import atomic
-from tenmin.config import DEFAULT_RENDER, OcrConfig
+from tenmin.config import DEFAULT_RENDER, LLMConfig, OcrConfig
 from tenmin.ingest import ocr
 from tenmin.ingest.asr import render_srt
 from tenmin.ingest.clean import to_simplified
+from tenmin.ingest.ocr_correction import (
+    correction_pending,
+    is_human_edited,
+    record_fallback,
+    select_corrected,
+)
 from tenmin.ingest.resolve import _is_usable_cache
 from tenmin.render.ffmpeg import FFmpegError
+from tenmin.script.llm import LLMProvider
 
 VIDEO_SUFFIXES = frozenset({".mp4", ".mkv", ".mov", ".m4v", ".webm", ".avi", ".ts"})
 
@@ -34,6 +41,7 @@ class BatchSummary:
     done: list[Path] = field(default_factory=list)
     skipped: list[Path] = field(default_factory=list)
     failed: list[tuple[Path, str]] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
 
 
 def collect_videos(inputs: Iterable[Path]) -> list[Path]:
@@ -105,5 +113,84 @@ def run_batch(
             cues = [cue.model_copy(update={"text": to_simplified(cue.text)}) for cue in cues]
         atomic.write_text(dest, render_srt(cues))
         print(f"  画面字幕识别完成，{len(cues)} 条 → {dest}")
+        summary.done.append(video)
+    return summary
+
+
+async def run_batch_corrected(
+    videos: Iterable[Path],
+    *,
+    out_dir: Path | None,
+    simplified: bool,
+    force: bool,
+    ocr_config: OcrConfig,
+    provider_factory: Callable[[], LLMProvider],
+    llm_config: LLMConfig,
+    ffmpeg_path: str = DEFAULT_RENDER.ffmpeg_path,
+    ffprobe_path: str = DEFAULT_RENDER.ffprobe_path,
+) -> BatchSummary:
+    """独立 OCR 的可选校对：原稿缓存与交付物分开，失败使用原稿。"""
+    summary = BatchSummary()
+    if out_dir is not None:
+        out_dir.mkdir(parents=True, exist_ok=True)
+    for video in videos:
+        dest = output_path(video, out_dir, simplified=simplified)
+        raw = dest.with_name(f"{dest.stem}.raw.srt")
+        state = dest.with_suffix(".ai-state.json")
+        review = dest.with_suffix(".review.json")
+        # 历史交付物缺少原稿和可信状态，必须先保护人工字幕。
+        if dest.is_file() and not raw.is_file() and not force:
+            summary.skipped.append(video)
+            summary.warnings.append(
+                f"{video.name}：现有 {dest.name} 无校对状态，已保留；"
+                "备份后加 --force 重新识别"
+            )
+            continue
+        try:
+            if force or not _is_usable_cache(raw, video):
+                cues = ocr.recognize_cues(
+                    video, ocr=ocr_config, ffmpeg_path=ffmpeg_path, ffprobe_path=ffprobe_path
+                )
+                if simplified:
+                    cues = [
+                        cue.model_copy(update={"text": to_simplified(cue.text)}) for cue in cues
+                    ]
+                atomic.write_text(raw, render_srt(cues))
+        except ocr.OCRUnavailableError:
+            raise
+        except _PER_VIDEO_ERRORS as exc:
+            summary.failed.append((video, str(exc)))
+            continue
+
+        if force and dest.is_file() and not state.is_file():
+            backup = dest.with_name(f"{dest.stem}.{dest.stat().st_mtime_ns}.bak.srt")
+            atomic.copy_file(dest, backup)
+            summary.warnings.append(f"{video.name}：现有字幕已备份至 {backup}")
+
+        stat = video.stat()
+        identity = f"{video.resolve()}:{stat.st_size}:{stat.st_mtime_ns}"
+        pending = correction_pending(raw, dest, state, cfg=llm_config, source_identity=identity)
+        if not force and not pending:
+            summary.skipped.append(video)
+            continue
+        chosen, warnings, _ = await select_corrected(
+            raw,
+            dest,
+            state,
+            review,
+            provider_factory=provider_factory,
+            cfg=llm_config,
+            source_identity=identity,
+            overwrite_unmanaged=force and not state.is_file(),
+        )
+        summary.warnings.extend(f"{video.name}：{message}" for message in warnings)
+        if chosen == raw:
+            if is_human_edited(dest, state):
+                # 经人工修改且来源更新：先备份，再让交付路径指向本次真实原稿。
+                backup = dest.with_name(f"{dest.stem}.{int(dest.stat().st_mtime_ns)}.bak.srt")
+                atomic.copy_file(dest, backup)
+                summary.warnings.append(f"{video.name}：旧人工字幕已备份至 {backup}")
+            atomic.copy_file(raw, dest)
+            record_fallback(raw, dest, state, cfg=llm_config, source_identity=identity)
         summary.done.append(video)
     return summary
