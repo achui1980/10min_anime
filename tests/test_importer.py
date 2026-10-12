@@ -8,6 +8,8 @@ from tenmin.importer import (
     EXTRA,
     LANGUAGE_SUFFIXES,
     Ambiguous,
+    apply_import_plan,
+    build_import_plan,
     infer_ranges,
     is_extra,
     parse_episode_number,
@@ -17,6 +19,7 @@ from tenmin.importer import (
 )
 from tenmin.ingest.normalize import build_track
 from tenmin.render.ffmpeg import FFmpegBinaryError, FFmpegError
+from tenmin.script.llm import LLMError
 
 from .fakes import FakeProvider
 
@@ -372,3 +375,221 @@ def test_infer_ranges_does_not_pin_project_defaults(tmp_path, golden_srt_path, f
     assert preview.op_range == (150.0, 225.0)
     assert preview.write is None
     assert "项目级" in preview.note
+
+
+def _season(tmp_path: Path, golden_srt_path: Path, stems: list[str]) -> Path:
+    season = tmp_path / "season"
+    season.mkdir(exist_ok=True)
+    for stem in stems:
+        _touch(season / f"{stem}.mkv")
+        _touch(season / f"{stem}.srt", golden_srt_path.read_bytes())
+    return season
+
+
+def _no_llm():
+    raise AssertionError("正则已全部命中，不该构造 provider")
+
+
+class _ClosingProvider(FakeProvider):
+    def __init__(self, responses):
+        super().__init__(responses)
+        self.closed = False
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+class _FailingProvider:
+    async def complete(self, system, user, schema=None):
+        raise LLMError("HTTP 429 限流")
+
+
+async def test_plan_never_builds_a_provider_when_regex_resolves_everything(
+    tmp_path, golden_srt_path, fixed_duration
+):
+    cfg = _project(tmp_path)
+    season = _season(tmp_path, golden_srt_path, ["Show E01", "Show E02"])
+
+    plan = await build_import_plan(cfg, season, provider_factory=_no_llm)
+
+    assert [item.number for item in plan.items] == [1, 2]
+    assert plan.items[0].ranges.write == ((153.5, 224.7), (1348.2, 1416.6))
+    assert plan.items[0].prefilled is False
+    assert plan.warnings == []
+
+
+async def test_plan_sends_only_unresolved_names_to_the_llm(
+    tmp_path, golden_srt_path, fixed_duration
+):
+    cfg = _project(tmp_path)
+    season = _season(
+        tmp_path, golden_srt_path, ["86 - 11", "Kimi no Na wa", "Mystery Bonus", "Show E01"]
+    )
+    provider = _ClosingProvider(
+        [{"files": [{"id": 1, "episode": 11}, {"id": 2}, {"id": 3, "extra": True}]}]
+    )
+
+    plan = await build_import_plan(cfg, season, provider_factory=lambda: provider)
+
+    assert [item.number for item in plan.items] == [1, 11]
+    assert [p.name for p in plan.extras] == ["Mystery Bonus.mkv"]
+    assert [s.path.name for s in plan.ambiguous] == ["Kimi no Na wa.mkv"]
+    sent = json.loads(provider.calls[0]["user"])["files"]
+    assert [f["filename"] for f in sent] == ["86 - 11", "Kimi no Na wa", "Mystery Bonus"]
+    assert provider.closed is True
+
+
+async def test_plan_skips_ambiguous_files_when_the_provider_cannot_be_built(
+    tmp_path, golden_srt_path, fixed_duration
+):
+    cfg = _project(tmp_path)
+    season = _season(tmp_path, golden_srt_path, ["86 - 11", "Show E01"])
+
+    def factory():
+        raise RuntimeError("缺少 Gemini API key，请设置环境变量 TENMIN_GEMINI_API_KEY")
+
+    plan = await build_import_plan(cfg, season, provider_factory=factory)
+
+    assert [item.number for item in plan.items] == [1]
+    assert [s.path.name for s in plan.ambiguous] == ["86 - 11.mkv"]
+    assert any("TENMIN_GEMINI_API_KEY" in w for w in plan.warnings)
+
+
+async def test_plan_skips_ambiguous_files_when_the_llm_call_fails(
+    tmp_path, golden_srt_path, fixed_duration
+):
+    cfg = _project(tmp_path)
+    season = _season(tmp_path, golden_srt_path, ["86 - 11", "Show E01"])
+
+    plan = await build_import_plan(cfg, season, provider_factory=_FailingProvider)
+
+    assert [item.number for item in plan.items] == [1]
+    assert [s.path.name for s in plan.ambiguous] == ["86 - 11.mkv"]
+    assert any("429" in w for w in plan.warnings)
+
+
+async def test_plan_skips_extras_without_asking_the_llm(tmp_path, golden_srt_path, fixed_duration):
+    cfg = _project(tmp_path)
+    season = _season(tmp_path, golden_srt_path, ["Show NCOP", "Show SP01", "Show PV", "Show E01"])
+
+    plan = await build_import_plan(cfg, season, provider_factory=_no_llm)
+
+    assert [item.number for item in plan.items] == [1]
+    assert sorted(p.name for p in plan.extras) == ["Show NCOP.mkv", "Show PV.mkv", "Show SP01.mkv"]
+
+
+async def test_plan_skips_every_file_that_shares_an_episode_number(
+    tmp_path, golden_srt_path, fixed_duration
+):
+    cfg = _project(tmp_path)
+    season = _season(tmp_path, golden_srt_path, ["Show E01", "Show EP01 v2", "Show E02"])
+
+    plan = await build_import_plan(cfg, season, provider_factory=_no_llm)
+
+    assert [item.number for item in plan.items] == [2]
+    assert sorted(s.path.name for s in plan.ambiguous) == ["Show E01.mkv", "Show EP01 v2.mkv"]
+    assert all("重复" in s.reason for s in plan.ambiguous)
+
+
+async def test_plan_skips_registered_episodes_and_fills_prefilled_ones(
+    tmp_path, golden_srt_path, fixed_duration
+):
+    cfg = _project(
+        tmp_path,
+        "episodes:\n"
+        "- number: 1\n  srt: srt/E01.srt\n"
+        "- number: 2\n  ed_range: [1300, 1420]\n"
+        "- number: 3\n",
+    )
+    season = _season(tmp_path, golden_srt_path, ["Show E01", "Show E02", "Show E03"])
+
+    plan = await build_import_plan(cfg, season, provider_factory=_no_llm)
+
+    assert [s.path.name for s in plan.registered] == ["Show E01.mkv"]
+    by_number = {item.number: item for item in plan.items}
+    assert sorted(by_number) == [2, 3]
+    assert by_number[2].prefilled is True
+    assert by_number[2].ranges.write is None
+    assert by_number[2].ranges.ed_range == (1300.0, 1420.0)
+    assert by_number[3].prefilled is True
+    assert by_number[3].ranges.write == ((153.5, 224.7), (1348.2, 1416.6))
+    assert by_number[3].invalidates_outputs is True
+    assert by_number[2].invalidates_outputs is False
+
+
+async def test_plan_keeps_unpaired_files_out_of_the_way(tmp_path, golden_srt_path, fixed_duration):
+    cfg = _project(tmp_path)
+    season = _season(tmp_path, golden_srt_path, ["Show E01"])
+    _touch(season / "Show E02.mkv")
+    _touch(season / "Other E05.srt")
+
+    plan = await build_import_plan(cfg, season, provider_factory=_no_llm)
+
+    assert [item.number for item in plan.items] == [1]
+    assert [p.name for p in plan.unpaired_videos] == ["Show E02.mkv"]
+    assert [p.name for p in plan.unpaired_srts] == ["Other E05.srt"]
+
+
+async def test_plan_records_an_unreadable_episode_and_keeps_going(
+    tmp_path, golden_srt_path, fixed_duration, monkeypatch
+):
+    cfg = _project(tmp_path)
+    season = _season(tmp_path, golden_srt_path, ["Show E01", "Show E02"])
+
+    original = infer_ranges
+
+    def fake_infer(cfg, *, number, srt, video, existing=None):
+        if number == 1:
+            raise ValueError("字幕编码无法识别")
+        return original(cfg, number=number, srt=srt, video=video, existing=existing)
+
+    monkeypatch.setattr("tenmin.importer.infer_ranges", fake_infer)
+
+    plan = await build_import_plan(cfg, season, provider_factory=_no_llm)
+
+    assert [item.number for item in plan.items] == [2]
+    assert [s.path.name for s in plan.failed] == ["Show E01.mkv"]
+    assert "字幕编码无法识别" in plan.failed[0].reason
+
+
+async def test_plan_lets_a_misconfigured_ffprobe_through(tmp_path, golden_srt_path, monkeypatch):
+    _probe(monkeypatch, FFmpegBinaryError("找不到 ffprobe"))
+    cfg = _project(tmp_path)
+    season = _season(tmp_path, golden_srt_path, ["Show E01"])
+
+    with pytest.raises(FFmpegBinaryError):
+        await build_import_plan(cfg, season, provider_factory=_no_llm)
+
+
+async def test_plan_with_unknown_duration_still_imports_without_ranges(
+    tmp_path, golden_srt_path, monkeypatch
+):
+    _probe(monkeypatch, FFmpegError("moov atom not found"))
+    cfg = _project(tmp_path)
+    season = _season(tmp_path, golden_srt_path, ["Show E01"])
+
+    plan = await build_import_plan(cfg, season, provider_factory=_no_llm)
+
+    assert [item.number for item in plan.items] == [1]
+    assert plan.items[0].ranges.write is None
+
+
+async def test_apply_registers_items_and_writes_only_the_planned_ranges(
+    tmp_path, golden_srt_path, fixed_duration
+):
+    cfg = _project(tmp_path, "episodes:\n- number: 2\n  ed_range: [1300, 1420]\n")
+    season = _season(tmp_path, golden_srt_path, ["Show E01", "Show E02"])
+    plan = await build_import_plan(cfg, season, provider_factory=_no_llm)
+
+    apply_import_plan(cfg, plan)
+
+    reloaded = load_project(cfg.config_path)
+    by_number = {e.number: e for e in reloaded.episodes}
+    assert by_number[1].srt == Path("srt/E01.srt")
+    assert by_number[1].video == (season / "Show E01.mkv").resolve()
+    assert by_number[1].op_range == (153.5, 224.7)
+    assert by_number[1].ed_range == (1348.2, 1416.6)
+    assert by_number[2].op_range is None
+    assert by_number[2].ed_range == (1300.0, 1420.0)
+    assert (cfg.root / "srt" / "E01.srt").read_bytes() == golden_srt_path.read_bytes()
+    assert (cfg.root / "srt" / "E02.srt").is_file()

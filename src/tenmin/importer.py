@@ -8,18 +8,20 @@ from __future__ import annotations
 import json
 import re
 import unicodedata
-from collections.abc import Sequence
+from collections import Counter
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from decimal import ROUND_HALF_UP, Decimal
 from pathlib import Path
 from typing import Literal
 
+import httpx
 from pydantic import BaseModel
 
 from tenmin.config import EpisodeConfig, ProjectConfig
 from tenmin.ingest.normalize import build_track, credit_range_source
 from tenmin.ingest.ocr_batch import VIDEO_SUFFIXES
-from tenmin.pipeline import _source_duration
+from tenmin.pipeline import _source_duration, register_episode
 from tenmin.script.llm import LLMProvider
 
 # 视频主体后面允许跟的语言后缀。顺序就是同一视频命中多个候选 SRT 时的优先级
@@ -345,3 +347,166 @@ def infer_ranges(
     if op is None or ed is None:
         return preview(note="取整到 0.1 秒后区间无效，两个都不写")
     return preview(write=(op, ed))
+
+
+@dataclass(frozen=True)
+class Skipped:
+    """跳过的一个视频及原因（给预览用）。"""
+
+    path: Path
+    reason: str
+
+
+@dataclass(frozen=True)
+class ImportItem:
+    number: int
+    pair: Pair
+    prefilled: bool
+    ranges: RangePreview
+
+    @property
+    def invalidates_outputs(self) -> bool:
+        """补齐来源的预填集要写区间：EPISODE 配置切片含 op_range/ed_range，
+        这一集已有的 ingest/timeline/audio/render 产物会失效重跑，预览要提示。"""
+        return self.prefilled and self.ranges.write is not None
+
+
+@dataclass
+class ImportPlan:
+    items: list[ImportItem] = field(default_factory=list)
+    registered: list[Skipped] = field(default_factory=list)
+    ambiguous: list[Skipped] = field(default_factory=list)
+    failed: list[Skipped] = field(default_factory=list)
+    extras: list[Path] = field(default_factory=list)
+    unpaired_videos: list[Path] = field(default_factory=list)
+    unpaired_srts: list[Path] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+
+
+# LLM 兜底调用失败的形态：LLMError（RuntimeError 子类）、没被包装的 httpx 传输异常、
+# 以及 schema 校验失败的 pydantic ValidationError（ValueError 子类）。
+_LLM_CALL_FAILURES = (RuntimeError, ValueError, httpx.HTTPError)
+
+
+def _describe(error: BaseException) -> str:
+    return str(error) or type(error).__name__
+
+
+async def _llm_numbers(
+    pending: list[Pair],
+    provider_factory: Callable[[], LLMProvider],
+    plan: ImportPlan,
+) -> list[tuple[int, Pair]]:
+    """正则没认出来的那批文件交给 LLM。provider 只在这里、且确实有待判文件时才构造。
+
+    构造失败（缺 key）或调用失败都不中断命令：这批文件按歧义跳过并给一条 warning，
+    正则已判定的集照常导入。
+    """
+    if not pending:
+        return []
+
+    def skip_all(reason: str) -> list[tuple[int, Pair]]:
+        plan.ambiguous.extend(Skipped(pair.video, reason) for pair in pending)
+        return []
+
+    try:
+        provider = provider_factory()
+    except (RuntimeError, ValueError) as error:
+        plan.warnings.append(
+            f"LLM 兜底不可用（{_describe(error)}），{len(pending)} 个文件按集号无法确定跳过"
+        )
+        return skip_all("文件名里认不出集号，LLM 兜底不可用")
+    try:
+        verdicts = await resolve_ambiguous([pair.video.stem for pair in pending], provider)
+    except _LLM_CALL_FAILURES as error:
+        plan.warnings.append(
+            f"LLM 兜底调用失败（{_describe(error)}），{len(pending)} 个文件按集号无法确定跳过"
+        )
+        return skip_all("文件名里认不出集号，LLM 兜底调用失败")
+    finally:
+        aclose = getattr(provider, "aclose", None)
+        if aclose is not None:
+            await aclose()
+
+    numbered: list[tuple[int, Pair]] = []
+    for pair, verdict in zip(pending, verdicts, strict=True):
+        if verdict == EXTRA:
+            plan.extras.append(pair.video)
+        elif verdict is None:
+            plan.ambiguous.append(Skipped(pair.video, "文件名里认不出集号，LLM 也无法确定"))
+        else:
+            numbered.append((verdict, pair))
+    return numbered
+
+
+async def build_import_plan(
+    cfg: ProjectConfig,
+    video_dir: Path,
+    srt_dir: Path | None = None,
+    *,
+    provider_factory: Callable[[], LLMProvider],
+) -> ImportPlan:
+    """扫描、识别集号、分拣，并对可导入集做区间推断。全程只读，不写任何文件。
+
+    分拣顺序：非正片 → 集号（正则，再 LLM 兜底）→ 重复集号（同号文件全部跳过，
+    不靠排序挑一个）→ 已登记且有来源（跳过，不替换来源、不覆盖区间）→ 其余可导入
+    （预填条目补齐来源、保留已有区间）。`FFmpegBinaryError` 原样外抛。
+    """
+    scan = scan_directory(video_dir, srt_dir)
+    plan = ImportPlan(
+        unpaired_videos=list(scan.unpaired_videos), unpaired_srts=list(scan.unpaired_srts)
+    )
+    numbered: list[tuple[int, Pair]] = []
+    pending: list[Pair] = []
+    for pair in scan.pairs:
+        if is_extra(pair.video.stem):
+            plan.extras.append(pair.video)
+            continue
+        verdict = parse_episode_number(pair.video.stem)
+        if isinstance(verdict, int):
+            numbered.append((verdict, pair))
+        else:
+            pending.append(pair)
+    numbered.extend(await _llm_numbers(pending, provider_factory, plan))
+
+    counts = Counter(number for number, _ in numbered)
+    by_number = {episode.number: episode for episode in cfg.episodes}
+    for number, pair in sorted(numbered, key=lambda item: (item[0], item[1].video.name)):
+        if counts[number] > 1:
+            plan.ambiguous.append(Skipped(pair.video, f"集号 {number} 重复，同号文件都跳过"))
+            continue
+        existing = by_number.get(number)
+        if existing is not None and existing.has_source:
+            plan.registered.append(
+                Skipped(pair.video, f"第 {number} 集已登记，跳过（不替换来源、不覆盖区间）")
+            )
+            continue
+        try:
+            ranges = infer_ranges(
+                cfg, number=number, srt=pair.srt, video=pair.video, existing=existing
+            )
+        except (ValueError, OSError) as error:
+            plan.failed.append(Skipped(pair.video, f"字幕读不出来：{_describe(error)}"))
+            continue
+        plan.items.append(
+            ImportItem(number=number, pair=pair, prefilled=existing is not None, ranges=ranges)
+        )
+    return plan
+
+
+def apply_import_plan(cfg: ProjectConfig, plan: ImportPlan) -> ProjectConfig:
+    """按确认过的计划逐集登记：拷 SRT 到 srt/E{NN}.srt、记视频绝对路径、写区间建议。
+
+    每一集各自原子写回 project.yaml，不做跨集事务：中途失败时已登记的集保留。
+    """
+    for item in plan.items:
+        op_range, ed_range = item.ranges.write if item.ranges.write is not None else (None, None)
+        cfg = register_episode(
+            cfg,
+            episode=item.number,
+            srt=item.pair.srt,
+            video=item.pair.video,
+            op_range=op_range,
+            ed_range=ed_range,
+        )
+    return cfg
