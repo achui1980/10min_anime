@@ -3625,6 +3625,134 @@ def test_reregistering_changes_only_that_entrys_source_lines(tmp_path, golden_sr
     assert "    op_range: [153.5, 224.7]" in after.splitlines()
 
 
+def _tiny_srt(path: Path) -> Path:
+    path.write_text("1\n00:00:01,000 --> 00:00:02,000\n台词\n", encoding="utf-8")
+    return path
+
+
+def test_register_episode_writes_both_ranges_for_a_new_entry(tmp_path):
+    root = tmp_path / "saijo"
+    (root / "srt").mkdir(parents=True)
+    yaml_path = root / "project.yaml"
+    yaml_path.write_text(_COMMENTED_YAML, encoding="utf-8")
+    cfg = load_project(yaml_path)
+    video = tmp_path / "e04.mkv"
+    video.write_bytes(b"fake")
+
+    register_episode(
+        cfg,
+        episode=4,
+        srt=_tiny_srt(tmp_path / "e04.srt"),
+        video=video,
+        op_range=(90.0, 180.5),
+        ed_range=(1348.2, 1416.6),
+    )
+
+    after = yaml_path.read_text(encoding="utf-8")
+    assert _removed_lines(_COMMENTED_YAML, after) == []
+    lines = after.splitlines()
+    assert "    op_range: [90.0, 180.5]" in lines
+    assert "    ed_range: [1348.2, 1416.6]" in lines
+    episode4 = next(e for e in load_project(yaml_path).episodes if e.number == 4)
+    assert episode4.op_range == (90.0, 180.5)
+    assert episode4.ed_range == (1348.2, 1416.6)
+    assert (root / "srt" / "E04.srt").is_file()
+
+
+def test_register_episode_fills_ranges_of_an_empty_prefilled_entry(tmp_path):
+    root = tmp_path / "saijo"
+    (root / "srt").mkdir(parents=True)
+    yaml_path = root / "project.yaml"
+    before = "show: 才女的侍从\nslug: saijo\nepisodes:\n- number: 5\n"
+    yaml_path.write_text(before, encoding="utf-8")
+    cfg = load_project(yaml_path)
+    video = tmp_path / "e05.mkv"
+    video.write_bytes(b"fake")
+
+    register_episode(
+        cfg,
+        episode=5,
+        srt=_tiny_srt(tmp_path / "e05.srt"),
+        video=video,
+        op_range=(90.0, 180.5),
+        ed_range=(1348.2, 1416.6),
+    )
+
+    lines = yaml_path.read_text(encoding="utf-8").splitlines()
+    assert "  op_range: [90.0, 180.5]" in lines
+    assert "  ed_range: [1348.2, 1416.6]" in lines
+    reloaded = load_project(yaml_path)
+    assert [e.number for e in reloaded.episodes] == [5]
+    assert reloaded.episodes[0].op_range == (90.0, 180.5)
+
+
+def test_register_episode_never_overrides_a_partial_manual_range(tmp_path):
+    root = tmp_path / "saijo"
+    (root / "srt").mkdir(parents=True)
+    yaml_path = root / "project.yaml"
+    yaml_path.write_text(_COMMENTED_YAML, encoding="utf-8")
+    cfg = load_project(yaml_path)
+    video = tmp_path / "e03.mkv"
+    video.write_bytes(b"fake")
+
+    register_episode(
+        cfg,
+        episode=3,
+        srt=_tiny_srt(tmp_path / "e03.srt"),
+        video=video,
+        op_range=(90.0, 180.5),
+        ed_range=(1348.2, 1416.6),
+    )
+
+    after = yaml_path.read_text(encoding="utf-8")
+    assert _removed_lines(_COMMENTED_YAML, after) == []
+    assert "[90.0, 180.5]" not in after
+    episode3 = next(e for e in load_project(yaml_path).episodes if e.number == 3)
+    assert episode3.op_range is None
+    assert episode3.ed_range == (1300.0, 1420.0)
+
+
+def test_register_episode_rejects_half_a_range_before_touching_anything(tmp_path):
+    root = tmp_path / "saijo"
+    (root / "srt").mkdir(parents=True)
+    yaml_path = root / "project.yaml"
+    yaml_path.write_text(_COMMENTED_YAML, encoding="utf-8")
+    cfg = load_project(yaml_path)
+
+    with pytest.raises(ValueError, match="同时"):
+        register_episode(
+            cfg,
+            episode=4,
+            srt=_tiny_srt(tmp_path / "e04.srt"),
+            video=tmp_path / "e04.mkv",
+            op_range=(90.0, 180.5),
+        )
+
+    assert not (root / "srt" / "E04.srt").exists()
+    assert yaml_path.read_text(encoding="utf-8") == _COMMENTED_YAML
+
+
+def test_register_episode_rejects_an_inverted_range_before_copying(tmp_path):
+    root = tmp_path / "saijo"
+    (root / "srt").mkdir(parents=True)
+    yaml_path = root / "project.yaml"
+    yaml_path.write_text(_COMMENTED_YAML, encoding="utf-8")
+    cfg = load_project(yaml_path)
+
+    with pytest.raises(ValueError):
+        register_episode(
+            cfg,
+            episode=4,
+            srt=_tiny_srt(tmp_path / "e04.srt"),
+            video=tmp_path / "e04.mkv",
+            op_range=(180.5, 90.0),
+            ed_range=(1348.2, 1416.6),
+        )
+
+    assert not (root / "srt" / "E04.srt").exists()
+    assert yaml_path.read_text(encoding="utf-8") == _COMMENTED_YAML
+
+
 def test_register_episode_preserves_four_space_mapping_indent(tmp_path):
     root = tmp_path / "saijo"
     root.mkdir()

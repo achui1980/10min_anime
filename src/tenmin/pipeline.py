@@ -787,8 +787,10 @@ def _find_episode(cfg: ProjectConfig, episode_number: int) -> EpisodeConfig:
     )
 
 
-def _write_back_episode(yaml_path: Path, entry: EpisodeConfig) -> None:
-    """只更新这一集的来源字段，保留其它 YAML 节点的注释、顺序与格式。
+def _write_back_episode(
+    yaml_path: Path, entry: EpisodeConfig, *, write_ranges: bool = False
+) -> None:
+    """只更新这一集的来源字段（write_ranges 时连同 OP/ED 区间），保留其它节点的注释、顺序与格式。
 
     从原文件猜序列缩进，兼容 init 的顶格列表和手写的缩进列表；
     长路径不折行。整份结果经原子写替换，避免中断损坏已登记的集数。
@@ -842,13 +844,25 @@ def _write_back_episode(yaml_path: Path, entry: EpisodeConfig) -> None:
     else:
         target["srt"] = entry.srt.as_posix()
     target["video"] = str(entry.video)
+    if write_ranges:
+        # flow 序列写成 `op_range: [153.5, 224.7]`，跟手写的形状一致。
+        for key in ("op_range", "ed_range"):
+            value = CommentedSeq(list(getattr(entry, key)))
+            value.fa.set_flow_style()
+            target[key] = value
     buffer = io.StringIO()
     round_trip.dump(data, buffer)
     atomic.write_text(yaml_path, buffer.getvalue())
 
 
 def register_episode(
-    cfg: ProjectConfig, *, episode: int, srt: Path | None, video: Path
+    cfg: ProjectConfig,
+    *,
+    episode: int,
+    srt: Path | None,
+    video: Path,
+    op_range: tuple[float, float] | None = None,
+    ed_range: tuple[float, float] | None = None,
 ) -> ProjectConfig:
     """把这一集登记进 project.yaml：SRT 拷进项目目录，视频只记路径不拷。
 
@@ -879,11 +893,20 @@ def register_episode(
     其余集、以及 yaml 里别的一切（注释、键序、引号）都由 _write_back_episode 原样保留，
     存量的相对路径（work/saijo/ 下 10 个已经拷好的 mp4）逐字节不变，video_path() 照旧按
     project.yaml 所在目录解析。
+
+    op_range / ed_range 是 `tenmin import` 用的推断建议，必须成对给：这两个字段直接
+    驱动 credits 识别窗，只写一半会把另一半的窗彻底关掉。只有这一集现有的 op_range 与
+    ed_range **都为空**时才写入；任一已有手填值时两个都不动，绝不覆盖人工配置。
     """
     # cfg 可能在载入后被人手改了文件；再次校验磁盘上的 YAML，避免拷好字幕
     # 才由 round-trip parser 报错，留下没有登记成功的 SRT。
     _parse_project_yaml(cfg.config_path)
     # 在拷贝字幕或改写配置之前检查输入，给出可读的错误并避免部分登记。
+    if (op_range is None) != (ed_range is None):
+        raise ValueError("op_range 与 ed_range 必须同时给出：只写一半会关掉另一半的识别窗")
+    if op_range is not None:
+        # 跟加载 project.yaml 时同一套区间校验（起点 < 终点、不为负），抛 ValueError。
+        EpisodeConfig(number=episode, op_range=op_range, ed_range=ed_range)
     if srt is not None and not Path(srt).is_file():
         raise FileNotFoundError(f"找不到要登记的字幕文件：{srt}")
 
@@ -900,16 +923,29 @@ def register_episode(
     video_source = Path(video).resolve()
 
     existing = next((e for e in cfg.episodes if e.number == episode), None)
+    write_ranges = False
     if existing is not None:
-        # 预填条目也走这条：只改 srt/video，op_range/ed_range 原样留着。
+        # 预填条目也走这条：只改 srt/video，已有的 op_range/ed_range 原样留着；
+        # 两个都空时才接受这次给的建议。
         existing.srt = relative_srt
         existing.video = video_source
+        if op_range is not None and existing.op_range is None and existing.ed_range is None:
+            existing.op_range = op_range
+            existing.ed_range = ed_range
+            write_ranges = True
         entry = existing
     else:
-        entry = EpisodeConfig(number=episode, srt=relative_srt, video=video_source)
+        entry = EpisodeConfig(
+            number=episode,
+            srt=relative_srt,
+            video=video_source,
+            op_range=op_range,
+            ed_range=ed_range,
+        )
+        write_ranges = op_range is not None
         cfg.episodes.append(entry)
 
-    _write_back_episode(cfg.config_path, entry)
+    _write_back_episode(cfg.config_path, entry, write_ranges=write_ranges)
 
     return cfg
 
