@@ -10,12 +10,16 @@ import re
 import unicodedata
 from collections.abc import Sequence
 from dataclasses import dataclass, field
+from decimal import ROUND_HALF_UP, Decimal
 from pathlib import Path
 from typing import Literal
 
 from pydantic import BaseModel
 
+from tenmin.config import EpisodeConfig, ProjectConfig
+from tenmin.ingest.normalize import build_track, credit_range_source
 from tenmin.ingest.ocr_batch import VIDEO_SUFFIXES
+from tenmin.pipeline import _source_duration
 from tenmin.script.llm import LLMProvider
 
 # 视频主体后面允许跟的语言后缀。顺序就是同一视频命中多个候选 SRT 时的优先级
@@ -246,3 +250,98 @@ async def resolve_ambiguous(
         else:
             verdicts.append(None)
     return verdicts
+
+
+_TENTH = Decimal("0.1")
+
+
+def round_range(value: tuple[float, float]) -> tuple[float, float] | None:
+    """四舍五入到 0.1 秒（半入，经 str 走 Decimal，避免二进制浮点的 0.25 → 0.2）。
+
+    取整后 start >= end 返回 None：调用方把它当推断失败，不写入。
+    """
+    start, end = (float(Decimal(str(x)).quantize(_TENTH, rounding=ROUND_HALF_UP)) for x in value)
+    if start >= end:
+        return None
+    return (start, end)
+
+
+@dataclass(frozen=True)
+class RangePreview:
+    """一集的区间预览。
+
+    op_range / ed_range 是 build_track 实际给出的值（含已有手填/项目默认），给人看；
+    write 是确认后要写进 project.yaml 的那一对（已取整），None 表示一个都不写，
+    note 说明为什么不写。
+    """
+
+    duration: float | None
+    op_range: tuple[float, float] | None
+    ed_range: tuple[float, float] | None
+    write: tuple[tuple[float, float], tuple[float, float]] | None
+    note: str | None = None
+
+
+def infer_ranges(
+    cfg: ProjectConfig,
+    *,
+    number: int,
+    srt: Path,
+    video: Path,
+    existing: EpisodeConfig | None = None,
+) -> RangePreview:
+    """用 ingest 同一套 build_track 推断这一集的 OP/ED，并决定写不写。
+
+    片长走 pipeline._source_duration：`FFmpegBinaryError`（ffprobe 配错）照旧外抛，
+    其余探测失败降级为 None —— 此时 build_track 会退化到字幕末尾，ED 口径不可信，
+    所以不写。existing 是预填条目：把它已有的区间原样喂给 build_track，预览才跟
+    之后真正的 ingest 一致。
+
+    写入规则（OP/ED 两个字段直接驱动 credits 识别窗，只写一半会把另一半的窗关掉）：
+    已有任一手填值 → 不写；片长未知 → 不写；项目级默认区间在这一集生效 → 不写
+    （那不是推断值，钉成逐集值只会让项目默认以后改不动这一集）；OP 或 ED 任一推不出
+    → 都不写；取整后任一区间无效 → 都不写。
+    """
+    duration = _source_duration(cfg, EpisodeConfig(number=number, video=Path(video).resolve()))
+    manual_op = existing.op_range if existing is not None else None
+    manual_ed = existing.ed_range if existing is not None else None
+    track = build_track(
+        srt,
+        episode=number,
+        source="srt",
+        glossary=cfg.glossary,
+        convert_traditional=cfg.locale.convert_traditional,
+        show_title=cfg.show,
+        op_range=manual_op,
+        ed_range=manual_ed,
+        duration=duration,
+        ingest=cfg.ingest,
+        credits=cfg.credits,
+    )
+
+    def preview(write=None, note=None) -> RangePreview:
+        return RangePreview(
+            duration=duration,
+            op_range=track.op_range,
+            ed_range=track.ed_range,
+            write=write,
+            note=note,
+        )
+
+    if manual_op is not None or manual_ed is not None:
+        return preview(note="已有手填区间，原样保留")
+    if duration is None:
+        return preview(note="片长未知，不写区间")
+    sources = {
+        credit_range_source(None, cfg.credits.default_op_range, track.duration),
+        credit_range_source(None, cfg.credits.default_ed_range, track.duration),
+    }
+    if sources != {"inferred"}:
+        return preview(note="项目级默认区间生效，不写逐集区间")
+    if track.op_range is None or track.ed_range is None:
+        return preview(note="OP 与 ED 未能都识别，两个都不写")
+    op = round_range(track.op_range)
+    ed = round_range(track.ed_range)
+    if op is None or ed is None:
+        return preview(note="取整到 0.1 秒后区间无效，两个都不写")
+    return preview(write=(op, ed))

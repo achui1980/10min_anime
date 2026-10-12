@@ -3,15 +3,20 @@ from pathlib import Path
 
 import pytest
 
+from tenmin.config import EpisodeConfig, ProjectConfig, load_project
 from tenmin.importer import (
     EXTRA,
     LANGUAGE_SUFFIXES,
     Ambiguous,
+    infer_ranges,
     is_extra,
     parse_episode_number,
     resolve_ambiguous,
+    round_range,
     scan_directory,
 )
+from tenmin.ingest.normalize import build_track
+from tenmin.render.ffmpeg import FFmpegBinaryError, FFmpegError
 
 from .fakes import FakeProvider
 
@@ -248,3 +253,122 @@ async def test_resolve_ambiguous_with_no_stems_makes_no_call():
 
     assert await resolve_ambiguous([], provider) == []
     assert provider.calls == []
+
+
+def _project(tmp_path: Path, extra_yaml: str = "episodes: []\n") -> ProjectConfig:
+    root = tmp_path / "work" / "saijo"
+    (root / "srt").mkdir(parents=True)
+    (root / "project.yaml").write_text(
+        "show: 才女的侍从\nslug: saijo\n" + extra_yaml, encoding="utf-8"
+    )
+    return load_project(root / "project.yaml")
+
+
+def _probe(monkeypatch, result):
+    """把 pipeline._source_duration 用的 ffprobe 换成固定结果（数字）或固定异常。"""
+
+    def fake_probe(path, *, ffprobe):
+        if isinstance(result, BaseException):
+            raise result
+        return result
+
+    monkeypatch.setattr("tenmin.pipeline.probe_duration", fake_probe)
+
+
+@pytest.fixture
+def fixed_duration(monkeypatch):
+    _probe(monkeypatch, 1420.0)
+
+
+def test_round_range_rounds_half_up_to_a_tenth():
+    assert round_range((153.486, 224.681)) == (153.5, 224.7)
+    assert round_range((0.25, 0.35)) == (0.3, 0.4)
+
+
+def test_round_range_rejects_a_collapsed_range():
+    assert round_range((10.02, 10.04)) is None
+    assert round_range((10.06, 10.04)) is None
+
+
+def test_infer_ranges_matches_build_track_and_writes_both(
+    tmp_path, golden_srt_path, fixed_duration
+):
+    cfg = _project(tmp_path)
+    video = _touch(tmp_path / "e02.mkv")
+
+    preview = infer_ranges(cfg, number=2, srt=golden_srt_path, video=video)
+
+    track = build_track(
+        golden_srt_path,
+        episode=2,
+        show_title=cfg.show,
+        glossary=cfg.glossary,
+        convert_traditional=cfg.locale.convert_traditional,
+        duration=1420.0,
+        ingest=cfg.ingest,
+        credits=cfg.credits,
+    )
+    assert preview.duration == 1420.0
+    assert preview.op_range == track.op_range
+    assert preview.ed_range == track.ed_range
+    assert preview.write == ((153.5, 224.7), (1348.2, 1416.6))
+    assert preview.note is None
+
+
+def test_infer_ranges_writes_nothing_when_only_op_is_found(tmp_path, golden_srt_path, monkeypatch):
+    _probe(monkeypatch, 1500.0)
+    cfg = _project(tmp_path)
+    video = _touch(tmp_path / "e02.mkv")
+
+    preview = infer_ranges(cfg, number=2, srt=golden_srt_path, video=video)
+
+    assert preview.op_range == (153.486, 224.681)
+    assert preview.ed_range is None
+    assert preview.write is None
+    assert "都不写" in preview.note
+
+
+def test_infer_ranges_writes_nothing_when_duration_is_unknown(
+    tmp_path, golden_srt_path, monkeypatch
+):
+    _probe(monkeypatch, FFmpegError("moov atom not found"))
+    cfg = _project(tmp_path)
+    video = _touch(tmp_path / "e02.mkv")
+
+    preview = infer_ranges(cfg, number=2, srt=golden_srt_path, video=video)
+
+    assert preview.duration is None
+    assert preview.write is None
+    assert "片长未知" in preview.note
+
+
+def test_infer_ranges_lets_a_misconfigured_ffprobe_through(tmp_path, golden_srt_path, monkeypatch):
+    _probe(monkeypatch, FFmpegBinaryError("找不到 ffprobe"))
+    cfg = _project(tmp_path)
+    video = _touch(tmp_path / "e02.mkv")
+
+    with pytest.raises(FFmpegBinaryError):
+        infer_ranges(cfg, number=2, srt=golden_srt_path, video=video)
+
+
+def test_infer_ranges_keeps_existing_manual_ranges(tmp_path, golden_srt_path, fixed_duration):
+    cfg = _project(tmp_path)
+    video = _touch(tmp_path / "e03.mkv")
+    existing = EpisodeConfig(number=3, ed_range=(1300.0, 1420.0))
+
+    preview = infer_ranges(cfg, number=3, srt=golden_srt_path, video=video, existing=existing)
+
+    assert preview.ed_range == (1300.0, 1420.0)
+    assert preview.write is None
+    assert "已有手填区间" in preview.note
+
+
+def test_infer_ranges_does_not_pin_project_defaults(tmp_path, golden_srt_path, fixed_duration):
+    cfg = _project(tmp_path, "credits:\n  default_op_range: [150, 225]\nepisodes: []\n")
+    video = _touch(tmp_path / "e02.mkv")
+
+    preview = infer_ranges(cfg, number=2, srt=golden_srt_path, video=video)
+
+    assert preview.op_range == (150.0, 225.0)
+    assert preview.write is None
+    assert "项目级" in preview.note
