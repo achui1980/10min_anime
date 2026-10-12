@@ -1,8 +1,10 @@
 import json
+from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
 
 import pytest
 
+from tenmin import importer
 from tenmin.config import EpisodeConfig, ProjectConfig, load_project
 from tenmin.importer import (
     EXTRA,
@@ -424,6 +426,160 @@ def test_infer_ranges_does_not_pin_project_defaults(tmp_path, golden_srt_path, f
     assert "项目级" in preview.note
 
 
+def test_av_side_is_frozen_and_defaults_are_optional():
+    assert hasattr(importer, "AvSide")
+    side = importer.AvSide((100.0, 190.0))
+    assert (side.distance, side.reason, side.estimated) == (None, None, False)
+    with pytest.raises(FrozenInstanceError):
+        side.range = None
+
+
+def test_infer_ranges_combines_av_op_with_subtitle_ed(tmp_path, golden_srt_path, fixed_duration):
+    assert hasattr(importer, "AvSide")
+    preview = infer_ranges(
+        _project(tmp_path),
+        number=2,
+        srt=golden_srt_path,
+        video=_touch(tmp_path / "e02.mkv"),
+        op_av=importer.AvSide((100.25, 190.35), distance=4, estimated=True),
+    )
+
+    assert preview.op_range == (100.25, 190.35)
+    assert preview.ed_range == (1348.18, 1416.622)
+    assert preview.write == ((100.3, 190.4), (1348.2, 1416.6))
+    assert (preview.op_source, preview.ed_source) == ("av", "subtitle")
+    assert (preview.op_distance, preview.ed_distance) == (4, None)
+    assert preview.op_length_estimated is True
+
+
+def test_infer_ranges_failed_av_ed_never_falls_back_to_subtitles(
+    tmp_path, golden_srt_path, fixed_duration
+):
+    assert hasattr(importer, "AvSide")
+    preview = infer_ranges(
+        _project(tmp_path),
+        number=2,
+        srt=golden_srt_path,
+        video=_touch(tmp_path / "e02.mkv"),
+        ed_av=importer.AvSide(None, distance=28, reason="ED 截图未匹配"),
+    )
+
+    assert preview.op_range == (153.486, 224.681)
+    assert preview.ed_range is None
+    assert preview.write is None
+    assert (preview.op_source, preview.ed_source) == ("subtitle", "av")
+    assert (preview.op_distance, preview.ed_distance) == (None, 28)
+    assert preview.note == "OP 与 ED 未能都识别，两个都不写（ED 截图未匹配）"
+
+
+def test_infer_ranges_joins_only_failed_av_reasons(tmp_path, golden_srt_path, fixed_duration):
+    assert hasattr(importer, "AvSide")
+    preview = infer_ranges(
+        _project(tmp_path),
+        number=2,
+        srt=golden_srt_path,
+        video=_touch(tmp_path / "e02.mkv"),
+        op_av=importer.AvSide(None, reason="OP 截图未匹配"),
+        ed_av=importer.AvSide(None, reason="ED 音频未识别"),
+    )
+    assert preview.write is None
+    assert preview.note == "OP 与 ED 未能都识别，两个都不写（OP 截图未匹配；ED 音频未识别）"
+
+
+def test_infer_ranges_without_av_labels_subtitle_sources(tmp_path, golden_srt_path, fixed_duration):
+    preview = infer_ranges(
+        _project(tmp_path),
+        number=2,
+        srt=golden_srt_path,
+        video=_touch(tmp_path / "e02.mkv"),
+    )
+    assert hasattr(preview, "op_source")
+    assert (preview.op_source, preview.ed_source) == ("subtitle", "subtitle")
+    assert (preview.op_distance, preview.ed_distance) == (None, None)
+    assert preview.op_length_estimated is False
+    assert preview.write == _WRITE
+
+
+@pytest.mark.parametrize("manual_side", ["op", "ed"])
+def test_infer_ranges_manual_side_preserves_track_and_ignores_av(
+    tmp_path, golden_srt_path, fixed_duration, manual_side
+):
+    assert hasattr(importer, "AvSide")
+    cfg = _project(tmp_path)
+    existing = EpisodeConfig(number=2, **{f"{manual_side}_range": (100.0, 190.0)})
+    video = _touch(tmp_path / "e02.mkv")
+    original = infer_ranges(cfg, number=2, srt=golden_srt_path, video=video, existing=existing)
+    preview = infer_ranges(
+        cfg,
+        number=2,
+        srt=golden_srt_path,
+        video=video,
+        existing=existing,
+        op_av=importer.AvSide((200.0, 290.0), distance=0, estimated=True),
+        ed_av=importer.AvSide(None, distance=30, reason="未匹配"),
+    )
+    assert preview == original
+    assert (preview.op_source, preview.ed_source) == (None, None)
+    assert (preview.op_distance, preview.ed_distance) == (None, None)
+    assert preview.op_length_estimated is False
+    assert preview.write is None
+
+
+def test_infer_ranges_project_defaults_preserve_unlabelled_track_despite_av(
+    tmp_path, golden_srt_path, fixed_duration
+):
+    assert hasattr(importer, "AvSide")
+    cfg = _project(tmp_path, "credits:\n  default_op_range: [150, 225]\nepisodes: []\n")
+    video = _touch(tmp_path / "e02.mkv")
+    original = infer_ranges(cfg, number=2, srt=golden_srt_path, video=video)
+    preview = infer_ranges(
+        cfg,
+        number=2,
+        srt=golden_srt_path,
+        video=video,
+        op_av=importer.AvSide((200.0, 290.0), distance=0, estimated=True),
+    )
+    assert preview == original
+    assert (preview.op_source, preview.ed_source) == (None, None)
+    assert preview.op_length_estimated is False
+    assert preview.write is None
+
+
+def test_infer_ranges_unknown_duration_never_writes_av_ranges(
+    tmp_path, golden_srt_path, monkeypatch
+):
+    assert hasattr(importer, "AvSide")
+    _probe(monkeypatch, FFmpegError("moov atom not found"))
+    preview = infer_ranges(
+        _project(tmp_path),
+        number=2,
+        srt=golden_srt_path,
+        video=_touch(tmp_path / "e02.mkv"),
+        op_av=importer.AvSide((100.0, 190.0)),
+        ed_av=importer.AvSide((1300.0, 1400.0)),
+    )
+    assert preview.duration is None
+    assert preview.op_range == (100.0, 190.0)
+    assert preview.ed_range == (1300.0, 1400.0)
+    assert preview.write is None
+    assert preview.note == "片长未知，不写区间"
+
+
+def test_infer_ranges_collapsed_av_range_prevents_both_writes(
+    tmp_path, golden_srt_path, fixed_duration
+):
+    assert hasattr(importer, "AvSide")
+    preview = infer_ranges(
+        _project(tmp_path),
+        number=2,
+        srt=golden_srt_path,
+        video=_touch(tmp_path / "e02.mkv"),
+        op_av=importer.AvSide((10.02, 10.04)),
+    )
+    assert preview.write is None
+    assert preview.note == "取整到 0.1 秒后区间无效，两个都不写"
+
+
 def _season(tmp_path: Path, golden_srt_path: Path, stems: list[str]) -> Path:
     season = tmp_path / "season"
     season.mkdir(exist_ok=True)
@@ -691,6 +847,46 @@ def test_preview_marks_unknown_duration_and_unrecognised_ranges():
     assert "片长未知" in text
     assert "ED：未识别" in text
     assert "不写区间：片长未知，不写区间" in text
+
+
+@pytest.mark.parametrize("ed", [(1348.18, 1416.622), None])
+def test_preview_labels_both_av_sides_with_distances_even_when_failed(ed):
+    item = _item(2, ed=ed, write=None, note="两个都不写")
+    assert hasattr(item.ranges, "op_source")
+    item = replace(
+        item,
+        ranges=replace(
+            item.ranges,
+            op_source="av",
+            ed_source="av",
+            op_distance=0,
+            ed_distance=28,
+        ),
+    )
+    text = "\n".join(render_preview(ImportPlan(items=[item])))
+    assert "OP：153.5–224.7 秒（画面+音频，距离 0/64）" in text
+    expected_ed = "未识别" if ed is None else "1348.2–1416.6 秒"
+    assert f"ED：{expected_ed}（画面+音频，距离 28/64）" in text
+
+
+def test_preview_shows_subtitle_label_without_distance_and_estimated_op_line():
+    item = _item(2)
+    assert hasattr(item.ranges, "op_source")
+    item = replace(
+        item,
+        ranges=replace(
+            item.ranges,
+            op_source="av",
+            ed_source="subtitle",
+            op_length_estimated=True,
+        ),
+    )
+    lines = render_preview(ImportPlan(items=[item]))
+    assert "OP：153.5–224.7 秒（画面+音频）" in lines[2]
+    assert "ED：1348.2–1416.6 秒（字幕推断）" in lines[2]
+    assert "距离" not in lines[2]
+    assert "       OP 长度按 90 秒估计" in lines
+    assert "OP 长度按" not in "\n".join(render_preview(ImportPlan(items=[_item(1)])))
 
 
 def test_preview_warns_that_prefilled_episodes_will_rerun():

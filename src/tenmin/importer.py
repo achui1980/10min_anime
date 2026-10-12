@@ -19,6 +19,7 @@ import httpx
 from pydantic import BaseModel
 
 from tenmin.config import EpisodeConfig, ProjectConfig
+from tenmin.ingest import av_match
 from tenmin.ingest.normalize import build_track, credit_range_source
 from tenmin.ingest.ocr_batch import VIDEO_SUFFIXES
 from tenmin.pipeline import _source_duration, register_episode
@@ -31,6 +32,7 @@ LANGUAGE_SUFFIXES = ("zh-Hans", "zh-Hant", "sc", "tc", "chs", "cht", "zh", "ja",
 _LANGUAGE_SEPARATORS = (".", "_")
 REFERENCE_SIDES = ("op", "ed")
 REFERENCE_SUFFIXES = frozenset({".png", ".jpg", ".jpeg"})
+SOURCE_LABELS = {"av": "画面+音频", "subtitle": "字幕推断"}
 
 
 @dataclass(frozen=True)
@@ -291,10 +293,20 @@ def round_range(value: tuple[float, float]) -> tuple[float, float] | None:
 
 
 @dataclass(frozen=True)
+class AvSide:
+    """一侧的画面+音频识别结果；range 为空表示识别失败，不能回落到字幕。"""
+
+    range: tuple[float, float] | None
+    distance: int | None = None
+    reason: str | None = None
+    estimated: bool = False
+
+
+@dataclass(frozen=True)
 class RangePreview:
     """一集的区间预览。
 
-    op_range / ed_range 是 build_track 实际给出的值（含已有手填/项目默认），给人看；
+    op_range / ed_range 是按侧选择的识别值（已有手填/项目默认时用 build_track 原值）；
     write 是确认后要写进 project.yaml 的那一对（已取整），None 表示一个都不写，
     note 说明为什么不写。
     """
@@ -304,6 +316,11 @@ class RangePreview:
     ed_range: tuple[float, float] | None
     write: tuple[tuple[float, float], tuple[float, float]] | None
     note: str | None = None
+    op_source: str | None = None
+    ed_source: str | None = None
+    op_distance: int | None = None
+    ed_distance: int | None = None
+    op_length_estimated: bool = False
 
 
 def infer_ranges(
@@ -313,6 +330,8 @@ def infer_ranges(
     srt: Path,
     video: Path,
     existing: EpisodeConfig | None = None,
+    op_av: AvSide | None = None,
+    ed_av: AvSide | None = None,
 ) -> RangePreview:
     """用 ingest 同一套 build_track 推断这一集的 OP/ED，并决定写不写。
 
@@ -320,6 +339,7 @@ def infer_ranges(
     其余探测失败降级为 None —— 此时 build_track 会退化到字幕末尾，ED 口径不可信，
     所以不写。existing 是预填条目：把它已有的区间原样喂给 build_track，预览才跟
     之后真正的 ingest 一致。
+    提供 AvSide 的侧使用其结果，识别失败也不回落到字幕；其余侧用字幕推断。
 
     写入规则（OP/ED 两个字段直接驱动 credits 识别窗，只写一半会把另一半的窗关掉）：
     已有任一手填值 → 不写；片长未知 → 不写；项目级默认区间在这一集生效 → 不写
@@ -343,29 +363,54 @@ def infer_ranges(
         credits=cfg.credits,
     )
 
+    op_range, ed_range = track.op_range, track.ed_range
+    op_source = ed_source = None
+    op_distance = ed_distance = None
+    op_length_estimated = False
+
     def preview(write=None, note=None) -> RangePreview:
         return RangePreview(
             duration=duration,
-            op_range=track.op_range,
-            ed_range=track.ed_range,
+            op_range=op_range,
+            ed_range=ed_range,
             write=write,
             note=note,
+            op_source=op_source,
+            ed_source=ed_source,
+            op_distance=op_distance,
+            ed_distance=ed_distance,
+            op_length_estimated=op_length_estimated,
         )
 
     if manual_op is not None or manual_ed is not None:
         return preview(note="已有手填区间，原样保留")
-    if duration is None:
-        return preview(note="片长未知，不写区间")
     sources = {
         credit_range_source(None, cfg.credits.default_op_range, track.duration),
         credit_range_source(None, cfg.credits.default_ed_range, track.duration),
     }
     if sources != {"inferred"}:
         return preview(note="项目级默认区间生效，不写逐集区间")
-    if track.op_range is None or track.ed_range is None:
-        return preview(note="OP 与 ED 未能都识别，两个都不写")
-    op = round_range(track.op_range)
-    ed = round_range(track.ed_range)
+    op_range = op_av.range if op_av is not None else track.op_range
+    ed_range = ed_av.range if ed_av is not None else track.ed_range
+    op_source = "av" if op_av is not None else "subtitle"
+    ed_source = "av" if ed_av is not None else "subtitle"
+    op_distance = op_av.distance if op_av is not None else None
+    ed_distance = ed_av.distance if ed_av is not None else None
+    op_length_estimated = op_av.estimated if op_av is not None else False
+    if duration is None:
+        return preview(note="片长未知，不写区间")
+    if op_range is None or ed_range is None:
+        note = "OP 与 ED 未能都识别，两个都不写"
+        reasons = [
+            side.reason
+            for side in (op_av, ed_av)
+            if side is not None and side.range is None and side.reason
+        ]
+        if reasons:
+            note += "（" + "；".join(reasons) + "）"
+        return preview(note=note)
+    op = round_range(op_range)
+    ed = round_range(ed_range)
     if op is None or ed is None:
         return preview(note="取整到 0.1 秒后区间无效，两个都不写")
     return preview(write=(op, ed))
@@ -540,6 +585,18 @@ def _format_range(value: tuple[float, float] | None) -> str:
     return f"{value[0]:.1f}–{value[1]:.1f} 秒"
 
 
+def _format_side(
+    value: tuple[float, float] | None, source: str | None, distance: int | None
+) -> str:
+    text = _format_range(value)
+    if source is None:
+        return text
+    label = SOURCE_LABELS[source]
+    if distance is not None:
+        label += f"，距离 {distance}/{av_match.HASH_BITS}"
+    return f"{text}（{label}）"
+
+
 def render_preview(plan: ImportPlan) -> list[str]:
     """逐项预览：集数、视频、SRT、片长、OP/ED、是否写入区间，以及各类跳过项。"""
     lines = [f"可导入 {len(plan.items)} 集："]
@@ -551,9 +608,12 @@ def render_preview(plan: ImportPlan) -> list[str]:
         )
         duration = "片长未知" if ranges.duration is None else f"片长 {ranges.duration:.1f} 秒"
         lines.append(
-            f"       {duration}  OP：{_format_range(ranges.op_range)}  "
-            f"ED：{_format_range(ranges.ed_range)}"
+            f"       {duration}  "
+            f"OP：{_format_side(ranges.op_range, ranges.op_source, ranges.op_distance)}  "
+            f"ED：{_format_side(ranges.ed_range, ranges.ed_source, ranges.ed_distance)}"
         )
+        if ranges.op_length_estimated:
+            lines.append(f"       OP 长度按 {av_match.DEFAULT_OP_LENGTH:g} 秒估计")
         if ranges.write is not None:
             op, ed = ranges.write
             lines.append(f"       将写入区间：op_range {list(op)}，ed_range {list(ed)}")
