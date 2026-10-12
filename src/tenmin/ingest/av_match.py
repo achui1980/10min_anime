@@ -109,7 +109,8 @@ def sample_hashes(
         raise ffmpeg.FFmpegError(
             f"ffmpeg 帧数 {len(hashes)} 与时间戳数 {len(times)} 不一致：\n{ffmpeg.tail(stderr)}"
         )
-    return list(zip(times, hashes, strict=True))
+    # fps 会按采样网格舍入并补帧；先验证完整输出对齐，再剔除搜索窗口外的帧。
+    return [(time, value) for time, value in zip(times, hashes, strict=True) if start <= time < end]
 
 
 def image_hash(image: Path, *, ffmpeg_path: str = ffmpeg.FFMPEG) -> int:

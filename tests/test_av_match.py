@@ -329,6 +329,36 @@ def test_sample_hashes_empty_interval_does_no_io(monkeypatch, end):
     assert av_match.sample_hashes(Path("video.mkv"), 10, end, 2) == []
 
 
+def test_sample_hashes_filters_fractional_window_without_losing_hash_alignment(monkeypatch):
+    pts = [-0.1, 0, 0.05, 0.09, 0.1, 0.2]
+    frames = [bytes([i]) * HASH_BYTES for i in range(len(pts))]
+    frames[2] = bytes(reversed(range(HASH_BYTES)))
+
+    def run(args, *, frame_size, on_frame, ffmpeg):
+        for frame in frames:
+            on_frame(frame)
+        return "\n".join(
+            f"[Parsed_showinfo_3 @ abc] n: {i} pts: {i} pts_time:{value} fmt:gray"
+            for i, value in enumerate(pts)
+        )
+
+    monkeypatch.setattr(ffmpeg, "run_raw_frames", run)
+    assert av_match.sample_hashes(Path("video.mkv"), 1.31, 1.40, 10) == [
+        (1.31, dhash(frames[1])),
+        (1.36, dhash(frames[2])),
+    ]
+
+
+def test_sample_hashes_validates_count_before_filtering_outside_window(monkeypatch):
+    monkeypatch.setattr(
+        ffmpeg,
+        "run_raw_frames",
+        lambda *a, **kw: "[Parsed_showinfo_3 @ abc] n: 0 pts: 1 pts_time:0.1 fmt:gray",
+    )
+    with pytest.raises(ffmpeg.FFmpegError, match="帧数 0 与时间戳数 1 不一致"):
+        av_match.sample_hashes(Path("video.mkv"), 1.31, 1.40, 10)
+
+
 @pytest.mark.parametrize("count", [0, 1, 2])
 def test_image_hash_requires_one_frame_and_shared_scale_chain(monkeypatch, count):
     frame = bytes(reversed(range(HASH_BYTES)))
@@ -448,6 +478,35 @@ def test_real_sample_hashes_reports_absolute_timestamps(av_video):
     samples = av_match.sample_hashes(av_video, 1, 5, 2)
     assert len(samples) == 8
     assert [time for time, _ in samples] == pytest.approx([1 + 0.5 * i for i in range(8)], abs=0.05)
+
+
+@pytest.mark.render
+def test_real_sample_hashes_excludes_fps_rounding_past_fractional_window(av_video, tmp_path):
+    video = tmp_path / "five-fps.mkv"
+    subprocess.run(
+        [
+            ffmpeg.FFMPEG,
+            "-nostdin",
+            "-hide_banner",
+            "-v",
+            "error",
+            "-y",
+            "-i",
+            str(av_video),
+            "-vf",
+            "fps=5",
+            "-an",
+            "-c:v",
+            "libx264",
+            str(video),
+        ],
+        check=True,
+        capture_output=True,
+        stdin=subprocess.DEVNULL,
+    )
+    samples = av_match.sample_hashes(video, 1.31, 1.40, 10)
+    assert all(1.31 <= time < 1.40 for time, _ in samples)
+    assert samples == []
 
 
 @pytest.mark.render
