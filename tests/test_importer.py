@@ -176,3 +176,33 @@ def test_is_extra_flags_non_main_material(stem):
 @pytest.mark.parametrize("stem", ["Spy x Family - 01", "Show - 01", "Nova E02"])
 def test_is_extra_leaves_main_episodes_alone(stem):
     assert is_extra(stem) is False
+
+
+@pytest.mark.parametrize(
+    ("stem", "expected"),
+    [
+        ("Show - 05 [E3A1B2C4]", 5),
+        ("[Group] Show - 07 [1080p][e3a1b2c4]", 7),
+        ("Show S01E05 [E3A1B2C4]", 5),
+        ("Show E05v2", 5),
+        ("Show S01E05v2", 5),
+        ("Show E3A1", None),
+    ],
+)
+def test_parse_strong_pattern_ignores_crc_tags_and_allows_version_suffix(stem, expected):
+    assert parse_episode_number(stem) == expected
+
+
+@pytest.mark.parametrize(
+    ("stem", "expected"),
+    [
+        ("Show - 03v2", 3),
+        ("Show - 03V2 [1080p]", 3),
+        ("Show - 08 [DDP5.1]", 8),
+        ("Show - 08 [DD5.1]", 8),
+        ("Show - 08 [AAC 5.1ch]", 8),
+        ("Show - 08 [2.0ch]", 8),
+    ],
+)
+def test_parse_weak_pattern_version_suffix_and_channel_tokens(stem, expected):
+    assert parse_episode_number(stem) == expected

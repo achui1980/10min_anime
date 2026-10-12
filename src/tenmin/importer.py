@@ -108,20 +108,29 @@ class Ambiguous:
     candidates: tuple[int, ...]
 
 
+# 匹配任何模式之前先剔掉的方括号 CRC32 校验码（`[E3A1B2C4]`）：它以 `E`+数字开头时
+# 会被强模式当成集号，纯数字时又会在弱模式里多出一个候选。
+_CRC_TAG = re.compile(r"\[[0-9A-Fa-f]{8}\]")
+
+# 集号数字后面允许跟的版本后缀（`03v2` = 第 3 集的第 2 版）。
+_VERSION = r"(?:v[0-9]+)?"
+
 # 第一级强模式。全部在 NFKC 归一（全角数字/字母 → 半角）之后匹配。
-# `E` 前面不许是字母，挡掉 `WEB`、`THE01` 这类误命中；S01E01 也会被第二条命中，
+# `E` 前面不许是字母，挡掉 `WEB`、`THE01` 这类误命中；数字（含版本后缀）后面不许紧跟
+# 字母数字，挡掉没加方括号的十六进制串（`E3A1`）。S01E01 也会被第二条命中，
 # 两条给出同一个数字，去重后不构成歧义。
 _STRONG_PATTERNS = (
-    re.compile(r"S[0-9]{1,2}E([0-9]{1,3})(?![0-9])", re.IGNORECASE),
-    re.compile(r"(?<![A-Za-z])EP?([0-9]{1,3})(?![0-9])", re.IGNORECASE),
+    re.compile(rf"S[0-9]{{1,2}}E([0-9]{{1,3}}){_VERSION}(?![A-Za-z0-9])", re.IGNORECASE),
+    re.compile(rf"(?<![A-Za-z])EP?([0-9]{{1,3}}){_VERSION}(?![A-Za-z0-9])", re.IGNORECASE),
     re.compile(r"第\s*([0-9]{1,3})\s*[集話话]"),
 )
 
-# 第二级之前先剔掉的噪声 token：分辨率、编码、位深、音频编码（含声道写法 AAC2.0）、
-# 四位年份。两侧不许紧挨字母数字，免得啃掉标题的一部分。
+# 第二级之前先剔掉的噪声 token：分辨率、编码、位深、音频编码（含声道写法 AAC2.0、
+# DDP5.1）、独立的声道写法（5.1ch）、四位年份。两侧不许紧挨字母数字，免得啃掉标题的一部分。
 _NOISE = re.compile(
     r"(?<![A-Za-z0-9])(?:"
-    r"[0-9]{3,4}p|4k|[xh]\.?26[45]|avc|hevc|(?:aac|flac|opus)(?:[0-9]\.[0-9])?"
+    r"[0-9]{3,4}p|4k|[xh]\.?26[45]|avc|hevc|(?:aac|flac|opus|ddp?)(?:[0-9]\.[0-9])?"
+    r"|[0-9]\.[0-9]ch"
     r"|[0-9]{1,2}bit|(?:19|20)[0-9]{2}"
     r")(?![A-Za-z0-9])",
     re.IGNORECASE,
@@ -130,7 +139,7 @@ _NOISE = re.compile(
 # 第二级的分隔符：spec 列的 `-`、空白、`[`、`]`、`.`、`_`，外加中日文命名常见的
 # 全角/半角圆括号与 `【】`（只会让更多「被分隔符包住的数字」露出来，不会制造新的歧义判定）。
 _WEAK_SEPARATORS = re.compile(r"[-\s\[\]._()（）【】]+")
-_WEAK_NUMBER = re.compile(r"[0-9]{1,3}")
+_WEAK_NUMBER = re.compile(rf"([0-9]{{1,3}}){_VERSION}", re.IGNORECASE)
 
 # 非正片素材。ASCII 关键词两侧不许是字母（`Spy` 不算 SP、`Nova` 不算 OVA），
 # 后面跟数字照样算（NCED1、SP01）。
@@ -161,16 +170,19 @@ def _verdict(numbers: list[int]) -> int | Ambiguous | None:
 def parse_episode_number(stem: str) -> int | Ambiguous | None:
     """从文件名主体里认集号。纯函数，完全离线。
 
-    强模式（E01 / EP01 / S01E01 / 第01集 / 第01話）任一命中就只看强模式；全部未命中
-    才走弱模式：剔掉噪声 token 后，被分隔符包围的 1–3 位数字。剩一个 → 集号；
+    先剔掉方括号 CRC32 校验码。强模式（E01 / EP01 / S01E01 / 第01集 / 第01話，
+    E/S..E 两种允许 `v2` 版本后缀）任一命中就只看强模式；全部未命中才走弱模式：
+    剔掉噪声 token 后，被分隔符包围的 1–3 位数字（可带 `v2` 后缀）。剩一个 → 集号；
     一个都没有 → None；不止一个 → Ambiguous。**绝不**按排序顺序补集号。
     """
-    text = _normalize(stem)
+    text = _CRC_TAG.sub(" ", _normalize(stem))
     strong = [int(m.group(1)) for pattern in _STRONG_PATTERNS for m in pattern.finditer(text)]
     if strong:
         return _verdict(strong)
     cleaned = _NOISE.sub(" ", text)
     weak = [
-        int(token) for token in _WEAK_SEPARATORS.split(cleaned) if _WEAK_NUMBER.fullmatch(token)
+        int(match.group(1))
+        for token in _WEAK_SEPARATORS.split(cleaned)
+        if (match := _WEAK_NUMBER.fullmatch(token))
     ]
     return _verdict(weak)
