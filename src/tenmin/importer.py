@@ -23,6 +23,7 @@ from tenmin.ingest import av_match
 from tenmin.ingest.normalize import build_track, credit_range_source
 from tenmin.ingest.ocr_batch import VIDEO_SUFFIXES
 from tenmin.pipeline import _source_duration, register_episode
+from tenmin.render.ffmpeg import FFmpegBinaryError, FFmpegError
 from tenmin.script.llm import LLMProvider
 
 # 视频主体后面允许跟的语言后缀。顺序就是同一视频命中多个候选 SRT 时的优先级
@@ -33,6 +34,8 @@ _LANGUAGE_SEPARATORS = (".", "_")
 REFERENCE_SIDES = ("op", "ed")
 REFERENCE_SUFFIXES = frozenset({".png", ".jpg", ".jpeg"})
 SOURCE_LABELS = {"av": "画面+音频", "subtitle": "字幕推断"}
+OP_SEARCH_SECONDS = 300
+ED_SEARCH_SECONDS = 180
 
 
 @dataclass(frozen=True)
@@ -302,6 +305,172 @@ class AvSide:
     estimated: bool = False
 
 
+def reference_hashes(cfg: ProjectConfig, references: dict[str, Path]) -> dict[str, int]:
+    """先验证全部截图，坏图必须在 LLM 兜底与导入写入之前报错。"""
+    hashes = {}
+    for side, path in references.items():
+        try:
+            hashes[side] = av_match.image_hash(path, ffmpeg_path=cfg.render.ffmpeg_path)
+        except FFmpegBinaryError:
+            raise
+        except FFmpegError as error:
+            raise ValueError(
+                f"参考截图读不出来：{path}（{_first_line(error)}）。换一张或删掉它再导入"
+            ) from error
+    return hashes
+
+
+def _locate_side(
+    cfg: ProjectConfig, video: Path, ref: int, *, label: str, start: float, end: float
+) -> av_match.Match | AvSide:
+    try:
+        match = av_match.locate(
+            video, ref, start=start, end=end, ffmpeg_path=cfg.render.ffmpeg_path
+        )
+    except FFmpegBinaryError:
+        raise
+    except FFmpegError as error:
+        return AvSide(None, reason=f"{label} 抽帧失败：{_first_line(error)}")
+    if match is None:
+        return AvSide(None, reason=f"{label} 搜索窗内没有画面")
+    if match.distance > av_match.MAX_DISTANCE:
+        return AvSide(
+            None,
+            distance=match.distance,
+            reason=f"{label} 画面对不上（最佳距离 {match.distance}/64，超过 12/64）",
+        )
+    return match
+
+
+def _envelope(cfg: ProjectConfig, video: Path, start: float):
+    return av_match.audio_envelope(
+        av_match.read_pcm(
+            video, start, av_match.REFERENCE_SECONDS, ffmpeg_path=cfg.render.ffmpeg_path
+        )
+    )
+
+
+def _op_sides(
+    cfg: ProjectConfig, starts: dict[int, tuple[Path, float, av_match.Match]]
+) -> dict[int, AvSide]:
+    """选画面距离最小的集作音频参考，每集只读一次并共用稳健长度。"""
+    if not starts:
+        return {}
+    sides: dict[int, AvSide] = {}
+    usable = dict(starts)
+    length = av_match.DEFAULT_OP_LENGTH
+    estimated = True
+    if len(starts) > 1:
+        reference = min(starts, key=lambda n: (starts[n][2].distance, n))
+        video, _, match = starts[reference]
+        try:
+            ref_env = _envelope(cfg, video, match.time)
+        except FFmpegBinaryError:
+            raise
+        except FFmpegError as error:
+            reason = f"OP 参考集 E{reference:02d} 的音频读不出来：{_first_line(error)}"
+            return {
+                n: AvSide(None, distance=m.distance, reason=reason)
+                for n, (_, _, m) in starts.items()
+            }
+        lengths = []
+        for number, (video, _, match) in starts.items():
+            if number == reference:
+                continue
+            try:
+                env = _envelope(cfg, video, match.time)
+            except FFmpegBinaryError:
+                raise
+            except FFmpegError as error:
+                sides[number] = AvSide(
+                    None, distance=match.distance, reason=f"OP 音频读不出来：{_first_line(error)}"
+                )
+                del usable[number]
+                continue
+            measured = av_match.op_length(ref_env, env)
+            if measured is not None:
+                lengths.append(measured)
+        if lengths:
+            length = av_match.median_length(lengths)
+            if length is None:
+                values = "、".join(f"{value:g}" for value in sorted(lengths))
+                reason = f"各集 OP 长度相差太大（{values} 秒），定不了终点"
+                sides.update(
+                    {
+                        n: AvSide(None, distance=m.distance, reason=reason)
+                        for n, (_, _, m) in usable.items()
+                    }
+                )
+                return sides
+            estimated = False
+    sides.update(
+        {
+            number: AvSide(
+                (match.time, min(match.time + length, duration)),
+                distance=match.distance,
+                estimated=estimated,
+            )
+            for number, (_, duration, match) in usable.items()
+        }
+    )
+    return sides
+
+
+def match_credits(
+    cfg: ProjectConfig,
+    candidates: Sequence[tuple[int, Pair, EpisodeConfig | None]],
+    references: dict[str, int],
+) -> dict[int, tuple[AvSide | None, AvSide | None]]:
+    """对无手填区间的候选集做有界画面搜索，再批量确定 OP 长度。"""
+    if not references:
+        return {}
+    eligible = [
+        (number, pair)
+        for number, pair, existing in candidates
+        if existing is None or (existing.op_range is None and existing.ed_range is None)
+    ]
+    results: dict[int, tuple[AvSide | None, AvSide | None]] = {}
+    starts: dict[int, tuple[Path, float, av_match.Match]] = {}
+    for index, (number, pair) in enumerate(eligible, start=1):
+        print(f"正在匹配画面 {index}/{len(eligible)}")
+        video = pair.video.resolve()
+        duration = _source_duration(cfg, EpisodeConfig(number=number, video=video))
+        if duration is None:
+            failed = AvSide(None, reason="片长未知，没做画面匹配")
+            results[number] = (
+                failed if references.get("op") is not None else None,
+                failed if references.get("ed") is not None else None,
+            )
+            continue
+        op = ed = None
+        if (ref := references.get("op")) is not None:
+            found = _locate_side(
+                cfg, video, ref, label="OP", start=0, end=min(OP_SEARCH_SECONDS, duration)
+            )
+            if isinstance(found, av_match.Match):
+                starts[number] = (video, duration, found)
+            else:
+                op = found
+        if (ref := references.get("ed")) is not None:
+            found = _locate_side(
+                cfg,
+                video,
+                ref,
+                label="ED",
+                start=max(0, duration - ED_SEARCH_SECONDS),
+                end=duration,
+            )
+            ed = (
+                AvSide((found.time, duration), distance=found.distance)
+                if isinstance(found, av_match.Match)
+                else found
+            )
+        results[number] = (op, ed)
+    for number, op in _op_sides(cfg, starts).items():
+        results[number] = (op, results[number][1])
+    return results
+
+
 @dataclass(frozen=True)
 class RangePreview:
     """一集的区间预览。
@@ -459,6 +628,10 @@ def _describe(error: BaseException) -> str:
     return str(error) or type(error).__name__
 
 
+def _first_line(error: BaseException) -> str:
+    return _describe(error).splitlines()[0]
+
+
 async def _llm_numbers(
     pending: list[Pair],
     provider_factory: Callable[[], LLMProvider],
@@ -520,6 +693,7 @@ async def build_import_plan(
     （预填条目补齐来源、保留已有区间）。`FFmpegBinaryError` 原样外抛。
     """
     scan = scan_directory(video_dir, srt_dir)
+    references = reference_hashes(cfg, scan.references)
     plan = ImportPlan(
         unpaired_videos=list(scan.unpaired_videos), unpaired_srts=list(scan.unpaired_srts)
     )
@@ -538,6 +712,7 @@ async def build_import_plan(
 
     counts = Counter(number for number, _ in numbered)
     by_number = {episode.number: episode for episode in cfg.episodes}
+    candidates: list[tuple[int, Pair, EpisodeConfig | None]] = []
     for number, pair in sorted(numbered, key=lambda item: (item[0], item[1].video.name)):
         if counts[number] > 1:
             plan.ambiguous.append(Skipped(pair.video, f"集号 {number} 重复，同号文件都跳过"))
@@ -548,9 +723,19 @@ async def build_import_plan(
                 Skipped(pair.video, f"第 {number} 集已登记，跳过（不替换来源、不覆盖区间）")
             )
             continue
+        candidates.append((number, pair, existing))
+    matched = match_credits(cfg, candidates, references)
+    for number, pair, existing in candidates:
+        op_av, ed_av = matched.get(number, (None, None))
         try:
             ranges = infer_ranges(
-                cfg, number=number, srt=pair.srt, video=pair.video, existing=existing
+                cfg,
+                number=number,
+                srt=pair.srt,
+                video=pair.video,
+                existing=existing,
+                op_av=op_av,
+                ed_av=ed_av,
             )
         except (ValueError, OSError) as error:
             plan.failed.append(Skipped(pair.video, f"字幕读不出来：{_describe(error)}"))

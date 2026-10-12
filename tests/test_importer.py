@@ -2,6 +2,7 @@ import json
 from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 from tenmin import importer
@@ -25,6 +26,7 @@ from tenmin.importer import (
     round_range,
     scan_directory,
 )
+from tenmin.ingest import av_match
 from tenmin.ingest.normalize import build_track
 from tenmin.render.ffmpeg import FFmpegBinaryError, FFmpegError
 from tenmin.script.llm import LLMError
@@ -741,10 +743,10 @@ async def test_plan_records_an_unreadable_episode_and_keeps_going(
 
     original = infer_ranges
 
-    def fake_infer(cfg, *, number, srt, video, existing=None):
+    def fake_infer(cfg, *, number, srt, video, existing=None, **kwargs):
         if number == 1:
             raise ValueError("字幕编码无法识别")
-        return original(cfg, number=number, srt=srt, video=video, existing=existing)
+        return original(cfg, number=number, srt=srt, video=video, existing=existing, **kwargs)
 
     monkeypatch.setattr("tenmin.importer.infer_ranges", fake_infer)
 
@@ -925,3 +927,265 @@ def test_preview_lists_every_skipped_category():
     assert "非正片跳过：\n  Show NCOP.mkv" in text
     assert "未配对视频：\n  Show E07.mkv" in text
     assert "未配对字幕：\n  Other.srt" in text
+
+
+@pytest.fixture
+def av_season(tmp_path, golden_srt_path, monkeypatch, fixed_duration):
+    """只替换媒体 IO；画面搜索与音频包络、长度、中位数计算都用真实实现。"""
+    cfg = _project(tmp_path)
+    cfg.render.ffmpeg_path = "custom-ffmpeg"
+    season = _season(tmp_path, golden_srt_path, ["Show E01", "Show E02", "Show E03"])
+    for side in ("op", "ed"):
+        _touch(season / f"{side}.png")
+    state = {
+        "starts": {1: 12.0, 2: 40.5, 3: 100.3},
+        "ends": {1: 1330.0, 2: 1325.2, 3: 1340.0},
+        "lengths": {1: 90, 2: 90, 3: 90},
+        "distances": {},
+        "frame_errors": {},
+        "audio_errors": {},
+        "windows": [],
+        "reads": [],
+        "images": [],
+        "empty": False,
+    }
+    shared = np.random.default_rng(42).normal(0, 5000, 150 * av_match.SAMPLE_RATE)
+
+    def number(video):
+        return parse_episode_number(video.stem)
+
+    def image_hash(path, *, ffmpeg_path):
+        assert ffmpeg_path == "custom-ffmpeg"
+        state["images"].append(path.name)
+        return 0 if path.stem == "op" else (1 << 64) - 1
+
+    def sample_hashes(video, start, end, fps, *, ffmpeg_path):
+        assert ffmpeg_path == "custom-ffmpeg"
+        n = number(video)
+        state["windows"].append((n, start, end, fps))
+        if n in state["frame_errors"]:
+            raise state["frame_errors"][n]
+        if state["empty"]:
+            return []
+        samples = []
+        for i in range(int(np.ceil((end - start) * fps))):
+            time = round(start + i / fps, 3)
+            if not start <= time < end:
+                continue
+            value = (1 << 32) - 1
+            if state["starts"][n] <= time < state["starts"][n] + 2:
+                value = (1 << state["distances"].get(n, 0)) - 1
+            if state["ends"][n] <= time < state["ends"][n] + 2:
+                value = (1 << 64) - 1
+            samples.append((time, value))
+        return samples
+
+    def read_pcm(video, start, duration, *, ffmpeg_path):
+        assert ffmpeg_path == "custom-ffmpeg"
+        n = number(video)
+        state["reads"].append((n, start, duration))
+        if n in state["audio_errors"]:
+            raise state["audio_errors"][n]
+        samples = np.random.default_rng(n).normal(0, 5000, len(shared))
+        stop = state["lengths"][n] * av_match.SAMPLE_RATE
+        samples[:stop] = shared[:stop]
+        return samples.astype("<i2").tobytes()
+
+    monkeypatch.setattr(av_match, "image_hash", image_hash)
+    monkeypatch.setattr(av_match, "sample_hashes", sample_hashes)
+    monkeypatch.setattr(av_match, "read_pcm", read_pcm)
+    return cfg, season, state
+
+
+async def _av_plan(av_season):
+    cfg, season, _ = av_season
+    return await build_import_plan(cfg, season, provider_factory=_no_llm)
+
+
+async def test_av_plan_matches_three_episodes_and_reads_reference_once(av_season, capsys):
+    plan = await _av_plan(av_season)
+    _, _, state = av_season
+    for item in plan.items:
+        ranges = item.ranges
+        assert ranges.op_range[0] == pytest.approx(state["starts"][item.number], abs=0.1)
+        assert ranges.op_range[1] - ranges.op_range[0] == pytest.approx(90, abs=0.3)
+        assert ranges.ed_range == (state["ends"][item.number], 1420)
+        assert (ranges.op_source, ranges.ed_source) == ("av", "av")
+        assert (ranges.op_distance, ranges.ed_distance) == (0, 0)
+        assert ranges.write is not None
+        assert not ranges.op_length_estimated
+    assert [read[0] for read in state["reads"]] == [1, 2, 3]
+    assert all(read[2] == 150 for read in state["reads"])
+    coarse = [(n, start, end) for n, start, end, fps in state["windows"] if fps == 2]
+    assert coarse == [(n, start, end) for n in (1, 2, 3) for start, end in ((0, 300), (1240, 1420))]
+    assert capsys.readouterr().out.splitlines() == [f"正在匹配画面 {n}/3" for n in (1, 2, 3)]
+
+
+@pytest.mark.parametrize("missing", ["op", "ed"])
+async def test_av_missing_reference_uses_subtitle_for_that_side(av_season, missing):
+    _, season, _ = av_season
+    (season / f"{missing}.png").unlink()
+    plan = await _av_plan(av_season)
+    ranges = plan.items[0].ranges
+    assert getattr(ranges, f"{missing}_source") == "subtitle"
+    provided = "ed" if missing == "op" else "op"
+    assert getattr(ranges, f"{provided}_source") == "av"
+    assert getattr(ranges, f"{missing}_range") == (
+        (153.486, 224.681) if missing == "op" else (1348.18, 1416.622)
+    )
+
+
+async def test_av_near_miss_does_not_fall_back(av_season):
+    av_season[2]["distances"][2] = 15
+    ranges = (await _av_plan(av_season)).items[1].ranges
+    assert ranges.op_range is None
+    assert ranges.op_distance == 15
+    assert ranges.write is None
+    assert "OP 画面对不上（最佳距离 15/64，超过 12/64）" in ranges.note
+
+
+async def test_av_single_episode_estimates_without_audio_and_clamps_short_video(
+    av_season, monkeypatch
+):
+    _, season, state = av_season
+    for n in (2, 3):
+        (season / f"Show E{n:02d}.mkv").unlink()
+    state["starts"][1] = 40
+    state["ends"][1] = 95
+    _probe(monkeypatch, 100)
+    ranges = (await _av_plan(av_season)).items[0].ranges
+    assert ranges.op_range == (40, 100)
+    assert ranges.ed_range == (95, 100)
+    assert ranges.op_length_estimated
+    assert state["reads"] == []
+    assert [(start, end) for _, start, end, fps in state["windows"] if fps == 2] == [
+        (0, 100),
+        (0, 100),
+    ]
+
+
+async def test_av_median_discards_sixty_second_outlier(av_season):
+    _, season, state = av_season
+    _touch(season / "Show E04.mkv")
+    _touch(season / "Show E04.srt", (season / "Show E01.srt").read_bytes())
+    state["starts"][4], state["ends"][4], state["lengths"][4] = 20, 1330, 60
+    plan = await _av_plan(av_season)
+    assert len(plan.items) == 4
+    for item in plan.items:
+        assert item.ranges.op_range[1] - item.ranges.op_range[0] == pytest.approx(90, abs=0.3)
+        assert not item.ranges.op_length_estimated
+
+
+async def test_av_inconsistent_lengths_fail_all_usable_sides(av_season):
+    av_season[2]["lengths"][3] = 60
+    plan = await _av_plan(av_season)
+    for item in plan.items:
+        assert item.ranges.op_range is None
+        assert "各集 OP 长度相差太大（" in item.ranges.note
+        assert "秒），定不了终点" in item.ranges.note
+
+
+async def test_av_no_measured_lengths_estimates_all(av_season):
+    av_season[2]["lengths"] = {1: 150, 2: 150, 3: 150}
+    for item in (await _av_plan(av_season)).items:
+        assert item.ranges.op_range[1] - item.ranges.op_range[0] == pytest.approx(90)
+        assert item.ranges.op_length_estimated
+
+
+@pytest.mark.parametrize("kind", ["frames", "audio"])
+async def test_av_broken_episode_does_not_block_others(av_season, kind):
+    state = av_season[2]
+    state["frame_errors" if kind == "frames" else "audio_errors"][2] = FFmpegError(
+        "坏媒体\n详细错误"
+    )
+    plan = await _av_plan(av_season)
+    assert len(plan.items) == 3
+    assert plan.items[0].ranges.write is not None
+    assert plan.items[2].ranges.write is not None
+    broken = plan.items[1].ranges
+    assert broken.op_range is None
+    assert ("OP 抽帧失败：坏媒体" if kind == "frames" else "OP 音频读不出来：坏媒体") in broken.note
+    assert "详细错误" not in broken.note
+
+
+async def test_av_reference_audio_failure_fails_all_starts(av_season):
+    state = av_season[2]
+    state["audio_errors"][1] = FFmpegError("坏音频\n细节")
+    for item in (await _av_plan(av_season)).items:
+        assert item.ranges.op_range is None
+        assert "OP 参考集 E01 的音频读不出来：坏音频" in item.ranges.note
+    assert [read[0] for read in state["reads"]] == [1]
+
+
+async def test_av_reference_is_best_distance_then_episode_number(av_season):
+    state = av_season[2]
+    state["distances"][1] = 1
+    await _av_plan(av_season)
+    assert [read[0] for read in state["reads"]] == [2, 1, 3]
+
+
+@pytest.mark.parametrize("layer", ["image", "frames", "reference_audio", "audio"])
+async def test_av_binary_error_propagates(av_season, monkeypatch, layer):
+    error = FFmpegBinaryError("找不到 ffmpeg")
+    state = av_season[2]
+    if layer == "image":
+
+        def broken(*args, **kwargs):
+            raise error
+
+        monkeypatch.setattr(av_match, "image_hash", broken)
+    elif layer == "frames":
+        state["frame_errors"][2] = error
+    else:
+        state["audio_errors"][1 if layer == "reference_audio" else 2] = error
+    with pytest.raises(FFmpegBinaryError, match="找不到 ffmpeg"):
+        await _av_plan(av_season)
+
+
+async def test_av_corrupt_reference_is_rejected_before_llm(av_season, monkeypatch):
+    cfg, season, _ = av_season
+    _touch(season / "Mystery.mkv")
+    _touch(season / "Mystery.srt")
+
+    def broken(*args, **kwargs):
+        raise FFmpegError("无效图片\n细节")
+
+    monkeypatch.setattr(av_match, "image_hash", broken)
+    with pytest.raises(ValueError) as error:
+        await build_import_plan(cfg, season, provider_factory=_no_llm)
+    assert (
+        str(error.value)
+        == f"参考截图读不出来：{season / 'op.png'}（无效图片）。换一张或删掉它再导入"
+    )
+
+
+async def test_av_unknown_duration_does_no_media_matching(av_season, monkeypatch):
+    _probe(monkeypatch, FFmpegError("片长未知"))
+    for item in (await _av_plan(av_season)).items:
+        assert item.ranges.op_range is None
+        assert item.ranges.ed_range is None
+        assert item.ranges.write is None
+    assert av_season[2]["windows"] == []
+    assert av_season[2]["reads"] == []
+
+
+@pytest.mark.parametrize("side", ["op", "ed"])
+async def test_av_manual_range_excludes_episode_from_matching(av_season, side, capsys):
+    cfg, _, state = av_season
+    cfg.episodes = [EpisodeConfig(number=2, **{f"{side}_range": (100, 190)})]
+    plan = await _av_plan(av_season)
+    assert plan.items[1].ranges.write is None
+    assert getattr(plan.items[1].ranges, f"{side}_range") == (100, 190)
+    assert {n for n, *_ in state["windows"]} == {1, 3}
+    assert [read[0] for read in state["reads"]] == [1, 3]
+    assert capsys.readouterr().out.splitlines() == ["正在匹配画面 1/2", "正在匹配画面 2/2"]
+
+
+async def test_av_empty_search_window_fails_without_subtitle_fallback(av_season):
+    av_season[2]["empty"] = True
+    for item in (await _av_plan(av_season)).items:
+        assert item.ranges.op_range is None
+        assert item.ranges.ed_range is None
+        assert "OP 搜索窗内没有画面" in item.ranges.note
+        assert "ED 搜索窗内没有画面" in item.ranges.note
+    assert av_season[2]["reads"] == []

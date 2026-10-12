@@ -1307,3 +1307,35 @@ def test_import_reports_pipeline_errors_as_one_line(
 
     assert result.exit_code == 1
     assert "第 1 集的对白轨坏了" in out(result)
+
+
+def test_import_corrupt_screenshot_fails_before_any_side_effects(
+    tmp_path, golden_srt_path, import_env, monkeypatch
+):
+    from tenmin.render.ffmpeg import FFmpegError
+
+    root = _import_project(tmp_path)
+    season = _import_season(tmp_path, golden_srt_path, ["Mystery", "Show E01"])
+    (season / "op.png").write_bytes(b"corrupt")
+    before = (root / "project.yaml").read_bytes()
+    providers = []
+
+    def provider(*args):
+        providers.append(args)
+        raise AssertionError("损坏截图应在构造 provider 前失败")
+
+    def broken_image(*args, **kwargs):
+        raise FFmpegError("无效图片\n详细错误")
+
+    monkeypatch.setattr("tenmin.cli.build_provider", provider)
+    monkeypatch.setattr("tenmin.ingest.av_match.image_hash", broken_image)
+    result = runner.invoke(app, _import_args(tmp_path, season, "--yes"))
+
+    assert result.exit_code == 1
+    assert "参考截图读不出来" in out(result)
+    assert "换一张或删掉它再导入" in out(result)
+    assert "详细错误" not in out(result)
+    assert providers == []
+    assert import_env == []
+    assert (root / "project.yaml").read_bytes() == before
+    assert list((root / "srt").iterdir()) == []
