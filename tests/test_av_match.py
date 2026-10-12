@@ -3,6 +3,7 @@
 import numpy as np
 import pytest
 
+from tenmin.ingest import av_match
 from tenmin.ingest.av_match import (
     HASH_BITS,
     HASH_BYTES,
@@ -66,3 +67,101 @@ def test_best_frame_keeps_first_tie_and_reports_distance_above_threshold():
 def test_best_frame_rejects_empty_sequence():
     with pytest.raises(ValueError, match="没有可比较的帧"):
         best_frame([], 0)
+
+
+def _pcm(samples: np.ndarray) -> bytes:
+    return np.clip(samples, -32768, 32767).astype("<i2").tobytes()
+
+
+def test_audio_envelope_has_ten_frames_per_second_and_drops_the_tail():
+    pcm = _pcm(np.zeros(8000 * 3 + 123)) + b"\xff"
+
+    envelope = av_match.audio_envelope(pcm)
+
+    assert envelope.shape == (30, 16)
+    assert np.all(envelope == 0)
+
+
+def test_audio_envelope_puts_a_tone_in_the_right_band():
+    t = np.arange(8000 * 2) / 8000
+    pcm = _pcm(8000 * np.sin(2 * np.pi * 440 * t))
+
+    envelope = av_match.audio_envelope(pcm)
+
+    # 440 Hz 是第 44 个 bin，落在 [40, 53) 的频带。
+    assert int(np.argmax(envelope.mean(axis=0))) == 8
+
+
+def test_audio_envelope_of_empty_input_is_empty():
+    assert av_match.audio_envelope(b"").shape == (0, 16)
+
+
+def _noise_envelope(seconds: float, seed: int) -> np.ndarray:
+    return np.random.default_rng(seed).normal(5.0, 1.0, size=(round(seconds * 10), 16))
+
+
+def _episode(op: np.ndarray, seconds: float, seed: int, *, lead_frames=0, gain=0.0):
+    """先放少量前导帧，再共享 OP，剩余部分换成本集独立的噪声。"""
+    frames = round(seconds * 10)
+    rest = _noise_envelope(150.0, seed)
+    return np.concatenate([rest[:lead_frames], op[:frames] + gain, rest[lead_frames + frames :]])[
+        : len(op)
+    ]
+
+
+def test_op_length_finds_where_the_shared_audio_ends():
+    ref = _noise_envelope(150.0, 0)
+    other = _episode(ref, 90.0, seed=1)
+
+    assert av_match.op_length(ref, other) == pytest.approx(90.0, abs=0.2)
+
+
+def test_op_length_ignores_a_loudness_difference():
+    ref = _noise_envelope(150.0, 0)
+    other = _episode(ref, 72.0, seed=2, gain=1.5)
+
+    assert av_match.op_length(ref, other) == pytest.approx(72.0, abs=0.2)
+
+
+def test_op_length_absorbs_a_small_start_offset():
+    ref = _noise_envelope(150.0, 0)
+    other = _episode(ref, 85.0, seed=3, lead_frames=4)
+
+    assert av_match.op_length(ref, other) == pytest.approx(85.4, abs=0.2)
+
+
+def test_op_length_ignores_a_short_dip_inside_the_op():
+    ref = _noise_envelope(150.0, 0)
+    other = _episode(ref, 90.0, seed=4)
+    other[300:310] = _noise_envelope(1.0, 5)
+
+    assert av_match.op_length(ref, other) == pytest.approx(90.0, abs=0.2)
+
+
+def test_op_length_is_none_when_the_two_never_line_up():
+    ref = _noise_envelope(150.0, 0)
+    other = _noise_envelope(150.0, 6)
+
+    assert av_match.op_length(ref, other) is None
+
+
+def test_op_length_is_none_when_the_op_outlasts_the_reference_audio():
+    ref = _noise_envelope(150.0, 0)
+
+    assert av_match.op_length(ref, ref.copy()) is None
+
+
+def test_median_length_drops_outliers_before_taking_the_median():
+    assert av_match.median_length([89.9, 90.1, 90.0, 60.0, 130.0]) == pytest.approx(90.0)
+
+
+def test_median_length_keeps_values_within_ten_seconds():
+    assert av_match.median_length([80.0, 90.0, 99.0]) == pytest.approx(90.0)
+
+
+def test_median_length_of_nothing_is_none():
+    assert av_match.median_length([]) is None
+
+
+def test_median_length_is_none_when_everything_is_an_outlier():
+    assert av_match.median_length([60.0, 90.0]) is None
