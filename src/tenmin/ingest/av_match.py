@@ -1,21 +1,30 @@
-"""截图与音频匹配的纯函数：dHash、最佳帧、音频包络与跨集 OP 长度。
+"""截图与音频匹配：媒体抽取、dHash 定位、音频包络与跨集 OP 长度。
 
-本模块不读取配置、不执行 IO；未来的图片读取与视频取帧层负责提供
-9×8 灰度像素或 PCM 字节，并在匹配结果上应用阈值，与这里的计算逻辑分离。
+匹配结果不应用阈值，由调用方决定是否接受。
 """
 
 import itertools
 import math
+import re
 from collections.abc import Sequence
+from dataclasses import dataclass
+from pathlib import Path
 from statistics import median
 
 import numpy as np
+
+from tenmin.render import ffmpeg
 
 HASH_WIDTH = 9
 HASH_HEIGHT = 8
 HASH_BYTES = 72
 HASH_BITS = 64
 MAX_DISTANCE = 12
+COARSE_FPS = 2
+FINE_FPS = 10
+FINE_RADIUS_SECONDS = 1
+_SCALE_CHAIN = "scale=9:8:flags=area,format=gray"
+_SHOWINFO = re.compile(r"\[[^\]\n]*showinfo[^\]]*\].*?\bn:\s*\d+\s+pts:\s*\S+\s+pts_time:(\S+)")
 
 
 def dhash(gray: bytes | Sequence[int] | np.ndarray) -> int:
@@ -49,6 +58,118 @@ def best_frame(hashes: Sequence[int], ref: int) -> tuple[int, int]:
     )
 
 
+def _hash_frames(args: list[str], *, ffmpeg_path: str) -> tuple[list[int], str]:
+    """共享的 9×8 灰度帧读取层，保留 stderr 供时间戳解析与诊断。"""
+    hashes: list[int] = []
+    stderr = ffmpeg.run_raw_frames(
+        args,
+        frame_size=HASH_BYTES,
+        on_frame=lambda frame: hashes.append(dhash(frame)),
+        ffmpeg=ffmpeg_path,
+    )
+    return hashes, stderr
+
+
+def sample_hashes(
+    video: Path, start: float, end: float, fps: float, *, ffmpeg_path: str = ffmpeg.FFMPEG
+) -> list[tuple[float, int]]:
+    """抽取有界片段的哈希；showinfo 的相对 PTS 加回片段起点。"""
+    if end <= start:
+        return []
+    hashes, stderr = _hash_frames(
+        [
+            "-hide_banner",
+            "-v",
+            "info",
+            "-ss",
+            f"{start:.3f}",
+            "-t",
+            f"{end - start:.3f}",
+            "-i",
+            str(video),
+            "-map",
+            "0:v:0",
+            "-vf",
+            f"fps={fps:g},{_SCALE_CHAIN},showinfo",
+            "-fps_mode",
+            "passthrough",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "gray",
+            "-",
+        ],
+        ffmpeg_path=ffmpeg_path,
+    )
+    try:
+        times = [start + float(match.group(1)) for match in _SHOWINFO.finditer(stderr)]
+    except ValueError as error:
+        raise ffmpeg.FFmpegError(f"ffmpeg showinfo 时间戳无效：\n{ffmpeg.tail(stderr)}") from error
+    if len(times) != len(hashes):
+        raise ffmpeg.FFmpegError(
+            f"ffmpeg 帧数 {len(hashes)} 与时间戳数 {len(times)} 不一致：\n{ffmpeg.tail(stderr)}"
+        )
+    return list(zip(times, hashes, strict=True))
+
+
+def image_hash(image: Path, *, ffmpeg_path: str = ffmpeg.FFMPEG) -> int:
+    """用与视频相同的缩放链读取一张截图。"""
+    hashes, stderr = _hash_frames(
+        [
+            "-hide_banner",
+            "-v",
+            "error",
+            "-i",
+            str(image),
+            "-map",
+            "0:v:0",
+            "-vf",
+            _SCALE_CHAIN,
+            "-frames:v",
+            "1",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "gray",
+            "-",
+        ],
+        ffmpeg_path=ffmpeg_path,
+    )
+    if len(hashes) != 1:
+        raise ffmpeg.FFmpegError(
+            f"截图需要恰好一帧，收到 {len(hashes)} 帧：\n{ffmpeg.tail(stderr)}"
+        )
+    return hashes[0]
+
+
+@dataclass(frozen=True)
+class Match:
+    time: float
+    distance: int
+
+
+def locate(
+    video: Path, ref: int, *, start: float, end: float, ffmpeg_path: str = ffmpeg.FFMPEG
+) -> Match | None:
+    """先粗采样，再在最佳帧前后一秒细采样；同距取最早时间。"""
+    coarse = sample_hashes(video, start, end, COARSE_FPS, ffmpeg_path=ffmpeg_path)
+    if not coarse:
+        return None
+    index, _ = best_frame([value for _, value in coarse], ref)
+    coarse_best = coarse[index]
+    center = coarse_best[0]
+    fine = sample_hashes(
+        video,
+        max(start, center - FINE_RADIUS_SECONDS),
+        min(end, center + FINE_RADIUS_SECONDS),
+        FINE_FPS,
+        ffmpeg_path=ffmpeg_path,
+    )
+    candidates = sorted([*fine, coarse_best], key=lambda sample: sample[0])
+    index, distance = best_frame([value for _, value in candidates], ref)
+    return Match(time=candidates[index][0], distance=distance)
+
+
 SAMPLE_RATE = 8000
 ENVELOPE_RATE = 10
 _HOP = SAMPLE_RATE // ENVELOPE_RATE
@@ -63,6 +184,15 @@ MAX_LAG_FRAMES = ENVELOPE_RATE
 ALIGN_FRAMES = 20 * ENVELOPE_RATE
 OUTLIER_SECONDS = 10.0
 DEFAULT_OP_LENGTH = 90.0
+
+
+def read_pcm(
+    video: Path, start: float, duration: float, *, ffmpeg_path: str = ffmpeg.FFMPEG
+) -> bytes:
+    """读取音频匹配所需的 8kHz 单声道 PCM。"""
+    return ffmpeg.run_pcm(
+        video, start=start, duration=duration, sample_rate=SAMPLE_RATE, ffmpeg=ffmpeg_path
+    )
 
 
 def audio_envelope(pcm: bytes) -> np.ndarray:

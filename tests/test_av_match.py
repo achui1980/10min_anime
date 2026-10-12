@@ -1,7 +1,10 @@
-"""截图匹配的纯函数契约，不依赖视频或文件 IO。"""
+"""截图匹配的计算、IO 契约与显式开启的真实媒体测试。"""
 
 import shlex
+import shutil
 import subprocess
+from dataclasses import FrozenInstanceError
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -263,3 +266,231 @@ def test_run_pcm_missing_binary_fails_before_spawning(tmp_path, monkeypatch):
 
     with pytest.raises(ffmpeg.FFmpegBinaryError, match="找不到可执行文件 'customff'"):
         ffmpeg.run_pcm(video, start=0.0, duration=2.0, sample_rate=8000, ffmpeg="customff")
+
+
+def test_sample_hashes_uses_showinfo_pts_and_exact_filter_args(monkeypatch):
+    frames = [bytes(72), bytes(range(72)), bytes(reversed(range(72)))]
+
+    def run(args, *, frame_size, on_frame, ffmpeg):
+        assert ffmpeg == "customff"
+        assert frame_size == HASH_BYTES
+        assert args == [
+            "-hide_banner",
+            "-v",
+            "info",
+            "-ss",
+            "10.000",
+            "-t",
+            "2.000",
+            "-i",
+            "video.mkv",
+            "-map",
+            "0:v:0",
+            "-vf",
+            "fps=2,scale=9:8:flags=area,format=gray,showinfo",
+            "-fps_mode",
+            "passthrough",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "gray",
+            "-",
+        ]
+        for frame in frames:
+            on_frame(frame)
+        return "unrelated pts_time:99\n" + "\n".join(
+            f"[Parsed_showinfo_3 @ abc] n: {i:3d} pts: {i} pts_time:{pts} fmt:gray"
+            for i, pts in enumerate(["0", "5e-1", "1"])
+        )
+
+    monkeypatch.setattr(ffmpeg, "run_raw_frames", run)
+    assert av_match.sample_hashes(Path("video.mkv"), 10, 12, 2, ffmpeg_path="customff") == [
+        (10 + i * 0.5, dhash(frame)) for i, frame in enumerate(frames)
+    ]
+
+
+@pytest.mark.parametrize("pts", [[], ["0", "0.5"], ["bad"]])
+def test_sample_hashes_rejects_timestamp_mismatch_or_invalid_value(monkeypatch, pts):
+    def run(args, *, frame_size, on_frame, ffmpeg):
+        on_frame(bytes(HASH_BYTES))
+        return "\n".join(
+            f"[Parsed_showinfo_3 @ abc] n: {i} pts: {i} pts_time:{value} fmt:gray"
+            for i, value in enumerate(pts)
+        )
+
+    monkeypatch.setattr(ffmpeg, "run_raw_frames", run)
+    with pytest.raises(ffmpeg.FFmpegError):
+        av_match.sample_hashes(Path("video.mkv"), 0, 2, 2)
+
+
+@pytest.mark.parametrize("end", [10, 9])
+def test_sample_hashes_empty_interval_does_no_io(monkeypatch, end):
+    monkeypatch.setattr(ffmpeg, "run_raw_frames", lambda *a, **kw: pytest.fail("IO"))
+    assert av_match.sample_hashes(Path("video.mkv"), 10, end, 2) == []
+
+
+@pytest.mark.parametrize("count", [0, 1, 2])
+def test_image_hash_requires_one_frame_and_shared_scale_chain(monkeypatch, count):
+    frame = bytes(reversed(range(HASH_BYTES)))
+
+    def run(args, *, frame_size, on_frame, ffmpeg):
+        assert ffmpeg == "customff"
+        assert frame_size == HASH_BYTES
+        assert args[args.index("-i") + 1] == "image.png"
+        assert args[args.index("-vf") + 1] == "scale=9:8:flags=area,format=gray"
+        assert args[args.index("-frames:v") + 1] == "1"
+        assert args[-5:] == ["-f", "rawvideo", "-pix_fmt", "gray", "-"]
+        for _ in range(count):
+            on_frame(frame)
+        return "image diagnostics"
+
+    monkeypatch.setattr(ffmpeg, "run_raw_frames", run)
+    if count == 1:
+        assert av_match.image_hash(Path("image.png"), ffmpeg_path="customff") == dhash(frame)
+    else:
+        with pytest.raises(ffmpeg.FFmpegError, match="image diagnostics"):
+            av_match.image_hash(Path("image.png"), ffmpeg_path="customff")
+
+
+def test_read_pcm_requests_eight_khz_and_passes_through_bytes(monkeypatch):
+    def run(video, *, start, duration, sample_rate, ffmpeg):
+        assert video == Path("video.mkv")
+        assert (start, duration, sample_rate, ffmpeg) == (1, 2, 8000, "customff")
+        return b"\x00\xff"
+
+    monkeypatch.setattr(ffmpeg, "run_pcm", run)
+    assert av_match.read_pcm(Path("video.mkv"), 1, 2, ffmpeg_path="customff") == b"\x00\xff"
+
+
+def test_locate_recovers_earliest_start_of_static_match(monkeypatch):
+    calls = []
+
+    def sample(video, start, end, fps, *, ffmpeg_path):
+        assert (video, ffmpeg_path) == (Path("video.mkv"), "customff")
+        calls.append((start, end, fps))
+        times = np.round(np.arange(start, end, 1 / fps), 3)
+        return [(float(t), 0 if 12.3 <= t < 15.3 else 65535) for t in times]
+
+    monkeypatch.setattr(av_match, "sample_hashes", sample, raising=False)
+    match = av_match.locate(Path("video.mkv"), 0, start=10, end=20, ffmpeg_path="customff")
+    assert match.time == pytest.approx(12.3)
+    assert match.distance == 0
+    assert calls == [(10, 20, 2), (11.5, 13.5, 10)]
+    with pytest.raises(FrozenInstanceError):
+        match.time = 99
+
+
+def test_locate_empty_coarse_sampling_returns_none(monkeypatch):
+    calls = []
+
+    def sample(*args, **kwargs):
+        calls.append(args)
+        return []
+
+    monkeypatch.setattr(av_match, "sample_hashes", sample, raising=False)
+    assert av_match.locate(Path("video.mkv"), 0, start=0, end=6) is None
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("center,window", [(0, (0, 1)), (5.5, (4.5, 6))])
+def test_locate_clamps_fine_window_and_retains_coarse_best(monkeypatch, center, window):
+    def sample(video, start, end, fps, *, ffmpeg_path):
+        if fps == 2:
+            return [(center, (1 << 13) - 1)]
+        assert (start, end, fps) == (*window, 10)
+        return [(start, (1 << 14) - 1)]
+
+    monkeypatch.setattr(av_match, "sample_hashes", sample, raising=False)
+    match = av_match.locate(Path("video.mkv"), 0, start=0, end=6)
+    assert (match.time, match.distance) == (center, 13)
+
+
+@pytest.fixture
+def av_video(tmp_path) -> Path:
+    if shutil.which(ffmpeg.FFMPEG) is None:
+        pytest.skip("没有 ffmpeg")
+    video = tmp_path / "av.mkv"
+    subprocess.run(
+        [
+            ffmpeg.FFMPEG,
+            "-nostdin",
+            "-hide_banner",
+            "-v",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=160x120:rate=24:duration=6",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:sample_rate=48000:duration=6",
+            "-vf",
+            "rotate=a=PI*t/3",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            str(video),
+        ],
+        check=True,
+        capture_output=True,
+        stdin=subprocess.DEVNULL,
+    )
+    return video
+
+
+@pytest.mark.render
+def test_real_sample_hashes_reports_absolute_timestamps(av_video):
+    samples = av_match.sample_hashes(av_video, 1, 5, 2)
+    assert len(samples) == 8
+    assert [time for time, _ in samples] == pytest.approx([1 + 0.5 * i for i in range(8)], abs=0.05)
+
+
+@pytest.mark.render
+def test_real_screenshot_locates_its_video_frame(av_video, tmp_path):
+    image = tmp_path / "frame.png"
+    subprocess.run(
+        [
+            ffmpeg.FFMPEG,
+            "-nostdin",
+            "-hide_banner",
+            "-v",
+            "error",
+            "-y",
+            "-ss",
+            "3",
+            "-i",
+            str(av_video),
+            "-map",
+            "0:v:0",
+            "-frames:v",
+            "1",
+            str(image),
+        ],
+        check=True,
+        capture_output=True,
+        stdin=subprocess.DEVNULL,
+    )
+    match = av_match.locate(av_video, av_match.image_hash(image), start=0, end=6)
+    assert match is not None
+    assert match.time == pytest.approx(3, abs=0.1)
+    assert match.distance <= MAX_DISTANCE
+
+
+@pytest.mark.render
+def test_real_corrupt_image_raises_ffmpeg_error(av_video, tmp_path):
+    image = tmp_path / "broken.png"
+    image.write_bytes(b"not an image")
+    with pytest.raises(ffmpeg.FFmpegError):
+        av_match.image_hash(image)
+
+
+@pytest.mark.render
+def test_real_read_pcm_has_expected_duration_and_tone_band(av_video):
+    pcm = av_match.read_pcm(av_video, 1, 2)
+    assert len(pcm) == pytest.approx(32000, abs=160)
+    assert int(np.argmax(av_match.audio_envelope(pcm).mean(axis=0))) == 8
