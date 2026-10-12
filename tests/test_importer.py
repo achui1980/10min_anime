@@ -116,6 +116,47 @@ def test_scan_pairs_from_a_separate_srt_dir(tmp_path):
     assert [(p.video, p.srt) for p in scan.pairs] == [(video, srt)]
 
 
+def test_scan_finds_references_case_insensitively_without_unpaired_files(tmp_path):
+    video = _touch(tmp_path / "Show 01.mkv")
+    srt = _touch(tmp_path / "Show 01.srt")
+    op = _touch(tmp_path / "OP.PNG")
+    ed = _touch(tmp_path / "ed.Jpeg")
+    _touch(tmp_path / "cover.jpg")
+    _touch(tmp_path / "op.txt")
+    _touch(tmp_path / "nested" / "op.jpg")
+    _touch(tmp_path / "ed.png" / "notes.txt")
+
+    scan = scan_directory(tmp_path)
+
+    assert scan.references == {"op": op, "ed": ed}
+    assert [(p.video, p.srt) for p in scan.pairs] == [(video, srt)]
+    assert scan.unpaired_videos == []
+    assert scan.unpaired_srts == []
+
+
+def test_scan_ignores_references_in_a_separate_srt_dir(tmp_path):
+    video = _touch(tmp_path / "videos" / "Show 01.mkv")
+    srt = _touch(tmp_path / "subs" / "Show 01.srt")
+    _touch(tmp_path / "subs" / "op.png")
+
+    scan = scan_directory(tmp_path / "videos", tmp_path / "subs")
+
+    assert scan.references == {}
+    assert [(p.video, p.srt) for p in scan.pairs] == [(video, srt)]
+    assert scan.unpaired_videos == []
+    assert scan.unpaired_srts == []
+
+
+def test_scan_rejects_duplicate_references_with_sorted_names(tmp_path):
+    _touch(tmp_path / "op.png")
+    _touch(tmp_path / "op.jpg")
+
+    with pytest.raises(ValueError) as error:
+        scan_directory(tmp_path)
+
+    assert str(error.value) == "OP 参考截图不止一张（op.jpg、op.png），只留一张再导入"
+
+
 def test_scan_rejects_a_missing_directory(tmp_path):
     with pytest.raises(FileNotFoundError, match="找不到目录"):
         scan_directory(tmp_path / "nope")

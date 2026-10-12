@@ -29,6 +29,8 @@ from tenmin.script.llm import LLMProvider
 # `<stem>.zh-Hans.srt` / `<stem>.zh-Hant.srt`，下载来的字幕也普遍带这类后缀。
 LANGUAGE_SUFFIXES = ("zh-Hans", "zh-Hant", "sc", "tc", "chs", "cht", "zh", "ja", "jp", "jpn")
 _LANGUAGE_SEPARATORS = (".", "_")
+REFERENCE_SIDES = ("op", "ed")
+REFERENCE_SUFFIXES = frozenset({".png", ".jpg", ".jpeg"})
 
 
 @dataclass(frozen=True)
@@ -45,6 +47,7 @@ class Scan:
     pairs: list[Pair] = field(default_factory=list)
     unpaired_videos: list[Path] = field(default_factory=list)
     unpaired_srts: list[Path] = field(default_factory=list)
+    references: dict[str, Path] = field(default_factory=dict)
 
 
 def _require_dir(path: Path) -> None:
@@ -71,11 +74,29 @@ def _srt_rank(video_stem: str, srt: Path) -> int | None:
     return None
 
 
+def _find_references(video_dir: Path) -> dict[str, Path]:
+    """只从视频目录顶层找 OP/ED 参考截图，每侧最多一张。"""
+    candidates: dict[str, list[Path]] = {side: [] for side in REFERENCE_SIDES}
+    for path in video_dir.iterdir():
+        side = path.stem.casefold()
+        if path.is_file() and side in candidates and path.suffix.lower() in REFERENCE_SUFFIXES:
+            candidates[side].append(path)
+    references: dict[str, Path] = {}
+    for side, paths in candidates.items():
+        if len(paths) > 1:
+            names = "、".join(sorted(path.name for path in paths))
+            raise ValueError(f"{side.upper()} 参考截图不止一张（{names}），只留一张再导入")
+        if paths:
+            references[side] = paths[0]
+    return references
+
+
 def scan_directory(video_dir: Path, srt_dir: Path | None = None) -> Scan:
     """单层枚举视频与 SRT 并配对。srt_dir 省略时从视频目录里找字幕。
 
     视频后缀复用 `ocr_batch.VIDEO_SUFFIXES`，字幕只认 `.srt`，两者都大小写不敏感。
     结果按文件名排序，保证预览与 LLM 兜底的输入顺序稳定。
+    OP/ED 参考截图只从 video_dir 顶层查找，不查 srt_dir，也不进入未配对列表。
     """
     _require_dir(video_dir)
     if srt_dir is not None:
@@ -110,6 +131,7 @@ def scan_directory(video_dir: Path, srt_dir: Path | None = None) -> Scan:
         )
         claimed.update(srt for _, srt in ranked)
     scan.unpaired_srts = [srt for srt in srts if srt not in claimed]
+    scan.references = _find_references(video_dir)
     return scan
 
 
