@@ -1,5 +1,8 @@
 """截图匹配的纯函数契约，不依赖视频或文件 IO。"""
 
+import shlex
+import subprocess
+
 import numpy as np
 import pytest
 
@@ -14,6 +17,7 @@ from tenmin.ingest.av_match import (
     dhash,
     hamming,
 )
+from tenmin.render import ffmpeg
 
 
 def test_dhash_falling_rows_are_all_ones():
@@ -165,3 +169,97 @@ def test_median_length_of_nothing_is_none():
 
 def test_median_length_is_none_when_everything_is_an_outlier():
     assert av_match.median_length([60.0, 90.0]) is None
+
+
+def test_run_pcm_returns_binary_stdout_with_exact_command(tmp_path, monkeypatch):
+    video = tmp_path / "源 视频.mkv"
+    video.touch()
+    pcm = b"\x00\xff\x80\x01"
+    binaries = []
+
+    def which(binary):
+        binaries.append(binary)
+        return binary
+
+    def run(argv, **kwargs):
+        assert binaries == ["customff"]
+        assert argv == [
+            "customff",
+            "-nostdin",
+            "-nostats",
+            "-hide_banner",
+            "-v",
+            "error",
+            "-ss",
+            "1.500",
+            "-t",
+            "2.000",
+            "-i",
+            str(video),
+            "-vn",
+            "-ac",
+            "1",
+            "-ar",
+            "8000",
+            "-f",
+            "s16le",
+            "-c:a",
+            "pcm_s16le",
+            "-",
+        ]
+        assert kwargs == {"capture_output": True, "stdin": subprocess.DEVNULL}
+        return subprocess.CompletedProcess(argv, 0, stdout=pcm, stderr=b"")
+
+    monkeypatch.setattr(ffmpeg.shutil, "which", which)
+    monkeypatch.setattr(ffmpeg.subprocess, "run", run)
+
+    result = ffmpeg.run_pcm(video, start=1.5, duration=2.0, sample_rate=8000, ffmpeg="customff")
+
+    assert isinstance(result, bytes)
+    assert result == pcm
+
+
+def test_run_pcm_nonzero_decodes_chinese_stderr_and_reports_command(tmp_path, monkeypatch):
+    video = tmp_path / "源 视频.mkv"
+    video.touch()
+    commands = []
+    stderr = "\n".join(["旧日志"] * ffmpeg.STDERR_TAIL_LINES + ["无法解码音频"])
+
+    def run(argv, **kwargs):
+        commands.append(argv)
+        return subprocess.CompletedProcess(argv, 7, stdout=b"", stderr=stderr.encode("utf-8"))
+
+    monkeypatch.setattr(ffmpeg.shutil, "which", lambda binary: binary)
+    monkeypatch.setattr(ffmpeg.subprocess, "run", run)
+
+    with pytest.raises(ffmpeg.FFmpegError) as error:
+        ffmpeg.run_pcm(video, start=1.5, duration=2.0, sample_rate=8000)
+
+    message = str(error.value)
+    assert "退出码 7" in message
+    assert shlex.join(commands[0]) in message
+    assert f"stderr 末尾 {ffmpeg.STDERR_TAIL_LINES} 行" in message
+    assert message.endswith(ffmpeg.tail(stderr))
+    assert message.count("旧日志") == ffmpeg.STDERR_TAIL_LINES - 1
+    assert "无法解码音频" in message
+
+
+def test_run_pcm_missing_video_uses_chinese_helper_error(tmp_path, monkeypatch):
+    video = tmp_path / "missing.mkv"
+    monkeypatch.setattr(ffmpeg.shutil, "which", lambda binary: binary)
+    monkeypatch.setattr(ffmpeg.subprocess, "run", lambda *args, **kwargs: pytest.fail("spawned"))
+
+    with pytest.raises(ffmpeg.FFmpegError, match="找不到源视频") as error:
+        ffmpeg.run_pcm(video, start=0.0, duration=2.0, sample_rate=8000)
+
+    assert str(error.value) == f"找不到源视频: {video}"
+
+
+def test_run_pcm_missing_binary_fails_before_spawning(tmp_path, monkeypatch):
+    video = tmp_path / "video.mkv"
+    video.touch()
+    monkeypatch.setattr(ffmpeg.shutil, "which", lambda binary: None)
+    monkeypatch.setattr(ffmpeg.subprocess, "run", lambda *args, **kwargs: pytest.fail("spawned"))
+
+    with pytest.raises(ffmpeg.FFmpegBinaryError, match="找不到可执行文件 'customff'"):
+        ffmpeg.run_pcm(video, start=0.0, duration=2.0, sample_rate=8000, ffmpeg="customff")

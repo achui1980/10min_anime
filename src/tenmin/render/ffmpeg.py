@@ -840,3 +840,52 @@ def run_raw_frames(
             f"帧大小与输出格式对不上：{shlex.join(argv)}"
         )
     return stderr
+
+
+def run_pcm(
+    video: Path,
+    *,
+    start: float,
+    duration: float,
+    sample_rate: int,
+    ffmpeg: str = FFMPEG,
+) -> bytes:
+    """读取指定片段的单声道 s16le PCM，返回二进制 stdout。
+
+    AV 匹配只读有界片段：150 秒、8kHz、16 位单声道约 2.4 MB，适合一次捕获。
+    stdout 是原始音频字节，不能开 text 模式；只有报错时才解码 stderr。
+    """
+    _require_binary(ffmpeg)
+    _require_source_video(video)
+    argv = [
+        ffmpeg,
+        "-nostdin",
+        "-nostats",
+        "-hide_banner",
+        "-v",
+        "error",
+        "-ss",
+        f"{start:.3f}",
+        "-t",
+        f"{duration:.3f}",
+        "-i",
+        str(video),
+        "-vn",
+        "-ac",
+        "1",
+        "-ar",
+        str(sample_rate),
+        "-f",
+        "s16le",
+        "-c:a",
+        "pcm_s16le",
+        "-",
+    ]
+    completed = subprocess.run(argv, capture_output=True, stdin=subprocess.DEVNULL)
+    if completed.returncode != 0:
+        raise FFmpegError(
+            f"ffmpeg 退出码 {completed.returncode}，命令：\n"
+            f"{shlex.join(argv)}\n\n"
+            f"stderr 末尾 {STDERR_TAIL_LINES} 行：\n{tail(_decode(completed.stderr))}"
+        )
+    return completed.stdout
