@@ -8,11 +8,17 @@ from tenmin.importer import (
     EXTRA,
     LANGUAGE_SUFFIXES,
     Ambiguous,
+    ImportItem,
+    ImportPlan,
+    Pair,
+    RangePreview,
+    Skipped,
     apply_import_plan,
     build_import_plan,
     infer_ranges,
     is_extra,
     parse_episode_number,
+    render_preview,
     resolve_ambiguous,
     round_range,
     scan_directory,
@@ -593,3 +599,92 @@ async def test_apply_registers_items_and_writes_only_the_planned_ranges(
     assert by_number[2].ed_range == (1300.0, 1420.0)
     assert (cfg.root / "srt" / "E01.srt").read_bytes() == golden_srt_path.read_bytes()
     assert (cfg.root / "srt" / "E02.srt").is_file()
+
+
+_WRITE = ((153.5, 224.7), (1348.2, 1416.6))
+
+
+def _item(
+    number: int,
+    *,
+    write=_WRITE,
+    note=None,
+    prefilled=False,
+    duration=1420.0,
+    ed=(1348.18, 1416.622),
+    ignored=(),
+) -> ImportItem:
+    pair = Pair(
+        video=Path(f"/season/Show E{number:02d}.mkv"),
+        srt=Path(f"/season/Show E{number:02d}.srt"),
+        ignored_srts=tuple(Path(f"/season/{name}") for name in ignored),
+    )
+    ranges = RangePreview(
+        duration=duration, op_range=(153.486, 224.681), ed_range=ed, write=write, note=note
+    )
+    return ImportItem(number=number, pair=pair, prefilled=prefilled, ranges=ranges)
+
+
+def test_preview_shows_pairing_ranges_and_the_write_decision():
+    plan = ImportPlan(items=[_item(1, ignored=["Show E01.ja.srt"])])
+
+    text = "\n".join(render_preview(plan))
+
+    assert "可导入 1 集" in text
+    assert "E01  视频：Show E01.mkv  字幕：Show E01.srt" in text
+    assert "片长 1420.0 秒" in text
+    assert "OP：153.5–224.7 秒" in text
+    assert "ED：1348.2–1416.6 秒" in text
+    assert "将写入区间：op_range [153.5, 224.7]，ed_range [1348.2, 1416.6]" in text
+    assert "忽略的候选字幕：Show E01.ja.srt" in text
+    assert "重跑" not in text
+
+
+def test_preview_marks_unknown_duration_and_unrecognised_ranges():
+    plan = ImportPlan(
+        items=[_item(2, write=None, note="片长未知，不写区间", duration=None, ed=None)]
+    )
+
+    text = "\n".join(render_preview(plan))
+
+    assert "片长未知" in text
+    assert "ED：未识别" in text
+    assert "不写区间：片长未知，不写区间" in text
+
+
+def test_preview_warns_that_prefilled_episodes_will_rerun():
+    plan = ImportPlan(
+        items=[
+            _item(3, prefilled=True),
+            _item(4, prefilled=True, write=None, note="已有手填区间，原样保留"),
+        ]
+    )
+
+    lines = render_preview(plan)
+
+    assert "E03" in "\n".join(lines)
+    warnings = [line for line in lines if "重跑" in line]
+    assert len(warnings) == 1
+    assert "E03" in warnings[0]
+    assert "预填条目" in "\n".join(lines)
+
+
+def test_preview_lists_every_skipped_category():
+    plan = ImportPlan(
+        registered=[Skipped(Path("/s/Show E05.mkv"), "第 5 集已登记，跳过")],
+        ambiguous=[Skipped(Path("/s/86 - 11.mkv"), "文件名里认不出集号，LLM 兜底不可用")],
+        failed=[Skipped(Path("/s/Show E06.mkv"), "字幕读不出来：坏了")],
+        extras=[Path("/s/Show NCOP.mkv")],
+        unpaired_videos=[Path("/s/Show E07.mkv")],
+        unpaired_srts=[Path("/s/Other.srt")],
+    )
+
+    text = "\n".join(render_preview(plan))
+
+    assert "可导入 0 集" in text
+    assert "已登记跳过：\n  Show E05.mkv：第 5 集已登记，跳过" in text
+    assert "集号无法确定跳过：\n  86 - 11.mkv：文件名里认不出集号，LLM 兜底不可用" in text
+    assert "字幕读取失败跳过：\n  Show E06.mkv：字幕读不出来：坏了" in text
+    assert "非正片跳过：\n  Show NCOP.mkv" in text
+    assert "未配对视频：\n  Show E07.mkv" in text
+    assert "未配对字幕：\n  Other.srt" in text

@@ -510,3 +510,56 @@ def apply_import_plan(cfg: ProjectConfig, plan: ImportPlan) -> ProjectConfig:
             ed_range=ed_range,
         )
     return cfg
+
+
+def _format_range(value: tuple[float, float] | None) -> str:
+    if value is None:
+        return "未识别"
+    return f"{value[0]:.1f}–{value[1]:.1f} 秒"
+
+
+def render_preview(plan: ImportPlan) -> list[str]:
+    """逐项预览：集数、视频、SRT、片长、OP/ED、是否写入区间，以及各类跳过项。"""
+    lines = [f"可导入 {len(plan.items)} 集："]
+    for item in plan.items:
+        ranges = item.ranges
+        label = "（预填条目，补齐来源）" if item.prefilled else ""
+        lines.append(
+            f"  E{item.number:02d}  视频：{item.pair.video.name}  字幕：{item.pair.srt.name}{label}"
+        )
+        duration = "片长未知" if ranges.duration is None else f"片长 {ranges.duration:.1f} 秒"
+        lines.append(
+            f"       {duration}  OP：{_format_range(ranges.op_range)}  "
+            f"ED：{_format_range(ranges.ed_range)}"
+        )
+        if ranges.write is not None:
+            op, ed = ranges.write
+            lines.append(f"       将写入区间：op_range {list(op)}，ed_range {list(ed)}")
+        else:
+            lines.append(f"       不写区间：{ranges.note}")
+        if item.pair.ignored_srts:
+            lines.append(
+                "       忽略的候选字幕：" + "、".join(p.name for p in item.pair.ignored_srts)
+            )
+        if item.invalidates_outputs:
+            lines.append(
+                f"       提示：写入区间会改变 E{item.number:02d} 的配置切片，"
+                "它已有的 ingest/timeline/audio/render 产物会失效重跑"
+            )
+    for title, skipped in (
+        ("已登记跳过", plan.registered),
+        ("集号无法确定跳过", plan.ambiguous),
+        ("字幕读取失败跳过", plan.failed),
+    ):
+        if skipped:
+            lines.append(f"{title}：")
+            lines.extend(f"  {entry.path.name}：{entry.reason}" for entry in skipped)
+    for title, paths in (
+        ("非正片跳过", plan.extras),
+        ("未配对视频", plan.unpaired_videos),
+        ("未配对字幕", plan.unpaired_srts),
+    ):
+        if paths:
+            lines.append(f"{title}：")
+            lines.extend(f"  {path.name}" for path in paths)
+    return lines
