@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -10,7 +11,7 @@ import httpx
 import typer
 import yaml
 
-from tenmin import atomic
+from tenmin import atomic, importer
 from tenmin.config import (
     DEFAULT_LLM,
     DEFAULT_OCR,
@@ -236,6 +237,21 @@ def init(slug: str, work_dir: Path = WORK_DIR_OPTION) -> None:
     typer.echo(f"字幕会被拷进 {root / 'srt'}，清洗规则调不好时可以就地改它。")
 
 
+def _print_artifacts(cfg: ProjectConfig, numbers: list[int]) -> None:
+    """跑完之后给出交付物路径（不存在的不打）。run 与 import 共用。"""
+    paths = Paths(cfg.root)
+    for number in numbers:
+        table_path = paths.table(number)
+        narration_path = paths.narration(number)
+        if table_path.exists():
+            typer.echo(f"对照表：{table_path}")
+        if narration_path.exists():
+            typer.echo(f"配音文本：{narration_path}")
+        video_path = paths.video(number)
+        if video_path.exists():
+            typer.echo(f"成品视频：{video_path}")
+
+
 async def _run_pipeline_and_close(
     cfg: ProjectConfig, provider: Any, **kwargs: Any
 ) -> list[str]:
@@ -343,22 +359,11 @@ def run(
     for warning in warnings:
         typer.secho(f"[warn] {warning}", fg="yellow")
 
-    paths = Paths(cfg.root)
     if episode is not None:
         printed_numbers = [episode]
     else:
         printed_numbers = [e.number for e in cfg.episodes if e.has_source]
-
-    for number in printed_numbers:
-        table_path = paths.table(number)
-        narration_path = paths.narration(number)
-        if table_path.exists():
-            typer.echo(f"对照表：{table_path}")
-        if narration_path.exists():
-            typer.echo(f"配音文本：{narration_path}")
-        video_path = paths.video(number)
-        if video_path.exists():
-            typer.echo(f"成品视频：{video_path}")
+    _print_artifacts(cfg, printed_numbers)
 
 
 # 对白轨来源（DialogueTrack.source）给 inspect 显示用。三种来源下游的处置各不相同
@@ -476,6 +481,107 @@ def inspect(
             f"  {format_timestamp(highlight.start)} | 强度 {highlight.strength} "
             f"| {'、'.join(highlight.triggers)} | {highlight.summary}"
         )
+
+
+IMPORT_DIRECTORY_ARGUMENT = typer.Argument(..., help="视频所在目录（只看第一层，不递归）")
+IMPORT_SRT_DIR_OPTION = typer.Option(None, "--srt-dir", help="字幕不在视频目录时，从这个目录配对")
+IMPORT_YES_OPTION = typer.Option(False, "--yes", help="跳过确认，直接登记并运行（脚本 / CI 用）")
+IMPORT_DRY_RUN_OPTION = typer.Option(False, "--dry-run", help="只预览：不写任何文件、不运行管线")
+
+
+def _stdin_is_interactive() -> bool:
+    """单独成函数，测试才能把 CliRunner 的非 TTY stdin 伪装成终端。"""
+    return sys.stdin.isatty()
+
+
+async def _run_imported_and_close(
+    cfg: ProjectConfig, plan: importer.ImportPlan, provider: Any, **kwargs: Any
+) -> list[str]:
+    """登记本次导入的集，再逐集跑单集模式管线，最后关掉 provider 的连接池。
+
+    刻意逐集调用而不是一次批处理：批处理会把存量集也过一遍，`zh/glossary.json` 这类
+    项目级输入一变动，存量集就会连带重跑。
+    """
+    try:
+        cfg = importer.apply_import_plan(cfg, plan)
+        warnings: list[str] = []
+        for item in plan.items:
+            warnings.extend(await run_pipeline(cfg, provider, episode=item.number, **kwargs))
+        return warnings
+    finally:
+        aclose = getattr(provider, "aclose", None)
+        if aclose is not None:
+            await aclose()
+
+
+@app.command("import")
+def import_(
+    slug: str,
+    directory: Path = IMPORT_DIRECTORY_ARGUMENT,
+    work_dir: Path = WORK_DIR_OPTION,
+    srt_dir: Path | None = IMPORT_SRT_DIR_OPTION,
+    yes: bool = IMPORT_YES_OPTION,
+    dry_run: bool = IMPORT_DRY_RUN_OPTION,
+) -> None:
+    """扫描目录批量导入：配对视频与 SRT、识别集号、预览 OP/ED，确认后登记并逐集运行。"""
+    project_file = _project_file(work_dir, slug)
+    # 扫描、集号解析（含 LLM 兜底）、ffprobe 与区间推断都是只读的，--dry-run 也照跑：
+    # 预览不完整就没有意义。
+    try:
+        cfg = load_project(project_file)
+        plan = asyncio.run(
+            importer.build_import_plan(
+                cfg,
+                directory,
+                srt_dir,
+                provider_factory=lambda: build_provider(cfg.llm, Settings()),
+            )
+        )
+    except PIPELINE_ERRORS as error:
+        typer.secho(_error_message(error), fg="red", err=True)
+        raise typer.Exit(code=1) from error
+
+    for line in importer.render_preview(plan):
+        typer.echo(line)
+    for warning in plan.warnings:
+        typer.secho(f"[warn] {warning}", fg="yellow")
+
+    if not plan.items:
+        typer.echo("没有可导入的集，未做任何改动。")
+        return
+    if dry_run:
+        typer.echo("--dry-run：只预览，未写入任何文件，也未运行管线。")
+        return
+    if not yes:
+        if not _stdin_is_interactive():
+            typer.secho("当前不是交互终端，无法确认；确认要导入请加 --yes", fg="red", err=True)
+            raise typer.Exit(code=1)
+        if not typer.confirm(f"导入以上 {len(plan.items)} 集并运行管线？", default=False):
+            typer.echo("已取消，未做任何改动。")
+            return
+
+    # 先把 provider 建好再登记：缺 key 时一个文件都不动，而不是登记完才在管线里炸。
+    try:
+        provider = build_provider(cfg.llm, Settings())
+    except (RuntimeError, ValueError) as error:
+        typer.secho(_error_message(error), fg="red", err=True)
+        raise typer.Exit(code=1) from error
+    tts_engine = build_tts_engine(cfg.render)
+
+    try:
+        with RichProgressReporter() as reporter:
+            warnings = asyncio.run(
+                _run_imported_and_close(
+                    cfg, plan, provider, tts_engine=tts_engine, reporter=reporter
+                )
+            )
+    except PIPELINE_ERRORS as error:
+        typer.secho(_error_message(error), fg="red", err=True)
+        raise typer.Exit(code=1) from error
+
+    for warning in warnings:
+        typer.secho(f"[warn] {warning}", fg="yellow")
+    _print_artifacts(cfg, [item.number for item in plan.items])
 
 
 OCR_INPUTS_ARGUMENT = typer.Argument(..., help="视频文件或目录（目录只看一层），可传多个")

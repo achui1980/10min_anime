@@ -1089,3 +1089,221 @@ def test_inspect_labels_a_native_subtitle_source(work, golden_srt_path):
     )
     assert result.exit_code == 0, out(result)
     assert "来源：srt（原生字幕），硬字幕：未声明" in out(result)
+
+
+# --- tenmin import ------------------------------------------------------------
+
+
+def _import_project(tmp_path, episodes="episodes: []\n"):
+    root = tmp_path / "work" / "saijo"
+    (root / "srt").mkdir(parents=True)
+    (root / "project.yaml").write_text(
+        "show: 才女的侍从\nslug: saijo\n" + episodes, encoding="utf-8"
+    )
+    return root
+
+
+def _import_season(tmp_path, golden_srt_path, stems):
+    season = tmp_path / "season"
+    season.mkdir()
+    for stem in stems:
+        (season / f"{stem}.mkv").write_bytes(b"fake video")
+        (season / f"{stem}.srt").write_bytes(golden_srt_path.read_bytes())
+    return season
+
+
+@pytest.fixture
+def import_env(monkeypatch):
+    """假管线（记下每次的 episode）+ 假 provider/TTS + 固定片长。返回 episode 记录。"""
+    episodes: list[object] = []
+
+    async def fake_pipeline(cfg, provider, **kwargs):
+        episodes.append(kwargs.get("episode"))
+        return []
+
+    def fake_probe(path, *, ffprobe):
+        return 1420.0
+
+    monkeypatch.setattr("tenmin.cli.run_pipeline", fake_pipeline)
+    monkeypatch.setattr("tenmin.cli.build_provider", lambda llm, settings: object())
+    monkeypatch.setattr("tenmin.cli.build_tts_engine", lambda cfg: object())
+    monkeypatch.setattr("tenmin.pipeline.probe_duration", fake_probe)
+    return episodes
+
+
+def _import_args(tmp_path, season, *extra):
+    return ["import", "saijo", str(season), "--work-dir", str(tmp_path / "work"), *extra]
+
+
+def test_import_yes_registers_and_runs_only_the_imported_episodes(
+    tmp_path, golden_srt_path, import_env
+):
+    root = _import_project(tmp_path, "episodes:\n- number: 2\n  srt: srt/E02.srt\n")
+    season = _import_season(tmp_path, golden_srt_path, ["Show E01", "Show E02", "Show E03"])
+
+    result = runner.invoke(app, _import_args(tmp_path, season, "--yes"))
+
+    assert result.exit_code == 0, out(result)
+    assert import_env == [1, 3]
+    assert "已登记跳过" in out(result)
+    data = yaml.safe_load((root / "project.yaml").read_text(encoding="utf-8"))
+    by_number = {e["number"]: e for e in data["episodes"]}
+    assert sorted(by_number) == [1, 2, 3]
+    assert by_number[1]["op_range"] == [153.5, 224.7]
+    assert by_number[1]["ed_range"] == [1348.2, 1416.6]
+    assert by_number[1]["video"] == str((season / "Show E01.mkv").resolve())
+    assert "video" not in by_number[2]
+    assert (root / "srt" / "E01.srt").is_file()
+    assert (root / "srt" / "E03.srt").is_file()
+
+
+def test_import_dry_run_has_no_side_effects(tmp_path, golden_srt_path, import_env):
+    root = _import_project(tmp_path)
+    season = _import_season(tmp_path, golden_srt_path, ["Show E01"])
+    before = (root / "project.yaml").read_text(encoding="utf-8")
+
+    result = runner.invoke(app, _import_args(tmp_path, season, "--dry-run"))
+
+    assert result.exit_code == 0, out(result)
+    assert "OP：153.5–224.7 秒" in out(result)
+    assert "dry-run" in out(result)
+    assert import_env == []
+    assert (root / "project.yaml").read_text(encoding="utf-8") == before
+    assert list((root / "srt").iterdir()) == []
+    assert not (root / ".config").exists()
+
+
+def test_import_without_yes_on_a_non_tty_refuses(tmp_path, golden_srt_path, import_env):
+    root = _import_project(tmp_path)
+    season = _import_season(tmp_path, golden_srt_path, ["Show E01"])
+    before = (root / "project.yaml").read_text(encoding="utf-8")
+
+    result = runner.invoke(app, _import_args(tmp_path, season))
+
+    assert result.exit_code == 1
+    assert "--yes" in out(result)
+    assert import_env == []
+    assert (root / "project.yaml").read_text(encoding="utf-8") == before
+
+
+def test_import_declined_confirmation_changes_nothing(
+    tmp_path, golden_srt_path, import_env, monkeypatch
+):
+    monkeypatch.setattr("tenmin.cli._stdin_is_interactive", lambda: True)
+    root = _import_project(tmp_path)
+    season = _import_season(tmp_path, golden_srt_path, ["Show E01"])
+    before = (root / "project.yaml").read_text(encoding="utf-8")
+
+    result = runner.invoke(app, _import_args(tmp_path, season), input="n\n")
+
+    assert result.exit_code == 0, out(result)
+    assert "已取消" in out(result)
+    assert import_env == []
+    assert (root / "project.yaml").read_text(encoding="utf-8") == before
+    assert list((root / "srt").iterdir()) == []
+
+
+def test_import_accepted_confirmation_imports(tmp_path, golden_srt_path, import_env, monkeypatch):
+    monkeypatch.setattr("tenmin.cli._stdin_is_interactive", lambda: True)
+    root = _import_project(tmp_path)
+    season = _import_season(tmp_path, golden_srt_path, ["Show E01"])
+
+    result = runner.invoke(app, _import_args(tmp_path, season), input="y\n")
+
+    assert result.exit_code == 0, out(result)
+    assert import_env == [1]
+    assert (root / "srt" / "E01.srt").is_file()
+
+
+def test_import_with_nothing_importable_asks_nothing(tmp_path, golden_srt_path, import_env):
+    root = _import_project(tmp_path)
+    season = tmp_path / "season"
+    season.mkdir()
+    (season / "Show E01.mkv").write_bytes(b"fake video")
+    before = (root / "project.yaml").read_text(encoding="utf-8")
+
+    result = runner.invoke(app, _import_args(tmp_path, season))
+
+    assert result.exit_code == 0, out(result)
+    assert "没有可导入的集" in out(result)
+    assert "未配对视频" in out(result)
+    assert import_env == []
+    assert (root / "project.yaml").read_text(encoding="utf-8") == before
+
+
+def test_import_a_bad_episode_does_not_block_the_good_ones(tmp_path, golden_srt_path, import_env):
+    _import_project(tmp_path)
+    season = _import_season(
+        tmp_path, golden_srt_path, ["Show E01", "Show E02", "Show EP02 v2", "Show NCOP"]
+    )
+    (season / "Show E09.mkv").write_bytes(b"fake video")
+
+    result = runner.invoke(app, _import_args(tmp_path, season, "--yes"))
+
+    assert result.exit_code == 0, out(result)
+    assert import_env == [1]
+    assert "重复" in out(result)
+    assert "非正片跳过" in out(result)
+
+
+def test_import_rejects_a_missing_directory(tmp_path, import_env):
+    _import_project(tmp_path)
+
+    result = runner.invoke(app, _import_args(tmp_path, tmp_path / "nope", "--yes"))
+
+    assert result.exit_code == 1
+    assert "找不到目录" in out(result)
+
+
+def test_import_rejects_a_missing_srt_dir(tmp_path, golden_srt_path, import_env):
+    _import_project(tmp_path)
+    season = _import_season(tmp_path, golden_srt_path, ["Show E01"])
+
+    result = runner.invoke(
+        app, _import_args(tmp_path, season, "--srt-dir", str(tmp_path / "subs"), "--yes")
+    )
+
+    assert result.exit_code == 1
+    assert "找不到目录" in out(result)
+
+
+def test_import_pairs_from_srt_dir(tmp_path, golden_srt_path, import_env):
+    root = _import_project(tmp_path)
+    season = tmp_path / "season"
+    season.mkdir()
+    (season / "Show E01.mkv").write_bytes(b"fake video")
+    subs = tmp_path / "subs"
+    subs.mkdir()
+    (subs / "Show E01.zh-Hans.srt").write_bytes(golden_srt_path.read_bytes())
+
+    result = runner.invoke(app, _import_args(tmp_path, season, "--srt-dir", str(subs), "--yes"))
+
+    assert result.exit_code == 0, out(result)
+    assert import_env == [1]
+    assert (root / "srt" / "E01.srt").read_bytes() == golden_srt_path.read_bytes()
+
+
+def test_import_missing_project_fails(tmp_path):
+    result = runner.invoke(
+        app, ["import", "nope", str(tmp_path), "--work-dir", str(tmp_path / "work")]
+    )
+
+    assert result.exit_code == 1
+    assert "project.yaml" in out(result)
+
+
+def test_import_reports_pipeline_errors_as_one_line(
+    tmp_path, golden_srt_path, import_env, monkeypatch
+):
+    _import_project(tmp_path)
+    season = _import_season(tmp_path, golden_srt_path, ["Show E01"])
+
+    async def broken_pipeline(cfg, provider, **kwargs):
+        raise ValueError("第 1 集的对白轨坏了")
+
+    monkeypatch.setattr("tenmin.cli.run_pipeline", broken_pipeline)
+
+    result = runner.invoke(app, _import_args(tmp_path, season, "--yes"))
+
+    assert result.exit_code == 1
+    assert "第 1 集的对白轨坏了" in out(result)
