@@ -2,7 +2,13 @@ from pathlib import Path
 
 import pytest
 
-from tenmin.importer import LANGUAGE_SUFFIXES, scan_directory
+from tenmin.importer import (
+    LANGUAGE_SUFFIXES,
+    Ambiguous,
+    is_extra,
+    parse_episode_number,
+    scan_directory,
+)
 
 
 def _touch(path: Path, data: bytes = b"fake") -> Path:
@@ -105,3 +111,68 @@ def test_scan_rejects_a_file_given_as_directory(tmp_path):
 def test_scan_rejects_a_missing_srt_dir(tmp_path):
     with pytest.raises(FileNotFoundError, match="找不到目录"):
         scan_directory(tmp_path, tmp_path / "subs")
+
+
+@pytest.mark.parametrize(
+    ("stem", "expected"),
+    [
+        ("Show E01", 1),
+        ("Show EP02", 2),
+        ("Show.S01E03.1080p.WEB", 3),
+        ("Show 第04集", 4),
+        ("Show 第05話", 5),
+        ("Show 第05话", 5),
+        ("Show 第０６話", 6),
+        ("Show ＥＰ07", 7),
+    ],
+)
+def test_parse_strong_patterns(stem, expected):
+    assert parse_episode_number(stem) == expected
+
+
+@pytest.mark.parametrize(
+    ("stem", "expected"),
+    [
+        ("[ANi] 才女的侍从 - 11 [1080P][Baha][WEB-DL][AAC AVC][CHT]", 11),
+        ("Show_08_x264_10bit", 8),
+        ("Show 2024 - 09 [H.264 AAC2.0]", 9),
+        ("Show.4K.12", 12),
+        ("[Group] Show [HEVC FLAC OPUS] [10]", 10),
+    ],
+)
+def test_parse_weak_pattern_skips_noise_tokens(stem, expected):
+    assert parse_episode_number(stem) == expected
+
+
+def test_parse_returns_none_when_no_number_is_left():
+    assert parse_episode_number("Kimi no Na wa") is None
+
+
+def test_parse_reports_ambiguous_weak_candidates():
+    assert parse_episode_number("86 - 11") == Ambiguous((11, 86))
+
+
+def test_parse_reports_conflicting_strong_matches_as_ambiguous():
+    assert parse_episode_number("Show E01 E02") == Ambiguous((1, 2))
+
+
+@pytest.mark.parametrize(
+    "stem",
+    [
+        "Show NCOP",
+        "[Group] Show NCED1",
+        "Show SP01",
+        "[Group] Show OVA",
+        "Show PV",
+        "Show 预告",
+        "Show 預告",
+        "Show Menu",
+    ],
+)
+def test_is_extra_flags_non_main_material(stem):
+    assert is_extra(stem) is True
+
+
+@pytest.mark.parametrize("stem", ["Spy x Family - 01", "Show - 01", "Nova E02"])
+def test_is_extra_leaves_main_episodes_alone(stem):
+    assert is_extra(stem) is False
