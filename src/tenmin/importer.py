@@ -5,12 +5,18 @@
 
 from __future__ import annotations
 
+import json
 import re
 import unicodedata
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Literal
+
+from pydantic import BaseModel
 
 from tenmin.ingest.ocr_batch import VIDEO_SUFFIXES
+from tenmin.script.llm import LLMProvider
 
 # 视频主体后面允许跟的语言后缀。顺序就是同一视频命中多个候选 SRT 时的优先级
 # （主体完全相等的排在它们全部之前）。必须放开：`tenmin ocr` 自己的产物就是
@@ -186,3 +192,57 @@ def parse_episode_number(stem: str) -> int | Ambiguous | None:
         if (match := _WEAK_NUMBER.fullmatch(token))
     ]
     return _verdict(weak)
+
+
+EXTRA: Literal["extra"] = "extra"
+"""LLM 兜底判为「非正片」时 resolve_ambiguous 返回的标记。"""
+
+_RESOLVE_SYSTEM = """\
+你在整理同一部番剧同一季的视频文件。请为下面每个文件名判断它是正片第几集：
+- 是正片：episode 填集号（正整数），extra 填 false。
+- 不是正片（NCOP、NCED、SP、OVA、PV、预告、菜单等）：episode 填 null，extra 填 true。
+- 无法确定：episode 填 null，extra 填 false。不要按文件的排列顺序猜集号。
+按输入里的 id 逐条返回，不要遗漏，也不要新增。"""
+
+
+class _EpisodeGuess(BaseModel):
+    id: int
+    episode: int | None = None
+    extra: bool = False
+
+
+class _EpisodeGuesses(BaseModel):
+    files: list[_EpisodeGuess]
+
+
+async def resolve_ambiguous(
+    stems: Sequence[str], provider: LLMProvider
+) -> list[int | Literal["extra"] | None]:
+    """把正则认不出/认出多个候选的文件名**打包成一次调用**交给 LLM。
+
+    返回值与 stems 逐位对齐：集号、`EXTRA`（非正片）或 None（仍无法确定）。
+    模型漏答、答了不在输入里的 id、给出非正整数集号，一律当「无法确定」；同一个 id
+    答了两次取第一次。provider 抛的异常原样外抛，由调用方决定怎么降级。
+    """
+    if not stems:
+        return []
+    user = json.dumps(
+        {"files": [{"id": i, "filename": stem} for i, stem in enumerate(stems, start=1)]},
+        ensure_ascii=False,
+    )
+    response = await provider.complete(_RESOLVE_SYSTEM, user, _EpisodeGuesses)
+    by_id: dict[int, _EpisodeGuess] = {}
+    for guess in response.files:
+        by_id.setdefault(guess.id, guess)
+    verdicts: list[int | Literal["extra"] | None] = []
+    for i in range(1, len(stems) + 1):
+        guess = by_id.get(i)
+        if guess is None:
+            verdicts.append(None)
+        elif guess.extra:
+            verdicts.append(EXTRA)
+        elif guess.episode is not None and guess.episode >= 1:
+            verdicts.append(guess.episode)
+        else:
+            verdicts.append(None)
+    return verdicts

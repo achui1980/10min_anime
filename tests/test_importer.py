@@ -1,14 +1,19 @@
+import json
 from pathlib import Path
 
 import pytest
 
 from tenmin.importer import (
+    EXTRA,
     LANGUAGE_SUFFIXES,
     Ambiguous,
     is_extra,
     parse_episode_number,
+    resolve_ambiguous,
     scan_directory,
 )
+
+from .fakes import FakeProvider
 
 
 def _touch(path: Path, data: bytes = b"fake") -> Path:
@@ -206,3 +211,40 @@ def test_parse_strong_pattern_ignores_crc_tags_and_allows_version_suffix(stem, e
 )
 def test_parse_weak_pattern_version_suffix_and_channel_tokens(stem, expected):
     assert parse_episode_number(stem) == expected
+
+
+async def test_resolve_ambiguous_sends_one_batched_call():
+    provider = FakeProvider(
+        [{"files": [{"id": 1, "episode": 11}, {"id": 2}, {"id": 3, "extra": True}]}]
+    )
+
+    verdicts = await resolve_ambiguous(["86 - 11", "Kimi no Na wa", "Mystery Bonus"], provider)
+
+    assert verdicts == [11, None, EXTRA]
+    assert len(provider.calls) == 1
+    payload = json.loads(provider.calls[0]["user"])
+    assert payload == {
+        "files": [
+            {"id": 1, "filename": "86 - 11"},
+            {"id": 2, "filename": "Kimi no Na wa"},
+            {"id": 3, "filename": "Mystery Bonus"},
+        ]
+    }
+    assert provider.calls[0]["schema"] is not None
+
+
+async def test_resolve_ambiguous_treats_missing_or_invalid_answers_as_unknown():
+    provider = FakeProvider(
+        [{"files": [{"id": 2, "episode": 0}, {"id": 2, "episode": 5}, {"id": 99, "episode": 3}]}]
+    )
+
+    verdicts = await resolve_ambiguous(["a", "b"], provider)
+
+    assert verdicts == [None, None]
+
+
+async def test_resolve_ambiguous_with_no_stems_makes_no_call():
+    provider = FakeProvider([])
+
+    assert await resolve_ambiguous([], provider) == []
+    assert provider.calls == []
