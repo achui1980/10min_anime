@@ -1,4 +1,4 @@
-"""截图与音频匹配：媒体抽取、dHash 定位、音频包络与跨集 OP 长度。
+"""截图与音频匹配：媒体抽取、dHash 定位、音频包络与跨集 OP/ED 终点。
 
 匹配结果不应用阈值，由调用方决定是否接受。
 """
@@ -185,6 +185,7 @@ MAX_LAG_FRAMES = ENVELOPE_RATE
 ALIGN_FRAMES = 20 * ENVELOPE_RATE
 OUTLIER_SECONDS = 10.0
 DEFAULT_OP_LENGTH = 90.0
+ED_MATCH_SECONDS = 5.0
 
 
 def read_pcm(
@@ -271,6 +272,63 @@ def op_length(ref_env: np.ndarray, env: np.ndarray) -> float | None:
             end = i - hold + 1 + lag + SIMILARITY_WINDOW // 2
             return end / ENVELOPE_RATE
     return None
+
+
+def ed_endpoints(
+    ref_env: np.ndarray, env: np.ndarray, ref_seconds: float, seconds: float
+) -> tuple[float | None, float | None]:
+    """返回两条各自时间轴上的 ED 终点，None 表示该侧证据不足。
+
+    沿用 OP 的去均值、错位与滑窗相关，但要求至少五秒连续匹配才能测尾。
+    静音或频带能量没有有效时间变化的窗不提供匹配证据；已有歌曲证据后算掉落。
+    持续掉落时分别返回歌曲终点；持续匹配耗尽时只确认确实覆盖到的文件 EOF，
+    不能把参考读段边界或较短集 EOF 当成较长集歌曲终点。
+    """
+    ref = ref_env - ref_env.mean(axis=0) if len(ref_env) else ref_env
+    other = env - env.mean(axis=0) if len(env) else env
+    lag = _best_lag(ref, other)
+    first, stop = _span(ref, other, lag)
+    hold = round(DROP_SECONDS * ENVELOPE_RATE)
+    sustained = round(ED_MATCH_SECONDS * ENVELOPE_RATE) - SIMILARITY_WINDOW + 1
+    matched = False
+    high_run = low_run = 0
+    for i in range(first, stop - SIMILARITY_WINDOW + 1):
+        ref_window = ref[i : i + SIMILARITY_WINDOW]
+        other_window = other[i + lag : i + lag + SIMILARITY_WINDOW]
+        # 全段去均值会把静音变成固定的非零频带向量。频带间的方差不算时间证据；
+        # 1e-8 仅排除浮点去均值残差，两侧都须有实际的频带能量时间变化。
+        varying = all(
+            np.any(np.ptp(window, axis=0) > 1e-8) for window in (ref_window, other_window)
+        )
+        # 匹配本身也只比较时间变化，避免静音/固定音色改变全段均值后，
+        # 把后续两段无关音频的共同频带偏置误认成持续歌曲匹配。
+        value = (
+            _correlation(
+                ref_window - ref_window.mean(axis=0),
+                other_window - other_window.mean(axis=0),
+            )
+            if varying else 0.0
+        )
+        if value >= SIMILARITY_THRESHOLD:
+            high_run += 1
+            matched = matched or high_run >= sustained
+            low_run = 0
+            continue
+        high_run = 0
+        if not matched:
+            continue
+        low_run += 1
+        if low_run == hold:
+            end = (i - hold + 1 + SIMILARITY_WINDOW // 2) / ENVELOPE_RATE
+            return min(end, ref_seconds), min(end + lag / ENVELOPE_RATE, seconds)
+    if not matched or low_run or high_run < sustained:
+        return None, None
+    # 包络舍弃不足一帧的尾部。只容许这个量化差，不容许参考读长截断。
+    tolerance = 1 / ENVELOPE_RATE + 1e-6
+    return (
+        ref_seconds if abs(stop / ENVELOPE_RATE - ref_seconds) <= tolerance else None,
+        seconds if abs((stop + lag) / ENVELOPE_RATE - seconds) <= tolerance else None,
+    )
 
 
 def median_length(lengths: Sequence[float]) -> float | None:

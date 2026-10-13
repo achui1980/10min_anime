@@ -159,6 +159,89 @@ def test_op_length_is_none_when_the_op_outlasts_the_reference_audio():
     assert av_match.op_length(ref, ref.copy()) is None
 
 
+def test_ed_endpoints_confirm_matching_audio_through_eof_beyond_150_seconds():
+    song = _noise_envelope(170, 10)
+    assert av_match.ed_endpoints(song, song + 1.5, 170, 170) == (170, 170)
+
+
+def test_ed_endpoints_exclude_episode_specific_postcredits_with_start_offset():
+    song = _noise_envelope(90, 10)
+    ref = np.concatenate([song, _noise_envelope(30, 11)])
+    peer = np.concatenate([_noise_envelope(0.4, 12), song, _noise_envelope(60, 13)])
+    ends = av_match.ed_endpoints(ref, peer, 120, 150.4)
+    assert ends == pytest.approx((90, 90.4), abs=0.2)
+
+
+@pytest.mark.parametrize("kind", ["unrelated", "silence", "brief-match"])
+def test_ed_endpoints_need_sustained_shared_audio(kind):
+    ref = _noise_envelope(90, 10)
+    peer = _noise_envelope(90, 11)
+    if kind == "silence":
+        ref[:] = peer[:] = 0
+    elif kind == "brief-match":
+        peer[:10] = ref[:10]
+    assert av_match.ed_endpoints(ref, peer, 90, 90) == (None, None)
+
+
+@pytest.mark.parametrize("ref_seconds,peer_seconds", [(60, 100), (100, 60)])
+def test_ed_endpoints_short_file_eof_does_not_confirm_longer_peer(ref_seconds, peer_seconds):
+    song = _noise_envelope(100, 10)
+    ends = av_match.ed_endpoints(
+        song[:ref_seconds * 10], song[:peer_seconds * 10], ref_seconds, peer_seconds
+    )
+    assert ends == ((60, None) if ref_seconds == 60 else (None, 60))
+
+
+def test_ed_endpoints_read_cutoff_is_not_file_eof():
+    song = _noise_envelope(150, 10)
+    assert av_match.ed_endpoints(song, song.copy(), 180, 180) == (None, None)
+
+
+def test_ed_endpoints_partial_drop_at_eof_is_not_confirmed():
+    ref = _noise_envelope(90, 10)
+    peer = ref.copy()
+    peer[-10:] = _noise_envelope(1, 11)
+    assert av_match.ed_endpoints(ref, peer, 90, 90) == (None, None)
+
+
+@pytest.mark.parametrize("tail_seconds", [0, 10], ids=["silence-to-eof", "audio-after-silence"])
+@pytest.mark.parametrize("shared_music", [False, True], ids=["unrelated", "shared-music"])
+def test_ed_pcm_shared_silence_requires_preceding_music_evidence(tail_seconds, shared_music):
+    rate = av_match.SAMPLE_RATE
+    music = np.random.default_rng(20).normal(0, 5000, 20 * rate)
+    other_music = music if shared_music else np.random.default_rng(21).normal(
+        0, 5000, 20 * rate
+    )
+    silence = np.zeros(10 * rate)
+    ref = av_match.audio_envelope(_pcm(np.concatenate([
+        music, silence, np.random.default_rng(22).normal(0, 5000, tail_seconds * rate)
+    ])))
+    peer = av_match.audio_envelope(_pcm(np.concatenate([
+        other_music, silence, np.random.default_rng(23).normal(0, 5000, tail_seconds * rate)
+    ])))
+    assert np.all(ref[200:300] == 0)
+    assert np.all(peer[200:300] == 0)
+    ends = av_match.ed_endpoints(ref, peer, 30 + tail_seconds, 30 + tail_seconds)
+    if shared_music:
+        assert ends == pytest.approx((20, 20), abs=0.6)
+    else:
+        assert ends == (None, None)
+
+
+def test_ed_pcm_stationary_band_profile_cannot_prove_shared_song():
+    rate = av_match.SAMPLE_RATE
+    # 整数周期重复的非静音 PCM：频带间有变化，时间轴却没有有效变化。
+    frame = _pcm(8000 * np.sin(2 * np.pi * 400 * np.arange(800) / rate))
+    stationary = av_match.audio_envelope(frame * 100)
+    ref = np.concatenate([stationary, av_match.audio_envelope(_pcm(
+        np.random.default_rng(24).normal(0, 5000, 10 * rate)
+    ))])
+    peer = np.concatenate([stationary, av_match.audio_envelope(_pcm(
+        np.random.default_rng(25).normal(0, 5000, 10 * rate)
+    ))])
+    assert av_match.ed_endpoints(ref, peer, 20, 20) == (None, None)
+
+
 def test_median_length_drops_outliers_before_taking_the_median():
     assert av_match.median_length([89.9, 90.1, 90.0, 60.0, 130.0]) == pytest.approx(90.0)
 
@@ -559,7 +642,7 @@ def test_real_read_pcm_has_expected_duration_and_tone_band(av_video):
 # --- 真实素材（av marker，默认跳过） -------------------------------------------
 
 
-@pytest.mark.parametrize("defect", [None, "fallback", "missing_episode"])
+@pytest.mark.parametrize("defect", [None, "fallback", "ed_fallback", "missing_episode"])
 async def test_real_season_contract_rejects_false_success(tmp_path, monkeypatch, defect):
     """直接走真实素材测试的断言；只替换解码结果，扫描与集号解析仍用真实文件。"""
     from tenmin import importer
@@ -590,6 +673,8 @@ async def test_real_season_contract_rejects_false_success(tmp_path, monkeypatch,
     )
     if defect == "fallback":
         plan.items[0] = replace(plan.items[0], ranges=replace(ranges, op_length_estimated=True))
+    elif defect == "ed_fallback":
+        plan.items[0] = replace(plan.items[0], ranges=replace(ranges, ed_length_estimated=True))
     elif defect == "missing_episode":
         plan.items.pop()
 
@@ -604,7 +689,11 @@ async def test_real_season_contract_rejects_false_success(tmp_path, monkeypatch,
     if defect is None:
         await test_real_season_locates_op_and_ed_by_screenshot_and_audio(tmp_path)
     else:
-        message = "OP 长度不能使用估算兜底" if defect == "fallback" else "导入集号未完整覆盖素材"
+        message = {
+            "fallback": "OP 长度不能使用估算兜底",
+            "ed_fallback": "ED 终点不能使用估算兜底",
+            "missing_episode": "导入集号未完整覆盖素材",
+        }[defect]
         with pytest.raises(AssertionError, match=message):
             await test_real_season_locates_op_and_ed_by_screenshot_and_audio(tmp_path)
 
@@ -661,10 +750,14 @@ async def test_real_season_locates_op_and_ed_by_screenshot_and_audio(tmp_path):
     for item in plan.items:
         ranges = item.ranges
         assert ranges.op_length_estimated is False, "OP 长度不能使用估算兜底"
+        assert ranges.ed_length_estimated is False, "ED 终点不能使用估算兜底"
         assert (ranges.op_source, ranges.ed_source) == ("av", "av"), item.number
         assert ranges.op_distance is not None and ranges.op_distance <= MAX_DISTANCE
         assert ranges.ed_distance is not None and ranges.ed_distance <= MAX_DISTANCE
         assert ranges.op_range is not None and ranges.ed_range is not None
         assert 60.0 <= ranges.op_range[1] - ranges.op_range[0] <= 120.0
-        assert ranges.ed_range[1] == ranges.duration
+        assert 0 < ranges.ed_range[0] < ranges.ed_range[1] <= ranges.duration
+        # 本验收素材 saijo E02/E12 的 ED 歌曲确实唱到 EOF，必须有音频证据。
+        if item.number in (2, 12):
+            assert ranges.ed_range[1] == ranges.duration
         assert ranges.write is not None

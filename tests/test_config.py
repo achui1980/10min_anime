@@ -80,6 +80,33 @@ def test_load_project_missing_file(tmp_path):
         load_project(tmp_path / "nope.yaml")
 
 
+def test_credit_references_default_to_none():
+    credits = CreditsConfig()
+    assert credits.op_reference is None
+    assert credits.ed_reference is None
+
+
+def test_load_project_accepts_credit_reference_paths_without_reading_them(tmp_path):
+    absolute = tmp_path / "external" / "ending.jpg"
+    path = tmp_path / "project.yaml"
+    path.write_text(
+        MINIMAL + f"credits:\n  op_reference: refs/opening.png\n  ed_reference: {absolute}\n",
+        encoding="utf-8",
+    )
+
+    cfg = load_project(path)
+
+    assert cfg.credits.op_reference == Path("refs/opening.png")
+    assert cfg.credits.ed_reference == absolute
+    assert cfg.root == tmp_path
+
+
+def test_credit_references_accept_explicit_null():
+    credits = CreditsConfig(op_reference=None, ed_reference=None)
+    assert credits.op_reference is None
+    assert credits.ed_reference is None
+
+
 def test_load_project_rejects_unknown_mode(tmp_path):
     path = tmp_path / "project.yaml"
     path.write_text(MINIMAL.replace("slug: demo", "slug: demo\nmode: whatever"), encoding="utf-8")

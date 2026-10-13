@@ -151,6 +151,32 @@ def test_a_whole_subconfig_entry_drops_the_excluded_knobs(tmp_path):
     assert data["llm"]["budget_rewrite_rounds"] == 1
 
 
+def test_import_references_preserve_legacy_ingest_payload(tmp_path):
+    cfg = _cfg(tmp_path)
+    payload = slice_payload(cfg, "ingest", cfg.episodes[0])
+    legacy = json.loads(payload)
+    legacy["credits"].pop("op_reference", None)
+    legacy["credits"].pop("ed_reference", None)
+    assert payload == json.dumps(legacy, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
+    assert {"credits.op_reference", "credits.ed_reference"} <= EXCLUDED
+
+
+def test_import_reference_changes_preserve_all_slice_bytes_and_mtimes(tmp_path):
+    cfg = _cfg(tmp_path)
+    write_slices(cfg, cfg.episodes)
+    paths = list((tmp_path / ".config").iterdir())
+    for path in paths:
+        os.utime(path, ns=(10**18, 10**18))
+    before = {path: (path.read_bytes(), path.stat().st_mtime_ns) for path in paths}
+    updated = _with(cfg, "credits.op_reference", Path("refs/opening.png"))
+    updated = _with(updated, "credits.ed_reference", tmp_path / "ending.jpg")
+
+    assert _payloads(updated) == _payloads(cfg)
+    write_slices(updated, updated.episodes)
+
+    assert {path: (path.read_bytes(), path.stat().st_mtime_ns) for path in paths} == before
+
+
 def test_the_episode_token_embeds_this_episodes_config(tmp_path):
     cfg = _cfg(tmp_path)
     data = json.loads(slice_payload(cfg, "ingest", cfg.episodes[0]))

@@ -192,6 +192,10 @@ class IngestConfig(StrictModel):
 class CreditsConfig(StrictModel):
     """OP/ED 与 staff 行识别的阈值（原 ingest/credits.py 的模块常量）。"""
 
+    # 仅 tenmin import 使用；相对路径由 importer 按项目根目录解析。
+    op_reference: Path | None = None
+    ed_reference: Path | None = None
+
     # 聚簇法找 OP 时，簇起点必须落在 [op_search_start, op_search_end] 内。
     # 下界 30 秒：实测最早的 OP 起点是《恶女》第 2 集的 53.554 秒，取 30 留足余量。
     # 原来的 60 秒会把它挡在窗外，OP 就退化成「最长的演出高光」。

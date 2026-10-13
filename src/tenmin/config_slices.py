@@ -4,7 +4,7 @@
 键的顺序或显式写出默认值，不会触发重跑。每集只放本集的 EpisodeConfig。
 
 改 STAGE_FIELDS 时：拿不准就多挂；LLM 阶段逐字段核对以免多付调用费用；
-EXCLUDED 只收不影响产物内容的运维旋钮。此模块不 import pipeline，以免形成循环。
+EXCLUDED 收运维旋钮与仅导入使用的字段。此模块不 import pipeline，以免形成循环。
 """
 
 from __future__ import annotations
@@ -101,10 +101,12 @@ STAGE_FIELDS: dict[str, tuple[str, ...]] = {
     ),
 }
 
-# 不影响产物内容的运维旋钮；语义重试与预算返工次数影响采纳的稿子，不在这里。
+# 运维旋钮与仅导入使用的字段；语义重试与预算返工次数影响采纳的稿子，不在这里。
 EXCLUDED: frozenset[str] = frozenset(
     {
         "slug",
+        "credits.op_reference",
+        "credits.ed_reference",
         "llm.timeout_seconds",
         "llm.read_timeout_seconds",
         "llm.total_timeout_seconds",
