@@ -800,6 +800,75 @@ async def test_apply_registers_items_and_writes_only_the_planned_ranges(
     assert (cfg.root / "srt" / "E02.srt").is_file()
 
 
+@pytest.mark.parametrize("source_yaml", ["  video: video/new.mkv\n", "  srt: srt/E02.srt\n"])
+async def test_apply_rejects_sources_registered_after_preview_before_any_copy(
+    tmp_path, golden_srt_path, fixed_duration, source_yaml
+):
+    cfg = _project(tmp_path, "episodes:\n- number: 2\n")
+    season = _season(tmp_path, golden_srt_path, ["Show E01", "Show E02"])
+    plan = await build_import_plan(cfg, season, provider_factory=_no_llm)
+    assert [item.number for item in plan.items] == [1, 2]
+    current_yaml = "show: 才女的侍从\nslug: saijo\nepisodes:\n- number: 2\n" + source_yaml
+    cfg.config_path.write_text(current_yaml, encoding="utf-8")
+    destination = _touch(cfg.root / "srt" / "E02.srt", b"manually registered subtitles")
+
+    with pytest.raises(ValueError, match="第 2 集已登记"):
+        apply_import_plan(cfg, plan)
+
+    assert cfg.config_path.read_text(encoding="utf-8") == current_yaml
+    assert destination.read_bytes() == b"manually registered subtitles"
+    assert not (cfg.root / "srt" / "E01.srt").exists()
+
+
+async def test_apply_carries_current_config_and_manual_ranges_through_multiple_items(
+    tmp_path, golden_srt_path, fixed_duration
+):
+    cfg = _project(tmp_path)
+    season = _season(tmp_path, golden_srt_path, ["Show E01", "Show E02"])
+    plan = await build_import_plan(cfg, season, provider_factory=_no_llm)
+    cfg.config_path.write_text(
+        "show: 才女的侍从\nslug: saijo\nrender:\n  rate: '+20%'\nepisodes:\n"
+        "- number: 1\n  op_range: [10, 100]\n  hardsub: true\n"
+        "- number: 2\n  op_range: [20, 110]\n  ed_range: [1300, 1420]\n"
+        "- number: 9\n  video: video/E09.mkv\n",
+        encoding="utf-8",
+    )
+
+    updated = apply_import_plan(cfg, plan)
+
+    reloaded = load_project(cfg.config_path)
+    assert updated == reloaded
+    assert updated.render.rate == "+20%"
+    by_number = {e.number: e for e in updated.episodes}
+    assert sorted(by_number) == [1, 2, 9]
+    assert by_number[1].op_range == (10.0, 100.0)
+    assert by_number[1].ed_range is None
+    assert by_number[1].hardsub is True
+    assert by_number[2].op_range == (20.0, 110.0)
+    assert by_number[2].ed_range == (1300.0, 1420.0)
+    assert by_number[9].video == Path("video/E09.mkv")
+    for number in (1, 2):
+        assert by_number[number].video == (season / f"Show E{number:02d}.mkv").resolve()
+        destination = cfg.root / "srt" / f"E{number:02d}.srt"
+        assert destination.read_bytes() == golden_srt_path.read_bytes()
+
+
+async def test_apply_validates_current_config_before_copying(
+    tmp_path, golden_srt_path, fixed_duration
+):
+    cfg = _project(tmp_path)
+    season = _season(tmp_path, golden_srt_path, ["Show E01"])
+    plan = await build_import_plan(cfg, season, provider_factory=_no_llm)
+    current_yaml = "show: 才女的侍从\nslug: saijo\nrender:\n  font_sise: 30\nepisodes: []\n"
+    cfg.config_path.write_text(current_yaml, encoding="utf-8")
+
+    with pytest.raises(ValueError, match=r"render\.font_sise"):
+        apply_import_plan(cfg, plan)
+
+    assert cfg.config_path.read_text(encoding="utf-8") == current_yaml
+    assert not (cfg.root / "srt" / "E01.srt").exists()
+
+
 _WRITE = ((153.5, 224.7), (1348.2, 1416.6))
 
 

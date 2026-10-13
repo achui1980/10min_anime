@@ -3712,6 +3712,49 @@ def test_register_episode_never_overrides_a_partial_manual_range(tmp_path):
     assert episode3.ed_range == (1300.0, 1420.0)
 
 
+@pytest.mark.parametrize("prefilled", [False, True])
+@pytest.mark.parametrize(
+    ("manual_yaml", "expected_op", "expected_ed"),
+    [
+        ("  op_range: [10, 100]\n", (10.0, 100.0), None),
+        ("  ed_range: [1300, 1420]\n", None, (1300.0, 1420.0)),
+        (
+            "  op_range: [10, 100]\n  ed_range: [1300, 1420]\n",
+            (10.0, 100.0),
+            (1300.0, 1420.0),
+        ),
+    ],
+)
+def test_register_episode_preserves_manual_ranges_added_after_loading(
+    tmp_path, prefilled, manual_yaml, expected_op, expected_ed
+):
+    root = tmp_path / "saijo"
+    root.mkdir()
+    yaml_path = root / "project.yaml"
+    header = "show: 才女的侍从\nslug: saijo\n"
+    yaml_path.write_text(
+        header + ("episodes:\n- number: 5\n" if prefilled else "episodes: []\n"),
+        encoding="utf-8",
+    )
+    cfg = load_project(yaml_path)
+    yaml_path.write_text(header + "episodes:\n- number: 5\n" + manual_yaml, encoding="utf-8")
+
+    updated = register_episode(
+        cfg,
+        episode=5,
+        srt=_tiny_srt(tmp_path / "e05.srt"),
+        video=tmp_path / "e05.mkv",
+        op_range=(90.0, 180.5),
+        ed_range=(1348.2, 1416.6),
+    )
+
+    reloaded = load_project(yaml_path)
+    assert reloaded.episodes[0].op_range == expected_op
+    assert reloaded.episodes[0].ed_range == expected_ed
+    assert updated == reloaded
+    assert manual_yaml in yaml_path.read_text(encoding="utf-8")
+
+
 def test_register_episode_rejects_half_a_range_before_touching_anything(tmp_path):
     root = tmp_path / "saijo"
     (root / "srt").mkdir(parents=True)

@@ -900,13 +900,15 @@ def register_episode(
     """
     # cfg 可能在载入后被人手改了文件；再次校验磁盘上的 YAML，避免拷好字幕
     # 才由 round-trip parser 报错，留下没有登记成功的 SRT。
-    _parse_project_yaml(cfg.config_path)
+    current = _parse_project_yaml(cfg.config_path)
     # 在拷贝字幕或改写配置之前检查输入，给出可读的错误并避免部分登记。
     if (op_range is None) != (ed_range is None):
         raise ValueError("op_range 与 ed_range 必须同时给出：只写一半会关掉另一半的识别窗")
     if op_range is not None:
         # 跟加载 project.yaml 时同一套区间校验（起点 < 终点、不为负），抛 ValueError。
         EpisodeConfig(number=episode, op_range=op_range, ed_range=ed_range)
+        # 建议区间的手填保护必须看磁盘上的最新条目，不能相信预览时的 cfg。
+        cfg.episodes = [EpisodeConfig.model_validate(e) for e in current.get("episodes", [])]
     if srt is not None and not Path(srt).is_file():
         raise FileNotFoundError(f"找不到要登记的字幕文件：{srt}")
 

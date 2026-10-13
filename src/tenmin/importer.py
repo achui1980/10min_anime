@@ -18,7 +18,7 @@ from typing import Literal
 import httpx
 from pydantic import BaseModel
 
-from tenmin.config import EpisodeConfig, ProjectConfig
+from tenmin.config import EpisodeConfig, ProjectConfig, load_project
 from tenmin.ingest import av_match
 from tenmin.ingest.normalize import build_track, credit_range_source
 from tenmin.ingest.ocr_batch import VIDEO_SUFFIXES
@@ -754,6 +754,14 @@ def apply_import_plan(cfg: ProjectConfig, plan: ImportPlan) -> ProjectConfig:
 
     每一集各自原子写回 project.yaml，不做跨集事务：中途失败时已登记的集保留。
     """
+    # 预览到确认之间可能新增来源或手填配置；先校验当前配置及全部待导入集，
+    # 避免覆盖已登记来源，也避免遇到后面的冲突前已经拷了前面的字幕。
+    cfg = load_project(cfg.config_path)
+    by_number = {episode.number: episode for episode in cfg.episodes}
+    for item in plan.items:
+        existing = by_number.get(item.number)
+        if existing is not None and existing.has_source:
+            raise ValueError(f"第 {item.number} 集已登记来源，请重新预览导入计划")
     for item in plan.items:
         op_range, ed_range = item.ranges.write if item.ranges.write is not None else (None, None)
         cfg = register_episode(
