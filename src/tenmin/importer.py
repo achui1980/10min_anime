@@ -343,11 +343,14 @@ def _locate_side(
 
 
 def _envelope(cfg: ProjectConfig, video: Path, start: float):
-    return av_match.audio_envelope(
+    envelope = av_match.audio_envelope(
         av_match.read_pcm(
             video, start, av_match.REFERENCE_SECONDS, ffmpeg_path=cfg.render.ffmpeg_path
         )
     )
+    if len(envelope) == 0:
+        raise FFmpegError("解码音频不足一帧，无法生成音频包络")
+    return envelope
 
 
 def _op_sides(

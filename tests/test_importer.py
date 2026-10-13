@@ -1117,6 +1117,37 @@ async def test_av_reference_audio_failure_fails_all_starts(av_season):
     assert [read[0] for read in state["reads"]] == [1]
 
 
+@pytest.mark.parametrize("pcm", [b"", b"\x00" * 1599], ids=["empty", "less-than-one-frame"])
+@pytest.mark.parametrize("number", [1, 2], ids=["reference", "peer"])
+async def test_av_decoded_audio_without_envelope_frames_fails(av_season, monkeypatch, pcm, number):
+    original = av_match.read_pcm
+
+    def read_pcm(video, start, duration, *, ffmpeg_path):
+        if parse_episode_number(video.stem) == number:
+            av_season[2]["reads"].append((number, start, duration))
+            return pcm
+        return original(video, start, duration, ffmpeg_path=ffmpeg_path)
+
+    monkeypatch.setattr(av_match, "read_pcm", read_pcm)
+    plan = await _av_plan(av_season)
+
+    for item in plan.items:
+        ranges = item.ranges
+        if number == 1 or item.number == number:
+            assert ranges.op_range is None
+            assert ranges.write is None
+            assert ranges.op_distance == 0
+            assert ranges.ed_range is not None
+            reason = "OP 参考集 E01 的音频读不出来：" if number == 1 else "OP 音频读不出来："
+            assert reason in ranges.note
+            assert not ranges.op_length_estimated
+        else:
+            assert ranges.write is not None
+            assert ranges.op_range[1] - ranges.op_range[0] == pytest.approx(90, abs=0.3)
+            assert not ranges.op_length_estimated
+    assert [read[0] for read in av_season[2]["reads"]] == ([1] if number == 1 else [1, 2, 3])
+
+
 async def test_av_reference_is_best_distance_then_episode_number(av_season):
     state = av_season[2]
     state["distances"][1] = 1
