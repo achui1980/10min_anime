@@ -4,7 +4,7 @@ import os
 import shlex
 import shutil
 import subprocess
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
 
 import numpy as np
@@ -559,15 +559,84 @@ def test_real_read_pcm_has_expected_duration_and_tone_band(av_video):
 # --- 真实素材（av marker，默认跳过） -------------------------------------------
 
 
+@pytest.mark.parametrize("defect", [None, "fallback", "missing_episode"])
+async def test_real_season_contract_rejects_false_success(tmp_path, monkeypatch, defect):
+    """直接走真实素材测试的断言；只替换解码结果，扫描与集号解析仍用真实文件。"""
+    from tenmin import importer
+
+    sample = tmp_path / "sample"
+    sample.mkdir()
+    for number in (2, 7, 12):
+        (sample / f"Show E{number:02d}.mp4").touch()
+        (sample / f"Show E{number:02d}.srt").touch()
+    (sample / "op.png").touch()
+    (sample / "ed.png").touch()
+    pairs = importer.scan_directory(sample).pairs
+    ranges = importer.RangePreview(
+        duration=1420.0,
+        op_range=(10.0, 100.0),
+        ed_range=(1300.0, 1420.0),
+        write=((10.0, 100.0), (1300.0, 1420.0)),
+        op_source="av",
+        ed_source="av",
+        op_distance=0,
+        ed_distance=0,
+    )
+    plan = importer.ImportPlan(
+        items=[
+            importer.ImportItem(number=number, pair=pair, prefilled=False, ranges=ranges)
+            for number, pair in zip((2, 7, 12), pairs, strict=True)
+        ]
+    )
+    if defect == "fallback":
+        plan.items[0] = replace(plan.items[0], ranges=replace(ranges, op_length_estimated=True))
+    elif defect == "missing_episode":
+        plan.items.pop()
+
+    async def decoded_plan(cfg, video_dir, *, provider_factory):
+        assert cfg.episodes == []
+        assert video_dir == sample
+        return plan
+
+    monkeypatch.setenv("TENMIN_AV_SAMPLE_DIR", str(sample))
+    monkeypatch.setattr(importer, "build_import_plan", decoded_plan)
+
+    if defect is None:
+        await test_real_season_locates_op_and_ed_by_screenshot_and_audio(tmp_path)
+    else:
+        message = "OP 长度不能使用估算兜底" if defect == "fallback" else "导入集号未完整覆盖素材"
+        with pytest.raises(AssertionError, match=message):
+            await test_real_season_locates_op_and_ed_by_screenshot_and_audio(tmp_path)
+
+
 @pytest.mark.av
 @pytest.mark.skipif(
     not os.environ.get("TENMIN_AV_SAMPLE_DIR"), reason="需要 TENMIN_AV_SAMPLE_DIR 指向素材目录"
 )
 async def test_real_season_locates_op_and_ed_by_screenshot_and_audio(tmp_path):
     from tenmin.config import load_project
-    from tenmin.importer import build_import_plan
+    from tenmin.importer import (
+        build_import_plan,
+        is_extra,
+        parse_episode_number,
+        scan_directory,
+    )
 
     sample = Path(os.environ["TENMIN_AV_SAMPLE_DIR"])
+    scan = scan_directory(sample)
+    assert not scan.unpaired_videos, scan.unpaired_videos
+    assert not scan.unpaired_srts, scan.unpaired_srts
+    assert set(scan.references) == {"op", "ed"}, "素材目录必须提供 OP 与 ED 截图"
+    expected_numbers = []
+    for pair in scan.pairs:
+        assert not is_extra(pair.video.stem), f"素材目录不能包含非正片：{pair.video.name}"
+        assert not pair.ignored_srts, pair.ignored_srts
+        number = parse_episode_number(pair.video.stem)
+        assert isinstance(number, int) and number > 0, f"素材集号必须可解析：{pair.video.name}"
+        expected_numbers.append(number)
+    assert len(expected_numbers) >= 2, "跨集音频匹配至少需要两集素材"
+    assert len(set(expected_numbers)) == len(expected_numbers), "素材集号必须唯一"
+
     root = tmp_path / "work" / "sample"
     (root / "srt").mkdir(parents=True)
     (root / "project.yaml").write_text(
@@ -580,9 +649,18 @@ async def test_real_season_locates_op_and_ed_by_screenshot_and_audio(tmp_path):
 
     plan = await build_import_plan(cfg, sample, provider_factory=no_llm)
 
-    assert plan.items, "素材目录里没有可导入的集"
+    assert not plan.failed, plan.failed
+    assert not plan.ambiguous, plan.ambiguous
+    assert not plan.registered, plan.registered
+    assert not plan.extras, plan.extras
+    assert not plan.unpaired_videos, plan.unpaired_videos
+    assert not plan.unpaired_srts, plan.unpaired_srts
+    assert sorted(item.number for item in plan.items) == sorted(expected_numbers), (
+        "导入集号未完整覆盖素材"
+    )
     for item in plan.items:
         ranges = item.ranges
+        assert ranges.op_length_estimated is False, "OP 长度不能使用估算兜底"
         assert (ranges.op_source, ranges.ed_source) == ("av", "av"), item.number
         assert ranges.op_distance is not None and ranges.op_distance <= MAX_DISTANCE
         assert ranges.ed_distance is not None and ranges.ed_distance <= MAX_DISTANCE
