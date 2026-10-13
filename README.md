@@ -159,6 +159,62 @@ uv run tenmin run akujo2 --from voice
 uv run tenmin run akujo2 --from audio --force
 ```
 
+### 批量导入与 OP/ED 自动识别
+
+此功能目前在 `feat/batch-directory-import` 分支，尚未合并到 main。
+以下命令在该分支运行；本机对应工作目录为 `/Users/portz/js/10min_anime-import`。
+
+目录中的视频与同名 SRT（支持 `.zh-Hans.srt` 等语言后缀）可以一次配对、识别集号、
+预览 OP/ED 区间，再确认登记并运行本次导入的集：
+
+```bash
+uv run tenmin init saijo
+uv run tenmin import saijo "/path/to/season" --dry-run  # 预览，不写项目
+uv run tenmin import saijo "/path/to/season"           # 确认后登记并运行
+```
+
+字幕另放目录时加 `--srt-dir "/path/to/subtitles"`；非交互执行加 `--yes`。
+已登记来源的集会跳过；集号先按文件名规则识别，有歧义时尝试 LLM 兜底。
+
+#### 配置你的 OP/ED 起点截图
+
+在 `work/saijo/project.yaml` 中添加以下字段，路径替换成实际截图位置。
+已有 `credits:` 时把字段并入同一节：
+
+```yaml
+credits:
+  op_reference: /Users/portz/js/10min_anime/op_start.png
+  ed_reference: /Users/portz/js/10min_anime/ed_start.png
+```
+
+也支持相对路径，例如 `refs/op_start.png`，以 **project.yaml 所在目录**为基准。
+未配置的侧会从视频目录顶层寻找 `op.png` / `ed.png`，也支持 jpg/jpeg、大小写不敏感；
+同侧多张候选会报错。配置路径按侧优先覆盖目录发现，图片不存在或读不出来会直接报错。
+
+截图应是你希望作为起点的、有辨识度的画面。程序定位的是截图对应帧，
+如果截图取在歌曲开始后几秒，识别起点也会偏后；避开黑场和通用 logo。
+
+#### 如何判断 OP/ED 区间
+
+| 位置 | 判断依据 | 证据不足时 |
+|---|---|---|
+| OP 起点 | 只搜索前 5 分钟，按 dHash 匹配截图 | 未识别，不扩大搜索窗 |
+| OP 终点 | 从各集起点取最多 150 秒音频，对齐共同音乐段，取稳健中位长度 | 按 90 秒估计，预览标注 |
+| ED 起点 | 只搜索最后 3 分钟，按 dHash 匹配截图 | 未识别，不扩大搜索窗 |
+| ED 终点 | 跨集比较起点至片尾的音频，判断共同歌曲结束或持续匹配到片尾 | 按片尾估计，提示可能包含 C 段/预告 |
+
+音频判断在本地使用 FFmpeg + NumPy：8kHz 单声道 PCM → Hann 窗与 FFT →
+每秒 10 帧、16 个对数频带能量 → ±1 秒对齐及滑窗相关性比较。
+ED 匹配排除静音和没有有效时间变化的窗口；较短集的片尾不能确认较长集的歌曲终点。
+只有一集时无法跨集比较，使用上述估计兜底。无截图的侧使用字幕推断，
+有截图但匹配失败的侧不会回落字幕。音频解码失败属于识别失败。
+
+先检查 `--dry-run` 预览中的区间、画面距离以及音频实测/估计标记。
+只有 OP 与 ED 都成功、逐集两个区间字段都空且没有生效的项目默认区间时，
+才成对写入 `episodes:` 中的 `op_range` / `ed_range`，取整到 0.1 秒。
+已有手填区间会保留。已有集要调整区间时，手动修改对应字段再重跑该集。
+截图配置仅用于 `tenmin import`，不会让 `tenmin run` 自动执行音画匹配。
+
 ## 对白轨从哪来（四岔）
 
 ingest 之前有一层来源解析，按「无损且便宜」排序取第一条成立的：

@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "tenmin · 番剧解说自动制作架构",
+    "locale": "zh-CN",
+    "quality_profile": "showcase",
+    "viewBox": [1360, 600]
+  },
+  "components": [
+    {"id":"tenmin-cli","type":"frontend","label":"命令行入口","sublabel":"cli.py · 项目登记与阶段选择","tag":"init / run / inspect / ocr","pos":[50,60],"size":[240,88]},
+    {"id":"episode-orchestrator","type":"backend","label":"按集编排与增量执行","sublabel":"pipeline.py · run_pipeline","tag":"配置切片 / mtime / 完成摘要","pos":[390,60],"size":[240,88]},
+    {"id":"narration-documents","type":"backend","label":"⑤ 解说文档生成","sublabel":"docgen · 对照表与配音文本","tag":"out/ · Markdown / TXT","pos":[730,60],"size":[240,88]},
+    {"id":"project-artifacts","type":"database","label":"本地项目与阶段产物","sublabel":"work/<slug>/ · 按 E{NN} 分集","tag":"project.yaml / JSON / 媒体缓存","pos":[1070,60],"size":[240,88]},
+    {"id":"subtitle-ingestion","type":"backend","label":"① 对白素材归一","sublabel":"ingest · 清洗、繁转简、剔除片头尾","tag":"01_dialogue/ · DialogueTrack","pos":[50,255],"size":[240,88]},
+    {"id":"translation-signals","type":"backend","label":"② 翻译 + ③ 信号提取","sublabel":"translate / signals · 术语与高能点","tag":"zh/ + 02_signals/","pos":[390,255],"size":[240,88]},
+    {"id":"script-authoring","type":"backend","label":"④ 分幕解说稿生成","sublabel":"script · 语义校验与时长预算返工","tag":"03_script/ · Script","pos":[730,255],"size":[240,88]},
+    {"id":"media-production","type":"backend","label":"⑥ 配音 → ⑦ 时间轴","sublabel":"⑧ 混音 → ⑨ 剪辑与烧字幕","tag":"render/ · FFmpeg / libass","pos":[1070,255],"size":[240,88]},
+    {"id":"subtitle-sources","type":"external","label":"视频与字幕输入","sublabel":"SRT → 软字幕 → 硬字幕 OCR → ASR","tag":"Apple Vision / 语音转写","pos":[50,455],"size":[240,88]},
+    {"id":"llm-providers","type":"external","label":"LLM 服务适配层","sublabel":"Gemini / MiniMax / OpenAI 兼容","tag":"LLMProvider · 重试 / schema 修复","pos":[730,455],"size":[240,88]},
+    {"id":"speech-provider","type":"external","label":"在线语音合成","sublabel":"edge-tts · 分块并发与内容哈希缓存","tag":"TTSEngine · 实测配音时长","pos":[1070,455],"size":[240,88]}
+  ],
+  "connections": [
+    {"id":"cli-starts-run","from":"tenmin-cli","to":"episode-orchestrator","label":"加载配置并运行","variant":"emphasis"},
+    {"id":"orchestrator-starts-ingest","from":"episode-orchestrator","to":"subtitle-ingestion","label":"调度阶段","fromSide":"left","toSide":"top"},
+    {"id":"source-to-dialogue","from":"subtitle-sources","to":"subtitle-ingestion","label":"按优先级选源","fromSide":"top","toSide":"bottom"},
+    {"id":"dialogue-to-analysis","from":"subtitle-ingestion","to":"translation-signals","label":"对白轨","variant":"emphasis"},
+    {"id":"analysis-to-script","from":"translation-signals","to":"script-authoring","label":"信号与术语","variant":"emphasis"},
+    {"id":"script-to-production","from":"script-authoring","to":"media-production","label":"分幕稿","variant":"emphasis"},
+    {"id":"script-to-documents","from":"script-authoring","to":"narration-documents","label":"文档渲染","fromSide":"top","toSide":"bottom"},
+    {"id":"documents-to-disk","from":"narration-documents","to":"project-artifacts","label":"写入文档"},
+    {"id":"production-to-disk","from":"media-production","to":"project-artifacts","label":"写入音视频","fromSide":"top","toSide":"bottom"},
+    {"id":"script-llm-request","from":"script-authoring","to":"llm-providers","label":"生成与返工请求","fromSide":"bottom","toSide":"top","labelDy":80},
+    {"id":"voice-tts-request","from":"media-production","to":"speech-provider","label":"配音合成请求","fromSide":"bottom","toSide":"top","labelDy":80}
+  ],
+  "cards": [
+    {"dot":"cyan","title":"来源决定翻译策略","items":["原生 SRT 跳过翻译；OCR 直接交付简体字幕；ASR 调 LLM 翻译并累积术语。","OCR 可选 AI 校对；独立 tenmin ocr 可批量导出字幕。"]},
+    {"dot":"violet","title":"编排与共享基础设施","items":["ingest / signals 先全局执行，再逐集 translate → script → docgen → voice → timeline → audio → render。","LLM 适配层也供翻译及 OCR 校对调用；models.py 定义数据契约，atomic.py 统一原子写入。"]},
+    {"dot":"emerald","title":"缓存与交付","items":["阶段配置切片与 mtime 控制重跑；ingest / signals 用摘要完成戳，内容相同不重写。","04_voice/ → 05_timeline/ → 06_audio/ → 07_render/E{NN}.mp4；文档与中文字幕放 out/。"]}
+  ]
+}

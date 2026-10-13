@@ -1,0 +1,34 @@
+{
+  "diagram_type": "architecture",
+  "output": "/Users/portz/js/10min_anime/docs/tenmin-architecture.zh-CN.html",
+  "specification": {
+    "file": "tenmin-architecture.zh-CN.json",
+    "sha256": "d420287798226b5783a6ef782d3a9658a0657e3cf7958823eb56562b71e7c826",
+    "bytes": 4859
+  },
+  "artifact": {
+    "sha256": "4449848e6fc4ae326271029be210ad826c1316cca7efa2d262d2d8c072ae4e71",
+    "bytes": 816506
+  },
+  "validation": {
+    "checks_passed": 9,
+    "check_count": 9,
+    "quality_profile": "showcase",
+    "errors": 0,
+    "warnings": 0
+  },
+  "browser_evidence": "passed",
+  "browser_receipt": "tenmin-architecture.zh-CN.visual-check.json",
+  "visual_review": "passed",
+  "visual_review_evidence": {
+    "reviewer": "image-capable assistant",
+    "screenshots": [
+      "tenmin-architecture.zh-CN.visual-check.1440x900.light.png",
+      "tenmin-architecture.zh-CN.visual-check.1440x900.dark.png",
+      "tenmin-architecture.zh-CN.visual-check.2048x1320.light.png",
+      "tenmin-architecture.zh-CN.visual-check.2048x1320.dark.png"
+    ],
+    "observations": "浅色与深色默认阅读视图的节点、关系标签、图例及说明卡片完整可读；连线无交叉遮挡；最大桌面尺寸构图保持三层布局与完整说明区。"
+  },
+  "correction_rounds": 1
+}
