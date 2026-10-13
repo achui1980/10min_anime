@@ -54,20 +54,22 @@ testpaths = ["tests"]
 asyncio_mode = "auto"
 
 # 刻意**不**配 addopts（尤其不配 `-m "not llm and not generalize and not render"`）。
-# 五个 marker 各自已经有更准的门，而且门都在代码里、不在这份配置里：
+# 六个 marker 各自已经有更准的门，而且门都在代码里、不在这份配置里：
 #   - render：tests/conftest.py 的 pytest_collection_modifyitems。没有显式 `-m render`
 #     就整批 skip。这批用例会真调 Edge-TTS（联网）并真编一段视频，而它们自己没有任何
 #     可以自检的前置条件 —— 所以它需要**外部机制**。
 #   - asr：同一个 hook，同一个理由。这批用例要加载一个几个 G 的语音模型跑上几分钟。
 #   - ocr：同一个 hook。这批用例要 macOS + ocr extra + 一个真实的硬字幕片源，整集识别
 #     要跑上几分钟。
+#   - av：同一个 hook，外加「有没有 TENMIN_AV_SAMPLE_DIR」的 skipif。这批用例要对一整
+#     个真实素材目录逐集抽帧、读音频。
 #   - llm：tests/test_e2e.py 的 `@pytest.mark.skipif(not os.environ.get(
 #     "TENMIN_GEMINI_API_KEY"))`。门是「有没有 key」，比按 marker 摘更准 —— 有 key 的
 #     人跑 `uv run pytest` 就该顺带跑到它。
 #   - generalize：tests/test_generalize.py 的 `@pytest.mark.skipif(not SRT_FILES)`。
 #     这条 marker 的**约定本身**就是「把 SRT 放进 tests/fixtures/generalize/ 后自动
 #     生效」，用 addopts 按 marker 摘掉会把这条约定直接打死。
-# 换句话说 addopts deselect 对 render / asr / ocr 是重复、对 llm 是退化、对 generalize
+# 换句话说 addopts deselect 对 render / asr / ocr / av 是重复、对 llm 是退化、对 generalize
 # 是有害。别再加一遍。
 markers = [
     "llm: 需要真实 LLM API key，默认跳过（跑法：TENMIN_GEMINI_API_KEY=xxx uv run pytest -m llm）",
@@ -75,6 +77,7 @@ markers = [
     "render: 需要真实视频文件与编入 libass 的 ffmpeg，默认跳过（跑法：uv run pytest -m render）",
     "asr: 需要装了 asr extra 与真实视频，默认跳过（跑法：uv run pytest -m asr）",
     "ocr: 需要 macOS、装了 ocr extra 与真实的硬字幕片源，默认跳过（跑法：TENMIN_OCR_SAMPLE_VIDEO=<片源> uv run pytest -m ocr）",
+    "av: 需要一个放了视频、SRT 与 op/ed 截图的真实素材目录，默认跳过（跑法：TENMIN_AV_SAMPLE_DIR=<目录> uv run pytest -m av）",
 ]
 
 [tool.ruff]

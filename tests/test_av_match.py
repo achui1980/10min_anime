@@ -1,5 +1,6 @@
 """截图匹配的计算、IO 契约与显式开启的真实媒体测试。"""
 
+import os
 import shlex
 import shutil
 import subprocess
@@ -553,3 +554,39 @@ def test_real_read_pcm_has_expected_duration_and_tone_band(av_video):
     pcm = av_match.read_pcm(av_video, 1, 2)
     assert len(pcm) == pytest.approx(32000, abs=160)
     assert int(np.argmax(av_match.audio_envelope(pcm).mean(axis=0))) == 8
+
+
+# --- 真实素材（av marker，默认跳过） -------------------------------------------
+
+
+@pytest.mark.av
+@pytest.mark.skipif(
+    not os.environ.get("TENMIN_AV_SAMPLE_DIR"), reason="需要 TENMIN_AV_SAMPLE_DIR 指向素材目录"
+)
+async def test_real_season_locates_op_and_ed_by_screenshot_and_audio(tmp_path):
+    from tenmin.config import load_project
+    from tenmin.importer import build_import_plan
+
+    sample = Path(os.environ["TENMIN_AV_SAMPLE_DIR"])
+    root = tmp_path / "work" / "sample"
+    (root / "srt").mkdir(parents=True)
+    (root / "project.yaml").write_text(
+        "show: sample\nslug: sample\nepisodes: []\n", encoding="utf-8"
+    )
+    cfg = load_project(root / "project.yaml")
+
+    def no_llm():
+        raise RuntimeError("真实素材测试不调 LLM")
+
+    plan = await build_import_plan(cfg, sample, provider_factory=no_llm)
+
+    assert plan.items, "素材目录里没有可导入的集"
+    for item in plan.items:
+        ranges = item.ranges
+        assert (ranges.op_source, ranges.ed_source) == ("av", "av"), item.number
+        assert ranges.op_distance is not None and ranges.op_distance <= MAX_DISTANCE
+        assert ranges.ed_distance is not None and ranges.ed_distance <= MAX_DISTANCE
+        assert ranges.op_range is not None and ranges.ed_range is not None
+        assert 60.0 <= ranges.op_range[1] - ranges.op_range[0] <= 120.0
+        assert ranges.ed_range[1] == ranges.duration
+        assert ranges.write is not None

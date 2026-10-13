@@ -17,6 +17,7 @@ _GATED_MARKERS = {
     "render": "需要真实素材与 ffmpeg，跑法：uv run pytest -m render",
     "asr": "需要 asr extra 与真实视频，跑法：uv run pytest -m asr",
     "ocr": "需要 macOS、ocr extra 与真实硬字幕片源，跑法：uv run pytest -m ocr",
+    "av": "需要真实素材目录，跑法：TENMIN_AV_SAMPLE_DIR=<目录> uv run pytest -m av",
 }
 
 

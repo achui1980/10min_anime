@@ -146,3 +146,16 @@ def test_the_ocr_marker_is_gated_until_named():
     named = _FakeItem("ocr")
     conftest.pytest_collection_modifyitems(_FakeConfig("ocr"), [named])
     assert named.marks == []
+
+
+def test_the_av_marker_is_gated_until_named():
+    """真实目录的截图匹配与音频分析只在显式点名 av 时运行。"""
+    from . import conftest
+
+    default = _FakeItem("av")
+    conftest.pytest_collection_modifyitems(_FakeConfig(None), [default])
+    assert default.marks
+
+    named = _FakeItem("av")
+    conftest.pytest_collection_modifyitems(_FakeConfig("av"), [named])
+    assert named.marks == []
