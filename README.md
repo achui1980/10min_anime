@@ -96,6 +96,128 @@ TENMIN_OPENAI_COMPATIBLE_API_KEY=your-key-here
 project 用一个 base_url），且和 MiniMax 一样，schema 是写进 prompt
 文本里再用 pydantic 校验的，不依赖服务端严格执行 `response_format`。
 
+## 命令总览
+
+以下是当前 `main` 支持的全部命令。示例在仓库根目录执行，`saijo` 是项目名，
+`--work-dir` 默认是 `work`。每个命令都支持 `--help`，可查看完整参数：
+
+```bash
+uv run tenmin --help
+uv run tenmin run --help
+```
+
+| 命令 | 用途 | 是否需要项目 |
+|---|---|---|
+| `tenmin init <slug>` | 创建项目配置与字幕目录 | 创建新项目 |
+| `tenmin run <slug>` | 登记素材、运行或重跑制作管线，也可只检查已有成片 | 是 |
+| `tenmin inspect <slug> --episode N` | 查看对白来源、OP/ED 区间、无字幕间隙与高能点 | 是 |
+| `tenmin ocr <文件或目录>...` | 批量将画面硬字幕识别成 SRT，可选 AI 校对 | 否 |
+| `tenmin check-content <视频>` | 本地内容评级，生成截图、分数与 HTML 报告 | 否 |
+
+### 创建项目：`init`
+
+```bash
+uv run tenmin init saijo
+uv run tenmin init saijo --work-dir /path/to/projects
+```
+
+生成 `<work-dir>/<slug>/project.yaml` 与 `srt/`；已有配置不会被覆盖。
+
+### 制作与阶段重跑：`run`
+
+```bash
+# 登记第 2 集并制作；没有独立字幕时省略 --srt
+uv run tenmin run saijo --episode 2 --srt "字幕.srt" --video "源片.mp4"
+uv run tenmin run saijo --episode 3 --video "源片.mp4"
+
+# 已登记素材：处理单集，或批量处理所有已登记的集
+uv run tenmin run saijo --episode 2
+uv run tenmin run saijo
+
+# 从配音阶段开始，或只重出解说文档
+uv run tenmin run saijo --episode 2 --from voice
+uv run tenmin run saijo --episode 2 --only docgen --force
+
+# 多阶段可逗号分隔，也可重复传 --only
+uv run tenmin run saijo --episode 2 --only ingest,signals
+uv run tenmin run saijo --episode 2 --only ingest --only signals
+
+# 只检查已有成片，即使项目未开启自动检查也会执行
+uv run --extra content-check tenmin run saijo --episode 2 --only check
+```
+
+| 参数 | 含义 |
+|---|---|
+| `--work-dir <目录>` | 项目根目录，默认 `work` |
+| `--episode <集号>` | 处理指定集；不传则批处理 |
+| `--video <文件>` | 登记视频，必须同时传 `--episode` |
+| `--srt <文件>` | 登记字幕，必须同时传 `--episode` 与 `--video` |
+| `--from <阶段>` | 从指定阶段运行到末尾，默认 `ingest` |
+| `--only <阶段列表>` | 只运行指定阶段；可重复传或用逗号分隔，优先于 `--from` |
+| `--force` | 忽略制作阶段新鲜度与检查缓存，强制重跑 |
+
+阶段顺序：`ingest → translate → signals → script → docgen → voice → timeline → audio → render → check`。
+自动 `check` 默认关闭；显式 `--only check` / `--from check` 会检查已有成片，
+`--only render` 只渲染。更多配置见[最终成片内容检查](#最终成片内容检查可选本地推理)。
+
+### 查看素材与信号：`inspect`
+
+```bash
+uv run tenmin inspect saijo --episode 2
+uv run tenmin inspect saijo --episode 2 --suspect
+```
+
+`--episode` 必填；`--suspect` 只列疑似 OCR 噪声行；`--work-dir` 指定项目根目录。
+通常先运行 `ingest` 与 `signals`，再查看对应产物。
+
+### 独立批量字幕识别：`ocr`
+
+需要 macOS 与 `ocr` extra；目录只扫描一层，可混合传入多个文件和目录。
+
+```bash
+uv run --extra ocr tenmin ocr "番剧目录/" -o "字幕目录/"
+uv run --extra ocr tenmin ocr "第1集.mp4" "第2集.mkv" --traditional
+uv run --extra ocr tenmin ocr "视频.mp4" --crop-top 0.65 --crop-bottom 0.95 --force
+uv run --extra ocr tenmin ocr "视频.mp4" --ai-correct
+```
+
+| 参数 | 含义 |
+|---|---|
+| `-o` / `--output <目录>` | SRT 输出目录；默认在视频旁 |
+| `--simplified` / `--traditional` | 默认输出简体；后者保留繁体原文 |
+| `--crop-top <比例>` | 字幕带上沿，默认 `0.72` |
+| `--crop-bottom <比例>` | 字幕带下沿，默认不限 |
+| `--force` | 已有结果也重新识别 |
+| `--ai-correct` | 用 LLM 校对 OCR 文字，需对应 API key |
+| `--llm-provider <服务>` | 校对服务：`gemini` / `minimax` / `openai_compatible`，默认 `gemini` |
+| `--llm-model <模型>` | 校对模型，默认 `gemini-3.6-flash` |
+| `--llm-base-url <地址>` | OpenAI 兼容服务地址 |
+
+### 独立视频内容检查：`check-content`
+
+需要 `content-check` extra，单次检查一个视频，输出截图、`results.json` 与 `report.html`。
+
+```bash
+uv run --extra content-check tenmin check-content "视频.mp4"
+uv run --extra content-check tenmin check-content "视频.mp4" --output "检查报告/" \
+  --interval 1 --sensitive-threshold 0.6 --adult-threshold 0.5
+uv run --extra content-check tenmin check-content "视频.mp4" --offline --force
+```
+
+| 参数 | 含义 |
+|---|---|
+| `--output <目录>` | 报告目录，默认视频旁的 `<stem>.content-check/` |
+| `--interval <秒>` | 采样间隔，默认 `1.0`，必须为有限正数 |
+| `--sensitive-threshold <分数>` | sensitive 候选阈值，默认 `0.5`，范围 `0~1` |
+| `--adult-threshold <分数>` | questionable + explicit 候选阈值，默认 `0.5`，范围 `0~1` |
+| `--force` | 忽略缓存，重新抽帧和推理 |
+| `--offline` | 模型只读本地缓存；首次需提前缓存模型 |
+
+候选仅供人工复核，命中仍退出 `0`，执行失败退出 `1`；评级分数不是色情概率。
+
+`tenmin import` 目前仅在 `feat/batch-directory-import` 分支提供，使用说明见
+[批量导入与 OP/ED 自动识别](#批量导入与-oped-自动识别)。
+
 ## 使用
 
 ```bash
