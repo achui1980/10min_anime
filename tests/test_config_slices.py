@@ -193,6 +193,10 @@ def test_changing_an_excluded_knob_changes_no_slice(tmp_path, field):
         ("ocr.enabled", True, {"ingest"}),
         ("ocr.crop_top", 0.7, {"ingest"}),
         ("ocr.crop_bottom", 0.95, {"ingest"}),
+        ("content_check.enabled", True, {"check"}),
+        ("content_check.sample_interval", 2.0, {"check"}),
+        ("content_check.sensitive_threshold", 0.7, {"check"}),
+        ("content_check.adult_threshold", 0.7, {"check"}),
         ("signals.min_gap_seconds", 5.0, {"signals"}),
         ("validate_script.max_beats", 7, {"script"}),
         ("target_seconds", 200.0, {"script"}),
@@ -255,10 +259,18 @@ def test_a_declared_hardsub_reaches_ingest(tmp_path):
 
 
 def test_slice_paths(tmp_path):
+    assert slice_path(tmp_path, "check", 2) == tmp_path / ".config" / "E02.check.json"
     assert slice_path(tmp_path, "script", 2) == tmp_path / ".config" / "E02.script.json"
     assert slice_path(tmp_path, "signals", None) == tmp_path / ".config" / "signals.json"
     with pytest.raises(ValueError):
         slice_path(tmp_path, "script", None)
+
+
+def test_check_slice_contains_only_content_check_config(tmp_path):
+    cfg = _cfg(tmp_path)
+    assert json.loads(slice_payload(cfg, "check", cfg.episodes[0])) == {
+        "content_check": cfg.content_check.model_dump(mode="json")
+    }
 
 
 def test_a_new_slice_is_backdated_to_epoch_zero(tmp_path):

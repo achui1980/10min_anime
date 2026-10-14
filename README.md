@@ -3,6 +3,9 @@
 把番剧字幕 + 视频变成解说成片。输入 SRT 与源片，输出「分段文案与剪辑时间轴对照表」、
 配音纯文本，以及配好音、烧好硬字幕的 mp4。
 
+成片可追加本地内容检查，生成带时间点、截图与四类评级分数的报告；
+`tenmin check-content` 也能不建项目直接检查单个视频（见「最终成片内容检查」）。
+
 吃自带字幕的片源，也吃生肉：对白轨有四条来源（手传 SRT / 视频里的软字幕轨 / 画面硬字幕 OCR
 / 语音转写），生肉还会额外交付一份中文字幕。只想把一批视频的硬字幕认成 SRT 的话，
 `tenmin ocr` 不用建项目就能批量跑（见「不建项目，单独批量 OCR」）。设计文档见
@@ -158,6 +161,54 @@ uv run tenmin run akujo2 --from voice
 ```bash
 uv run tenmin run akujo2 --from audio --force
 ```
+
+### 最终成片内容检查（可选、本地推理）
+
+```bash
+uv sync --extra content-check
+```
+
+在 `project.yaml` 中开启后，10 阶段管线的最后一步是 `render → check`，逐集检查最终成片：
+
+```yaml
+content_check:
+  enabled: true                # 默认 false
+  sample_interval: 1.0         # 有限正秒数
+  sensitive_threshold: 0.5     # 0~1
+  adult_threshold: 0.5         # questionable + explicit，0~1
+```
+
+```bash
+uv run --extra content-check tenmin run saijo --episode 2
+uv run --extra content-check tenmin run saijo --episode 2 --only check
+uv run tenmin run saijo --episode 2 --only render
+uv run --extra content-check tenmin check-content 视频.mp4 --output 检查报告目录 --offline
+uv run --extra content-check tenmin check-content 视频.mp4 --interval 1 --sensitive-threshold 0.6
+```
+
+`--only check` / `--from check` 是显式请求，即使开关关闭也检查已有成片，不构造 LLM/TTS、
+不需要 API key。`--only render` 只出片；启用时全流程和 `--from render` 会检查。
+项目报告在 `work/<slug>/08_check/E{NN}/`，独立命令默认在视频旁的
+`<stem>.content-check/`；其中 `results.json` 保存全部分数，`report.html` 可直接浏览器打开，
+`frames/` 保留全部截图。页面支持阈值调整、全帧、排序及分页；页面调整不回写 JSON 或配置。
+
+首次安装依赖、缓存模型需要联网。模型固定为 `deepghs/anime_dbrating` 的
+`mobilenetv3_large_100_v0_ls0.2`（revision `7af21db648acdeb74f5c334abda9dd7403407b3c`），
+CPU 本地推理；缓存齐全后优先本地读取。独立 `--offline` 仅限制模型读取，
+uv 的依赖解析/安装离线控制另用 `uv --offline`，并提前安装 extra。
+`uv run --extra content-check` 保留此 extra；后续裸 `uv sync` / `uv run` 可能移除可选依赖。
+
+同身份完整结果可复用；只改阈值或丢失 HTML 时仅重建报告，不抽帧、不推理。
+缺截图、损坏 JSON 或身份变化会重查。身份依据视频 resolve 路径、size、mtime_ns、固定模型
+及采样/预处理版本，不是视频全哈希；内容修改却刻意保留 size/mtime 时用 `--force`。
+输出目录由工具所有权标记管理，非本工具拥有的非空目录会报错。
+
+候选规则是 `sensitive >= sensitive_threshold` 或 `questionable + explicit >= adult_threshold`。
+四类为 general / sensitive / questionable / explicit，**是图片评级原始分数，不是校准后的色情
+概率或严重程度百分制**。候选需要人工看图，采样点范围不是精确剪辑边界，短于采样间隔的镜头
+可能漏掉。候选非零仍退出 0；独立检查执行失败退出 1；项目检查的可预期失败会警告、保留成片、
+继续后续集数并汇总失败集数。实际离线验收和人工观察见
+[`docs/content-check-validation.md`](docs/content-check-validation.md)。
 
 ### 批量导入与 OP/ED 自动识别
 
@@ -523,8 +574,10 @@ uv run tenmin inspect akujo --episode 1
 | timeline | `05_timeline/E{NN}.timeline.json`、`05_timeline/E{NN}.ass` | 按真实配音时长重算画面时间轴，生成硬字幕 |
 | audio | `06_audio/E{NN}.mixed.m4a` | 旁白盖在原声之上，旁白期间原声压低 |
 | render | `07_render/E{NN}.mp4` | 一次编码完成切片、拼接、烧字幕、挂音轨 |
+| check（可选） | `08_check/E{NN}/results.json`、`report.html`、`frames/` | 否；本地 ONNX 图片评级，仅报告候选 |
 
-默认按 mtime 跳过已是最新的阶段，`--force` 强制重跑。
+制作阶段按 mtime 跳过已是最新的产物；check 验证视频、模型、采样身份和缓存完整性。
+`--force` 强制重跑，单改检查阈值仅重建报告。
 
 ## 测试
 
@@ -558,5 +611,6 @@ TENMIN_OCR_SAMPLE_VIDEO=<片源> uv run pytest -m ocr   # 真跑画面 OCR，需
 - **v2**（已完成）Edge-TTS 配音 + ffmpeg 切片拼接 + 混音 + 烧硬字幕 → 1920x1080 mp4
 - **v3**（已完成）mlx-whisper 语音转写支持生肉 + `translate` 阶段交付中文字幕
 - **v3.1**（本版）画面硬字幕 OCR（Apple Vision）作为对白轨的第四条来源；`tenmin ocr` 脱离项目批量识别，默认繁转简
+- **v3.2**（已完成）最终成片本地内容检查 + 独立 `tenmin check-content`，输出截图与评级报告
 - **v4** 本地 Web GUI（`script.json` 可视化编辑器）
 - **v5** PySceneDetect + CLIP 视觉索引，整季 12 集压到 10 分钟

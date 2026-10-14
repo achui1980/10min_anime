@@ -137,6 +137,7 @@ def test_stage_names():
         "timeline",
         "audio",
         "render",
+        "check",
     ]
 
 
@@ -149,6 +150,7 @@ def test_stages_from_middle():
         "timeline",
         "audio",
         "render",
+        "check",
     ]
 
 
@@ -302,6 +304,7 @@ FROZEN_LAYOUT = {
     "subtitles": "05_timeline/E02.ass",
     "mixed_audio": "06_audio/E02.mixed.m4a",
     "video": "07_render/E02.mp4",
+    "check_dir": "08_check/E02",
     "asr_cache": "srt/E02.asr.srt",
     "ocr_cache": "srt/E02.ocr.srt",
 }

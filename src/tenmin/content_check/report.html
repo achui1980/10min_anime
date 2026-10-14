@@ -1,0 +1,130 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>成片内容检查 · 本地报告</title>
+<style>
+:root{color-scheme:light;--ink:#252b28;--muted:#536359;--line:#d5ddd7;--accent:#285b45}
+*{box-sizing:border-box}
+body{margin:0;background:#f3f5f1;color:var(--ink);font-family:"PingFang SC","Microsoft YaHei",sans-serif;line-height:1.6}
+main{max-width:1440px;margin:auto;padding:32px 24px}
+header{border-top:4px solid var(--accent);padding-top:16px;margin-bottom:24px}
+h1{margin:0;font-family:"Songti SC","SimSun",serif;font-size:32px}
+.eyebrow{color:var(--accent);font-size:12px;letter-spacing:.16em;margin:0 0 8px}
+.notice,small{color:var(--muted)}
+#summary{overflow-wrap:anywhere;font-size:14px}
+.legend{display:flex;flex-wrap:wrap;gap:8px 24px;font-size:14px}
+.controls{display:flex;flex-wrap:wrap;align-items:center;gap:16px;background:white;border:1px solid var(--line);padding:16px}
+label{display:inline-flex;align-items:center;gap:8px}
+input[type=number]{width:88px}
+input,select,button{font:inherit;accent-color:var(--accent)}
+input[type=number],select{padding:4px;border:1px solid var(--line);border-radius:3px}
+:focus-visible{outline:2px solid var(--accent);outline-offset:3px}
+#error{color:#9b3024;font-weight:bold}
+#error:empty{display:none}
+#count{font-weight:bold}
+#segments{font-size:14px;margin:16px 0 24px;overflow-wrap:anywhere}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(300px,100%),1fr));gap:16px}
+article{background:white;border:1px solid var(--line);padding:12px}
+img{width:100%;aspect-ratio:16/9;object-fit:contain;background:#e8ece7}
+h3{font-size:16px;margin:12px 0}
+table{width:100%;font-variant-numeric:tabular-nums;font-size:14px}
+td{border-top:1px solid #edf0ec;padding:4px 0}td:last-child{text-align:right;font-family:monospace}
+button{padding:8px 24px;margin-top:24px;background:var(--accent);color:white;border:0;border-radius:3px;cursor:pointer}
+[hidden]{display:none}
+</style>
+</head>
+<body>
+<main>
+<header>
+<p class="eyebrow">TENMIN / LOCAL FRAME REVIEW</p>
+<h1>成片内容检查</h1>
+<p class="notice">仅为图片评级粗筛，候选 ≠ 色情或裸露。请对照截图人工判断；抽帧不能保证发现短于采样间隔的镜头。</p>
+<p id="summary"></p>
+<div class="legend" aria-label="模型评级解释">
+<span>general · 普通</span><span>sensitive · 敏感</span>
+<span>questionable · 成人倾向</span><span>explicit · 露骨</span>
+</div>
+</header>
+<section class="controls" aria-label="查看与筛选">
+<label>sensitive 阈值 <input id="s" type="number" min="0" max="1" step="any" aria-describedby="error"></label>
+<label>questionable + explicit 阈值 <input id="a" type="number" min="0" max="1" step="any" aria-describedby="error"></label>
+<label><input id="all" type="checkbox"> 显示所有采样帧（检查漏报）</label>
+<label>排序 <select id="sort"><option value="risk">筛选分数优先</option><option value="time">时间顺序</option></select></label>
+</section>
+<p><small>页面调整仅用于当前查看，不回写项目配置或 JSON。排序值 max(sensitive, questionable + explicit) 仅用于查看优先级；分数不是经过校准的色情概率，也不是严重程度百分制。</small></p>
+<p id="error" role="alert"></p>
+<p id="count" role="status"></p>
+<div id="segments"></div>
+<div class="grid" id="grid"></div>
+<button id="more" type="button">显示更多</button>
+<noscript>此报告需要启用 JavaScript 才能显示截图和筛选结果。</noscript>
+</main>
+<script>
+const report=__DATA__;
+const labels={general:'普通',sensitive:'敏感',questionable:'成人倾向',explicit:'露骨'};
+const $=id=>document.getElementById(id);
+const stamp=t=>{
+  const centiseconds=Math.round(t*100);
+  const minutes=Math.floor(centiseconds/6000).toString().padStart(2,'0');
+  const seconds=((centiseconds%6000)/100).toFixed(2).padStart(5,'0');
+  return `${minutes}:${seconds}`;
+};
+const risk=f=>Math.max(f.scores.sensitive,f.scores.questionable+f.scores.explicit);
+let limit=60;
+$('s').value=report.sensitive_threshold;
+$('a').value=report.adult_threshold;
+$('summary').textContent=`${report.identity.video_path} | ${report.identity.repository} / ${report.identity.model} | revision ${report.identity.revision} | ${report.frames.length} 帧 | 采样间隔 ${report.identity.sample_interval}s | 提取 ${report.extraction_seconds.toFixed(1)}s / 推理 ${report.inference_seconds.toFixed(1)}s | provider: ${report.providers.join(', ')}`;
+function threshold(id){
+  const raw=String($(id).value).trim();
+  const value=Number(raw);
+  return raw!==''&&Number.isFinite(value)&&value>=0&&value<=1?value:null;
+}
+function render(){
+  const sensitive=threshold('s'), adult=threshold('a');
+  $('grid').replaceChildren();
+  if(sensitive===null||adult===null){
+    $('error').textContent='参数提示：两个阈值必须为 0 到 1 之间的有限数，不能为空。';
+    $('count').textContent='请修正阈值后查看候选。';
+    $('segments').textContent='';
+    $('more').hidden=true;
+    return;
+  }
+  $('error').textContent='';
+  const candidates=report.frames.filter(f=>f.scores.sensitive>=sensitive||f.scores.questionable+f.scores.explicit>=adult);
+  const groups=[];
+  for(const f of candidates){
+    const previous=groups.at(-1);
+    if(previous&&f.time-previous.last<=report.identity.sample_interval*1.5){
+      previous.last=f.time;previous.count++;
+    }else groups.push({first:f.time,last:f.time,count:1});
+  }
+  $('segments').textContent='候选采样点范围（非精确片段边界）：'+(groups.map(g=>`${stamp(g.first)}–${stamp(g.last)} (${g.count}帧)`).join('；')||'无');
+  const shown=[...($('all').checked?report.frames:candidates)];
+  shown.sort($('sort').value==='time'?(x,y)=>x.time-y.time:(x,y)=>risk(y)-risk(x)||x.time-y.time);
+  const empty=candidates.length===0?'已检查，未发现达到当前阈值的候选。':'';
+  $('count').textContent=`${empty}候选 ${candidates.length}/${report.frames.length} 帧；当前显示 ${Math.min(limit,shown.length)}/${shown.length}。`;
+  for(const f of shown.slice(0,limit)){
+    const card=document.createElement('article');
+    const img=document.createElement('img');
+    img.src=f.image;img.loading='lazy';img.alt=`${stamp(f.time)} 的采样截图`;
+    const title=document.createElement('h3');
+    title.textContent=`${stamp(f.time)} · top-1: ${f.label} · ${labels[f.label]}`;
+    const table=document.createElement('table');
+    for(const label of Object.keys(labels)){
+      const row=table.insertRow();
+      row.insertCell().textContent=`${label} · ${labels[label]}`;
+      row.insertCell().textContent=f.scores[label].toFixed(4);
+    }
+    card.append(img,title,table);$('grid').append(card);
+  }
+  $('more').hidden=limit>=shown.length;
+}
+for(const id of ['s','a'])$(id).addEventListener('input',()=>{limit=60;render();});
+for(const id of ['all','sort'])$(id).addEventListener('change',()=>{limit=60;render();});
+$('more').onclick=()=>{limit+=60;render();};
+render();
+</script>
+</body>
+</html>

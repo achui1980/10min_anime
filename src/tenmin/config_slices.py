@@ -99,6 +99,7 @@ STAGE_FIELDS: dict[str, tuple[str, ...]] = {
         "show",
         EPISODE,
     ),
+    "check": ("content_check",),
 }
 
 # 不影响产物内容的运维旋钮；语义重试与预算返工次数影响采纳的稿子，不在这里。

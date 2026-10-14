@@ -41,6 +41,15 @@ def test_init_creates_srt_dir(work):
     assert (work / "saijo" / "srt").is_dir()
 
 
+def test_init_template_carries_content_check_defaults(work):
+    from tenmin.config import DEFAULT_CONTENT_CHECK
+
+    result = runner.invoke(app, ["init", "saijo", "--work-dir", str(work)])
+    assert result.exit_code == 0, out(result)
+    data = yaml.safe_load((work / "saijo" / "project.yaml").read_text(encoding="utf-8"))
+    assert data["content_check"] == DEFAULT_CONTENT_CHECK.model_dump(mode="json")
+
+
 def test_init_refuses_to_clobber(work):
     runner.invoke(app, ["init", "saijo", "--work-dir", str(work)])
     result = runner.invoke(app, ["init", "saijo", "--work-dir", str(work)])

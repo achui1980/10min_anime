@@ -586,6 +586,15 @@ class OcrConfig(StrictModel):
     language: str = "zh-Hant"
 
 
+class ContentCheckConfig(StrictModel):
+    """最终成片的采样间隔与候选评级阈值。"""
+
+    enabled: bool = False
+    sample_interval: float = Field(default=1.0, gt=0, allow_inf_nan=False)
+    sensitive_threshold: float = Field(default=.5, ge=0, le=1, allow_inf_nan=False)
+    adult_threshold: float = Field(default=.5, ge=0, le=1, allow_inf_nan=False)
+
+
 class ProjectConfig(StrictModel):
     show: str
     slug: str
@@ -602,6 +611,7 @@ class ProjectConfig(StrictModel):
     render: RenderConfig = Field(default_factory=RenderConfig)
     asr: AsrConfig = Field(default_factory=AsrConfig)
     ocr: OcrConfig = Field(default_factory=OcrConfig)
+    content_check: ContentCheckConfig = Field(default_factory=ContentCheckConfig)
 
     _root: Path = PrivateAttr(default=Path("."))
 
@@ -676,6 +686,7 @@ DEFAULT_VALIDATE = ValidateConfig()
 DEFAULT_RENDER = RenderConfig()
 DEFAULT_ASR = AsrConfig()
 DEFAULT_OCR = OcrConfig()
+DEFAULT_CONTENT_CHECK = ContentCheckConfig()
 DEFAULT_LLM = LLMConfig()
 
 

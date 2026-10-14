@@ -9,17 +9,23 @@ from typing import Any
 import httpx
 import typer
 import yaml
+from pydantic import ValidationError
 
 from tenmin import atomic
 from tenmin.config import (
+    DEFAULT_CONTENT_CHECK,
     DEFAULT_LLM,
     DEFAULT_OCR,
+    DEFAULT_RENDER,
+    ContentCheckConfig,
     LLMConfig,
     OcrConfig,
     ProjectConfig,
     Settings,
     load_project,
 )
+from tenmin.content_check.models import CheckOutcome, ContentCheckError
+from tenmin.content_check.service import check_video
 from tenmin.ingest import ocr_batch
 from tenmin.ingest.asr import ASRError
 from tenmin.ingest.normalize import credit_range_source
@@ -116,6 +122,7 @@ PROJECT_TEMPLATE_FIELDS: dict[str, Any] = {
     "episodes": True,
     "glossary": True,
     "llm": {"provider", "model"},
+    "content_check": True,
     "render": {
         "voice",
         "rate",
@@ -262,14 +269,14 @@ def run(
         "ingest", "--from", help=f"从哪个阶段开始，可选：{', '.join(STAGES)}"
     ),
     only: list[str] | None = ONLY_OPTION,
-    force: bool = typer.Option(False, "--force", help="忽略 mtime 强制重跑"),
+    force: bool = typer.Option(False, "--force", help="忽略 mtime 和检查缓存，强制重跑"),
     episode: int | None = typer.Option(
         None, "--episode", help="要处理的集数；配合 --srt/--video 可注册新的一集"
     ),
     srt: Path | None = SRT_OPTION,
     video: Path | None = VIDEO_OPTION,
 ) -> None:
-    """跑流水线：ingest→translate→signals→script→docgen→voice→timeline→audio→render。"""
+    """跑流水线：ingest→translate→signals→script→docgen→voice→timeline→audio→render→check。"""
     project_file = _project_file(work_dir, slug)
 
     # 三条规则（原来是「--srt 与 --video 必须一起传」那一条对称的规则）：
@@ -322,6 +329,8 @@ def run(
     if "voice" in stages:
         tts_engine = build_tts_engine(cfg.render)
 
+    check_results: dict[int, CheckOutcome] = {}
+    check_errors: list[Exception] = []
     try:
         with RichProgressReporter() as reporter:
             warnings = asyncio.run(
@@ -334,14 +343,24 @@ def run(
                     tts_engine=tts_engine,
                     episode=episode,
                     reporter=reporter,
+                    check_results=check_results,
+                    check_errors=check_errors,
                 )
             )
     except PIPELINE_ERRORS as error:
+        if any(error is check_error for check_error in check_errors):
+            raise
         typer.secho(_error_message(error), fg="red", err=True)
         raise typer.Exit(code=1) from error
 
     for warning in warnings:
         typer.secho(f"[warn] {warning}", fg="yellow")
+
+    explicit_check = (only_stages is not None and "check" in only_stages) or (
+        only_stages is None and from_stage == "check"
+    )
+    if "check" in stages and not cfg.content_check.enabled and not explicit_check:
+        typer.echo("检查未启用")
 
     paths = Paths(cfg.root)
     if episode is not None:
@@ -359,6 +378,66 @@ def run(
         video_path = paths.video(number)
         if video_path.exists():
             typer.echo(f"成品视频：{video_path}")
+        if number in check_results:
+            typer.echo(f"E{number:02d}：")
+            _print_check_outcome(check_results[number])
+
+
+def _print_check_outcome(outcome: CheckOutcome) -> None:
+    """两个入口使用相同的成功文案，缓存命中也显示当前候选数。"""
+    typer.echo(f"已检查 {outcome.frame_count} 帧；候选 {outcome.candidate_count} 帧")
+    typer.echo(f"检查报告：{outcome.report_path}")
+
+
+CHECK_OUTPUT_OPTION = typer.Option(
+    None, "--output", help="报告目录；默认在视频旁的 <stem>.content-check",
+)
+CHECK_INTERVAL_OPTION = typer.Option(
+    DEFAULT_CONTENT_CHECK.sample_interval, "--interval", help="采样间隔（有限正秒数）",
+)
+CHECK_SENSITIVE_OPTION = typer.Option(
+    DEFAULT_CONTENT_CHECK.sensitive_threshold, "--sensitive-threshold",
+    help="sensitive 候选阈值（0~1）",
+)
+CHECK_ADULT_OPTION = typer.Option(
+    DEFAULT_CONTENT_CHECK.adult_threshold, "--adult-threshold",
+    help="questionable + explicit 阈值（0~1）",
+)
+CHECK_FORCE_OPTION = typer.Option(False, "--force", help="忽略检查缓存，重新抽帧和推理")
+CHECK_OFFLINE_OPTION = typer.Option(False, "--offline", help="模型只读本地缓存")
+
+
+@app.command("check-content")
+def check_content(
+    video: Path,
+    output: Path | None = CHECK_OUTPUT_OPTION,
+    interval: float = CHECK_INTERVAL_OPTION,
+    sensitive_threshold: float = CHECK_SENSITIVE_OPTION,
+    adult_threshold: float = CHECK_ADULT_OPTION,
+    force: bool = CHECK_FORCE_OPTION,
+    offline: bool = CHECK_OFFLINE_OPTION,
+) -> None:
+    """独立检查一个视频（需 `uv sync --extra content-check`），候选不影响退出码。"""
+    destination = output if output is not None else video.with_name(f"{video.stem}.content-check")
+    try:
+        cfg = ContentCheckConfig(
+            sample_interval=interval,
+            sensitive_threshold=sensitive_threshold,
+            adult_threshold=adult_threshold,
+        )
+    except ValidationError as error:
+        typer.secho(_error_message(error), fg="red", err=True)
+        raise typer.Exit(code=1) from error
+    try:
+        outcome = check_video(
+            video, destination, cfg=cfg,
+            ffmpeg=DEFAULT_RENDER.ffmpeg_path, ffprobe=DEFAULT_RENDER.ffprobe_path,
+            force=force, offline=offline,
+        )
+    except ContentCheckError as error:
+        typer.secho(_error_message(error), fg="red", err=True)
+        raise typer.Exit(code=1) from error
+    _print_check_outcome(outcome)
 
 
 # 对白轨来源（DialogueTrack.source）给 inspect 显示用。三种来源下游的处置各不相同
