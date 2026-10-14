@@ -4,7 +4,9 @@ import pytest
 from pydantic import ValidationError
 
 from tenmin.config import (
+    DEFAULT_CONTENT_CHECK,
     AsrConfig,
+    ContentCheckConfig,
     CreditsConfig,
     EpisodeConfig,
     IngestConfig,
@@ -45,6 +47,55 @@ episodes:
   - number: 1
     srt: srt/E01.srt
 """
+
+
+def test_content_check_defaults_are_disabled_and_independent(tmp_path):
+    path = tmp_path / "project.yaml"
+    path.write_text(MINIMAL, encoding="utf-8")
+    cfg = load_project(path)
+    assert cfg.content_check.model_dump() == {
+        "enabled": False,
+        "sample_interval": 1.0,
+        "sensitive_threshold": 0.5,
+        "adult_threshold": 0.5,
+    }
+    assert cfg.content_check == DEFAULT_CONTENT_CHECK
+    cfg.content_check.enabled = True
+    assert not DEFAULT_CONTENT_CHECK.enabled
+    assert not ProjectConfig(show="X", slug="x").content_check.enabled
+
+
+@pytest.mark.parametrize("value", [0, -1, float("nan"), float("inf"), -float("inf")])
+def test_content_check_interval_rejects_invalid(value):
+    with pytest.raises(ValidationError, match="sample_interval"):
+        ContentCheckConfig(sample_interval=value)
+
+
+@pytest.mark.parametrize("field", ["sensitive_threshold", "adult_threshold"])
+@pytest.mark.parametrize("value", [-1e-9, 1 + 1e-9, float("nan"), float("inf")])
+def test_content_check_threshold_rejects_invalid(field, value):
+    with pytest.raises(ValidationError, match=field):
+        ContentCheckConfig(**{field: value})
+
+
+@pytest.mark.parametrize("value", [0, 1])
+def test_content_check_threshold_accepts_endpoints(value):
+    cfg = ContentCheckConfig(sensitive_threshold=value, adult_threshold=value)
+    assert cfg.sensitive_threshold == cfg.adult_threshold == value
+
+
+def test_load_content_check_config_and_reject_unknown_key(tmp_path):
+    path = tmp_path / "project.yaml"
+    path.write_text(
+        MINIMAL + "content_check:\n  enabled: true\n  sample_interval: 2.5\n",
+        encoding="utf-8",
+    )
+    cfg = load_project(path)
+    assert cfg.content_check.enabled
+    assert cfg.content_check.sample_interval == 2.5
+    path.write_text(MINIMAL + "content_check:\n  sample_interva: 2\n", encoding="utf-8")
+    with pytest.raises(ProjectConfigError, match=r"content_check\.sample_interva"):
+        load_project(path)
 
 
 def test_load_project_full(tmp_path):

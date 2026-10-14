@@ -3,6 +3,9 @@
 把番剧字幕 + 视频变成解说成片。输入 SRT 与源片，输出「分段文案与剪辑时间轴对照表」、
 配音纯文本，以及配好音、烧好硬字幕的 mp4。
 
+成片可追加本地内容检查，生成带时间点、截图与四类评级分数的报告；
+`tenmin check-content` 也能不建项目直接检查单个视频（见「最终成片内容检查」）。
+
 吃自带字幕的片源，也吃生肉：对白轨有四条来源（手传 SRT / 视频里的软字幕轨 / 画面硬字幕 OCR
 / 语音转写），生肉还会额外交付一份中文字幕。只想把一批视频的硬字幕认成 SRT 的话，
 `tenmin ocr` 不用建项目就能批量跑（见「不建项目，单独批量 OCR」）。设计文档见
@@ -93,6 +96,144 @@ TENMIN_OPENAI_COMPATIBLE_API_KEY=your-key-here
 project 用一个 base_url），且和 MiniMax 一样，schema 是写进 prompt
 文本里再用 pydantic 校验的，不依赖服务端严格执行 `response_format`。
 
+## 命令总览
+
+以下是当前 `main` 支持的全部命令。示例在仓库根目录执行，`saijo` 是项目名，
+`--work-dir` 默认是 `work`。每个命令都支持 `--help`，可查看完整参数：
+
+```bash
+uv run tenmin --help
+uv run tenmin run --help
+```
+
+| 命令 | 用途 | 是否需要项目 |
+|---|---|---|
+| `tenmin init <slug>` | 创建项目配置与字幕目录 | 创建新项目 |
+| `tenmin run <slug>` | 登记素材、运行或重跑制作管线，也可只检查已有成片 | 是 |
+| `tenmin inspect <slug> --episode N` | 查看对白来源、OP/ED 区间、无字幕间隙与高能点 | 是 |
+| `tenmin ocr <文件或目录>...` | 批量将画面硬字幕识别成 SRT，可选 AI 校对 | 否 |
+| `tenmin check-content <视频>` | 本地内容评级，生成截图、分数与 HTML 报告 | 否 |
+| `tenmin import <slug> <目录>` | 批量配对视频与字幕、识别集号与 OP/ED，确认后登记并运行 | 是 |
+
+### 创建项目：`init`
+
+```bash
+uv run tenmin init saijo
+uv run tenmin init saijo --work-dir /path/to/projects
+```
+
+生成 `<work-dir>/<slug>/project.yaml` 与 `srt/`；已有配置不会被覆盖。
+
+### 制作与阶段重跑：`run`
+
+```bash
+# 登记第 2 集并制作；没有独立字幕时省略 --srt
+uv run tenmin run saijo --episode 2 --srt "字幕.srt" --video "源片.mp4"
+uv run tenmin run saijo --episode 3 --video "源片.mp4"
+
+# 已登记素材：处理单集，或批量处理所有已登记的集
+uv run tenmin run saijo --episode 2
+uv run tenmin run saijo
+
+# 从配音阶段开始，或只重出解说文档
+uv run tenmin run saijo --episode 2 --from voice
+uv run tenmin run saijo --episode 2 --only docgen --force
+
+# 多阶段可逗号分隔，也可重复传 --only
+uv run tenmin run saijo --episode 2 --only ingest,signals
+uv run tenmin run saijo --episode 2 --only ingest --only signals
+
+# 只检查已有成片，即使项目未开启自动检查也会执行
+uv run --extra content-check tenmin run saijo --episode 2 --only check
+```
+
+| 参数 | 含义 |
+|---|---|
+| `--work-dir <目录>` | 项目根目录，默认 `work` |
+| `--episode <集号>` | 处理指定集；不传则批处理 |
+| `--video <文件>` | 登记视频，必须同时传 `--episode` |
+| `--srt <文件>` | 登记字幕，必须同时传 `--episode` 与 `--video` |
+| `--from <阶段>` | 从指定阶段运行到末尾，默认 `ingest` |
+| `--only <阶段列表>` | 只运行指定阶段；可重复传或用逗号分隔，优先于 `--from` |
+| `--force` | 忽略制作阶段新鲜度与检查缓存，强制重跑 |
+
+阶段顺序：`ingest → translate → signals → script → docgen → voice → timeline → audio → render → check`。
+自动 `check` 默认关闭；显式 `--only check` / `--from check` 会检查已有成片，
+`--only render` 只渲染。更多配置见[最终成片内容检查](#最终成片内容检查可选本地推理)。
+
+### 查看素材与信号：`inspect`
+
+```bash
+uv run tenmin inspect saijo --episode 2
+uv run tenmin inspect saijo --episode 2 --suspect
+```
+
+`--episode` 必填；`--suspect` 只列疑似 OCR 噪声行；`--work-dir` 指定项目根目录。
+通常先运行 `ingest` 与 `signals`，再查看对应产物。
+
+### 独立批量字幕识别：`ocr`
+
+需要 macOS 与 `ocr` extra；目录只扫描一层，可混合传入多个文件和目录。
+
+```bash
+uv run --extra ocr tenmin ocr "番剧目录/" -o "字幕目录/"
+uv run --extra ocr tenmin ocr "第1集.mp4" "第2集.mkv" --traditional
+uv run --extra ocr tenmin ocr "视频.mp4" --crop-top 0.65 --crop-bottom 0.95 --force
+uv run --extra ocr tenmin ocr "视频.mp4" --ai-correct
+```
+
+| 参数 | 含义 |
+|---|---|
+| `-o` / `--output <目录>` | SRT 输出目录；默认在视频旁 |
+| `--simplified` / `--traditional` | 默认输出简体；后者保留繁体原文 |
+| `--crop-top <比例>` | 字幕带上沿，默认 `0.72` |
+| `--crop-bottom <比例>` | 字幕带下沿，默认不限 |
+| `--force` | 已有结果也重新识别 |
+| `--ai-correct` | 用 LLM 校对 OCR 文字，需对应 API key |
+| `--llm-provider <服务>` | 校对服务：`gemini` / `minimax` / `openai_compatible`，默认 `gemini` |
+| `--llm-model <模型>` | 校对模型，默认 `gemini-3.6-flash` |
+| `--llm-base-url <地址>` | OpenAI 兼容服务地址 |
+
+### 独立视频内容检查：`check-content`
+
+需要 `content-check` extra，单次检查一个视频，输出截图、`results.json` 与 `report.html`。
+
+```bash
+uv run --extra content-check tenmin check-content "视频.mp4"
+uv run --extra content-check tenmin check-content "视频.mp4" --output "检查报告/" \
+  --interval 1 --sensitive-threshold 0.6 --adult-threshold 0.5
+uv run --extra content-check tenmin check-content "视频.mp4" --offline --force
+```
+
+| 参数 | 含义 |
+|---|---|
+| `--output <目录>` | 报告目录，默认视频旁的 `<stem>.content-check/` |
+| `--interval <秒>` | 采样间隔，默认 `1.0`，必须为有限正数 |
+| `--sensitive-threshold <分数>` | sensitive 候选阈值，默认 `0.5`，范围 `0~1` |
+| `--adult-threshold <分数>` | questionable + explicit 候选阈值，默认 `0.5`，范围 `0~1` |
+| `--force` | 忽略缓存，重新抽帧和推理 |
+| `--offline` | 模型只读本地缓存；首次需提前缓存模型 |
+
+候选仅供人工复核，命中仍退出 `0`，执行失败退出 `1`；评级分数不是色情概率。
+
+### 目录批量导入：`import`
+
+```bash
+uv run tenmin import saijo "/path/to/season" --dry-run   # 只预览，零写入
+uv run tenmin import saijo "/path/to/season"             # 确认后登记并运行本次导入的集
+uv run tenmin import saijo "/path/to/season" --srt-dir "/path/to/subtitles" --yes
+```
+
+| 参数 | 含义 |
+|---|---|
+| `--work-dir <目录>` | 项目根目录，默认 `work` |
+| `--srt-dir <目录>` | 字幕不在视频目录时，从这个目录配对 |
+| `--yes` | 跳过确认，直接登记并运行；非交互环境必须传 |
+| `--dry-run` | 只预览，不写文件、不运行管线 |
+
+目录只扫描一层；已登记来源的集会跳过。OP/ED 截图与判断依据见
+[从目录批量导入](#从目录批量导入)。
+
 ## 使用
 
 ```bash
@@ -158,6 +299,54 @@ uv run tenmin run akujo2 --from voice
 ```bash
 uv run tenmin run akujo2 --from audio --force
 ```
+
+### 最终成片内容检查（可选、本地推理）
+
+```bash
+uv sync --extra content-check
+```
+
+在 `project.yaml` 中开启后，10 阶段管线的最后一步是 `render → check`，逐集检查最终成片：
+
+```yaml
+content_check:
+  enabled: true                # 默认 false
+  sample_interval: 1.0         # 有限正秒数
+  sensitive_threshold: 0.5     # 0~1
+  adult_threshold: 0.5         # questionable + explicit，0~1
+```
+
+```bash
+uv run --extra content-check tenmin run saijo --episode 2
+uv run --extra content-check tenmin run saijo --episode 2 --only check
+uv run tenmin run saijo --episode 2 --only render
+uv run --extra content-check tenmin check-content 视频.mp4 --output 检查报告目录 --offline
+uv run --extra content-check tenmin check-content 视频.mp4 --interval 1 --sensitive-threshold 0.6
+```
+
+`--only check` / `--from check` 是显式请求，即使开关关闭也检查已有成片，不构造 LLM/TTS、
+不需要 API key。`--only render` 只出片；启用时全流程和 `--from render` 会检查。
+项目报告在 `work/<slug>/08_check/E{NN}/`，独立命令默认在视频旁的
+`<stem>.content-check/`；其中 `results.json` 保存全部分数，`report.html` 可直接浏览器打开，
+`frames/` 保留全部截图。页面支持阈值调整、全帧、排序及分页；页面调整不回写 JSON 或配置。
+
+首次安装依赖、缓存模型需要联网。模型固定为 `deepghs/anime_dbrating` 的
+`mobilenetv3_large_100_v0_ls0.2`（revision `7af21db648acdeb74f5c334abda9dd7403407b3c`），
+CPU 本地推理；缓存齐全后优先本地读取。独立 `--offline` 仅限制模型读取，
+uv 的依赖解析/安装离线控制另用 `uv --offline`，并提前安装 extra。
+`uv run --extra content-check` 保留此 extra；后续裸 `uv sync` / `uv run` 可能移除可选依赖。
+
+同身份完整结果可复用；只改阈值或丢失 HTML 时仅重建报告，不抽帧、不推理。
+缺截图、损坏 JSON 或身份变化会重查。身份依据视频 resolve 路径、size、mtime_ns、固定模型
+及采样/预处理版本，不是视频全哈希；内容修改却刻意保留 size/mtime 时用 `--force`。
+输出目录由工具所有权标记管理，非本工具拥有的非空目录会报错。
+
+候选规则是 `sensitive >= sensitive_threshold` 或 `questionable + explicit >= adult_threshold`。
+四类为 general / sensitive / questionable / explicit，**是图片评级原始分数，不是校准后的色情
+概率或严重程度百分制**。候选需要人工看图，采样点范围不是精确剪辑边界，短于采样间隔的镜头
+可能漏掉。候选非零仍退出 0；独立检查执行失败退出 1；项目检查的可预期失败会警告、保留成片、
+继续后续集数并汇总失败集数。实际离线验收和人工观察见
+[`docs/content-check-validation.md`](docs/content-check-validation.md)。
 
 ### 从目录批量导入
 
@@ -529,8 +718,10 @@ uv run tenmin inspect akujo --episode 1
 | timeline | `05_timeline/E{NN}.timeline.json`、`05_timeline/E{NN}.ass` | 按真实配音时长重算画面时间轴，生成硬字幕 |
 | audio | `06_audio/E{NN}.mixed.m4a` | 旁白盖在原声之上，旁白期间原声压低 |
 | render | `07_render/E{NN}.mp4` | 一次编码完成切片、拼接、烧字幕、挂音轨 |
+| check（可选） | `08_check/E{NN}/results.json`、`report.html`、`frames/` | 否；本地 ONNX 图片评级，仅报告候选 |
 
-默认按 mtime 跳过已是最新的阶段，`--force` 强制重跑。
+制作阶段按 mtime 跳过已是最新的产物；check 验证视频、模型、采样身份和缓存完整性。
+`--force` 强制重跑，单改检查阈值仅重建报告。
 
 ## 测试
 
@@ -564,5 +755,6 @@ TENMIN_OCR_SAMPLE_VIDEO=<片源> uv run pytest -m ocr   # 真跑画面 OCR，需
 - **v2**（已完成）Edge-TTS 配音 + ffmpeg 切片拼接 + 混音 + 烧硬字幕 → 1920x1080 mp4
 - **v3**（已完成）mlx-whisper 语音转写支持生肉 + `translate` 阶段交付中文字幕
 - **v3.1**（本版）画面硬字幕 OCR（Apple Vision）作为对白轨的第四条来源；`tenmin ocr` 脱离项目批量识别，默认繁转简
+- **v3.2**（已完成）最终成片本地内容检查 + 独立 `tenmin check-content`，输出截图与评级报告
 - **v4** 本地 Web GUI（`script.json` 可视化编辑器）
 - **v5** PySceneDetect + CLIP 视觉索引，整季 12 集压到 10 分钟

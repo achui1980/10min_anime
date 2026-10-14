@@ -14,6 +14,8 @@ from ruamel.yaml.util import load_yaml_guess_indent
 
 from tenmin import atomic, config_slices
 from tenmin.config import EpisodeConfig, ProjectConfig, _parse_project_yaml
+from tenmin.content_check.models import CheckOutcome, ContentCheckError
+from tenmin.content_check.service import check_video
 from tenmin.docgen.narration import render_narration
 from tenmin.docgen.table import render_table
 from tenmin.ingest.normalize import build_track
@@ -70,6 +72,7 @@ STAGES = [
     "timeline",
     "audio",
     "render",
+    "check",
 ]
 
 
@@ -131,6 +134,7 @@ _ARTIFACTS: dict[str, tuple[str, str]] = {
     "subtitles": ("05_timeline", ".ass"),
     "mixed_audio": ("06_audio", ".mixed.m4a"),
     "video": ("07_render", ".mp4"),
+    "check_dir": ("08_check", ""),
     # 语音转写的落点。它（连同下面的 ocr_cache）是本表里仅有的落在 srt/（输入目录）里的条目，也是
     # 仅有的既不在带序号的阶段目录、也不在 out/ 交付目录里的，刻意的：这份 SRT 是双重身份的
     # —— 它是 ingest 自己产出的缓存，同时也是下一次运行的**输入**（转差了就手改，
@@ -242,6 +246,9 @@ class Paths:
 
     def video(self, episode: int) -> Path:
         return self._artifact("video", episode)
+
+    def check_dir(self, episode: int) -> Path:
+        return self._artifact("check_dir", episode)
 
     def asr_cache(self, episode: int) -> Path:
         """语音转写结果的落点，也是 resolve_subtitle_source 的 cache 参数。"""
@@ -1209,6 +1216,18 @@ def run_render(
     )
 
 
+def run_check(cfg: ProjectConfig, episode: int, *, force: bool = False) -> CheckOutcome:
+    """检查最终成片；完整性与缓存复用由共享服务决定。"""
+    paths = Paths(cfg.root)
+    video = paths.video(episode)
+    if not video.is_file():
+        raise ContentCheckError(f"缺少最终成片 {video}，请先跑 render 阶段")
+    return check_video(
+        video, paths.check_dir(episode), cfg=cfg.content_check,
+        ffmpeg=cfg.render.ffmpeg_path, ffprobe=cfg.render.ffprobe_path, force=force,
+    )
+
+
 class _EpisodeLabelledReporter:
     """把 substep 的 label 打上集号前缀，其余 5 个方法原样转发。
 
@@ -1272,7 +1291,7 @@ async def _drain_script_tasks(
 
 async def run_pipeline(
     cfg: ProjectConfig,
-    provider: LLMProvider,
+    provider: LLMProvider | None,
     *,
     from_stage: str = "ingest",
     only: Sequence[str] | None = None,
@@ -1281,8 +1300,13 @@ async def run_pipeline(
     episode: int | None = None,
     reporter: ProgressReporter | None = None,
     correction_provider_factory: Callable[[], LLMProvider] | None = None,
+    check_results: dict[int, CheckOutcome] | None = None,
+    check_errors: list[Exception] | None = None,
 ) -> list[str]:
     """返回本次运行累积的 warnings。
+
+    check_errors 可收集检查执行中原样抛出的未知异常，供 CLI 判定错误来源；
+    不包含已转为 warnings 的 ContentCheckError，每次运行开始清空。
 
     only 传阶段名序列，只跑这些阶段（CLI 的 --only 传单元素列表，
     端到端测试会传 ["ingest", "signals"] 这样的多元素列表）。
@@ -1296,17 +1320,27 @@ async def run_pipeline(
     script task 都已经起了，然后 await 第 i 集那个。本次运行含 translate 时窗口被钳到 1
     （术语表是 script 的输入却由循环里的 translate 写）。取舍见 `_launch_scripts` 的注释。
     """
+    if check_results is not None:
+        check_results.clear()
+    if check_errors is not None:
+        check_errors.clear()
     if cfg.mode == "season":
         raise NotImplementedError("整季模式尚未实现，请使用 mode: single_episode")
 
     reporter = reporter or NullProgressReporter()
 
     wanted = resolve_stages(from_stage=from_stage, only=only)
+    if not wanted:
+        return []
+    explicit_check = (
+        (only is not None and "check" in only)
+        or (only is None and from_stage == "check")
+    )
 
     paths = Paths(cfg.root)
     active = _active_episodes(cfg)
     numbers = [ep.number for ep in active]
-    ingest_inputs = _ingest_inputs(cfg)
+    ingest_inputs = _ingest_inputs(cfg) if "ingest" in wanted else []
     warnings: list[str] = []
 
     if episode is None:
@@ -1500,7 +1534,9 @@ async def run_pipeline(
             # 独立依赖它（--only audio/render 不一定会先跑 timeline）。
             episode_cfg = _find_episode(cfg, number)
             video_inputs = (
-                [cfg.video_path(episode_cfg)] if episode_cfg.video is not None else []
+                [cfg.video_path(episode_cfg)]
+                if episode_cfg.video is not None and {"timeline", "audio", "render"} & set(wanted)
+                else []
             )
 
             if "translate" in wanted:
@@ -1605,6 +1641,31 @@ async def run_pipeline(
                     reporter.stage_done("render")
                 else:
                     reporter.stage_skip("render")
+
+            if "check" in wanted:
+                if cfg.content_check.enabled or explicit_check:
+                    reporter.stage_start("check")
+                    try:
+                        outcome = run_check(cfg, number, force=force)
+                    except ContentCheckError as error:
+                        warnings.append(f"E{number:02d}：本次检查失败／报告未更新：{error}")
+                    except Exception as error:
+                        # 只记录来源并原样抛出，让 CLI 区分检查编程错误与其他阶段的
+                        # 预期 ValueError；不包装异常，也不将未知错误当成批处理警告。
+                        if check_errors is not None:
+                            check_errors.append(error)
+                        raise
+                    else:
+                        if check_results is not None:
+                            check_results[number] = outcome
+                        reporter.substep(
+                            "check", outcome.frame_count, outcome.frame_count,
+                            f"候选 {outcome.candidate_count} 帧；报告 {outcome.report_path}",
+                        )
+                        reporter.stage_done("check")
+                else:
+                    reporter.substep("check", 0, 0, "检查未启用")
+                    reporter.stage_skip("check")
 
             if episode is None:
                 reporter.episode_done(number, number_to_index[number], len(target_numbers))

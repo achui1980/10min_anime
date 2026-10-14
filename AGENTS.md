@@ -4,10 +4,10 @@
 
 ## 项目是做什么的
 
-tenmin（10 分钟看番剧）：把番剧字幕（SRT）或生肉视频 + 视频，自动加工成"解说方案"文档 + 配音 + 烧字幕的成片。9 个阶段，每个阶段读上游产物、写自己的产物，靠文件 mtime 决定要不要重跑：
+tenmin（10 分钟看番剧）：把番剧字幕（SRT）或生肉视频 + 视频，自动加工成"解说方案"文档 + 配音 + 烧字幕的成片。10 个阶段，制作阶段靠文件 mtime 决定要不要重跑，末尾可选 check 由检查服务验证缓存身份和完整性：
 
 ```
-ingest → translate → signals → script → docgen → voice → timeline → audio → render
+ingest → translate → signals → script → docgen → voice → timeline → audio → render → check
 ```
 
 - `ingest`：解析 SRT，生成对白轨（`01_dialogue/`）。**对白轨从哪来是四岔**（`ingest/resolve.py`）：手传 SRT → 视频里的软字幕轨直抽（`E{NN}.embedded.srt`，每次重抽）→ 声明了硬字幕时画面 OCR（`E{NN}.ocr.srt`，按 mtime 复用；只在 `cfg.hardsub_enabled(episode)` 为真时走，跑不了就报错、**不回落到语音转写**）→ 语音转写（`E{NN}.asr.srt`，按 mtime 复用）。四条都归一成一个 SRT 路径，所以 `build_track` 的形态不变；`DialogueTrack.source` 记的是 `"srt"` / `"ocr"` / `"asr"`（`ocr` 跟 `srt` 一样过 OpenCC 繁转简，`asr` 不过）。
@@ -19,6 +19,7 @@ ingest → translate → signals → script → docgen → voice → timeline �
 - `timeline`：根据真实配音时长重新计算时间轴，生成字幕（`05_timeline/`）。
 - `audio`：原声压低（ducking）+ 配音叠加混音（`06_audio/`）。
 - `render`：一次性剪辑、拼接、烧字幕、合成音轨，出片（`07_render/`）。
+- `check`：可选本地图片评级粗筛，只检查最终成片（`08_check/E{NN}/`），默认关闭。
 
 一个 project（`work/<slug>/project.yaml`）对应**一部番**，可以登记多集。所有阶段产物都是按集号加前缀的（`Paths` 类，见 `src/tenmin/pipeline.py`），例如 `03_script/E02.script.json`、`out/E02.narration.txt`、`07_render/E02.mp4`。
 
@@ -52,23 +53,23 @@ cat /path/to/zscaler_ca_bundle.pem >> .venv/lib/python3.14/site-packages/certifi
 
 ## 代码结构
 
-- `src/tenmin/config.py`：`ProjectConfig`（15 个字段）与它的 9 个子 config（`.locale` / `.llm` / `.ingest` / `.credits` / `.signals` / `.validate_script` / `.render` / `.asr` / `.ocr`）、`EpisodeConfig`，`Settings`（`BaseSettings`，读 `.env`，`env_prefix="TENMIN_"`）。**全项目所有「经验阈值」的唯一权威来源**；分家的判据是「这部番想要什么」的创作旋钮进 config，「物理上不可能／数据坏了」的合法性边界留在各模块的模块级常量里。各阶段模块只保留 `DEFAULT_XXX.field` 的模块级别名。改了子 config 的个数就来改这句数字（判据是 `ProjectConfig.model_fields` 里注解是 `BaseModel` 子类的那些）。
+- `src/tenmin/config.py`：`ProjectConfig`（16 个字段）与它的 10 个子 config（`.locale` / `.llm` / `.ingest` / `.credits` / `.signals` / `.validate_script` / `.render` / `.asr` / `.ocr` / `.content_check`）、`EpisodeConfig`，`Settings`（`BaseSettings`，读 `.env`，`env_prefix="TENMIN_"`）。**全项目所有「经验阈值」的唯一权威来源**；分家的判据是「这部番想要什么」的创作旋钮进 config，「物理上不可能／数据坏了」的合法性边界留在各模块的模块级常量里。各阶段模块只保留 `DEFAULT_XXX.field` 的模块级别名。改了子 config 的个数就来改这句数字（判据是 `ProjectConfig.model_fields` 里注解是 `BaseModel` 子类的那些）。
 
-  这 11 个配置模型（项目、9 个子配置、集配置）继承 `StrictModel`（`extra="forbid"`）；`Settings` 除外，因为 `.env` 可含别的程序的变量。`load_project` 用 `_UniqueKeyLoader`（PyYAML SafeLoader + 同层重复键检查）；YAML 语法/重复键或 pydantic 校验失败都包装为 `ProjectConfigError(ValueError)`，点名文件和完整字段路径（如 `render.font_sise`、`episodes[0].op_rang`），未知字段给拼写建议。`EpisodeConfig` 可预填仅有集号/OP/ED、没有 srt/video 的条目；运行时按 `has_source` 判：批处理跳过并警告，单集运行要求 `--video`，inspect 标「未登记视频」；登记时合并同一条并保留 OP/ED。
+  这 12 个配置模型（项目、10 个子配置、集配置）继承 `StrictModel`（`extra="forbid"`）；`Settings` 除外，因为 `.env` 可含别的程序的变量。`load_project` 用 `_UniqueKeyLoader`（PyYAML SafeLoader + 同层重复键检查）；YAML 语法/重复键或 pydantic 校验失败都包装为 `ProjectConfigError(ValueError)`，点名文件和完整字段路径（如 `render.font_sise`、`episodes[0].op_rang`），未知字段给拼写建议。`EpisodeConfig` 可预填仅有集号/OP/ED、没有 srt/video 的条目；运行时按 `has_source` 判：批处理跳过并警告，单集运行要求 `--video`，inspect 标「未登记视频」；登记时合并同一条并保留 OP/ED。
 
   `AsrConfig` 只有 2 个字段（`model` / `language`），但有一条**不在代码里的操作约束**：`E{NN}.asr.srt` 的新鲜度只比源视频 mtime、**刻意不看 `AsrConfig`**，所以换了 `asr.model` 必须自己删那份 SRT。理由是它是一份人能手改的产物，按指纹失效会把手改静默冲掉。
 
   `OcrConfig` 有 9 个字段（`enabled` / `ai_correct` / `sample_fps` / `crop_top` / `crop_bottom` / `center_tolerance` / `similarity` / `min_frames` / `language`），同样有那条**不在代码里的操作约束**：`E{NN}.ocr.srt` 的新鲜度只比源视频 mtime、**刻意不看 `OcrConfig`**，改了 OCR 参数必须自己删那份 SRT（理由同上）。`crop_bottom` 可选，按原画面高度比例指定字幕带下沿；取帧仍裁到底，Vision 识别后按框中心的 y 过滤下层字幕，防止物理裁剪边缘漏认中文。「这一集带不带硬字幕」只有一个判定入口 `ProjectConfig.hardsub_enabled(episode)`：`EpisodeConfig.hardsub` 写了 true/false 就听它的，`None` 跟随 `ocr.enabled`。`config_slices` 在 `hardsub is None` 时**不**把这个键写进 EPISODE 切片——否则升级后 timeline/audio/render 的切片全部被改写、存量集白白重跑。OCR 引擎只有 Apple Vision（pyobjc，optional extra `ocr`，仅 macOS），pyobjc 的 import 只許写在 `ingest/ocr.py` 的 `_recognize` 函数体内。硬字幕片源会把**居中**的 OP/ED staff 字一起认进来（两侧的靠 `center_tolerance` 挡掉），所以这类片源要手填 `op_range` / `ed_range` 或 `credits.default_*`，交给三级回退去剔除。ingest 的配置切片含 `ocr`，所以改任何 `ocr.*` 旋钮都会让 ingest 重跑一次（便宜：缓存照旧复用、产物字节不变就不写，下游不连带），但**不会**让已有的 `.ocr.srt` 失效。
 
   **OP/ED 区间是三级回退**，改 ingest 的 credits 相关代码前先分清自己在哪一级：`EpisodeConfig.op_range`/`ed_range`（逐集手填）→ `CreditsConfig.default_op_range`/`default_ed_range`（项目级手填，ED 终点允许 `None` = 到片尾，在 `normalize._resolve_manual_range` 里按**这一集**的 duration 解析）→ `credits.find_credit_ranges` 的启发式推断。关键点：**前两级（手填）还会直接驱动 `in_credit_window`** —— 拿到确定区间时窗就是那两段（各留 `manual_window_margin`=5 秒余量），`credit_head_window`/`ed_keyword_window_seconds` 那对盲窗完全不参与；两级都空才走盲窗，且那条路与改动前**逐字节等价**（实测新旧代码各跑一遍，13 份 `01_dialogue/*.json` 哈希全同）。手填模式刻意不受 `credit_window_max_ratio` 约束（那是给盲窗兜底的，静默收缩用户的显式声明比覆盖过宽更难查）。实测收益：接住 3 条落在 300 秒盲窗外的 staff 行、同时救回 5 条落在盲窗内被规则 4/5 误杀的真台词；代价是填错会在**你填的区间内**误判。`normalize.credit_range_source()` 报告实际生效的是哪一级（`tenmin inspect` 用），它刻意复用 `_resolve_manual_range` 而不是自己再判一遍「字段填了没」——项目级默认可能填了却在某一集上解析不出合法区间。
-- `src/tenmin/pipeline.py`：`Paths` 类（每阶段产物路径，全部按集号 `E{episode:02d}` 前缀），`STAGES` 列表（9 项，`translate` 在 index 1），`run_pipeline()` 顶层编排（支持单集/批量两种模式，靠 `episode: int | None` 区分），`register_episode()`（`--episode --video` 注册新集，`--srt` 可省；可选成对的 `op_range`/`ed_range` 只在这一集两个字段都空时写入，给 `tenmin import` 用；只给一半抛 `ValueError`）。
+- `src/tenmin/pipeline.py`：`Paths` 类（每阶段产物路径，全部按集号 `E{episode:02d}` 前缀），`STAGES` 列表（10 项，`translate` 在 index 1），`run_pipeline()` 顶层编排（支持单集/批量两种模式，靠 `episode: int | None` 区分），`register_episode()`（`--episode --video` 注册新集，`--srt` 可省；可选成对的 `op_range`/`ed_range` 只在这一集两个字段都空时写入，给 `tenmin import` 用；只给一半抛 `ValueError`）。
 
   **新鲜度按阶段配置切片**：`run_pipeline` 先写解析后的 `.config/E{NN}.<stage>.json`（signals 是项目级 `.config/signals.json`），替代整个 `project.yaml` 作为阶段输入。改阶段的配置读取点时核对 `src/tenmin/config_slices.py` 的 `STAGE_FIELDS`，同步更新对应阶段；`tests/test_config_slices.py` 只检测字段是否挂到任一阶段，抓不到「已挂在其他阶段的字段又被本阶段读取」。运维旋钮由 `EXCLUDED` 排除。切片内容不变不碰文件；首次创建 mtime 置 epoch 0，升级前已修改却未跑的配置首次不会失效旧产物；这种情况及删掉 `.config/` 后需 `--force`。
 
   ingest/signals **产物字节不变就不写**，避免下游因 mtime 变动连带重跑；全局阶段的新鲜度另由 `.config/{ingest,signals}.done` 记录上次完成时间及**每份产物 SHA-256 摘要**（`_is_fresh_stamped` 比对摘要和输入时间）。重跑前先将戳子置空，失败留下空戳子、下次必重跑；戳子不存在或是旧版阶段名纯文本时才退回按产物 mtime 判。`register_episode` 用 `ruamel.yaml` round-trip 只改目标集的 srt/video，保留其他字段、注释、键序、引号与原有序列缩进；配置读取仍用 PyYAML。登记 SRT 不存在时先报错，不拷贝也不写配置。
 
   批量模式的编排是**按集纵向**（P0-C 定的：中途失败要留下完整交付物，而不是一堆半成品）。script 阶段的多集并发（`llm.script_concurrency`，默认 1）是在这个纵向循环上加一个**有界预取窗口** —— 走到第 i 集时确保前 `i + concurrency` 集的 script task 都起了，然后 await 第 i 集那个。**刻意不把 script 抽成横向并发阶段**：那会直接推翻上面那条不变量（全部集的 script 跑完之前一集成片都不会有，而 script 恰好是最慢也最容易失败的阶段）。默认 1 的依据见 `config.LLMConfig.script_concurrency` 的注释（并发易撞 429、失败时在飞调用白花钱、audio/render 的同步 ffmpeg 会堵住事件循环）。失败收摊走 `_drain_script_tasks`，`try/finally` 包住整个纵向循环。
-- `src/tenmin/cli.py`：Typer CLI（`tenmin init` / `tenmin run` / `tenmin inspect` / `tenmin ocr` / `tenmin import`）。`tenmin ocr` 是脱离项目的批量画面 OCR（见下面 `ingest/ocr_batch.py`），不走管线。`tenmin import <slug> <dir>`（函数名 `import_`，`import` 是关键字）扫描目录批量登记，见下面 `importer.py`：默认打印预览后要确认，`--yes` 跳过确认，`--dry-run` 只预览（含 LLM 兜底与 ffprobe，零写入），非 TTY 且没 `--yes` 报错退出；确认后先构造管线 provider（缺 key 时一个文件都不动），再**只对本次导入的集**逐集跑 `run_pipeline` 单集模式。`tenmin run` 支持四种用法：
+- `src/tenmin/cli.py`：Typer CLI（`tenmin init` / `tenmin run` / `tenmin inspect` / `tenmin ocr` / `tenmin check-content` / `tenmin import`）。`tenmin ocr` 是脱离项目的批量画面 OCR（见下面 `ingest/ocr_batch.py`），不走管线。`tenmin import <slug> <dir>`（函数名 `import_`，`import` 是关键字）扫描目录批量登记，见下面 `importer.py`：默认打印预览后要确认，`--yes` 跳过确认，`--dry-run` 只预览（含 LLM 兜底与 ffprobe，零写入），非 TTY 且没 `--yes` 报错退出；确认后先构造管线 provider（缺 key 时一个文件都不动），再**只对本次导入的集**逐集跑 `run_pipeline` 单集模式。`tenmin run` 支持四种用法：
   - `--episode N --srt <path> --video <path>`：注册新集并跑。
   - `--episode N --video <path>`（不带 `--srt`）：**生肉入口**，对白轨靠软字幕轨抽取、（声明了硬字幕时）画面 OCR 或语音转写拿。反过来「只传 `--srt`」非法（视频是渲染阶段的硬需求）。
   - `--episode N`（不带 srt/video）：重跑已注册的某一集。
@@ -121,13 +122,17 @@ cat /path/to/zscaler_ca_bundle.pem >> .venv/lib/python3.14/site-packages/certifi
   - `srt_writer.py`：中文字幕交付物（`render_zh_srt`）。分工是「翻译不碰时间，时间戳回对白轨取」。id 越界（`< 1` 或 `> len(lines)`）一律报错、与「译文空白就静默跳过」刻意不对称——多出来的 id 必然指到一行不是这句的时间，而 0/负数会被 Python 负下标静默配到末尾某行。按 `(start, end, id)` 三键排序，第三键是给 `split_dual_track` 拆出的同起止各段兜底（否则先后由模型回填顺序决定，同一素材换次调用就换个字节）。时间戳分隔符用逗号，靠 `timecode.format_timestamp(...).replace(".", ",")` 而不是重抄实现（重抄会漏掉 nan/inf 守卫与负数夹紧）。
 
 
+- `src/tenmin/content_check/`：`service.check_video` 是项目/独立 CLI 共用入口；`frames.py` 用真实 showinfo PTS 和旋转后的 DAR 抽图；`model.py` 固定 mobile revision/摘要、先查本地 HF 缓存，再按需联网，optional extra 的导入在执行函数体内；`candidates.py` 是候选/归组唯一口径；`report.py` 通过 `importlib.resources` 读取同包 `report.html`，安全嵌入 JSON。
+  **缓存完成标记是最后原子发布的 `results.json`**：临时目录抽帧/推理，发布前清掉旧完成标记，固定所有权标记授权替换工具产物。阈值不进入推理身份，只重建候选和报告；截图缺失/JSON 损坏/身份变化/force 重跑。即使 render 跳过，仍调服务验证缓存。显式 only/from check 忽略 enabled、不构造 LLM/TTS；未知异常和中断传播，仅 `ContentCheckError` 转项目警告继续。`check_results` 只收本次成功，`check_errors` 记录未知异常来源以绕过 CLI 旧 ValueError 捕获；旧报告存在不能推断本次成功。
+  修改抽帧、缓存或 HTML 时读 `docs/content-check-validation.md` 的真实验收及效果边界；分数是图片评级、候选是人工查看入口，不能宣称检测准确率。
+
 ## 测试
 
 ```bash
 uv run pytest tests/ -q          # 全量跑，默认跳过需要真实 API key / 素材的标记测试
 ```
 
-`tests/` 目录：`test_config.py`、`test_llm.py`、`test_pipeline.py`、`test_cli.py`、`test_config_slices.py`、`test_render_*.py` 等，共 54 个 Python 文件（按 `tests/**/*.py` glob，含 conftest.py / fakes.py / __init__.py）。pytest markers（`pyproject.toml` 里是**六个**）：
+`tests/` 目录：`test_config.py`、`test_llm.py`、`test_pipeline.py`、`test_cli.py`、`test_config_slices.py`、`test_render_*.py`、`test_content_check_*.py` 等，共 61 个 Python 文件（按 `tests/**/*.py` glob，含 conftest.py / fakes.py / __init__.py）。pytest markers（`pyproject.toml` 里是**六个**）。content-check 日常测试不下载模型；真实媒体回归在有 ffmpeg/ffprobe 时本地生成微型片段，否则逐项 skip；旋转用例另探测 `-display_rotation` 支持，仅不支持该参数时跳过该用例：
 
 - `llm`：需要真实 LLM API key（默认跳过），跑法：`TENMIN_GEMINI_API_KEY=xxx uv run pytest -m llm`。
 - `generalize`：需要额外的番剧 SRT fixture。
