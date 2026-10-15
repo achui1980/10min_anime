@@ -1,0 +1,155 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>OCR 校对抽查 · __TITLE__</title>
+<style>
+  body { font-family: -apple-system, "PingFang SC", sans-serif; margin: 0; background: #f4f4f5; color: #18181b; }
+  header { position: sticky; top: 0; background: #fff; border-bottom: 1px solid #ddd; padding: 12px 20px; z-index: 1; }
+  h1 { font-size: 16px; margin: 0 0 6px; }
+  .stats { font-size: 14px; display: flex; gap: 16px; flex-wrap: wrap; align-items: center; }
+  .stats b { font-size: 16px; }
+  main { padding: 16px 20px; display: grid; gap: 14px; }
+  .card { background: #fff; border-radius: 8px; padding: 12px; display: grid; grid-template-columns: 480px 1fr; gap: 14px; border-left: 5px solid #d4d4d8; }
+  .card[data-verdict="right"] { border-left-color: #16a34a; }
+  .card[data-verdict="wrong"] { border-left-color: #dc2626; }
+  .card[data-verdict="unsure"] { border-left-color: #ca8a04; }
+  .card img { width: 100%; border-radius: 4px; background: #000; }
+  .meta { font-size: 12px; color: #71717a; margin-bottom: 6px; }
+  .tag { display: inline-block; font-size: 12px; padding: 1px 6px; border-radius: 4px; margin-left: 6px; }
+  .tag.changed { background: #dbeafe; color: #1d4ed8; }
+  .tag.uncertain { background: #fef3c7; color: #92400e; }
+  .line { font-size: 18px; margin: 4px 0; line-height: 1.6; }
+  .label { font-size: 12px; color: #71717a; display: inline-block; width: 48px; }
+  del { background: #fecaca; text-decoration: line-through; }
+  ins { background: #bbf7d0; text-decoration: none; }
+  .reason { font-size: 13px; color: #52525b; margin-top: 6px; }
+  .buttons { margin-top: 10px; display: flex; gap: 8px; }
+  button { border: 1px solid #d4d4d8; background: #fff; padding: 4px 12px; border-radius: 6px; cursor: pointer; font-size: 14px; }
+  button.on[data-v="right"] { background: #16a34a; color: #fff; }
+  button.on[data-v="wrong"] { background: #dc2626; color: #fff; }
+  button.on[data-v="unsure"] { background: #ca8a04; color: #fff; }
+  select { font-size: 14px; }
+</style>
+</head>
+<body>
+<header>
+  <h1 id="title"></h1>
+  <div class="stats">
+    <span id="summary"></span>
+    <span>改错率：<b id="rate">—</b></span>
+    <label>显示 <select id="filter">
+      <option value="all">全部</option>
+      <option value="todo">未判定</option>
+      <option value="changed">AI 改过的</option>
+      <option value="uncertain">不确定的</option>
+      <option value="wrong">判为改错</option>
+    </select></label>
+    <button id="export">导出判定 JSON</button>
+  </div>
+</header>
+<main id="list"></main>
+<script>
+const DATA = __DATA__;
+const KEY = "ocr-audit:" + DATA.title;
+const verdicts = JSON.parse(localStorage.getItem(KEY) || "{}");
+const LABELS = { right: "改对", wrong: "改错", unsure: "不确定" };
+
+function stamp(sec) {
+  const m = Math.floor(sec / 60), s = (sec % 60).toFixed(2).padStart(5, "0");
+  return String(m).padStart(2, "0") + ":" + s;
+}
+
+function diffNode(diff, side) {
+  const span = document.createElement("span");
+  for (const [op, text] of diff) {
+    if (op === "equal") span.append(text);
+    else if (op === "delete" && side === "old") { const n = document.createElement("del"); n.textContent = text; span.append(n); }
+    else if (op === "insert" && side === "new") { const n = document.createElement("ins"); n.textContent = text; span.append(n); }
+  }
+  return span;
+}
+
+function line(label, node) {
+  const div = document.createElement("div");
+  div.className = "line";
+  const l = document.createElement("span");
+  l.className = "label"; l.textContent = label;
+  div.append(l, node);
+  return div;
+}
+
+function render() {
+  const filter = document.getElementById("filter").value;
+  const list = document.getElementById("list");
+  list.replaceChildren();
+  for (const item of DATA.items) {
+    const v = verdicts[item.id];
+    if (filter === "todo" && v) continue;
+    if (filter === "changed" && !item.changed) continue;
+    if (filter === "uncertain" && !item.uncertain) continue;
+    if (filter === "wrong" && v !== "wrong") continue;
+    const card = document.createElement("div");
+    card.className = "card";
+    if (v) card.dataset.verdict = v;
+    const img = document.createElement("img");
+    img.src = item.image; img.loading = "lazy"; img.alt = "第 " + item.id + " 条画面";
+    const body = document.createElement("div");
+    const meta = document.createElement("div");
+    meta.className = "meta";
+    meta.textContent = "#" + item.id + "  " + stamp(item.start) + " → " + stamp(item.end);
+    if (item.changed) { const t = document.createElement("span"); t.className = "tag changed"; t.textContent = "AI 改过"; meta.append(t); }
+    if (item.uncertain) { const t = document.createElement("span"); t.className = "tag uncertain"; t.textContent = "不确定"; meta.append(t); }
+    body.append(meta, line("原稿", diffNode(item.diff, "old")), line("校对后", diffNode(item.diff, "new")));
+    if (item.candidate) body.append(line("候选", document.createTextNode(item.candidate)));
+    if (item.reason) { const r = document.createElement("div"); r.className = "reason"; r.textContent = "理由：" + item.reason; body.append(r); }
+    const buttons = document.createElement("div");
+    buttons.className = "buttons";
+    for (const key of ["right", "wrong", "unsure"]) {
+      const b = document.createElement("button");
+      b.dataset.v = key; b.textContent = LABELS[key];
+      if (v === key) b.classList.add("on");
+      b.onclick = () => {
+        if (verdicts[item.id] === key) delete verdicts[item.id]; else verdicts[item.id] = key;
+        localStorage.setItem(KEY, JSON.stringify(verdicts));
+        render();
+      };
+      buttons.append(b);
+    }
+    body.append(buttons);
+    card.append(img, body);
+    list.append(card);
+  }
+  updateStats();
+}
+
+function updateStats() {
+  const changed = DATA.items.filter(i => i.changed).length;
+  const uncertain = DATA.items.filter(i => i.uncertain).length;
+  const counts = { right: 0, wrong: 0, unsure: 0 };
+  for (const item of DATA.items) { const v = verdicts[item.id]; if (v) counts[v]++; }
+  const judged = Object.values(counts).reduce((a, b) => a + b, 0);
+  document.getElementById("summary").textContent =
+    "共 " + DATA.total + " 条字幕，AI 改动 " + changed + " 条，不确定 " + uncertain +
+    " 条；已判定 " + judged + "/" + DATA.items.length +
+    "（改对 " + counts.right + "，改错 " + counts.wrong + "，不确定 " + counts.unsure + "）";
+  const decided = counts.right + counts.wrong;
+  document.getElementById("rate").textContent =
+    decided ? (counts.wrong / decided * 100).toFixed(1) + "%（" + counts.wrong + "/" + decided + "）" : "—";
+}
+
+document.getElementById("title").textContent = "OCR 校对抽查 · " + DATA.title;
+document.getElementById("filter").onchange = render;
+document.getElementById("export").onclick = () => {
+  const out = DATA.items.filter(i => verdicts[i.id]).map(i => ({
+    id: i.id, start: i.start, end: i.end, original: i.original, corrected: i.corrected,
+    uncertain: i.uncertain, verdict: verdicts[i.id],
+  }));
+  const blob = new Blob([JSON.stringify({ title: DATA.title, verdicts: out }, null, 2)], { type: "application/json" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob); a.download = "ocr-audit-verdicts.json"; a.click();
+};
+render();
+</script>
+</body>
+</html>

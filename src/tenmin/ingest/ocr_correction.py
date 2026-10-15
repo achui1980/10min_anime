@@ -58,14 +58,49 @@ def _verify(expected: set[int], response: _Correction) -> dict[int, _CorrectedLi
     return {line.id: line for line in response.lines}
 
 
+def alignment_hint(exc: ValueError, expected: set[int], response: _Correction) -> str:
+    """把上一次没对齐的具体 id 回灌给模型，让重试有的放矢。"""
+    actual = [line.id for line in response.lines]
+    return (
+        f"{exc}；缺少 {sorted(expected - set(actual))}；"
+        f"多余 {sorted(set(actual) - expected)}；"
+        f"重复 {sorted({i for i in actual if actual.count(i) > 1})}。"
+        "重新返回 correct_these 的全部条目，每个 id 恰好一次。"
+    )
+
+
+async def verified_batch(
+    provider: LLMProvider, system: str, payload: dict, expected: set[int], *, max_attempts: int
+) -> dict[int, _CorrectedLine]:
+    """同一批按 max_attempts 重试；仍不合格就抛出最后一次的 ValueError。"""
+    for attempt in range(max_attempts):
+        response = await provider.complete(
+            system, json.dumps(payload, ensure_ascii=False), _Correction
+        )
+        try:
+            return _verify(expected, response)
+        except ValueError as exc:
+            if attempt + 1 >= max_attempts:
+                raise
+            payload["alignment_error"] = alignment_hint(exc, expected, response)
+    raise ValueError("OCR 校对重试次数必须为正数")
+
+
 async def correct_cues(
-    cues: list[RawCue], provider: LLMProvider, *, cfg: LLMConfig
+    cues: list[RawCue], provider: LLMProvider, *, cfg: LLMConfig,
+    failures: list[str] | None = None,
 ) -> tuple[list[RawCue], list[ReviewItem]]:
-    """每批附前后两条的只读上下文；一批失败就不产出任何半成品。"""
+    """每批附前后两条的只读上下文；某批重试后仍不合格只回退该批。
+
+    回退的那批保留原文并全部进 review；全部批次都失败才整体报错。
+    失败说明追加进 ``failures``，调用方据此把状态记成待重试。
+    """
     if not cues:
         raise ValueError("OCR 原稿没有可校对的字幕")
     result: list[RawCue] = []
     review: list[ReviewItem] = []
+    failed: list[str] = []
+    batches = 0
     for begin in range(0, len(cues), _BATCH_SIZE):
         batch = cues[begin : begin + _BATCH_SIZE]
         context = cues[
@@ -76,18 +111,25 @@ async def correct_cues(
             for pos, cue in enumerate(context, start=max(0, begin - _CONTEXT_SIZE))
             if pos < begin or pos >= begin + len(batch)
         ]
-        user = json.dumps(
-            {
-                "context_only": context_lines,
-                "correct_these": [
-                    {"id": begin + pos + 1, "text": cue.text}
-                    for pos, cue in enumerate(batch)
-                ],
-            },
-            ensure_ascii=False,
-        )
-        response = await provider.complete(_SYSTEM, user, _Correction)
-        lines = _verify(set(range(begin + 1, begin + len(batch) + 1)), response)
+        payload = {
+            "context_only": context_lines,
+            "correct_these": [
+                {"id": begin + pos + 1, "text": cue.text} for pos, cue in enumerate(batch)
+            ],
+        }
+        batches += 1
+        expected = set(range(begin + 1, begin + len(batch) + 1))
+        try:
+            lines = await verified_batch(
+                provider, _SYSTEM, payload, expected, max_attempts=cfg.max_attempts
+            )
+        except ValueError as exc:
+            note = f"第 {begin + 1}–{begin + len(batch)} 条校对失败，保留原文：{exc}"
+            failed.append(note)
+            for pos, cue in enumerate(batch, start=begin + 1):
+                review.append(ReviewItem(pos, cue.start, cue.end, cue.text, note))
+                result.append(cue)
+            continue
         for pos, cue in enumerate(batch, start=begin + 1):
             line = lines[pos]
             if line.uncertain:
@@ -97,6 +139,10 @@ async def correct_cues(
             result.append(
                 cue.model_copy(update={"text": cue.text if line.uncertain else line.text})
             )
+    if len(failed) == batches:
+        raise ValueError(f"OCR 校对全部批次失败：{failed[-1]}")
+    if failures is not None:
+        failures.extend(failed)
     return result, review
 
 
@@ -216,19 +262,26 @@ async def select_corrected(
     provider = None
     messages = []
     semantic_pending = False
+    failures: list[str] = []
     try:
         parsed = load_srt_detailed(raw)
         if parsed.skipped_blocks or parsed.clamped_cues:
             raise ValueError("OCR 原稿含无效时间戳，跳过 AI 校对以保留原稿")
         try:
             provider = provider_factory()
-            cues, items = await correct_cues(parsed.cues, provider, cfg=cfg)
+            cues, items = await correct_cues(
+                parsed.cues, provider, cfg=cfg, failures=failures
+            )
             from tenmin.ingest.ocr_semantic import semantic_review
 
             try:
-                cues, items = await semantic_review(
-                    parsed.cues, cues, provider, max_attempts=cfg.max_attempts
+                cues, semantic_items = await semantic_review(
+                    parsed.cues, cues, provider,
+                    max_attempts=cfg.max_attempts, failures=failures,
                 )
+                kept = {item.id for item in semantic_items}
+                items = semantic_items + [item for item in items if item.id not in kept]
+                items.sort(key=lambda item: item.id)
             except (RuntimeError, ValueError, httpx.HTTPError, TimeoutError) as exc:
                 messages.append(f"OCR 语义复核失败，使用第一轮校对稿：{exc}")
                 semantic_pending = True
@@ -244,8 +297,11 @@ async def select_corrected(
     atomic.write_text_if_changed(
         review, json.dumps([item.__dict__ for item in items], ensure_ascii=False, indent=2) + "\n"
     )
+    if failures:
+        messages.extend(f"OCR AI 校对部分失败：{note}" for note in failures)
+        semantic_pending = True
     _write_state(
         raw, corrected, state, cfg=cfg, source_identity=source_identity,
-        status="semantic_pending" if semantic_pending else "success",
+        status="partial" if failures else ("semantic_pending" if semantic_pending else "success"),
     )
     return corrected, messages, semantic_pending

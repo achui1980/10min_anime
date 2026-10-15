@@ -27,7 +27,7 @@ from tenmin.config import (
 )
 from tenmin.content_check.models import CheckOutcome, ContentCheckError
 from tenmin.content_check.service import check_video
-from tenmin.ingest import ocr_batch
+from tenmin.ingest import ocr_audit, ocr_batch
 from tenmin.ingest.asr import ASRError
 from tenmin.ingest.normalize import credit_range_source
 from tenmin.ingest.ocr import OCRError, OCRUnavailableError
@@ -789,3 +789,37 @@ def ocr(
         typer.secho(f"[warn] {warning}", fg="yellow")
     if summary.failed:
         raise typer.Exit(code=1)
+
+
+AUDIT_VIDEO_ARGUMENT = typer.Argument(..., help="做过 AI 校对的视频")
+AUDIT_CORRECTED_OPTION = typer.Option(
+    None, "--corrected", help="校对稿 SRT；不传就按视频名在 --srt-dir 里找"
+)
+AUDIT_SRT_DIR_OPTION = typer.Option(
+    None, "--srt-dir", help="找校对稿的目录；默认视频所在目录"
+)
+AUDIT_OUTPUT_OPTION = typer.Option(
+    None, "--output", "-o", help="报告目录；默认校对稿旁边的 <视频名>.ocr-audit/"
+)
+
+
+@app.command("ocr-audit")
+def ocr_audit_command(
+    video: Path = AUDIT_VIDEO_ARGUMENT,
+    corrected: Path | None = AUDIT_CORRECTED_OPTION,
+    srt_dir: Path | None = AUDIT_SRT_DIR_OPTION,
+    output: Path | None = AUDIT_OUTPUT_OPTION,
+) -> None:
+    """生成 OCR AI 校对改动的抽查报告（只读，不调 LLM、不改字幕）。"""
+    try:
+        if not video.is_file():
+            raise FileNotFoundError(f"视频不存在：{video}")
+        if corrected is None:
+            corrected = ocr_audit.find_corrected(video, srt_dir or video.parent)
+        out_dir = output or corrected.parent / f"{video.stem}.ocr-audit"
+        result = ocr_audit.audit(video, corrected, out_dir)
+    except (FileNotFoundError, ValueError, FFmpegError) as error:
+        typer.secho(_error_message(error), fg="red", err=True)
+        raise typer.Exit(code=1) from error
+    typer.echo(f"共 {result.total} 条字幕，待抽查 {result.items} 条")
+    typer.echo(f"报告：{result.report}")

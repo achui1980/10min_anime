@@ -112,6 +112,7 @@ uv run tenmin run --help
 | `tenmin run <slug>` | 登记素材、运行或重跑制作管线，也可只检查已有成片 | 是 |
 | `tenmin inspect <slug> --episode N` | 查看对白来源、OP/ED 区间、无字幕间隙与高能点 | 是 |
 | `tenmin ocr <文件或目录>...` | 批量将画面硬字幕识别成 SRT，可选 AI 校对 | 否 |
+| `tenmin ocr-audit <视频>` | 抽查 AI 校对改过的字幕：原文→校对后对照、截图、逐条标记改对/改错 | 否 |
 | `tenmin check-content <视频>` | 本地内容评级，生成截图、分数与 HTML 报告 | 否 |
 | `tenmin import <slug> <目录>` | 批量配对视频与字幕、识别集号与 OP/ED，确认后登记并运行 | 是 |
 
@@ -593,10 +594,17 @@ ocr:
 AI 校对自动执行两轮：第一轮修复错字，第二轮结合原稿、首轮结果与连续对话复核句意，
 检查残余乱码和首轮误改。上下文明确信息时可恢复整句；无法确定的条目保留首轮文本，
 并在 `.review.json` 记录候选修正及理由。cue 数量、顺序和时间不变。
-缺 key 或第一轮失败时 warning 后使用原稿；第二轮失败则使用完整首轮结果。
-下次运行自动重试，无需 `--force`，也无需重新做画面 OCR。两轮都会产生模型调用成本。
+某批回复的 id 对不齐时，会把缺少/多余/重复的 id 告诉模型并重试（次数 `llm.max_attempts`）；
+仍失败只回退该批（保留原文并全部记入 review），其他批照常生效，状态记为 `partial`。
+缺 key、调用失败或全部批次失败时 warning 后使用原稿；第二轮某批失败则该批保留首轮结果。
+下次运行自动重试（整集重做），无需 `--force`，也无需重新做画面 OCR。两轮都会产生模型调用成本。
 
 - 独立命令保留 `<stem>.zh-Hans.raw.srt`，最终字幕仍是 `<stem>.zh-Hans.srt`；繁体命名同理。
+- 抽查校对质量：`uv run tenmin ocr-audit "视频.mp4"` 读取原稿、校对稿与 review，
+  生成 `<stem>.ocr-audit/report.html`：只列改过或不确定的行，字级差异高亮、该行中间时刻截图，
+  每条可标「改对 / 改错 / 不确定」（存浏览器本地），顶部实时显示改错率，可导出 JSON。
+  只读、不调 LLM、不联网；`--corrected` 指定校对稿（也认项目的 `E{NN}.ocr.corrected.srt`），
+  `--srt-dir` 指定搜索目录，`-o` 指定报告目录。漏改测不出来，需另做人工标准答案。
 - 项目保留 `srt/E{NN}.ocr.srt`，成功稿为 `E{NN}.ocr.corrected.srt`，由 ingest 读取后供翻译直通、解说使用。
 - `.ai-state.json` 记录来源、模型和机器输出摘要。来源未变时人工修改的终稿优先保留；
   来源变化后使用新原稿，旧人工稿保留（独立命令另存 `.bak.srt`）。

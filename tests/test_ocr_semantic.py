@@ -45,7 +45,7 @@ def test_semantic_failure_delivers_first_round_and_retries(tmp_path):
     assert _select(paths, TwoRound) == (paths[1], [], False)
 
 
-def test_failed_later_semantic_batch_discards_entire_second_round(tmp_path):
+def test_failed_later_semantic_batch_keeps_only_that_batch_first_round(tmp_path):
     from tenmin.ingest.asr import render_srt
     from tenmin.models import RawCue
 
@@ -69,7 +69,8 @@ def test_failed_later_semantic_batch_discards_entire_second_round(tmp_path):
 
     chosen, warnings, retry = _select(paths, LaterFailure)
     assert chosen == paths[1] and retry and warnings
-    assert [cue.text for cue in load_srt(chosen)] == ["首轮"] * 65
+    assert [cue.text for cue in load_srt(chosen)] == ["二轮"] * 60 + ["首轮"] * 5
+    assert json.loads(paths[2].read_text())["status"] == "partial"
 
 
 def test_semantic_alignment_error_is_sent_back_for_bounded_retry(tmp_path):

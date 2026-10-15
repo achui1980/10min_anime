@@ -221,3 +221,40 @@ def test_batches_have_read_only_context_and_preserve_original_order():
     assert corrected == cues and not review
     assert [x["id"] for x in provider.calls[0]["context_only"]] == [61, 62]
     assert [x["id"] for x in provider.calls[1]["context_only"]] == [59, 60]
+
+
+def _many(n):
+    return [RawCue(idx=i + 1, start=i * 2, end=i * 2 + 1, text=f"原{i + 1}") for i in range(n)]
+
+
+class FlakyAlign:
+    """第一批先漏一条、带着回灌提示重试后才对齐；第二批始终对不齐。"""
+
+    def __init__(self):
+        self.calls = []
+
+    async def complete(self, system, user, schema):
+        request = json.loads(user)
+        self.calls.append(request)
+        rows = request["correct_these"]
+        if rows[0]["id"] > 60:
+            return schema.model_validate({"lines": []})
+        if "alignment_error" not in request:
+            rows = rows[:-1]
+        return schema.model_validate({"lines": [
+            {"id": r["id"], "text": "改" + r["text"], "uncertain": False} for r in rows
+        ]})
+
+
+def test_alignment_failure_retries_with_hint_then_falls_back_only_that_batch():
+    provider = FlakyAlign()
+    failures = []
+    cues, review = asyncio.run(correct_cues(
+        _many(65), provider, cfg=LLMConfig(max_attempts=2), failures=failures
+    ))
+    assert [c.text for c in cues] == [f"改原{i}" for i in range(1, 61)] + [
+        f"原{i}" for i in range(61, 66)
+    ]
+    assert "缺少 [60]" in provider.calls[1]["alignment_error"]
+    assert [r.id for r in review] == list(range(61, 66))
+    assert len(failures) == 1 and "61–65" in failures[0]

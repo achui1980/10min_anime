@@ -1,6 +1,5 @@
 """以原稿和第一轮采用文本共同约束第二轮语义复核。"""
 
-import json
 import re
 from importlib.resources import files
 
@@ -9,8 +8,7 @@ from tenmin.ingest.ocr_correction import (
     _BATCH_SIZE,
     _CONTEXT_SIZE,
     ReviewItem,
-    _Correction,
-    _verify,
+    verified_batch,
 )
 from tenmin.models import RawCue
 from tenmin.script.llm import LLMProvider
@@ -24,9 +22,13 @@ _NUMBERS = re.compile(
 async def semantic_review(
     original: list[RawCue], first: list[RawCue], provider: LLMProvider,
     *, max_attempts: int = DEFAULT_LLM.max_attempts,
+    failures: list[str] | None = None,
 ) -> tuple[list[RawCue], list[ReviewItem]]:
+    """某批重试后仍不合格就保留该批第一轮文本；全部失败才整体报错。"""
     result = []
     review = []
+    failed: list[str] = []
+    batches = 0
     for begin in range(0, len(first), _BATCH_SIZE):
         end = min(begin + _BATCH_SIZE, len(first))
         rows = [
@@ -38,23 +40,15 @@ async def semantic_review(
             "correct_these": [row for row in rows if begin < row["id"] <= end],
         }
         expected = set(range(begin + 1, end + 1))
-        for attempt in range(max_attempts):
-            response = await provider.complete(
-                SYSTEM, json.dumps(payload, ensure_ascii=False), _Correction
+        batches += 1
+        try:
+            lines = await verified_batch(
+                provider, SYSTEM, payload, expected, max_attempts=max_attempts
             )
-            try:
-                lines = _verify(expected, response)
-                break
-            except ValueError as exc:
-                if attempt + 1 == max_attempts:
-                    raise
-                actual = [line.id for line in response.lines]
-                payload["alignment_error"] = (
-                    f"{exc}；缺少 {sorted(expected - set(actual))}；"
-                    f"多余 {sorted(set(actual) - expected)}；"
-                    f"重复 {sorted({i for i in actual if actual.count(i) > 1})}。"
-                    "重新返回 correct_these 的全部条目。"
-                )
+        except ValueError as exc:
+            failed.append(f"语义复核第 {begin + 1}–{end} 条失败，保留第一轮文本：{exc}")
+            result.extend(first[begin:end])
+            continue
         for i in range(begin, end):
             cue = first[i]
             line = lines[i + 1]
@@ -71,4 +65,8 @@ async def semantic_review(
             result.append(cue.model_copy(update={
                 "text": cue.text if line.uncertain or number_changed else line.text
             }))
+    if failed and len(failed) == batches:
+        raise ValueError(failed[-1])
+    if failures is not None:
+        failures.extend(failed)
     return result, review
