@@ -19,7 +19,7 @@ from tenmin.content_check.service import check_video
 from tenmin.docgen.narration import render_narration
 from tenmin.docgen.table import render_table
 from tenmin.ingest.normalize import build_track
-from tenmin.ingest.ocr_correction import select_corrected
+from tenmin.ingest.ocr_correction import prepare_asr, select_corrected
 from tenmin.ingest.resolve import resolve_subtitle_source
 from tenmin.models import (
     DialogueTrack,
@@ -548,6 +548,14 @@ async def run_ingest_corrected(
         )
         selected = source.path
         if source.kind == "ocr":
+            asr_path = None
+            if cfg.ocr.asr_assist and episode.video is not None:
+                asr_path, asr_warning = prepare_asr(
+                    cfg.video_path(episode), paths.asr_cache(episode.number),
+                    asr_config=cfg.asr, ffmpeg_path=cfg.render.ffmpeg_path,
+                )
+                if asr_warning:
+                    warnings.append(f"E{episode.number:02d}：{asr_warning}")
             selected, messages, retry = await select_corrected(
                 source.path,
                 source.path.with_suffix(".corrected.srt"),
@@ -556,6 +564,7 @@ async def run_ingest_corrected(
                 provider_factory=provider_factory,
                 cfg=cfg.llm,
                 source_identity=_ocr_source_identity(cfg, episode),
+                asr=asr_path,
             )
             warnings.extend(f"E{episode.number:02d}：{message}" for message in messages)
             pending |= retry

@@ -15,13 +15,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from tenmin import atomic
-from tenmin.config import DEFAULT_RENDER, LLMConfig, OcrConfig
+from tenmin.config import DEFAULT_RENDER, AsrConfig, LLMConfig, OcrConfig
 from tenmin.ingest import ocr
 from tenmin.ingest.asr import render_srt
 from tenmin.ingest.clean import to_simplified
 from tenmin.ingest.ocr_correction import (
     correction_pending,
     is_human_edited,
+    prepare_asr,
     record_fallback,
     select_corrected,
 )
@@ -126,10 +127,14 @@ async def run_batch_corrected(
     ocr_config: OcrConfig,
     provider_factory: Callable[[], LLMProvider],
     llm_config: LLMConfig,
+    asr_config: AsrConfig | None = None,
     ffmpeg_path: str = DEFAULT_RENDER.ffmpeg_path,
     ffprobe_path: str = DEFAULT_RENDER.ffprobe_path,
 ) -> BatchSummary:
-    """独立 OCR 的可选校对：原稿缓存与交付物分开，失败使用原稿。"""
+    """独立 OCR 的可选校对：原稿缓存与交付物分开，失败使用原稿。
+
+    给了 asr_config 就带日语转写校对，转写缓存写在 `<视频名>.ja.asr.srt`（与字幕同目录）。
+    """
     summary = BatchSummary()
     if out_dir is not None:
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -169,7 +174,17 @@ async def run_batch_corrected(
 
         stat = video.stat()
         identity = f"{video.resolve()}:{stat.st_size}:{stat.st_mtime_ns}"
-        pending = correction_pending(raw, dest, state, cfg=llm_config, source_identity=identity)
+        asr_path = None
+        if asr_config is not None:
+            asr_path, asr_warning = prepare_asr(
+                video, dest.with_name(f"{video.stem}.ja.asr.srt"),
+                asr_config=asr_config, ffmpeg_path=ffmpeg_path,
+            )
+            if asr_warning:
+                summary.warnings.append(f"{video.name}：{asr_warning}")
+        pending = correction_pending(
+            raw, dest, state, cfg=llm_config, source_identity=identity, asr=asr_path
+        )
         if not force and not pending:
             summary.skipped.append(video)
             continue
@@ -182,6 +197,7 @@ async def run_batch_corrected(
             cfg=llm_config,
             source_identity=identity,
             overwrite_unmanaged=force and not state.is_file(),
+            asr=asr_path,
         )
         summary.warnings.extend(f"{video.name}：{message}" for message in warnings)
         if chosen == raw:
@@ -191,6 +207,8 @@ async def run_batch_corrected(
                 atomic.copy_file(dest, backup)
                 summary.warnings.append(f"{video.name}：旧人工字幕已备份至 {backup}")
             atomic.copy_file(raw, dest)
-            record_fallback(raw, dest, state, cfg=llm_config, source_identity=identity)
+            record_fallback(
+                raw, dest, state, cfg=llm_config, source_identity=identity, asr=asr_path
+            )
         summary.done.append(video)
     return summary

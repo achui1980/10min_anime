@@ -191,6 +191,7 @@ uv run --extra ocr tenmin ocr "视频.mp4" --ai-correct
 | `--crop-bottom <比例>` | 字幕带下沿，默认不限 |
 | `--force` | 已有结果也重新识别 |
 | `--ai-correct` | 用 LLM 校对 OCR 文字，需对应 API key |
+| `--asr-assist` | 校对时附上日语语音转写确认读音（需 `--ai-correct`） |
 | `--llm-provider <服务>` | 校对服务：`gemini` / `minimax` / `openai_compatible`，默认 `gemini` |
 | `--llm-model <模型>` | 校对模型，默认 `gemini-3.6-flash` |
 | `--llm-base-url <地址>` | OpenAI 兼容服务地址 |
@@ -529,6 +530,7 @@ uv run tenmin inspect akujo --episode 11
 |---|---|---|
 | `enabled` | `false` | 项目级声明这部番带硬字幕；逐集 `hardsub` 优先 |
 | `ai_correct` | `false` | 可选 AI 文字校对；成功稿进入后续流程，失败警告并使用原稿 |
+| `asr_assist` | `false` | AI 校对时附上日语语音转写确认读音（需 asr extra） |
 | `sample_fps` | `4.0` | 每秒抽几帧去识别（与片源帧率无关，24/30/60/120fps 都是每秒 4 帧） |
 | `crop_top` | `0.72` | 从画面高度的这个比例往下裁去识别；字幕位置偏高就**调小** |
 | `crop_bottom` | 不限 | 按文字框中心过滤字幕带下沿；上下双语字幕可用来排除下层文字 |
@@ -566,6 +568,7 @@ uv run tenmin ocr ep01.mp4 --crop-top 0.65 --force
 | `--crop-top` | `0.72` | 同上表的 `crop_top`；其余旋钮用默认值 |
 | `--crop-bottom` | 不限 | 同上表的 `crop_bottom` |
 | `--ai-correct` | 关 | 识别后用 AI 校对文字，失败仍交付原稿 |
+| `--asr-assist` | 关 | 校对时附上日语语音转写（需 `--ai-correct` 与 asr extra） |
 | `--llm-provider` / `--llm-model` | `gemini` / `gemini-3.6-flash` | 独立命令的校对服务和模型 |
 | `--llm-base-url` | 无 | OpenAI 兼容服务地址 |
 
@@ -591,13 +594,15 @@ ocr:
   ai_correct: true
 ```
 
-AI 校对自动执行两轮：第一轮修复错字，第二轮结合原稿、首轮结果与连续对话复核句意，
-检查残余乱码和首轮误改。上下文明确信息时可恢复整句；无法确定的条目保留首轮文本，
-并在 `.review.json` 记录候选修正及理由。cue 数量、顺序和时间不变。
-某批回复的 id 对不齐时，会把缺少/多余/重复的 id 告诉模型并重试（次数 `llm.max_attempts`）；
-仍失败只回退该批（保留原文并全部记入 review），其他批照常生效，状态记为 `partial`。
-缺 key、调用失败或全部批次失败时 warning 后使用原稿；第二轮某批失败则该批保留首轮结果。
-下次运行自动重试（整集重做），无需 `--force`，也无需重新做画面 OCR。两轮都会产生模型调用成本。
+AI 校对一次把整集 OCR 原稿（id + 时间 + 文字）交给模型，模型只返回需要修改或拿不准的行
+（`id` / `original` / `text` / `reason` / `uncertain`），其余行保持原文。程序再做三道校验：
+`original` 与该 id 原文对不上（疑似错位）、id 越界/重复、文本为空或含时间戳的修改直接丢弃；
+改动超过 `max(2 字, 30% 字数)` 不采用，保留原文并记入 `.review.json`；`uncertain` 的行同样保留原文、
+把候选修正和理由写进 review。cue 数量、顺序和时间不变。
+开启 `ocr.asr_assist`（独立命令 `--asr-assist`，需 asr extra）时，会把日语语音转写按时间附在提示词里，
+只用于确认人名读音和形近字，不按日语改写说法。转写复用 `srt/E{NN}.asr.srt`（独立命令为
+`<stem>.ja.asr.srt`），没有就先转写；转写失败只警告，本次不带日语。
+缺 key 或调用失败时 warning 后使用原稿，下次运行自动重试，无需 `--force`，也无需重新做画面 OCR。
 
 - 独立命令保留 `<stem>.zh-Hans.raw.srt`，最终字幕仍是 `<stem>.zh-Hans.srt`；繁体命名同理。
 - 抽查校对质量：`uv run tenmin ocr-audit "视频.mp4"` 读取原稿、校对稿与 review，

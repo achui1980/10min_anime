@@ -588,6 +588,9 @@ class OcrConfig(StrictModel):
     min_frames: int = Field(default=2, ge=1)
     # Vision 的识别语言。ANi / Baha 的片源是繁体中文。
     language: str = "zh-Hant"
+    # AI 校对时把日语语音转写（复用 E{NN}.asr.srt，没有就转写，需 asr extra）按时间
+    # 放进提示词，只用来确认人名读音和形近字。转写失败只警告、照常不带日语校对。
+    asr_assist: bool = False
 
 
 class ContentCheckConfig(StrictModel):

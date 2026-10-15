@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import os
 from pathlib import Path
 
@@ -296,9 +295,8 @@ def test_ai_correct_uses_separate_raw_and_final_and_retries_without_ocr(tmp_path
             requests.append(user)
             if len(requests) == 1:
                 raise RuntimeError("网络错误")
-            ids = [line["id"] for line in json.loads(user)["correct_these"]]
             return schema.model_validate({"lines": [
-                {"id": i, "text": "我们这里见", "uncertain": False} for i in ids
+                {"id": 1, "original": "我们这里见", "text": "我们在这里见"}
             ]})
 
     kwargs = {"out_dir": None, "simplified": True, "force": False, "ocr_config": OcrConfig()}
@@ -313,8 +311,8 @@ def test_ai_correct_uses_separate_raw_and_final_and_retries_without_ocr(tmp_path
         [video], provider_factory=Provider, llm_config=LLMConfig(), **kwargs
     ))
     assert second.done == [video]
-    assert len(calls) == 1 and len(requests) == 3
-    assert [c.text for c in load_srt_detailed(final).cues] == ["我们这里见"] * 2
+    assert len(calls) == 1 and len(requests) == 2
+    assert [c.text for c in load_srt_detailed(final).cues] == ["我们在这里见", "-说话\n-听见了"]
 
 
 def test_ai_correct_does_not_overwrite_unmanaged_final(tmp_path, monkeypatch):
@@ -369,11 +367,11 @@ def test_source_update_failure_uses_new_raw_then_retries(tmp_path, monkeypatch):
     class Provider:
         async def complete(self, system, user, schema):
             requests.append(user)
-            if len(requests) == 3:
+            if len(requests) == 2:
                 raise RuntimeError("调用失败")
+            first = user.splitlines()[1].split(" | ", 2)[2]
             return schema.model_validate({"lines": [
-                {"id": line["id"], "text": "修正版", "uncertain": False}
-                for line in json.loads(user)["correct_these"]
+                {"id": 1, "original": first, "text": first + "吧"}
             ]})
     kwargs = {
         "out_dir": None, "simplified": True, "force": False, "ocr_config": OcrConfig(),
@@ -385,8 +383,8 @@ def test_source_update_failure_uses_new_raw_then_retries(tmp_path, monkeypatch):
     asyncio.run(ocr_batch.run_batch_corrected([video], **kwargs))
     assert "新原稿" in (tmp_path / "a.zh-Hans.srt").read_text()
     asyncio.run(ocr_batch.run_batch_corrected([video], **kwargs))
-    assert len(requests) == 5
-    assert "修正版" in (tmp_path / "a.zh-Hans.srt").read_text()
+    assert len(requests) == 3
+    assert "新原稿吧" in (tmp_path / "a.zh-Hans.srt").read_text()
 
 
 def test_ai_force_keeps_old_final_until_correction_has_finished(tmp_path, monkeypatch):
@@ -419,3 +417,11 @@ def test_ai_force_ocr_failure_preserves_existing_final(tmp_path, monkeypatch):
         llm_config=LLMConfig(),
     ))
     assert summary.failed and final.read_text() == "已有人工稿"
+
+
+def test_cli_asr_assist_requires_ai_correct(tmp_path):
+    video = tmp_path / "ep01.mp4"
+    video.write_bytes(b"x")
+    result = runner.invoke(app, ["ocr", str(video), "--asr-assist"])
+    assert result.exit_code == 1
+    assert "--asr-assist 需要同时指定 --ai-correct" in result.output

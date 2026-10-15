@@ -31,7 +31,7 @@ def test_correction_failure_retries_then_updates_dialogue_and_translation(tmp_pa
             if len(calls) == 1:
                 raise RuntimeError("连接超时")
             return schema.model_validate({"lines": [
-                {"id": 1, "text": "垃圾也没丢", "uncertain": False}
+                {"id": 1, "original": "垃圾也杀丢", "text": "垃圾也没丢"}
             ]})
 
     kwargs = {"only": ["ingest", "translate"], "correction_provider_factory": Provider}
@@ -40,12 +40,12 @@ def test_correction_failure_retries_then_updates_dialogue_and_translation(tmp_pa
     paths = Paths(tmp_path)
     assert "垃圾也杀丢" in paths.dialogue(1).read_text()
     asyncio.run(run_pipeline(cfg, None, **kwargs))
-    assert len(calls) == 3
+    assert len(calls) == 2
     assert "垃圾也没丢" in paths.dialogue(1).read_text()
     assert "垃圾也没丢" in paths.zh_subtitles(1).read_text()
     old_mtime = paths.dialogue(1).stat().st_mtime_ns
     asyncio.run(run_pipeline(cfg, None, **kwargs))
-    assert len(calls) == 3
+    assert len(calls) == 2
     assert paths.dialogue(1).stat().st_mtime_ns == old_mtime
     assert json.loads(paths.dialogue(1).read_text())["source"] == "ocr"
 

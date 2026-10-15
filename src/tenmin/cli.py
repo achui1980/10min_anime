@@ -18,6 +18,7 @@ from tenmin.config import (
     DEFAULT_LLM,
     DEFAULT_OCR,
     DEFAULT_RENDER,
+    AsrConfig,
     ContentCheckConfig,
     LLMConfig,
     OcrConfig,
@@ -727,6 +728,11 @@ OCR_CROP_BOTTOM_OPTION = typer.Option(
 OCR_AI_CORRECT_OPTION = typer.Option(
     False, "--ai-correct", help="用 LLM 校对 OCR 错字；失败时保留原稿"
 )
+OCR_ASR_ASSIST_OPTION = typer.Option(
+    False,
+    "--asr-assist",
+    help="校对时附上日语语音转写确认读音（需 --ai-correct 与 asr extra）",
+)
 OCR_LLM_PROVIDER_OPTION = typer.Option(
     DEFAULT_LLM.provider, "--llm-provider", help="校对模型的 provider"
 )
@@ -743,11 +749,15 @@ def ocr(
     crop_top: float = OCR_CROP_TOP_OPTION,
     crop_bottom: float | None = OCR_CROP_BOTTOM_OPTION,
     ai_correct: bool = OCR_AI_CORRECT_OPTION,
+    asr_assist: bool = OCR_ASR_ASSIST_OPTION,
     llm_provider: str = OCR_LLM_PROVIDER_OPTION,
     llm_model: str = OCR_LLM_MODEL_OPTION,
     llm_base_url: str | None = OCR_LLM_BASE_URL_OPTION,
 ) -> None:
     """不建项目，批量把视频画面上的硬字幕认成 SRT（需 macOS + `uv sync --extra ocr`）。"""
+    if asr_assist and not ai_correct:
+        typer.secho("--asr-assist 需要同时指定 --ai-correct", fg="red", err=True)
+        raise typer.Exit(code=1)
     try:
         ocr_config = OcrConfig(crop_top=crop_top, crop_bottom=crop_bottom)
         videos = ocr_batch.collect_videos(inputs)
@@ -767,6 +777,7 @@ def ocr(
                     ocr_config=ocr_config,
                     llm_config=llm,
                     provider_factory=lambda: build_provider(llm, Settings()),
+                    asr_config=AsrConfig() if asr_assist else None,
                 )
             )
         else:
