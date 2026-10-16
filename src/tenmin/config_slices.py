@@ -108,6 +108,7 @@ EXCLUDED: frozenset[str] = frozenset(
         "slug",
         "credits.op_reference",
         "credits.ed_reference",
+        "credits.op_length",
         "llm.timeout_seconds",
         "llm.read_timeout_seconds",
         "llm.total_timeout_seconds",

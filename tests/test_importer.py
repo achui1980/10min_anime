@@ -335,14 +335,14 @@ def fixed_duration(monkeypatch):
     _probe(monkeypatch, 1420.0)
 
 
-def test_round_range_rounds_half_up_to_a_tenth():
-    assert round_range((153.486, 224.681)) == (153.5, 224.7)
-    assert round_range((0.25, 0.35)) == (0.3, 0.4)
+def test_round_range_floors_both_ends_to_whole_seconds():
+    assert round_range((63.5, 153.5)) == (63.0, 153.0)
+    assert round_range((0.5, 90.5)) == (0.0, 90.0)
 
 
 def test_round_range_rejects_a_collapsed_range():
-    assert round_range((10.02, 10.04)) is None
-    assert round_range((10.06, 10.04)) is None
+    assert round_range((10.2, 10.8)) is None
+    assert round_range((11.0, 10.0)) is None
 
 
 def test_infer_ranges_matches_build_track_and_writes_both(
@@ -366,7 +366,7 @@ def test_infer_ranges_matches_build_track_and_writes_both(
     assert preview.duration == 1420.0
     assert preview.op_range == track.op_range
     assert preview.ed_range == track.ed_range
-    assert preview.write == ((153.5, 224.7), (1348.2, 1416.6))
+    assert preview.write == ((153.0, 224.0), (1348.0, 1416.0))
     assert preview.note is None
 
 
@@ -449,7 +449,7 @@ def test_infer_ranges_combines_av_op_with_subtitle_ed(tmp_path, golden_srt_path,
 
     assert preview.op_range == (100.25, 190.35)
     assert preview.ed_range == (1348.18, 1416.622)
-    assert preview.write == ((100.3, 190.4), (1348.2, 1416.6))
+    assert preview.write == ((100.0, 190.0), (1348.0, 1416.0))
     assert (preview.op_source, preview.ed_source) == ("av", "subtitle")
     assert (preview.op_distance, preview.ed_distance) == (4, None)
     assert preview.op_length_estimated is True
@@ -580,7 +580,7 @@ def test_infer_ranges_collapsed_av_range_prevents_both_writes(
         op_av=importer.AvSide((10.02, 10.04)),
     )
     assert preview.write is None
-    assert preview.note == "取整到 0.1 秒后区间无效，两个都不写"
+    assert preview.note == "取整到整秒后区间无效，两个都不写"
 
 
 def _season(tmp_path: Path, golden_srt_path: Path, stems: list[str]) -> Path:
@@ -619,7 +619,7 @@ async def test_plan_never_builds_a_provider_when_regex_resolves_everything(
     plan = await build_import_plan(cfg, season, provider_factory=_no_llm)
 
     assert [item.number for item in plan.items] == [1, 2]
-    assert plan.items[0].ranges.write == ((153.5, 224.7), (1348.2, 1416.6))
+    assert plan.items[0].ranges.write == ((153.0, 224.0), (1348.0, 1416.0))
     assert plan.items[0].prefilled is False
     assert plan.warnings == []
 
@@ -718,7 +718,7 @@ async def test_plan_skips_registered_episodes_and_fills_prefilled_ones(
     assert by_number[2].ranges.write is None
     assert by_number[2].ranges.ed_range == (1300.0, 1420.0)
     assert by_number[3].prefilled is True
-    assert by_number[3].ranges.write == ((153.5, 224.7), (1348.2, 1416.6))
+    assert by_number[3].ranges.write == ((153.0, 224.0), (1348.0, 1416.0))
     assert by_number[3].invalidates_outputs is True
     assert by_number[2].invalidates_outputs is False
 
@@ -793,8 +793,8 @@ async def test_apply_registers_items_and_writes_only_the_planned_ranges(
     by_number = {e.number: e for e in reloaded.episodes}
     assert by_number[1].srt == Path("srt/E01.srt")
     assert by_number[1].video == (season / "Show E01.mkv").resolve()
-    assert by_number[1].op_range == (153.5, 224.7)
-    assert by_number[1].ed_range == (1348.2, 1416.6)
+    assert by_number[1].op_range == (153.0, 224.0)
+    assert by_number[1].ed_range == (1348.0, 1416.0)
     assert by_number[2].op_range is None
     assert by_number[2].ed_range == (1300.0, 1420.0)
     assert (cfg.root / "srt" / "E01.srt").read_bytes() == golden_srt_path.read_bytes()
@@ -870,7 +870,7 @@ async def test_apply_validates_current_config_before_copying(
     assert not (cfg.root / "srt" / "E01.srt").exists()
 
 
-_WRITE = ((153.5, 224.7), (1348.2, 1416.6))
+_WRITE = ((153.0, 224.0), (1348.0, 1416.0))
 
 
 def _item(
@@ -904,7 +904,7 @@ def test_preview_shows_pairing_ranges_and_the_write_decision():
     assert "片长 1420.0 秒" in text
     assert "OP：153.5–224.7 秒" in text
     assert "ED：1348.2–1416.6 秒" in text
-    assert "将写入区间：op_range [153.5, 224.7]，ed_range [1348.2, 1416.6]" in text
+    assert "将写入区间：op_range [153.0, 224.0]，ed_range [1348.0, 1416.0]" in text
     assert "忽略的候选字幕：Show E01.ja.srt" in text
     assert "重跑" not in text
 

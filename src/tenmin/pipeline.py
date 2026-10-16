@@ -849,6 +849,97 @@ def _write_back_episode(
     dump_round_trip(yaml_path, round_trip, data)
 
 
+def _write_credit_ranges(
+    yaml_path: Path,
+    number: int,
+    op_range: tuple[float, float],
+    ed_range: tuple[float, float],
+) -> bool:
+    """只给这一集补写 OP/ED 区间；磁盘上任一字段已填就不动，返回是否写入。"""
+    round_trip, data = load_round_trip(yaml_path)
+    episodes = data.get("episodes") if isinstance(data, dict) else None
+    target = next(
+        (
+            item
+            for item in episodes or []
+            if isinstance(item, dict) and item.get("number") == number
+        ),
+        None,
+    )
+    if target is None or target.get("op_range") is not None or target.get("ed_range") is not None:
+        return False
+    for key, value in (("op_range", op_range), ("ed_range", ed_range)):
+        seq = CommentedSeq(list(value))
+        seq.fa.set_flow_style()
+        target[key] = seq
+    dump_round_trip(yaml_path, round_trip, data)
+    return True
+
+
+def auto_match_credits(
+    cfg: ProjectConfig, numbers: Sequence[int]
+) -> tuple[ProjectConfig, list[str]]:
+    """ingest 前按截图自动补 OP/ED 区间，写回 project.yaml 后返回重新读入的配置。
+
+    只处理有视频、两个区间都没手填、项目级默认也没填、且配了截图的集；
+    OP 与 ED 都识别成功才一起写（只写一半会关掉另一半的盲窗），否则警告并走原来的推断。
+    """
+    from tenmin import importer
+    from tenmin.config import load_project
+
+    credits = cfg.credits
+    if credits.default_op_range is not None or credits.default_ed_range is not None:
+        return cfg, []
+    refs = {
+        side: cfg.root / path
+        for side in ("op", "ed")
+        if (path := getattr(credits, f"{side}_reference")) is not None
+    }
+    if not refs:
+        return cfg, []
+    wanted = set(numbers)
+    candidates = [
+        (ep.number, importer.Pair(video=cfg.video_path(ep), srt=cfg.video_path(ep)), ep)
+        for ep in cfg.episodes
+        if ep.number in wanted
+        and ep.has_source
+        and ep.op_range is None
+        and ep.ed_range is None
+    ]
+    if not candidates:
+        return cfg, []
+    hashes = importer.reference_hashes(cfg, refs)
+    results = importer.match_credits(cfg, candidates, hashes)
+    warnings: list[str] = []
+    wrote = False
+    for number, _, _ in candidates:
+        op_av, ed_av = results.get(number, (None, None))
+        op = importer.round_range(op_av.range) if op_av and op_av.range else None
+        ed = importer.round_range(ed_av.range) if ed_av and ed_av.range else None
+        if op is None or ed is None:
+            reasons = [
+                f"{label}：{side.reason}"
+                for label, side in (("OP", op_av), ("ED", ed_av))
+                if side is not None and side.reason
+            ]
+            detail = f"（{'；'.join(reasons)}）" if reasons else ""
+            warnings.append(
+                f"E{number:02d}：截图未能同时识别 OP 与 ED{detail}，本次按字幕推断"
+            )
+            continue
+        if _write_credit_ranges(cfg.config_path, number, op, ed):
+            wrote = True
+            op_note = "（估计）" if op_av.estimated else ""
+            ed_note = "（估计）" if ed_av.estimated else ""
+            print(
+                f"E{number:02d}：OP {op[0]:g}–{op[1]:g} 秒{op_note}／"
+                f"ED {ed[0]:g}–{ed[1]:g} 秒{ed_note}，已写入 project.yaml"
+            )
+    if wrote:
+        cfg = load_project(cfg.config_path)
+    return cfg, warnings
+
+
 def load_round_trip(yaml_path: Path) -> tuple[YAML, Any]:
     """按原文件的缩进配置好 ruamel，返回 (yaml, data)，供只改局部节点的写回使用。"""
     text = yaml_path.read_text(encoding="utf-8")
@@ -1377,6 +1468,14 @@ async def run_pipeline(
     else:
         _find_episode(cfg, episode)  # 找不到会抛 ValueError（"没有注册"）
         target_numbers = [episode]
+
+    if "ingest" in wanted:
+        cfg, match_warnings = auto_match_credits(cfg, target_numbers)
+        warnings.extend(match_warnings)
+        paths = Paths(cfg.root)
+        active = _active_episodes(cfg)
+        numbers = [ep.number for ep in active]
+        ingest_inputs = _ingest_inputs(cfg)
 
     # 开跑前把每个阶段读到的那部分配置落成切片（内容没变不碰文件）。放在集号解析之后：
     # --episode 指到一个没注册 / 预填的集时应该先报错，而不是先往磁盘上写东西。

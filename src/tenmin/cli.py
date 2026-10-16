@@ -652,7 +652,7 @@ def import_(
         typer.secho(_error_message(error), fg="red", err=True)
         raise typer.Exit(code=1) from error
 
-    for line in importer.render_preview(plan):
+    for line in importer.render_preview(plan, op_length=cfg.credits.op_length):
         typer.echo(line)
     for warning in plan.warnings:
         typer.secho(f"[warn] {warning}", fg="yellow")

@@ -6,12 +6,12 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 import unicodedata
 from collections import Counter
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
-from decimal import ROUND_HALF_UP, Decimal
 from pathlib import Path
 from typing import Literal
 
@@ -290,15 +290,12 @@ async def resolve_ambiguous(
     return verdicts
 
 
-_TENTH = Decimal("0.1")
-
-
 def round_range(value: tuple[float, float]) -> tuple[float, float] | None:
-    """四舍五入到 0.1 秒（半入，经 str 走 Decimal，避免二进制浮点的 0.25 → 0.2）。
+    """起点和终点都向下取整到整秒（63.5 → 63，0.5 → 0）。
 
     取整后 start >= end 返回 None：调用方把它当推断失败，不写入。
     """
-    start, end = (float(Decimal(str(x)).quantize(_TENTH, rounding=ROUND_HALF_UP)) for x in value)
+    start, end = (float(math.floor(x)) for x in value)
     if start >= end:
         return None
     return (start, end)
@@ -374,7 +371,7 @@ def _op_sides(
         return {}
     sides: dict[int, AvSide] = {}
     usable = dict(starts)
-    length = av_match.DEFAULT_OP_LENGTH
+    length = cfg.credits.op_length
     estimated = True
     if len(starts) > 1:
         reference = min(starts, key=lambda n: (starts[n][2].distance, n))
@@ -658,7 +655,7 @@ def infer_ranges(
     op = round_range(op_range)
     ed = round_range(ed_range)
     if op is None or ed is None:
-        return preview(note="取整到 0.1 秒后区间无效，两个都不写")
+        return preview(note="取整到整秒后区间无效，两个都不写")
     return preview(write=(op, ed))
 
 
@@ -872,7 +869,7 @@ def _format_side(
     return f"{text}（{label}）"
 
 
-def render_preview(plan: ImportPlan) -> list[str]:
+def render_preview(plan: ImportPlan, *, op_length: float = 90.0) -> list[str]:
     """逐项预览：集数、视频、SRT、片长、OP/ED、是否写入区间，以及各类跳过项。"""
     lines = [f"可导入 {len(plan.items)} 集："]
     for item in plan.items:
@@ -888,7 +885,7 @@ def render_preview(plan: ImportPlan) -> list[str]:
             f"ED：{_format_side(ranges.ed_range, ranges.ed_source, ranges.ed_distance)}"
         )
         if ranges.op_length_estimated:
-            lines.append(f"       OP 长度按 {av_match.DEFAULT_OP_LENGTH:g} 秒估计")
+            lines.append(f"       OP 长度按 {op_length:g} 秒估计")
         elif ranges.op_source == "av" and ranges.op_range is not None:
             lines.append("       OP 长度由跨集音频测得")
         if ranges.ed_length_estimated:

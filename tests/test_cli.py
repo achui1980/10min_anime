@@ -1158,8 +1158,8 @@ def test_import_yes_registers_and_runs_only_the_imported_episodes(
     data = yaml.safe_load((root / "project.yaml").read_text(encoding="utf-8"))
     by_number = {e["number"]: e for e in data["episodes"]}
     assert sorted(by_number) == [1, 2, 3]
-    assert by_number[1]["op_range"] == [153.5, 224.7]
-    assert by_number[1]["ed_range"] == [1348.2, 1416.6]
+    assert by_number[1]["op_range"] == [153.0, 224.0]
+    assert by_number[1]["ed_range"] == [1348.0, 1416.0]
     assert by_number[1]["video"] == str((season / "Show E01.mkv").resolve())
     assert "video" not in by_number[2]
     assert (root / "srt" / "E01.srt").is_file()

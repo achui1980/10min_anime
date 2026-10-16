@@ -93,13 +93,15 @@ cat /path/to/zscaler_ca_bundle.pem >> .venv/lib/python3.14/site-packages/certifi
 
   **参考截图按侧覆盖**：`credits.op_reference` / `ed_reference`（`Path | None`，默认 `None`）仅用于 import；相对路径以 `cfg.root`（project.yaml 父目录）为基准，绝对路径照用。`build_import_plan` 将已配置侧传给 `scan_directory(reference_overrides=...)`，该侧全部目录候选（包括重复或坏图）忽略；未配置侧继续视频目录顶层发现：主体恰好为 `op` / `ed`，扩展名 `.png` / `.jpg` / `.jpeg`，均不分大小写，不查 `--srt-dir`。独立 `scan_directory` 保持原来的同侧多张 `ValueError`。所选截图必须在 LLM 兜底与任何导入写入前验证，显式路径缺失或读不出直接报错。两字段放进 `config_slices.EXCLUDED`，默认值也不进入 ingest payload，保证升级及改路径时存量切片逐字节不变；`tenmin run` 的 AV 行为保持现状。截图应选起点附近有辨识度的画面，避开黑场或通用 logo：同距取最早帧，会把它们误配到片头别处。
 
-  **按侧选择来源**：有截图的侧用 `AvSide`（画面+音频），没有截图的侧才用字幕推断；截图匹配失败仍保留失败结果，**不回落字幕**。`match_credits` 跳过已有任一逐集手填区间的集；片长未知时跳过画面搜索、提供失败原因。OP 搜索 `[0, min(300, duration))`，ED 搜索 `[max(0, duration - 180), duration)`，接受画面距离 ≤12/64。搜索窗常量住在 importer，其余匹配常量住在 av_match，当前均为模块级常量，未新增 config 旋钮。
+  **按侧选择来源**：有截图的侧用 `AvSide`（画面+音频），没有截图的侧才用字幕推断；截图匹配失败仍保留失败结果，**不回落字幕**。`match_credits` 跳过已有任一逐集手填区间的集；片长未知时跳过画面搜索、提供失败原因。OP 搜索 `[0, min(300, duration))`，ED 搜索 `[max(0, duration - 180), duration)`，接受画面距离 ≤12/64。搜索窗常量住在 importer，其余匹配常量住在 av_match，均为模块级常量；唯一的 config 旋钮是 `credits.op_length`（默认 90，正数，进 `EXCLUDED`），给无法测长时的估计用。
 
-  **OP 长度**：多集截图匹配成功时，选距离最小者作音频参考（同距取集号小的），各集从各自画面起点读 150 秒包络，只读一次；参考与其他集逐一测长，剔除距原始中位数 >10 秒的值后再取中位数，所有可用集共用这个长度、终点夹到片长。只有一集时直接按 90 秒估计、不读音频；多集没有任何可测长度时也按 90 秒估计，两者都标记 `estimated`；已有测量却被全部剔除时判失败。参考集音频解码失败使全部已匹配 OP 失败；对比集音频失败只影响该集。**空 PCM / 不足一帧的包络也算音频失败**，不能混进「无法测长 → 90 秒估计」；缺 ffmpeg 的 `FFmpegBinaryError` 原样外抛。
+  **OP 长度**：多集截图匹配成功时，选距离最小者作音频参考（同距取集号小的），各集从各自画面起点读 150 秒包络，只读一次；参考与其他集逐一测长，剔除距原始中位数 >10 秒的值后再取中位数，所有可用集共用这个长度、终点夹到片长。只有一集时直接按 `credits.op_length` 估计、不读音频；多集没有任何可测长度时也按 `credits.op_length` 估计，两者都标记 `estimated`；已有测量却被全部剔除时判失败。参考集音频解码失败使全部已匹配 OP 失败；对比集音频失败只影响该集。**空 PCM / 不足一帧的包络也算音频失败**，不能混进「无法测长 → 估计」；缺 ffmpeg 的 `FFmpegBinaryError` 原样外抛。
 
   **ED 终点**：`_ed_sides` 独立选同规则参考集，从截图起点读到各自片尾（搜索保证 ≤180 秒），各集只读一次。`av_match.ed_endpoints` 沿用 OP 包络、±1 秒错位、一秒相关窗与两秒持续掉落，但先要求五秒连续匹配。掉落返回两条各自时间轴的歌曲终点；持续匹配耗尽只确认覆盖到的那一侧文件 EOF（容许不足一帧的量化尾差）。读段截断、较短集 EOF、无匹配或 EOF 前不足两秒的掉落都不能替较长集确认终点。参考集端点证据取稳健中位数，对比集各用自己的证据；没有证据或单集时仍到片尾并标 `estimated`，单集不读音频。解码/空 PCM/缺 binary 的策略与 OP 按侧相同。`RangePreview.op_length_estimated` 与 `ed_length_estimated` 分别传递状态；预览实测与估计分侧显示，ED 估计明确提示可能包含 C 段/预告。
 
-  **OP/ED 必须一起写**：这两个字段直接驱动 `in_credit_window`，只写一半会把另一半的窗关掉，所以只在这一集两个字段都空、片长已知、项目级默认没生效、OP 与 ED 都识别成功且取整到 0.1 秒后仍合法时才写，否则两个都不写。已有手填区间原样保留，项目默认生效时保留其后续调整能力；补齐来源的预填集写区间会改 EPISODE 切片，预览里提示会重跑。预览按侧标「画面+音频」或「字幕推断」及可用的 `距离 N/64`，另列测量/估计、失败原因与是否写入；搜索时逐集打印 `正在匹配画面 i/N`。
+  **OP/ED 必须一起写**：这两个字段直接驱动 `in_credit_window`，只写一半会把另一半的窗关掉，所以只在这一集两个字段都空、片长已知、项目级默认没生效、OP 与 ED 都识别成功且起止都**向下取整到整秒**（`round_range`）后仍合法时才写，否则两个都不写。已有手填区间原样保留，项目默认生效时保留其后续调整能力；补齐来源的预填集写区间会改 EPISODE 切片，预览里提示会重跑。预览按侧标「画面+音频」或「字幕推断」及可用的 `距离 N/64`，另列测量/估计、失败原因与是否写入；搜索时逐集打印 `正在匹配画面 i/N`。
+
+  **`tenmin run` 自动匹配**：`pipeline.auto_match_credits` 在 `run_pipeline` 写配置切片之前（仅当阶段含 ingest）对目标集调用同一套 `reference_hashes` + `match_credits`：项目级 `default_*_range` 任一生效或没配截图就整体跳过；只处理有来源且两个区间都空的集；两侧都成功才经 `_write_credit_ranges` 成对写回（ruamel round-trip，写前再查磁盘上两个字段仍空），随后重新 `load_project`；失败只加警告、按盲窗/字幕推断继续。pipeline 对 importer 是函数体内延迟 import（importer 反向依赖 pipeline）。
 - `src/tenmin/ingest/av_match.py`：截图与音频匹配，分纯计算和媒体 IO 两层。纯函数 `dhash` 将 9×8 灰度图左右比较编码成 64 位哈希，`hamming` 数不同位，`best_frame` 返回最小距离及索引、同距取首帧；最优帧本身不应用接受阈值，由 importer 判定。`audio_envelope` 将 8kHz s16le 单声道 PCM 转成 10 帧/秒、16 个对数频带能量（Hann 窗 + FFT，丢弃末尾单字节与不足一帧的采样）；`op_length` 先去各频带时间均值，在 ±1 秒找最佳错位，再用 1 秒窗算 Pearson 相关：先见过 ≥0.5 的匹配，之后持续 2 秒低于阈值才判结束，终点取首个低相关窗中心；没对齐或没持续掉落返回 `None`。`median_length` 实现上述异常值过滤与中位数。
 
   **ED 音频证据**：`ed_endpoints` 在每个一秒窗内逐频带去时间均值后算相关，并要求两侧存在有效时间变化；全段去均值后的静音会变成固定非零向量，不能直接拿其频带间差异作为歌曲证据。至少五秒连续匹配才建立证据，之后持续两秒掉落可测结束；匹配耗尽时只确认覆盖到的自身 EOF。修改此函数时覆盖「不同音频 + 共同静音 + 不同音频」、真正共享歌曲后静音、固定频带信号，以及短集 EOF 不确认长集终点的回归；保持 `op_length` 的既有行为。
@@ -134,7 +136,7 @@ cat /path/to/zscaler_ca_bundle.pem >> .venv/lib/python3.14/site-packages/certifi
 uv run pytest tests/ -q          # 全量跑，默认跳过需要真实 API key / 素材的标记测试
 ```
 
-`tests/` 目录：`test_config.py`、`test_llm.py`、`test_pipeline.py`、`test_cli.py`、`test_config_slices.py`、`test_render_*.py`、`test_content_check_*.py` 等，共 62 个 Python 文件（按 `tests/**/*.py` glob，含 conftest.py / fakes.py / __init__.py）。pytest markers（`pyproject.toml` 里是**六个**）。content-check 日常测试不下载模型；真实媒体回归在有 ffmpeg/ffprobe 时本地生成微型片段，否则逐项 skip；旋转用例另探测 `-display_rotation` 支持，仅不支持该参数时跳过该用例：
+`tests/` 目录：`test_config.py`、`test_llm.py`、`test_pipeline.py`、`test_cli.py`、`test_config_slices.py`、`test_render_*.py`、`test_content_check_*.py` 等，共 63 个 Python 文件（按 `tests/**/*.py` glob，含 conftest.py / fakes.py / __init__.py）。pytest markers（`pyproject.toml` 里是**六个**）。content-check 日常测试不下载模型；真实媒体回归在有 ffmpeg/ffprobe 时本地生成微型片段，否则逐项 skip；旋转用例另探测 `-display_rotation` 支持，仅不支持该参数时跳过该用例：
 
 - `llm`：需要真实 LLM API key（默认跳过），跑法：`TENMIN_GEMINI_API_KEY=xxx uv run pytest -m llm`。
 - `generalize`：需要额外的番剧 SRT fixture。

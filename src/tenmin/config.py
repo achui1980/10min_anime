@@ -195,6 +195,8 @@ class CreditsConfig(StrictModel):
     # 仅 tenmin import 使用；相对路径由 importer 按项目根目录解析。
     op_reference: Path | None = None
     ed_reference: Path | None = None
+    # 截图匹配时 OP 测不出长度（单集或跨集音频无证据）就按这个秒数估计。
+    op_length: float = Field(default=90.0, gt=0)
 
     # 聚簇法找 OP 时，簇起点必须落在 [op_search_start, op_search_end] 内。
     # 下界 30 秒：实测最早的 OP 起点是《恶女》第 2 集的 53.554 秒，取 30 留足余量。
