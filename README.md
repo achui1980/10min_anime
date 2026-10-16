@@ -113,6 +113,7 @@ uv run tenmin run --help
 | `tenmin inspect <slug> --episode N` | 查看对白来源、OP/ED 区间、无字幕间隙与高能点 | 是 |
 | `tenmin ocr <文件或目录>...` | 批量将画面硬字幕识别成 SRT，可选 AI 校对 | 否 |
 | `tenmin ocr-audit <视频>` | 抽查 AI 校对改过的字幕：原文→校对后对照、截图、逐条标记改对/改错 | 否 |
+| `tenmin glossary <slug> --subject ID` | 按 animeko 条目 ID 拉取角色名，写入 `project.yaml` 的 `glossary`（日文名 → 中文名） | 否 |
 | `tenmin check-content <视频>` | 本地内容评级，生成截图、分数与 HTML 报告 | 否 |
 | `tenmin import <slug> <目录>` | 批量配对视频与字幕、识别集号与 OP/ED，确认后登记并运行 | 是 |
 
@@ -217,6 +218,25 @@ uv run --extra content-check tenmin check-content "视频.mp4" --offline --force
 | `--offline` | 模型只读本地缓存；首次需提前缓存模型 |
 
 候选仅供人工复核，命中仍退出 `0`，执行失败退出 `1`；评级分数不是色情概率。
+
+### 人物名表：`glossary`
+
+```bash
+uv run tenmin glossary kusuriya3 --subject 568244 --dry-run   # 只预览
+uv run tenmin glossary kusuriya3 --subject 568244 --yes       # 直接写入
+```
+
+按 animeko 条目 ID（无需登录）拉取角色列表，只取主角/配角且有中文名的条目，生成「日文名 → 中文名」，
+追加到 `project.yaml` 的 `glossary`；**已有条目一律不覆盖**（值不同会列为「保留」）。原始响应缓存在
+`work/<slug>/meta/animeko-<ID>.json`。这份名表同时喂给翻译、解说稿和 OCR AI 校对（人名与表中只差一两个字时按表改）。
+
+| 参数 | 说明 |
+|---|---|
+| `--subject` | animeko 条目 ID（必填） |
+| `--work-dir` | 项目根目录，默认 `work` |
+| `--yes` | 跳过确认 |
+| `--dry-run` | 只预览，不写文件 |
+| `--refresh` | 忽略缓存重新拉取 |
 
 ### 目录批量导入：`import`
 

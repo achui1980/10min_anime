@@ -7,6 +7,7 @@ import io
 import json
 from collections.abc import Callable, Sequence
 from pathlib import Path
+from typing import Any
 
 from ruamel.yaml import YAML
 from ruamel.yaml.comments import CommentedMap, CommentedSeq
@@ -565,6 +566,7 @@ async def run_ingest_corrected(
                 cfg=cfg.llm,
                 source_identity=_ocr_source_identity(cfg, episode),
                 asr=asr_path,
+                glossary=cfg.glossary,
             )
             warnings.extend(f"E{episode.number:02d}：{message}" for message in messages)
             pending |= retry
@@ -811,29 +813,7 @@ def _write_back_episode(
     从原文件猜序列缩进，兼容 init 的顶格列表和手写的缩进列表；
     长路径不折行。整份结果经原子写替换，避免中断损坏已登记的集数。
     """
-    text = yaml_path.read_text(encoding="utf-8")
-    round_trip = YAML()
-    round_trip.preserve_quotes = True
-    round_trip.width = 4096
-    data, sequence_indent, sequence_offset = load_yaml_guess_indent(text, yaml=round_trip)
-    # The helper stops at the first block sequence, so its indent describes
-    # the position after `- ` rather than earlier nested maps. The parser's
-    # key columns also handle `render: # settings` and intervening comments.
-    mapping_indent = sequence_indent
-    if isinstance(data, CommentedMap):
-        mapping_indent = next(
-            (
-                value.lc.key(next(iter(value)))[1] - data.lc.key(key)[1]
-                for key, value in data.items()
-                if isinstance(value, CommentedMap) and value and not value.fa.flow_style()
-            ),
-            (sequence_indent - 2) if sequence_indent and sequence_offset else sequence_indent,
-        )
-    round_trip.indent(
-        mapping=mapping_indent or 2,
-        sequence=sequence_indent or 2,
-        offset=sequence_offset or 0,
-    )
+    round_trip, data = load_round_trip(yaml_path)
     if data is None:
         data = CommentedMap()
     episodes = data.get("episodes")
@@ -866,6 +846,39 @@ def _write_back_episode(
             value = CommentedSeq(list(getattr(entry, key)))
             value.fa.set_flow_style()
             target[key] = value
+    dump_round_trip(yaml_path, round_trip, data)
+
+
+def load_round_trip(yaml_path: Path) -> tuple[YAML, Any]:
+    """按原文件的缩进配置好 ruamel，返回 (yaml, data)，供只改局部节点的写回使用。"""
+    text = yaml_path.read_text(encoding="utf-8")
+    round_trip = YAML()
+    round_trip.preserve_quotes = True
+    round_trip.width = 4096
+    data, sequence_indent, sequence_offset = load_yaml_guess_indent(text, yaml=round_trip)
+    # The helper stops at the first block sequence, so its indent describes
+    # the position after `- ` rather than earlier nested maps. The parser's
+    # key columns also handle `render: # settings` and intervening comments.
+    mapping_indent = sequence_indent
+    if isinstance(data, CommentedMap):
+        mapping_indent = next(
+            (
+                value.lc.key(next(iter(value)))[1] - data.lc.key(key)[1]
+                for key, value in data.items()
+                if isinstance(value, CommentedMap) and value and not value.fa.flow_style()
+            ),
+            (sequence_indent - 2) if sequence_indent and sequence_offset else sequence_indent,
+        )
+    round_trip.indent(
+        mapping=mapping_indent or 2,
+        sequence=sequence_indent or 2,
+        offset=sequence_offset or 0,
+    )
+    return round_trip, data
+
+
+def dump_round_trip(yaml_path: Path, round_trip: YAML, data: Any) -> None:
+    """把 load_round_trip 得到的数据原子写回原文件。"""
     buffer = io.StringIO()
     round_trip.dump(data, buffer)
     atomic.write_text(yaml_path, buffer.getvalue())

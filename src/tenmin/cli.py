@@ -12,7 +12,7 @@ import typer
 import yaml
 from pydantic import ValidationError
 
-from tenmin import atomic, importer
+from tenmin import animeko, atomic, importer
 from tenmin.config import (
     DEFAULT_CONTENT_CHECK,
     DEFAULT_LLM,
@@ -834,3 +834,60 @@ def ocr_audit_command(
         raise typer.Exit(code=1) from error
     typer.echo(f"共 {result.total} 条字幕，待抽查 {result.items} 条")
     typer.echo(f"报告：{result.report}")
+
+
+GLOSSARY_SUBJECT_OPTION = typer.Option(..., "--subject", help="animeko 条目 ID（数字）")
+GLOSSARY_YES_OPTION = typer.Option(False, "--yes", help="跳过确认直接写入 project.yaml")
+GLOSSARY_DRY_RUN_OPTION = typer.Option(False, "--dry-run", help="只预览，不写入")
+GLOSSARY_REFRESH_OPTION = typer.Option(False, "--refresh", help="忽略本地缓存重新拉取")
+
+
+@app.command("glossary")
+def glossary_command(
+    slug: str,
+    subject: int = GLOSSARY_SUBJECT_OPTION,
+    work_dir: Path = WORK_DIR_OPTION,
+    yes: bool = GLOSSARY_YES_OPTION,
+    dry_run: bool = GLOSSARY_DRY_RUN_OPTION,
+    refresh: bool = GLOSSARY_REFRESH_OPTION,
+) -> None:
+    """按 animeko 条目 ID 拉取角色名，生成人物名表并写入 project.yaml 的 glossary。"""
+    project_file = _project_file(work_dir, slug)
+    try:
+        cfg = load_project(project_file)
+        data = animeko.load(cfg.root, subject, refresh=refresh)
+    except PIPELINE_ERRORS as error:
+        typer.secho(_error_message(error), fg="red", err=True)
+        raise typer.Exit(code=1) from error
+
+    names = animeko.build_names(data["characters"])
+    result = animeko.plan(cfg.glossary, names)
+    info = data["subject"]
+    title = info.get("nameCn") or info.get("name") or str(subject)
+    typer.echo(f"{title}：角色名 {len(names)} 条")
+    for name, name_cn in result.added.items():
+        typer.echo(f"  新增  {name} → {name_cn}")
+    for name, name_cn in result.same.items():
+        typer.echo(f"  已有  {name} → {name_cn}")
+    for name, (current, proposed) in result.conflicts.items():
+        typer.secho(f"  保留  {name} → {current}（animeko：{proposed}）", fg="yellow")
+
+    if not result.added:
+        typer.echo("没有需要新增的条目。")
+        return
+    if dry_run:
+        typer.echo("--dry-run：只预览，未写入。")
+        return
+    if not yes:
+        if not _stdin_is_interactive():
+            typer.secho("当前不是交互终端，无法确认；确认要写入请加 --yes", fg="red", err=True)
+            raise typer.Exit(code=1)
+        if not typer.confirm(f"写入 {len(result.added)} 条到 {project_file}？", default=False):
+            typer.echo("已取消，未做任何改动。")
+            return
+    try:
+        animeko.write_glossary(project_file, result.added)
+    except PIPELINE_ERRORS as error:
+        typer.secho(_error_message(error), fg="red", err=True)
+        raise typer.Exit(code=1) from error
+    typer.echo(f"已写入 {len(result.added)} 条：{project_file}")

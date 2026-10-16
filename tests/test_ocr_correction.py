@@ -244,3 +244,24 @@ def test_malformed_raw_is_not_silently_reduced(tmp_path):
     chosen, warnings, retry = _select(paths, lambda: provider)
     assert chosen == paths[0] and warnings and retry
     assert not provider.calls and not paths[1].exists()
+
+
+def test_glossary_goes_into_prompt_and_cache_identity(tmp_path):
+    paths = _paths(tmp_path)
+    provider = Provider(_results())
+    _select(paths, lambda: provider, glossary={"壬氏": "壬氏", "猫猫": "猫猫"})
+    assert "人物名表" in provider.calls[0]
+    assert "猫猫 → 猫猫" in provider.calls[0]
+    assert _select(
+        paths, lambda: pytest.fail("reuse"), glossary={"猫猫": "猫猫", "壬氏": "壬氏"}
+    )[0] == paths[1]
+    again = Provider(_results())
+    _select(paths, lambda: again, glossary={"猫猫": "猫猫"})
+    assert again.calls
+
+
+def test_no_glossary_keeps_prompt_without_section(tmp_path):
+    paths = _paths(tmp_path)
+    provider = Provider(_results())
+    _select(paths, lambda: provider)
+    assert "人物名表" not in provider.calls[0]

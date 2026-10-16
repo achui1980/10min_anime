@@ -65,8 +65,15 @@ def _too_large(before: str, after: str) -> bool:
     return _edit_size(before, after) > limit
 
 
-def _user_message(cues: list[RawCue], asr: list[RawCue] | None) -> str:
-    lines = ["# OCR 字幕原稿（id | 开始-结束秒 | 文本）"]
+def _user_message(
+    cues: list[RawCue], asr: list[RawCue] | None, glossary: dict[str, str] | None = None
+) -> str:
+    lines = []
+    if glossary:
+        lines += ["# 人物名表（日文 → 中文）"]
+        lines += [f"{ja} → {zh}" for ja, zh in glossary.items()]
+        lines += [""]
+    lines += ["# OCR 字幕原稿（id | 开始-结束秒 | 文本）"]
     lines += [
         f"{pos} | {cue.start:.2f}-{cue.end:.2f} | {cue.text}"
         for pos, cue in enumerate(cues, start=1)
@@ -121,12 +128,16 @@ def apply_fixes(
 
 
 async def correct_cues(
-    cues: list[RawCue], provider: LLMProvider, *, asr: list[RawCue] | None = None
+    cues: list[RawCue],
+    provider: LLMProvider,
+    *,
+    asr: list[RawCue] | None = None,
+    glossary: dict[str, str] | None = None,
 ) -> tuple[list[RawCue], list[ReviewItem], list[str]]:
     """整集一次调用；模型只返回需要修改或拿不准的行。"""
     if not cues:
         raise ValueError("OCR 原稿没有可校对的字幕")
-    response = await provider.complete(_SYSTEM, _user_message(cues, asr), _Fixes)
+    response = await provider.complete(_SYSTEM, _user_message(cues, asr, glossary), _Fixes)
     return apply_fixes(cues, response.lines)
 
 
@@ -134,12 +145,16 @@ def _digest(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def _identity(cfg: LLMConfig, asr: Path | None = None) -> str:
+def _identity(
+    cfg: LLMConfig, asr: Path | None = None, glossary: dict[str, str] | None = None
+) -> str:
     fields = cfg.model_dump(
         include={"provider", "model", "base_url", "thinking", "temperature", "max_output_tokens"}
     )
     fields["prompt_sha256"] = hashlib.sha256(_SYSTEM.encode("utf-8")).hexdigest()
     fields["asr_sha256"] = _digest(asr) if asr is not None and asr.is_file() else None
+    if glossary:
+        fields["glossary"] = dict(sorted(glossary.items()))
     return hashlib.sha256(json.dumps(fields, sort_keys=True).encode("utf-8")).hexdigest()
 
 
@@ -155,7 +170,7 @@ def _state(path: Path) -> dict | None:
 
 def correction_pending(
     raw: Path, corrected: Path, state: Path, *, cfg: LLMConfig, source_identity: str,
-    asr: Path | None = None,
+    asr: Path | None = None, glossary: dict[str, str] | None = None,
 ) -> bool:
     """失败降级后供全局 ingest 新鲜度判据识别待重试的校对。"""
     if not raw.is_file() or not corrected.is_file():
@@ -169,25 +184,26 @@ def correction_pending(
     )
     if same_source and saved.get("machine_sha256") != _digest(corrected):
         return False
-    current = (_digest(raw), source_identity, _identity(cfg, asr))
+    current = (_digest(raw), source_identity, _identity(cfg, asr, glossary))
     expected = (saved.get("raw_sha256"), saved.get("source_identity"), saved.get("llm_identity"))
     return saved.get("status") != "success" or current != expected
 
 
 def record_fallback(
     raw: Path, corrected: Path, state: Path, *, cfg: LLMConfig, source_identity: str,
-    asr: Path | None = None,
+    asr: Path | None = None, glossary: dict[str, str] | None = None,
 ) -> None:
     """记录交付物是机器回退稿，而不是人工稿；它仍须自动重试。"""
     _write_state(
         raw, corrected, state, cfg=cfg, source_identity=source_identity,
-        status="fallback", asr=asr,
+        status="fallback", asr=asr, glossary=glossary,
     )
 
 
 def _write_state(
     raw: Path, corrected: Path, state: Path,
     *, cfg: LLMConfig, source_identity: str, status: str, asr: Path | None = None,
+    glossary: dict[str, str] | None = None,
 ) -> None:
     atomic.write_text(
         state,
@@ -195,7 +211,7 @@ def _write_state(
             "status": status,
             "raw_sha256": _digest(raw),
             "source_identity": source_identity,
-            "llm_identity": _identity(cfg, asr),
+            "llm_identity": _identity(cfg, asr, glossary),
             "machine_sha256": _digest(corrected),
         }, ensure_ascii=False, indent=2) + "\n",
     )
@@ -220,10 +236,12 @@ async def select_corrected(
     source_identity: str,
     overwrite_unmanaged: bool = False,
     asr: Path | None = None,
+    glossary: dict[str, str] | None = None,
 ) -> tuple[Path, list[str], bool]:
     """选用成功/人工校对稿；失败用原稿并在下次自动重试。
 
-    ``asr`` 是可选的日语语音转写 SRT，只作读音/形近字佐证放进提示词。
+    ``asr`` 是可选的日语语音转写 SRT，只作读音/形近字佐证放进提示词；
+    ``glossary`` 是日文名→中文名的人物名表，用来统一人名写法。
     """
     raw_sha = _digest(raw)
     saved = _state(state)
@@ -234,7 +252,7 @@ async def select_corrected(
     current = saved is not None and (
         saved.get("raw_sha256") == raw_sha
         and saved.get("source_identity") == source_identity
-        and saved.get("llm_identity") == _identity(cfg, asr)
+        and saved.get("llm_identity") == _identity(cfg, asr, glossary)
     )
     same_source = (
         saved is not None and saved.get("raw_sha256") == raw_sha
@@ -259,7 +277,9 @@ async def select_corrected(
         asr_cues = load_srt(asr) if asr is not None and asr.is_file() else None
         try:
             provider = provider_factory()
-            cues, items, dropped = await correct_cues(parsed.cues, provider, asr=asr_cues)
+            cues, items, dropped = await correct_cues(
+                parsed.cues, provider, asr=asr_cues, glossary=glossary
+            )
         finally:
             if provider is not None:
                 aclose = getattr(provider, "aclose", None)
@@ -277,7 +297,7 @@ async def select_corrected(
         messages.append(f"OCR AI 校对丢弃了 {len(dropped)} 条不合格修改：{'；'.join(dropped)}")
     _write_state(
         raw, corrected, state, cfg=cfg, source_identity=source_identity,
-        status="success", asr=asr,
+        status="success", asr=asr, glossary=glossary,
     )
     return corrected, messages, False
 
