@@ -29,8 +29,10 @@ def _transport(calls):
     return httpx.MockTransport(handler)
 
 
-def test_build_names_keeps_only_characters_with_distinct_chinese():
-    assert animeko.build_names(CHARACTERS) == {"壬氏": "壬氏改", "高順": "高顺", "趙迂": "赵迂"}
+def test_build_names_keeps_main_and_supporting_including_same_name():
+    assert animeko.build_names(CHARACTERS) == {
+        "猫猫": "猫猫", "壬氏": "壬氏改", "高順": "高顺", "趙迂": "赵迂"
+    }
 
 
 def test_plan_never_overwrites_existing():
@@ -121,7 +123,7 @@ def test_cli_yes_writes_and_keeps_conflicts(tmp_path):
     from tenmin.config import load_project
 
     assert load_project(root / "project.yaml").glossary == {
-        "壬氏": "壬氏", "高順": "高顺", "趙迂": "赵迂"
+        "壬氏": "壬氏", "猫猫": "猫猫", "高順": "高顺", "趙迂": "赵迂"
     }
 
 

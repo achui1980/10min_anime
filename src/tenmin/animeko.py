@@ -75,7 +75,7 @@ def load(
 
 
 def build_names(characters: list[Any]) -> dict[str, str]:
-    """只取主角/配角，跳过没有中文名或中文名与原名相同的条目。"""
+    """只取主角/配角，跳过没有中文名的条目；同名的也收（让下游知道这是人名）。"""
     names: dict[str, str] = {}
     for item in characters:
         if not isinstance(item, dict) or item.get("role") not in CHARACTER_ROLES:
@@ -88,7 +88,7 @@ def build_names(characters: list[Any]) -> dict[str, str]:
         if not isinstance(name, str) or not isinstance(name_cn, str):
             continue
         name, name_cn = name.strip(), name_cn.strip()
-        if name and name_cn and name != name_cn and name not in names:
+        if name and name_cn and name not in names:
             names[name] = name_cn
     return names
 

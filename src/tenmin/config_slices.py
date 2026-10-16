@@ -49,6 +49,7 @@ STAGE_FIELDS: dict[str, tuple[str, ...]] = {
         "target_seconds",
         "mode",
         "glossary",
+        "aliases",
         "show",
         "render.rate",
     ),

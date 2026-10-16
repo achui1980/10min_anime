@@ -612,6 +612,8 @@ class ProjectConfig(StrictModel):
     locale: LocaleConfig = Field(default_factory=LocaleConfig)
     episodes: list[EpisodeConfig] = Field(default_factory=list)
     glossary: dict[str, str] = Field(default_factory=dict)
+    # 人物外号：正式名 → 剧中别的叫法（如 猫猫: [雀斑女]）。只喂解说稿，不进 OCR 校对与翻译。
+    aliases: dict[str, list[str]] = Field(default_factory=dict)
     llm: LLMConfig = Field(default_factory=LLMConfig)
     ingest: IngestConfig = Field(default_factory=IngestConfig)
     credits: CreditsConfig = Field(default_factory=CreditsConfig)

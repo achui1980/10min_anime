@@ -127,6 +127,15 @@ def build_highlight_block(report: SignalReport) -> str:
     return "\n".join(rows)
 
 
+def build_alias_block(aliases: Mapping[str, list[str]]) -> str:
+    rows = [
+        f"- {'、'.join(cleaned)} → {name}"
+        for name, nicknames in aliases.items()
+        if (cleaned := [n.strip() for n in nicknames if n.strip()])
+    ]
+    return "\n".join(rows) if rows else "（无外号）"
+
+
 def build_glossary_block(glossary: dict[str, str]) -> str:
     if not glossary:
         return "（无术语表）"
@@ -204,6 +213,7 @@ def build_user_prompt(
         glossary_block=build_glossary_block(
             dict(cfg.glossary) if glossary is None else dict(glossary)
         ),
+        alias_block=build_alias_block(cfg.aliases),
         credits_block=build_credits_block(track),
         highlight_block=build_highlight_block(report),
         dialogue_block=build_dialogue_block(track),
