@@ -107,6 +107,7 @@ STAGE_FIELDS: dict[str, tuple[str, ...]] = {
 EXCLUDED: frozenset[str] = frozenset(
     {
         "slug",
+        "animeko_subject",
         "credits.op_reference",
         "credits.ed_reference",
         "credits.op_length",

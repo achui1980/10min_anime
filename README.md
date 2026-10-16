@@ -231,6 +231,15 @@ uv run tenmin glossary kusuriya3 --subject 568244 --yes       # 直接写入
 `work/<slug>/meta/animeko-<ID>.json`。这份名表同时喂给翻译、解说稿和 OCR AI 校对（人名与表中只差一两个字时按表改）。
 日文与中文同名的角色（如 `猫猫: 猫猫`）也会写入，让下游知道这是人名。
 
+也可以把条目 ID 写进 `project.yaml`，省掉 `--subject`，并让 `tenmin run` 在 ingest 前自动补名表：
+
+```yaml
+animeko_subject: 568244
+```
+
+配了它，`tenmin run` 会先读缓存（没有才联网）、只追加新角色名；获取失败只打警告、沿用现有 glossary。
+新增条目会让 OCR 校对、翻译与解说稿重跑。**没配就完全不联网**，行为和以前一样。
+
 剧中常用外号称呼人物时（例如赵迂叫猫猫「雀斑女」），在 `project.yaml` 手写 `aliases`，解说稿会用正式名，
 只在引用台词时保留外号；外号只进解说稿（script 阶段），不进 OCR 校对与翻译：
 
@@ -241,7 +250,7 @@ aliases:
 
 | 参数 | 说明 |
 |---|---|
-| `--subject` | animeko 条目 ID（必填） |
+| `--subject` | animeko 条目 ID；省略时用 `project.yaml` 的 `animeko_subject` |
 | `--work-dir` | 项目根目录，默认 `work` |
 | `--yes` | 跳过确认 |
 | `--dry-run` | 只预览，不写文件 |

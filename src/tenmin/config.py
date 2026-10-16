@@ -614,6 +614,8 @@ class ProjectConfig(StrictModel):
     glossary: dict[str, str] = Field(default_factory=dict)
     # 人物外号：正式名 → 剧中别的叫法（如 猫猫: [雀斑女]）。只喂解说稿，不进 OCR 校对与翻译。
     aliases: dict[str, list[str]] = Field(default_factory=dict)
+    # animeko 条目 ID：配了就在 run 前自动补人物名表（只追加），不配就不联网。
+    animeko_subject: int | None = Field(default=None, gt=0)
     llm: LLMConfig = Field(default_factory=LLMConfig)
     ingest: IngestConfig = Field(default_factory=IngestConfig)
     credits: CreditsConfig = Field(default_factory=CreditsConfig)

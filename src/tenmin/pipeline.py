@@ -876,6 +876,29 @@ def _write_credit_ranges(
     return True
 
 
+def auto_fetch_glossary(cfg: ProjectConfig) -> tuple[ProjectConfig, list[str]]:
+    """配了 ``animeko_subject`` 就把 animeko 角色名追加进 glossary；没配直接返回。
+
+    只追加、不覆盖已有条目；缓存优先；网络或数据出错只警告，不中断运行。
+    """
+    subject = cfg.animeko_subject
+    if subject is None:
+        return cfg, []
+    from tenmin import animeko
+    from tenmin.config import load_project
+
+    try:
+        data = animeko.load(cfg.root, subject)
+        result = animeko.plan(cfg.glossary, animeko.build_names(data["characters"]))
+        if not result.added:
+            return cfg, []
+        animeko.write_glossary(cfg.config_path, result.added)
+    except (ValueError, OSError, KeyError, TypeError) as error:
+        return cfg, [f"animeko 人物名表获取失败，本次沿用现有 glossary：{error}"]
+    print(f"人物名表：从 animeko {subject} 新增 {len(result.added)} 条，已写入 project.yaml")
+    return load_project(cfg.config_path), []
+
+
 def auto_match_credits(
     cfg: ProjectConfig, numbers: Sequence[int]
 ) -> tuple[ProjectConfig, list[str]]:
@@ -1470,6 +1493,8 @@ async def run_pipeline(
         target_numbers = [episode]
 
     if "ingest" in wanted:
+        cfg, glossary_warnings = auto_fetch_glossary(cfg)
+        warnings.extend(glossary_warnings)
         cfg, match_warnings = auto_match_credits(cfg, target_numbers)
         warnings.extend(match_warnings)
         paths = Paths(cfg.root)

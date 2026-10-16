@@ -106,7 +106,7 @@ def _with(cfg: ProjectConfig, field: str, value: object) -> ProjectConfig:
     return cfg.model_copy(update={top: sub.model_copy(update={leaf: value})})
 
 
-def _bump(value: object) -> object:
+def _bump(value: object, field: str = "") -> object:
     if isinstance(value, bool):
         return not value
     if isinstance(value, int):
@@ -116,7 +116,7 @@ def _bump(value: object) -> object:
     if isinstance(value, str):
         return value + "x"
     if value is None:
-        return "http://proxy.test:8080"
+        return 1 if field == "animeko_subject" else "http://proxy.test:8080"
     raise TypeError(value)
 
 
@@ -199,7 +199,7 @@ def test_changing_an_excluded_knob_changes_no_slice(tmp_path, field):
     cfg = _cfg(tmp_path)
     top, _, leaf = field.partition(".")
     current = getattr(getattr(cfg, top), leaf) if leaf else getattr(cfg, top)
-    assert _changed(cfg, _with(cfg, field, _bump(current))) == set()
+    assert _changed(cfg, _with(cfg, field, _bump(current, field))) == set()
 
 
 @pytest.mark.parametrize(

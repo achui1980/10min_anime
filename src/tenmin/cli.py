@@ -836,7 +836,9 @@ def ocr_audit_command(
     typer.echo(f"报告：{result.report}")
 
 
-GLOSSARY_SUBJECT_OPTION = typer.Option(..., "--subject", help="animeko 条目 ID（数字）")
+GLOSSARY_SUBJECT_OPTION = typer.Option(
+    None, "--subject", help="animeko 条目 ID（数字）；省略时用 project.yaml 的 animeko_subject"
+)
 GLOSSARY_YES_OPTION = typer.Option(False, "--yes", help="跳过确认直接写入 project.yaml")
 GLOSSARY_DRY_RUN_OPTION = typer.Option(False, "--dry-run", help="只预览，不写入")
 GLOSSARY_REFRESH_OPTION = typer.Option(False, "--refresh", help="忽略本地缓存重新拉取")
@@ -845,7 +847,7 @@ GLOSSARY_REFRESH_OPTION = typer.Option(False, "--refresh", help="忽略本地缓
 @app.command("glossary")
 def glossary_command(
     slug: str,
-    subject: int = GLOSSARY_SUBJECT_OPTION,
+    subject: int | None = GLOSSARY_SUBJECT_OPTION,
     work_dir: Path = WORK_DIR_OPTION,
     yes: bool = GLOSSARY_YES_OPTION,
     dry_run: bool = GLOSSARY_DRY_RUN_OPTION,
@@ -855,6 +857,12 @@ def glossary_command(
     project_file = _project_file(work_dir, slug)
     try:
         cfg = load_project(project_file)
+        if subject is None:
+            subject = cfg.animeko_subject
+        if subject is None:
+            raise ValueError(
+                "请用 --subject 指定 animeko 条目 ID，或在 project.yaml 写 animeko_subject"
+            )
         data = animeko.load(cfg.root, subject, refresh=refresh)
     except PIPELINE_ERRORS as error:
         typer.secho(_error_message(error), fg="red", err=True)
