@@ -25,6 +25,8 @@ ingest → translate → signals → script → docgen → voice → timeline �
 
 ## 关键工具规则（非常重要）
 
+运行 `ocr.engine: vision_rapid` 的项目时使用 `uv run --extra ocr --extra rapidocr tenmin run ...`；启用了 `ocr.asr_assist` 再加 `--extra asr`。独立命令通过 `tenmin ocr ... --engine vision_rapid` 选择引擎，项目通过 YAML 选择。复识别发生在 Vision 合帧之后、AI 校对之前；切换引擎的缓存处理见下方 `OcrConfig` 约束。
+
 **跑本项目的 pipeline 命令和 pytest 时，一律用裸的 `uv run <cmd>`，绝对不要套 `rtk proxy` / `rtk pytest` / `rtk` 前缀。** 本项目的中文输出会把 rtk 的 UTF-8 抓取层搞崩。裸的 `rtk ls` / `rtk grep` / `rtk git` / `rtk read` 是安全的，可以正常用。
 
 ```bash

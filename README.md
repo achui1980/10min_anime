@@ -520,6 +520,25 @@ episodes:
     hardsub: false       # 只管这一集；不写 = 跟随 ocr.enabled
 ```
 
+配置好 `ocr.engine` 后，项目流水线按 YAML 选择引擎，例如：
+
+```bash
+uv run --extra ocr --extra rapidocr tenmin run kusuriya3 --episode 3
+```
+
+若同时启用了 `ocr.ai_correct` 和 `ocr.asr_assist`，附上 ASR 依赖运行：
+
+```bash
+uv run --extra ocr --extra rapidocr --extra asr tenmin run kusuriya3 --episode 3
+```
+
+`vision_rapid` 只复识别字幕文字，时间轴仍由 Vision 决定；AI 校对在复识别之后进行。
+要单独比较引擎效果，可给独立 OCR 命令指定新的输出目录，避免覆盖已有字幕：
+
+```bash
+uv run --extra ocr --extra rapidocr tenmin ocr "视频.mp4" --engine vision_rapid -o work/rapid-comparison
+```
+
 - 声明了硬字幕、但视频同时带软字幕轨时**照样走字幕轨**（文本字幕轨最准）。
 - 声明了硬字幕、但 OCR 跑不了（没 `uv sync --extra ocr`、不是 macOS）时**直接报错**，不会
   悄悄换成语音转写——你明确说了要用画面上那份更好的素材。
