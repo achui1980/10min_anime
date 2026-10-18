@@ -243,7 +243,11 @@ def test_run_only_ingest_needs_no_api_key(work, golden_srt_path, monkeypatch):
 
 def test_run_script_stage_without_api_key_fails(work, golden_srt_path, monkeypatch):
     monkeypatch.delenv("TENMIN_GEMINI_API_KEY", raising=False)
-    _bootstrap(work, golden_srt_path)
+    root = _bootstrap(work, golden_srt_path)
+    path = root / "project.yaml"
+    path.write_text(
+        path.read_text(encoding="utf-8") + "\nllm:\n  provider: gemini\n", encoding="utf-8"
+    )
     result = runner.invoke(app, ["run", "saijo", "--work-dir", str(work)])
     assert result.exit_code != 0
     assert "TENMIN_GEMINI_API_KEY" in out(result)
@@ -306,7 +310,9 @@ def test_init_template_carries_render_defaults(tmp_path):
     assert data["render"]["voice"] == "zh-CN-YunxiNeural"
     assert data["render"]["rate"] == "+0%"
     assert data["render"]["video_encoder"] == "libx264"
-    assert data["render"]["duck_db"] == -12.0
+    assert data["render"]["duck_db"] == -24.0
+    assert data["llm"]["provider"] == "minimax"
+    assert data["llm"]["model"] == "MiniMax-M3"
     assert data["render"]["font_size"] == 52
     assert data["render"]["fade_out_seconds"] == 1.5
     assert data["render"]["outro_card_seconds"] == 3.0
@@ -389,6 +395,7 @@ def test_init_output_has_no_keys_the_models_do_not_know(work):
     runner.invoke(app, ["init", "saijo", "--work-dir", str(work)])
     data = yaml.safe_load((work / "saijo" / "project.yaml").read_text(encoding="utf-8"))
 
+    assert data == ProjectConfig(show="saijo", slug="saijo").model_dump(mode="json")
     assert set(data) <= set(ProjectConfig.model_fields)
     assert set(data["llm"]) <= set(LLMConfig.model_fields)
     assert set(data["render"]) <= set(RenderConfig.model_fields)
@@ -1090,7 +1097,13 @@ def test_registering_keeps_the_init_header_comments(work, tmp_path, monkeypatch)
         for line in difflib.ndiff(before.splitlines(), after.splitlines())
         if line.startswith("- ")
     ]
-    assert removed == ["- episodes: []"]
+    assert "- episodes: []" in removed
+    # ruamel 将显式 null 规范化为空值；其余配置在登记后必须语义不变。
+    before_data = yaml.safe_load(before)
+    after_data = yaml.safe_load(after)
+    before_data.pop("episodes")
+    after_data.pop("episodes")
+    assert after_data == before_data
 
 
 def _ocr_project_with_dialogue(work, *, hardsub_line: str = "") -> None:

@@ -1,0 +1,299 @@
+# tenmin 完整配置参考。数值与程序默认值一致，项目名称 demo 仅为示例。
+# 可复制为 work/<项目名>/project.yaml，修改 show/slug 并登记视频。
+# 路径相对于 project.yaml 所在目录解析；绝对路径原样使用。
+# null 表示未配置；API key 放 .env，不写在本文件中。
+
+# 番剧名称，供解说提示词使用。
+show: demo
+# 项目标识，通常与 work 下的目录名一致。
+slug: demo
+# 制作模式：single_episode / season。
+mode: single_episode
+# 目标解说时长，单位秒；实际成片受配音、留白和片尾影响。
+target_seconds: 240.0
+# 文本规范化设置。
+locale:
+  # 字幕繁体转简体；ASR 来源不经过 ingest 的繁转简路径。
+  convert_traditional: true
+# 集列表。默认空列表；用 tenmin run demo --episode 1 --video <路径> 登记。
+# 每集全部属性示例（取消注释后替换真实路径）：
+# - number: 1                 # 集号，必填。
+#   srt: null                 # 手传 SRT；null 自动从视频获取对白。
+#   video: null               # 源视频路径；渲染需要视频。
+#   op_range: null            # OP [起点秒, 终点秒]，如 [63, 153]。
+#   ed_range: null            # ED [起点秒, 终点秒]；建议与 OP 成对填写。
+#   hardsub: null             # true/false 显式声明硬字幕；null 跟随 ocr.enabled。
+episodes: []
+# 手写术语/人名表：原文 → 简中译名，如 猫猫: 猫猫；优先于翻译累积表。
+glossary: {}
+# 正式名 → 外号列表，如 猫猫: [雀斑女]；只约束解说，不用于 OCR/翻译。
+aliases: {}
+# animeko 条目正整数 ID；null 不联网。run 的 ingest 前缓存优先补人名，只追加。
+animeko_subject: null
+
+# LLM：解说、翻译及可选 OCR 校对共用。
+llm:
+  # 服务类型：minimax / gemini / openai_compatible。
+  provider: minimax
+  # 模型名称，必须与 provider 匹配。
+  model: MiniMax-M3
+  # OpenAI 兼容服务地址；null 使用对应 provider 的默认地址。
+  base_url: null
+  # MiniMax 深度思考：disabled / adaptive。
+  thinking: disabled
+  # 采样温度，非负；null 不发送该参数，使用服务端默认值。
+  temperature: null
+  # 单次输出 token 上限，正整数；null 使用服务端默认值。
+  max_output_tokens: null
+  # 请求体写入超时，秒；不是完整生成时长。
+  timeout_seconds: 120.0
+  # 相邻流式数据块的读取等待上限，秒。
+  read_timeout_seconds: 120.0
+  # 单次 HTTP 请求的整体截止时间，秒。
+  total_timeout_seconds: 1200.0
+  # schema 修复总尝试次数，含首次；1 关闭 schema 重试。
+  max_attempts: 3
+  # 网络/限流等传输层总尝试次数，含首次；1 关闭传输重试。
+  transport_max_attempts: 4
+  # 时长预算允许偏差比例，0.12 表示 12%。
+  budget_tolerance: 0.12
+  # 解说语义校验失败后的额外重试次数；0 不重试。
+  validation_retries: 2
+  # 时长预算返工轮数；0 仅提示预算问题，不返工。
+  budget_rewrite_rounds: 1
+  # 批量制作的解说预取并发数；1 串行，调高会增加限流与失败调用成本。
+  script_concurrency: 1
+
+# 对白轨规范化：合并被硬换行切断的续句。
+ingest:
+  # 可合并续句之间的最大间隔，秒。
+  merge_max_gap: 0.3
+  # 续句合并的字符数阈值。
+  merge_max_chars: 40
+  # 参与续行合并的单条字幕时长上限，秒。
+  merge_max_line_seconds: 4.0
+
+# OP/ED 区间及 staff 文字剔除。启发式阈值一般保持默认。
+credits:
+  # OP 起点参考截图；import/run 自动匹配使用，null 不配置此侧截图。
+  op_reference: null
+  # ED 起点参考截图；同上。截图应有辨识度，避开黑场/通用 logo。
+  ed_reference: null
+  # 单集或音频测不出 OP 长度时的估计长度，秒，必须大于 0。
+  op_length: 90.0
+  # 字幕聚簇 OP 候选起点的搜索下限，秒；不是截图匹配搜索窗。
+  op_search_start: 30.0
+  # 字幕聚簇 OP 候选起点的搜索上限，秒。
+  op_search_end: 300.0
+  # 没有手填区间时，片头 staff 判定盲窗长度，秒。
+  credit_head_window: 300.0
+  # 合格 OP 字幕簇的最小跨度，秒。
+  op_span_min: 40.0
+  # 合格 OP 字幕簇的最大跨度，秒。
+  op_span_max: 120.0
+  # ED 字幕簇起点距片尾的最大距离，秒。
+  ed_cluster_tail_seconds: 120.0
+  # 没有手填区间时，片尾 staff 判定盲窗长度，秒。
+  ed_keyword_window_seconds: 80.0
+  # 两个盲窗覆盖片长的比例上限，(0,1]；不收缩手填区间。
+  credit_window_max_ratio: 0.5
+  # 相邻 staff 行并入同一簇的最大间隔，秒。
+  cluster_max_gap: 35.0
+  # 无对白静区推断 OP 时允许的最短跨度，秒。
+  op_min_silent_span: 60.0
+  # 无对白静区推断 OP 时允许的最长跨度，秒。
+  op_max_silent_span: 120.0
+  # 书名号内文字与剧名的字符重合率阈值，[0,1]。
+  title_overlap_threshold: 0.6
+  # 标题卡识别的文本长度上限，字符数。
+  title_card_max_len: 24
+  # 纯人名列表判为 staff 的最少 CJK 字数。
+  name_list_min_cjk: 6
+  # 分段数达到此值时，使用下面较低的 CJK 字数阈值。
+  name_list_many_segments: 4
+  # 多段人名列表判为 staff 的最少 CJK 字数。
+  name_list_many_min_cjk: 4
+  # staff 判定的拉丁字母比例阈值，[0,1]。
+  latin_ratio_threshold: 0.6
+  # 拉丁字母比例规则生效所需的最小非空白长度。
+  latin_min_len: 6
+  # 项目默认 OP [起点秒, 终点秒]；逐集值优先，null 使用推断/截图匹配。
+  default_op_range: null
+  # 项目默认 ED 区间；如 [1340, null] 表示从 1340 秒到各集片尾。
+  default_ed_range: null
+  # 手填区间前后供 staff 判定使用的余量，秒。
+  manual_window_margin: 5.0
+
+# 对白间隙、密度变化等高能点信号。
+signals:
+  # 记录无对白间隙的最短长度，秒；不是音频静音检测。
+  min_gap_seconds: 3.0
+  # 间隙达到此秒数时赋强度 4。
+  gap_strong_seconds: 15.0
+  # 间隙达到此秒数时赋强度 3，否则为 2。
+  gap_medium_seconds: 8.0
+  # 低对白密度阈值相对全片密度中位数的比例。
+  low_density_ratio: 0.4
+  # 低对白密度信号的最短时长，秒。
+  low_density_min_seconds: 2.0
+  # 低对白密度信号强度，1–5。
+  low_density_strength: 3
+  # 语速/对白密度变化的分析窗口，秒。
+  shift_window_seconds: 30.0
+  # 密度变化的标准化偏差阈值。
+  shift_z_threshold: 1.5
+  # 密度变化信号强度，1–5。
+  shift_strength: 2
+  # 聚合信号的时间分离阈值，秒。
+  min_separation: 2.0
+  # 高能点摘要最大字符数。
+  summary_max_chars: 30
+
+# 解说稿校验与修复阈值；并非所有超限都会中断制作。
+validate_script:
+  # 分幕节点数量下限，低于此值可触发语义返工。
+  min_beats: 3
+  # 分幕节点数量上限，用于质量提示。
+  max_beats: 8
+  # 全片留白数量上限，超限可触发语义返工。
+  max_holds: 8
+  # clip 与锚点字幕起点的最大允许偏差，秒；超出后按锚点修正。
+  anchor_tolerance_seconds: 5.0
+  # 可用 clip 的最短长度，秒；过短片段丢弃。
+  min_clip_seconds: 1.5
+  # 留白与候选画面之间的最大允许间隔，秒。
+  hold_clip_max_gap_seconds: 3.0
+  # 相邻节点画面起点倒退超过此秒数时提示。
+  timeline_regression_max_seconds: 60.0
+  # 旁白跨度/画面时长的宽松上限，超限提示。
+  stretch_max: 4.0
+  # 旁白跨度/画面时长的下限，低于时提示。
+  stretch_min: 0.125
+  # 比宽松上限更严格的拉伸阈值，超限可触发语义返工。
+  retry_stretch_max: 1.5
+
+# 配音、混音、字幕与视频渲染。
+render:
+  # Edge TTS 音色名称。
+  voice: zh-CN-YunxiNeural
+  # TTS 语速，相对默认速度的百分比字符串，如 +10% / -10%。
+  rate: +0%
+  # FFmpeg 视频编码器，常用 libx264 或 h264_videotoolbox。
+  video_encoder: libx264
+  # 旁白期间原声衰减量，dB；越负原声越小。
+  duck_db: -24.0
+  # 烧录字幕字号，与输出画布分辨率相关。
+  font_size: 52
+  # 结尾淡出时长，秒；0 关闭淡出。
+  fade_out_seconds: 1.5
+  # 结尾黑卡时长，秒；0 不加黑卡。
+  outro_card_seconds: 3.0
+  # 结尾黑卡文字。
+  outro_message: 解说结束，谢谢观看
+  # 成片宽度，像素；字幕画布使用同一尺寸。
+  width: 1920
+  # 成片高度，像素。
+  height: 1080
+  # 字幕字体族，需在本机安装。
+  subtitle_font_name: Lantinghei SC
+  # 字幕超过此行数时提示；0 关闭行数检查，不会强行截断文字。
+  subtitle_max_lines: 2
+  # 字幕显示短于此秒数时提示；0 关闭检查。
+  subtitle_min_seconds: 0.7
+  # 字幕单句过长的软字符数阈值。
+  subtitle_soft_max_chars: 36
+  # x264 恒定质量值，字符串；越小质量越高、文件通常越大。
+  crf: '20'
+  # x264 编码速度预设，如 medium / faster / veryfast。
+  preset: medium
+  # x264 调优模式，如 animation；空字符串不传 -tune。
+  tune: ''
+  # VideoToolbox 的目标码率；该编码器不使用 x264 的 CRF/preset。
+  videotoolbox_bitrate: 6000k
+  # 混音输出的音频编码器。
+  audio_codec: aac
+  # 混音输出的音频码率。
+  audio_bitrate: 192k
+  # 限幅器线性幅度上限，(0,1]；1 为满刻度。
+  limiter_ceiling: 1.0
+  # 留白原声允许落在旁白响度上下各多少 LU 的舒适带内。
+  hold_relative_lu: 3.0
+  # 留白原声响度补偿的最大增益，dB。
+  hold_gain_max_db: 6.0
+  # 留白原声低于此 LUFS 时作为静音底噪处理，避免过度放大。
+  hold_silence_floor_lufs: -40.0
+  # 留白原声切换时淡入淡出长度，秒。
+  hold_fade_seconds: 0.1
+  # 最终响度归一化目标，LUFS。
+  loudness_i: -14.0
+  # 最终真峰值目标，dBTP。
+  loudness_tp: -1.5
+  # 目标响度范围，LU。
+  loudness_lra: 11.0
+  # 片尾黑卡字体族，独立于字幕字体，需在本机安装。
+  outro_font_name: Lantinghei SC
+  # 每个 TTS chunk 总尝试次数，含首次。
+  tts_max_attempts: 3
+  # TTS chunk 并发数；1 串行。
+  tts_concurrency: 4
+  # TTS 代理地址；null 不显式设置代理。
+  tts_proxy: null
+  # TTS socket 连接超时，整数秒。
+  tts_connect_timeout: 10
+  # TTS socket 接收等待超时，整数秒；不是整个 chunk 的截止时间。
+  tts_receive_timeout: 60
+  # 单个 TTS chunk 合成的整体截止时间，秒。
+  tts_chunk_timeout_seconds: 300.0
+  # 时间轴漂移检查允许的误差，秒。
+  drift_tolerance: 0.5
+  # FFmpeg 可执行文件名称或绝对路径。
+  ffmpeg_path: ffmpeg
+  # FFprobe 可执行文件名称或绝对路径。
+  ffprobe_path: ffprobe
+
+# 语音转写：无字幕来源，或 OCR AI 校对启用 asr_assist 时使用。
+asr:
+  # mlx-whisper 模型仓库；需要 Apple Silicon 和 asr extra，首次可能下载。
+  model: mlx-community/whisper-large-v3-turbo
+  # 源音频语言代码，如 ja / en / zh；不自动检测。
+  language: ja
+
+# 画面硬字幕识别：无手传 SRT/软字幕轨时，按声明进入 OCR。
+# 项目 .ocr.srt 仅按视频 mtime 复用：改 OCR 参数需手动删除旧 .ocr.srt。
+# 独立 tenmin ocr 可用 --force；两种引擎均需 macOS + ocr extra。
+ocr:
+  # 项目片源是否带画面硬字幕；逐集 hardsub 可覆盖。
+  enabled: false
+  # vision / vision_rapid；后者需 rapidocr extra，Vision 定时间轴后 CPU 复识别。
+  engine: vision
+  # 是否调用 LLM 校对 OCR 文字；失败警告、保留原稿，下次重试。
+  ai_correct: false
+  # 每秒目标采样帧数；越大越密，处理通常越慢。
+  sample_fps: 4.0
+  # 字幕区域上沿占原画面高度的比例，(0,1)；0.72 取底部约 28%。
+  crop_top: 0.72
+  # 字幕区域下沿比例，须大于 crop_top；null 不筛下层字幕。
+  # 不物理裁去下半部，而是按识别框中心过滤，适用于上下双语字幕。
+  crop_bottom: null
+  # 文字框中心离画面水平中线的容差，画面宽度比例，(0,0.5]。
+  center_tolerance: 0.08
+  # 相邻采样文本归并为同一句的相似度阈值，(0,1]。
+  similarity: 0.6
+  # 一条字幕至少需要被采到的帧数，正整数。
+  min_frames: 2
+  # Vision 识别语言；zh-Hant 繁中，zh-Hans 简中。当前对白处理针对中文字幕。
+  language: zh-Hant
+  # AI 校对时附语音转写佐证读音，需 ai_correct 与 asr extra。
+  # 复用/生成 E{NN}.asr.srt；转写失败只警告，不阻断校对。
+  asr_assist: false
+
+# 最终成片的本地图片评级粗筛，不是准确的色情概率或整片审核结论。
+content_check:
+  # 是否在制作完成后自动检查；显式 --only check 不受此开关限制。
+  enabled: false
+  # 抽帧间隔，秒，有限正数；越小越密，仍可能漏掉短镜头。
+  sample_interval: 1.0
+  # sensitive 分数候选阈值，[0,1]。
+  sensitive_threshold: 0.5
+  # questionable + explicit 分数之和的候选阈值，[0,1]；两种阈值任一命中。
+  adult_threshold: 0.5

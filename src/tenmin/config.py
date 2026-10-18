@@ -105,8 +105,8 @@ class LocaleConfig(StrictModel):
 
 
 class LLMConfig(StrictModel):
-    provider: Literal["gemini", "minimax", "openai_compatible"] = "gemini"
-    model: str = "gemini-3.6-flash"
+    provider: Literal["gemini", "minimax", "openai_compatible"] = "minimax"
+    model: str = "MiniMax-M3"
     base_url: str | None = None
     # MiniMax-M3 默认打开"深度思考"，会先吐一大段 <think>…</think> 推理块再出正文，
     # 而这段推理内容目前直接被丢弃（见 script/llm.py 的 _strip_reasoning），纯粹是
@@ -382,7 +382,7 @@ class RenderConfig(StrictModel):
     voice: str = "zh-CN-YunxiNeural"
     rate: str = "+0%"
     video_encoder: str = "libx264"
-    duck_db: float = -12.0
+    duck_db: float = -24.0
     font_size: int = Field(default=52, gt=0)
     fade_out_seconds: float = Field(default=1.5, ge=0)
     outro_card_seconds: float = Field(default=3.0, ge=0)

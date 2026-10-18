@@ -999,7 +999,7 @@ async def test_generate_script_records_the_draft_and_the_budget_rewrite(cfg, tra
     assert usage[0].cached_tokens == 800
     assert usage[1].cached_tokens is None
     assert usage[1].requests == 2
-    assert all(record.provider == "gemini" for record in usage)
+    assert all(record.provider == cfg.llm.provider for record in usage)
     assert all(record.model == cfg.llm.model for record in usage)
     assert all(record.ok and record.elapsed_seconds >= 0.0 for record in usage)
 

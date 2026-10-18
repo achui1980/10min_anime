@@ -3479,7 +3479,7 @@ async def test_run_script_writes_a_usage_file(project):
     assert data["episode"] == 2
     assert [call["round"] for call in data["calls"]] == ["draft"]
     call = data["calls"][0]
-    assert call["provider"] == "gemini"
+    assert call["provider"] == project.llm.provider
     assert call["prompt_tokens"] is None
     assert call["completion_tokens"] is None
     assert call["cached_tokens"] is None

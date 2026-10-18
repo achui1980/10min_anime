@@ -2177,7 +2177,9 @@ async def test_gemini_honours_retry_after_header(monkeypatch, sleeps):
 
 
 def test_build_provider_wires_transport_max_attempts_into_gemini():
-    provider = build_provider(LLMConfig(transport_max_attempts=2), Settings(gemini_api_key="k"))
+    provider = build_provider(
+        LLMConfig(provider="gemini", transport_max_attempts=2), Settings(gemini_api_key="k")
+    )
     assert provider.transport_max_attempts == 2
 
 

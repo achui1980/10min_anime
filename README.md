@@ -70,8 +70,7 @@ ffmpeg -hide_banner -filters | grep -w subtitles   # 能匹配到才算装对
 
 ## LLM 配置
 
-默认用 Gemini（`TENMIN_GEMINI_API_KEY`）。也支持切到 MiniMax，在
-`project.yaml` 里把 `llm.provider` 设成 `minimax`：
+默认使用 MiniMax / `MiniMax-M3`（`TENMIN_MINIMAX_API_KEY`）：
 
 ```yaml
 llm:
@@ -84,6 +83,9 @@ llm:
 ```
 TENMIN_MINIMAX_API_KEY=your-key-here
 ```
+
+也支持 Gemini：将 `llm.provider` 设为 `gemini`、`llm.model` 设为所需 Gemini 模型，
+并配置 `TENMIN_GEMINI_API_KEY`。
 
 ### 使用其他 OpenAI 兼容模型（如 DeepSeek）
 
@@ -130,6 +132,13 @@ uv run tenmin run --help
 | `tenmin import <slug> <目录>` | 批量配对视频与字幕、识别集号与 OP/ED，确认后登记并运行 | 是 |
 
 ### 创建项目：`init`
+
+生成的 `work/<slug>/project.yaml` 列出全部项目属性、所有嵌套配置和默认值，
+每项的中文用途、单位及生效条件见 [完整配置示例](project.example.yaml)。
+可选值为 `null`，空列表和字典为 `[]`、`{}`。`episodes` 保持空列表，文件注释提供
+包含全部单集属性的示例；字段直接来自配置模型，新增配置会自动出现在新建项目中。
+默认 `llm.provider: minimax`、`llm.model: MiniMax-M3`、`render.duck_db: -24.0`。
+已有 YAML 不会被 init 改写；未显式填写这些字段的项目也使用上述程序默认值。
 
 ```bash
 uv run tenmin init saijo

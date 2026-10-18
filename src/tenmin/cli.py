@@ -115,49 +115,12 @@ VIDEO_OPTION = typer.Option(
     help="要注册的视频文件路径，需配合 --episode；不传 --srt 就是生肉入口",
 )
 
-PROJECT_TEMPLATE_FIELDS: dict[str, Any] = {
-    "show": True,
-    "slug": True,
-    "mode": True,
-    "target_seconds": True,
-    "locale": True,
-    "episodes": True,
-    "glossary": True,
-    "llm": {"provider", "model"},
-    "content_check": True,
-    "render": {
-        "voice",
-        "rate",
-        "video_encoder",
-        "duck_db",
-        "font_size",
-        "fade_out_seconds",
-        "outro_card_seconds",
-        "outro_message",
-    },
-}
-"""tenmin init 生成的 project.yaml 里登场哪些字段。
-
-这里只挑**字段名**，值一律由 ProjectConfig 现场算（见 build_project_template），
-所以「改了 config.py 的默认值、忘了改 cli.py 的模板」这类漂移不可能再发生——
-原实现是把 show/mode/target_seconds/llm/render 的默认值全部手抄一遍的字面量 dict。
-
-为什么不整份 model_dump（那样连字段名都不用挑）：ProjectConfig 底下现在有
-ingest(3) / credits(21) / signals(11) / validate_script(8) / render(30) / llm(15)
-/ asr(2) / ocr(7) 九十来个调参旋钮，全吐出来的 project.yaml 没人能读，而这个文件是用户的
-主要编辑面。
-
-为什么挑漏了不要紧：漏掉的字段照样走模型默认值，行为完全不变，只是「没在模板里
-被推荐」而已，用户想调时补一行就生效。也就是说这张表过期是良性的（少一句广告），
-而原来那份手抄值过期是有害的（磁盘上落一个错的默认值）。全部旋钮见 config.py。
-"""
-
 # 放在 yaml 正文前面的注释块。episodes 刻意是空的（见 build_project_template），
 # 所以「怎么加一集」必须就地说清楚。
 PROJECT_TEMPLATE_HEADER = """\
-# tenmin 项目配置。这里只列了最常改的旋钮，值全部取自 tenmin 的默认配置。
-# ingest / credits / signals / render 底下还有几十个阈值可以在这里覆盖，
-# 完整清单见 src/tenmin/config.py（那是全项目经验阈值的唯一权威来源）。
+# tenmin 项目配置。列出全部项目属性及嵌套默认值，来源为 src/tenmin/config.py。
+# 每个属性的中文说明、单位和生效条件见仓库根目录 project.example.yaml。
+# null 表示未配置；[] 和 {{}} 分别表示空列表和空字典。episodes 保持为空，按需登记。
 #
 # 登记一集（推荐，路径会自动填好；源片不会被拷进 work/，只记它的绝对路径）：
 #   tenmin run {slug} --episode 2 --srt <字幕路径> --video <源片路径>
@@ -171,6 +134,9 @@ PROJECT_TEMPLATE_HEADER = """\
 #   - number: 2
 #     srt: srt/E02.srt
 #     video: /abs/path/to/E02.mkv
+#     op_range: null
+#     ed_range: null
+#     hardsub: null
 """
 
 
@@ -187,9 +153,7 @@ def build_project_template(slug: str) -> dict[str, Any]:
     变成 [示例, 真的那集]，不带 --episode 的批处理模式就会去跑那个指向不存在的
     srt/E02.srt 的幽灵条目。手写 episodes 的形状见 PROJECT_TEMPLATE_HEADER。
     """
-    return ProjectConfig(show=slug, slug=slug).model_dump(
-        mode="json", include=PROJECT_TEMPLATE_FIELDS
-    )
+    return ProjectConfig(show=slug, slug=slug).model_dump(mode="json")
 
 
 def _project_file(work_dir: Path, slug: str) -> Path:

@@ -123,7 +123,7 @@ def test_load_project_minimal_applies_defaults(tmp_path):
     assert cfg.target_seconds == pytest.approx(240.0)
     assert cfg.locale.convert_traditional is True
     assert cfg.glossary == {}
-    assert cfg.llm.provider == "gemini"
+    assert cfg.llm.provider == "minimax"
 
 
 def test_load_project_missing_file(tmp_path):
@@ -191,8 +191,8 @@ def test_project_config_is_constructible_in_memory():
 
 def test_llm_config_base_url_defaults_to_none():
     cfg = LLMConfig()
-    assert cfg.provider == "gemini"
-    assert cfg.model == "gemini-3.6-flash"
+    assert cfg.provider == "minimax"
+    assert cfg.model == "MiniMax-M3"
     assert cfg.base_url is None
 
 
@@ -281,7 +281,7 @@ def test_render_config_defaults():
     assert cfg.voice == "zh-CN-YunxiNeural"
     assert cfg.rate == "+0%"
     assert cfg.video_encoder == "libx264"
-    assert cfg.duck_db == -12.0
+    assert cfg.duck_db == -24.0
     assert cfg.font_size == 52
     assert cfg.fade_out_seconds == 1.5
     assert cfg.outro_card_seconds == 3.0
