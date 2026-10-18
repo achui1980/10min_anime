@@ -282,7 +282,7 @@ ocr:
   # 一条字幕至少需要被采到的帧数，正整数。
   min_frames: 2
   # Vision 识别语言；zh-Hant 繁中，zh-Hans 简中。当前对白处理针对中文字幕。
-  language: zh-Hant
+  language: zh-Hans
   # AI 校对时附语音转写佐证读音，需 ai_correct 与 asr extra。
   # 复用/生成 E{NN}.asr.srt；转写失败只警告，不阻断校对。
   asr_assist: false

@@ -621,7 +621,7 @@ uv run tenmin inspect akujo --episode 11
 | `center_tolerance` | `0.08` | 文字框中心离画面中线超过这个比例就丢掉（挡两侧 staff 字） |
 | `similarity` | `0.6` | 相邻帧文字相似度不低于它就算同一条字幕 |
 | `min_frames` | `2` | 少于这么多帧出现的识别结果当噪声丢掉 |
-| `language` | `zh-Hant` | 识别语言（Vision 的语言代码） |
+| `language` | `zh-Hans` | 识别语言（默认简中；繁中可设 `zh-Hant`） |
 
 一条字幕都没认出来时会报错并提示检查 `ocr.crop_top`。
 

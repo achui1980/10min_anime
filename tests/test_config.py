@@ -712,7 +712,7 @@ def test_ocr_config_defaults():
         cfg.similarity,
         cfg.min_frames,
         cfg.language,
-    ) == (False, 4.0, 0.72, None, 0.08, 0.6, 2, "zh-Hant")
+    ) == (False, 4.0, 0.72, None, 0.08, 0.6, 2, "zh-Hans")
 
 
 def test_project_config_carries_an_ocr_section():
