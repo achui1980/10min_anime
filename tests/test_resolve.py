@@ -84,6 +84,25 @@ def _touch_relative_to(target: Path, video: Path, delta: float) -> None:
     os.utime(target, (when, when))
 
 
+def test_switching_ocr_engine_preserves_fresh_project_cache(tmp_path, stub):
+    calls, _ = stub
+    video = _video(tmp_path)
+    cache = _ocr_cache(tmp_path)
+    cache.parent.mkdir()
+    cache.write_text("1\n00:00:01,000 --> 00:00:02,000\n人工字幕\n")
+    _touch_relative_to(cache, video, 10)
+    before = (cache.read_bytes(), cache.stat().st_mtime_ns)
+
+    source = resolve.resolve_subtitle_source(
+        None, video, cache=_cache(tmp_path), asr_config=AsrConfig(),
+        hardsub=True, ocr_cache=cache, ocr_config=OcrConfig(engine="vision_rapid"),
+    )
+
+    assert source == resolve.SubtitleSource(cache, "ocr")
+    assert not calls["recognize"] and not calls["transcribe"]
+    assert (cache.read_bytes(), cache.stat().st_mtime_ns) == before
+
+
 def test_a_handed_srt_wins_and_nothing_is_probed(tmp_path, stub):
     calls, _ = stub
     srt = tmp_path / "hand.srt"

@@ -31,7 +31,8 @@ def _fake_recognize(monkeypatch, *, fail: dict[str, Exception] | None = None) ->
     fail = fail or {}
 
     def fake(video, *, ocr, ffmpeg_path, ffprobe_path):
-        calls.append({"video": Path(video), "ocr": ocr})
+        calls.append({"video": Path(video), "ocr": ocr,
+                      "ffmpeg_path": ffmpeg_path, "ffprobe_path": ffprobe_path})
         if Path(video).name in fail:
             raise fail[Path(video).name]
         return [
@@ -191,6 +192,130 @@ def test_the_config_reaches_recognition(tmp_path, monkeypatch):
     ocr_batch.run_batch([video], out_dir=None, simplified=True, force=False, ocr_config=config)
 
     assert calls[0]["ocr"] is config
+
+
+@pytest.mark.parametrize("corrected", [False, True])
+def test_combo_batch_forwards_custom_media_paths(tmp_path, monkeypatch, corrected):
+    calls = _fake_recognize(monkeypatch)
+    video = _touch(tmp_path / "a.mp4")
+    config = OcrConfig(engine="vision_rapid")
+    kwargs = {
+        "out_dir": None, "simplified": True, "force": False, "ocr_config": config,
+        "ffmpeg_path": "custom/ffmpeg", "ffprobe_path": "custom/ffprobe",
+    }
+    if corrected:
+        def missing_key():
+            raise RuntimeError("缺 key")
+        asyncio.run(ocr_batch.run_batch_corrected(
+            [video], provider_factory=missing_key, llm_config=LLMConfig(), **kwargs
+        ))
+    else:
+        ocr_batch.run_batch([video], **kwargs)
+    assert calls == [{"video": video, "ocr": config,
+                      "ffmpeg_path": "custom/ffmpeg", "ffprobe_path": "custom/ffprobe"}]
+
+
+def test_switching_engine_reuses_fresh_srt_until_cli_force(tmp_path, monkeypatch):
+    calls = _fake_recognize(monkeypatch)
+    video = _touch(tmp_path / "a.mp4", mtime=1000)
+    dest = _touch(tmp_path / "a.zh-Hans.srt", mtime=2000, data=b"human subtitle")
+    before = (dest.read_bytes(), dest.stat().st_mtime_ns)
+
+    result = runner.invoke(app, ["ocr", str(video), "--engine", "vision_rapid"])
+    assert result.exit_code == 0, result.output
+    assert not calls
+    assert (dest.read_bytes(), dest.stat().st_mtime_ns) == before
+
+    result = runner.invoke(app, ["ocr", str(video), "--engine", "vision_rapid", "--force"])
+    assert result.exit_code == 0, result.output
+    assert len(calls) == 1 and calls[0]["ocr"].engine == "vision_rapid"
+
+
+def test_switching_engine_preserves_human_corrected_subtitles(tmp_path, monkeypatch):
+    calls = _fake_recognize(monkeypatch)
+    video = _touch(tmp_path / "a.mp4", mtime=1000)
+
+    class Provider:
+        async def complete(self, system, user, schema):
+            return schema.model_validate({"lines": []})
+
+    kwargs = {
+        "out_dir": None, "simplified": True, "force": False,
+        "provider_factory": Provider, "llm_config": LLMConfig(),
+    }
+    asyncio.run(ocr_batch.run_batch_corrected([video], ocr_config=OcrConfig(), **kwargs))
+    final = tmp_path / "a.zh-Hans.srt"
+    final.write_text(final.read_text().replace("我们这里见", "人工校对稿"))
+    raw = tmp_path / "a.zh-Hans.raw.srt"
+    before = {p: (p.read_bytes(), p.stat().st_mtime_ns) for p in (raw, final)}
+
+    summary = asyncio.run(ocr_batch.run_batch_corrected(
+        [video], ocr_config=OcrConfig(engine="vision_rapid"), **kwargs
+    ))
+    assert summary.skipped == [video]
+    assert len(calls) == 1
+    assert {p: (p.read_bytes(), p.stat().st_mtime_ns) for p in (raw, final)} == before
+
+
+@pytest.mark.parametrize("corrected", [False, True])
+@pytest.mark.parametrize("unavailable", [False, True])
+def test_real_combo_batch_failure_preserves_outputs_and_error_policy(
+    tmp_path, monkeypatch, corrected, unavailable
+):
+    from tenmin.ingest import rapid
+
+    # Exercise the real shared facade and both publication paths; only media/Vision are faked.
+    monkeypatch.setattr(ocr.ffmpeg, "probe_frame_rate", lambda *a, **kw: 4.0)
+    monkeypatch.setattr(ocr.ffmpeg, "probe_duration", lambda *a, **kw: 1.0)
+    monkeypatch.setattr(ocr.ffmpeg, "probe_video_size", lambda *a, **kw: (1280, 720))
+    monkeypatch.setattr(ocr, "_recognize", lambda *a, **kw: [
+        ocr.TextBox("原文", 0.35, 0.2, 0.3, 0.15)
+    ])
+
+    def frames(args, *, on_frame, **kwargs):
+        on_frame(b"frame")
+        on_frame(b"frame")
+        return "n: 0 pts: 0 pts_time:0\nn: 1 pts: 1 pts_time:0.25\n"
+
+    monkeypatch.setattr(ocr.ffmpeg, "run_raw_frames", frames)
+    refined = []
+    error_type = ocr.OCRUnavailableError if unavailable else ocr.OCRError
+
+    def refine(video, cues, **kwargs):
+        refined.append(video)
+        if video.name == "a.mp4":
+            raise error_type("RapidOCR 失败")
+        return cues
+
+    monkeypatch.setattr(rapid, "refine_cues", refine)
+    videos = [_touch(tmp_path / name) for name in ("a.mp4", "b.mp4")]
+    dest = _touch(tmp_path / "a.zh-Hans.srt", data=b"human final")
+    raw = _touch(tmp_path / "a.zh-Hans.raw.srt", data=b"human raw")
+    before = {p: (p.read_bytes(), p.stat().st_mtime_ns) for p in (dest, raw)}
+    kwargs = {
+        "out_dir": None, "simplified": True, "force": True,
+        "ocr_config": OcrConfig(engine="vision_rapid"),
+    }
+
+    def run():
+        if corrected:
+            def missing_key():
+                raise RuntimeError("缺 key")
+            return asyncio.run(ocr_batch.run_batch_corrected(
+                videos, provider_factory=missing_key, llm_config=LLMConfig(), **kwargs
+            ))
+        return ocr_batch.run_batch(videos, **kwargs)
+
+    if unavailable:
+        with pytest.raises(ocr.OCRUnavailableError, match="RapidOCR 失败"):
+            run()
+        assert refined == videos[:1]
+    else:
+        summary = run()
+        assert summary.failed == [(videos[0], "RapidOCR 失败")]
+        assert summary.done == videos[1:]
+        assert refined == videos
+    assert {p: (p.read_bytes(), p.stat().st_mtime_ns) for p in (dest, raw)} == before
 
 
 # --- CLI ----------------------------------------------------------------------

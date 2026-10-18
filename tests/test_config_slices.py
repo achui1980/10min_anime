@@ -151,6 +151,22 @@ def test_a_whole_subconfig_entry_drops_the_excluded_knobs(tmp_path):
     assert data["llm"]["budget_rewrite_rounds"] == 1
 
 
+def test_adding_default_ocr_engine_only_changes_legacy_ingest_slice(tmp_path, monkeypatch):
+    cfg = _cfg(tmp_path)
+    current = _payloads(cfg)
+    original_dump = ProjectConfig.model_dump
+
+    def legacy_dump(self, **kwargs):
+        data = original_dump(self, **kwargs)
+        del data["ocr"]["engine"]
+        return data
+
+    monkeypatch.setattr(ProjectConfig, "model_dump", legacy_dump)
+    legacy = _payloads(cfg)
+    assert {stage for stage in current if current[stage] != legacy[stage]} == {"ingest"}
+    assert json.loads(current["ingest"])["ocr"]["engine"] == "vision"
+
+
 def test_import_references_preserve_legacy_ingest_payload(tmp_path):
     cfg = _cfg(tmp_path)
     payload = slice_payload(cfg, "ingest", cfg.episodes[0])
@@ -217,6 +233,7 @@ def test_changing_an_excluded_knob_changes_no_slice(tmp_path, field):
         ("credits.op_span_min", 30.0, {"ingest"}),
         ("asr.language", "en", {"ingest"}),
         ("ocr.enabled", True, {"ingest"}),
+        ("ocr.engine", "vision_rapid", {"ingest"}),
         ("ocr.crop_top", 0.7, {"ingest"}),
         ("ocr.crop_bottom", 0.95, {"ingest"}),
         ("content_check.enabled", True, {"check"}),

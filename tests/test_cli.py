@@ -20,6 +20,49 @@ def out(result) -> str:
     return text
 
 
+@pytest.mark.parametrize("engine", [None, "vision", "vision_rapid"])
+@pytest.mark.parametrize("corrected", [False, True])
+def test_ocr_cli_passes_engine_and_crop_settings(tmp_path, monkeypatch, engine, corrected):
+    from tenmin.ingest.ocr_batch import BatchSummary
+
+    video = tmp_path / "episode.mp4"
+    video.touch()
+    calls = []
+
+    def fake_batch(videos, **kwargs):
+        calls.append(kwargs["ocr_config"])
+        return BatchSummary(done=list(videos))
+
+    async def fake_corrected(videos, **kwargs):
+        return fake_batch(videos, **kwargs)
+
+    monkeypatch.setattr("tenmin.cli.ocr_batch.run_batch", fake_batch)
+    monkeypatch.setattr("tenmin.cli.ocr_batch.run_batch_corrected", fake_corrected)
+    args = ["ocr", str(video), "--crop-top", "0.6", "--crop-bottom", "0.9"]
+    if engine is not None:
+        args += ["--engine", engine]
+    if corrected:
+        args += ["--ai-correct"]
+
+    result = runner.invoke(app, args)
+
+    assert result.exit_code == 0, out(result)
+    assert len(calls) == 1
+    assert calls[0].engine == (engine or "vision")
+    assert calls[0].crop_top == 0.6
+    assert calls[0].crop_bottom == 0.9
+
+
+def test_ocr_cli_rejects_invalid_engine_before_collecting_videos(monkeypatch):
+    monkeypatch.setattr(
+        "tenmin.cli.ocr_batch.collect_videos", lambda _: pytest.fail("invalid engine reached IO")
+    )
+    result = runner.invoke(app, ["ocr", "missing.mp4", "--engine", "rapid"])
+    assert result.exit_code == 2
+    assert "--engine" in out(result)
+    assert "vision_rapid" in out(result)
+
+
 @pytest.fixture
 def work(tmp_path):
     return tmp_path / "work"

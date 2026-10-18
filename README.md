@@ -49,6 +49,18 @@ uv sync --extra ocr
 `uv sync --extra asr --extra ocr`。不装也能跑 `tenmin --help`，真走到画面 OCR 时会报一句
 「跑一次 `uv sync --extra ocr` 再试」。
 
+可选的 Vision + RapidOCR 模式先由 Vision 定时间轴，再逐条用中点帧复识别文字：
+
+```bash
+uv sync --extra ocr --extra rapidocr
+uv run --extra ocr --extra rapidocr tenmin ocr "视频.mp4" --engine vision_rapid
+```
+
+两种模式都依赖 Apple Vision，仍仅支持 macOS；RapidOCR 固定使用 ONNX CPU，关闭方向分类，
+不使用 CoreML/CUDA。首次使用可能下载模型，之后复用 RapidOCR 本地模型缓存；未装该 extra
+不影响默认 `vision` 和 CLI 帮助。复识别可能修对字，也可能引入新错，实测与边界见
+[Vision + RapidOCR 验收记录](docs/vision-rapid-validation.md)。
+
 渲染阶段需要编入 libass 的 ffmpeg（否则烧不了字幕）：
 
 ```bash
@@ -187,6 +199,7 @@ uv run --extra ocr tenmin ocr "视频.mp4" --ai-correct
 | 参数 | 含义 |
 |---|---|
 | `-o` / `--output <目录>` | SRT 输出目录；默认在视频旁 |
+| `--engine vision` / `--engine vision_rapid` | 默认 `vision`；组合模式另需 `rapidocr` extra |
 | `--simplified` / `--traditional` | 默认输出简体；后者保留繁体原文 |
 | `--crop-top <比例>` | 字幕带上沿，默认 `0.72` |
 | `--crop-bottom <比例>` | 字幕带下沿，默认不限 |
@@ -498,6 +511,7 @@ rm work/<slug>/srt/E11.asr.srt
 ```yaml
 ocr:
   enabled: true          # 这部番的片源带硬字幕
+  engine: vision_rapid   # 可选；默认 vision。组合模式需 ocr + rapidocr extras
 episodes:
   - number: 11
     video: /path/to/[ANi] 我是不才惡女 - 11 [1080P][Baha][WEB-DL][AAC AVC][CHT].mp4
@@ -514,6 +528,7 @@ episodes:
   没认出来时会报错并提示检查 `ocr.crop_top`（裁剪区要框住画面底部的字幕）。
 - **`E{NN}.ocr.srt` 跟 `.asr.srt` 一样只按 mtime 复用、不看 `ocr` 配置**：认错的字直接手改
   那份文件，下次照样复用；改了 `ocr.*` 参数想重认，得自己 `rm work/<slug>/srt/E11.ocr.srt`。
+  切换 `engine` 也一样；管线 `--force` 不会使这份 OCR 缓存失效。先备份手改内容，再删除原稿重认。
 - **要手填 OP/ED 区间**（见「标注 OP / ED 区间」）：OCR 会把画面**居中**的 staff 字（监督、
   原作、ED 里的大块名单）一起认进来，左右两侧的才会被自动挡掉；剩下那批靠手填的
   `op_range` / `ed_range` 或 `credits.default_*` 去剔除。
@@ -569,6 +584,7 @@ uv run tenmin inspect akujo --episode 11
 | 字段 | 默认 | 含义 |
 |---|---|---|
 | `enabled` | `false` | 项目级声明这部番带硬字幕；逐集 `hardsub` 优先 |
+| `engine` | `vision` | `vision_rapid` 在 Vision 合帧后逐条复识别，保持条数、顺序与时间；空文本保留 Vision 原文 |
 | `ai_correct` | `false` | 可选 AI 文字校对；成功稿进入后续流程，失败警告并使用原稿 |
 | `asr_assist` | `false` | AI 校对时附上日语语音转写确认读音（需 asr extra） |
 | `sample_fps` | `4.0` | 每秒抽几帧去识别（与片源帧率无关，24/30/60/120fps 都是每秒 4 帧） |
@@ -603,6 +619,7 @@ uv run tenmin ocr ep01.mp4 --crop-top 0.65 --force
 | 参数 | 默认 | 含义 |
 |---|---|---|
 | `-o` / `--output` | 视频旁边 | SRT 输出目录 |
+| `--engine` | `vision` | `vision` / `vision_rapid`；组合模式需 `ocr` 与 `rapidocr` extras |
 | `--simplified` / `--traditional` | `--simplified` | 繁转简（OpenCC，与 ingest 同一个转换器）/ 保留繁体 |
 | `--force` | 关 | 输出已存在也重新识别 |
 | `--crop-top` | `0.72` | 同上表的 `crop_top`；其余旋钮用默认值 |
@@ -614,6 +631,8 @@ uv run tenmin ocr ep01.mp4 --crop-top 0.65 --force
 
 - 输出名带语言后缀：简体 `<文件名>.zh-Hans.srt`，繁体 `<文件名>.zh-Hant.srt`，两种都跑也不会互相覆盖。
 - 输出已存在、非空且不比视频旧就跳过（打「已存在，跳过」），所以手改过的结果不会被冲掉；要重认加 `--force`。
+  切换 `--engine` 不自动失效缓存。使用 `--ai-correct` 时，校对流程仍保护人工编辑稿，
+  `--force` 不保证覆盖人工校对稿；来源变化时可能保留旧人工稿并使用新原稿。
 - 某个视频失败（没认出字幕、ffmpeg 报错等）只记下来、接着跑下一个；最后打「成功 N，跳过 N，失败 N」，
   有失败时退出码为 1。没装 `ocr` extra 会直接中止。
 - 它**不剔除 OP/ED 的 staff 字**（那要靠项目里的 `op_range` / `ed_range`），居中的 staff 字会留在 SRT 里。

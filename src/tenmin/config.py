@@ -541,9 +541,8 @@ class AsrConfig(StrictModel):
 class OcrConfig(StrictModel):
     """硬字幕 OCR 参数。只在「这部番声明了硬字幕、这一集又没有手传 SRT 和软字幕轨」时才用得上。
 
-    跟 AsrConfig 一样刻意没有 engine 字段：只接 Apple Vision 一个引擎（pyobjc 调用，
-    optional extra `uv sync --extra ocr`，只支持 macOS）。调用它的地方同样有两条硬约束：
-    **import 必须写在函数体内**，**ImportError 必须翻成一句「跑 uv sync --extra ocr」**。
+    默认 Apple Vision；vision_rapid 在 Vision 合帧后逐条复识别文字，不改时间轴。
+    两种模式都只支持 macOS，可选依赖必须惰性导入，缺失时给出安装 extras 的提示。
 
     下面的默认值全部出自一次实测：`[ANi] 我是不才惡女 - 11 [1080P][Baha][WEB-DL][CHT]`，
     h264 1920×1080、23.976 fps、1429.99 秒，macOS 26.6.2 arm64。整集 388 条（同集 ASR
@@ -559,6 +558,7 @@ class OcrConfig(StrictModel):
     # 这部番的片源带硬字幕。不做自动探测：画面里本来就有字（片头 staff、招牌、信件），
     # 误判避免不了，而且每集都要多付一轮抽样。一部番的片源通常来自同一个字幕组，声明一次就够。
     enabled: bool = False
+    engine: Literal["vision", "vision_rapid"] = "vision"
     # 只做文字校对；调用失败警告并使用原 OCR 字幕，下一次自动重试。
     ai_correct: bool = False
     # 目标取样密度（每秒帧数）。实际步长是 round(源帧率 / 这个值)，所以每次取到的都是

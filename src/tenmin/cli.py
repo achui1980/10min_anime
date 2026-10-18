@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import httpx
 import typer
@@ -715,6 +715,9 @@ OCR_SIMPLIFIED_OPTION = typer.Option(
     help="繁转简（默认）；--traditional 保留画面上的繁体原文",
 )
 OCR_FORCE_OPTION = typer.Option(False, "--force", help="输出已存在也重新识别")
+OCR_ENGINE_OPTION = typer.Option(
+    DEFAULT_OCR.engine, "--engine", help="识别引擎；vision_rapid 需额外安装 rapidocr extra"
+)
 OCR_CROP_TOP_OPTION = typer.Option(
     DEFAULT_OCR.crop_top,
     "--crop-top",
@@ -746,6 +749,7 @@ def ocr(
     output: Path | None = OCR_OUTPUT_OPTION,
     simplified: bool = OCR_SIMPLIFIED_OPTION,
     force: bool = OCR_FORCE_OPTION,
+    engine: Literal["vision", "vision_rapid"] = OCR_ENGINE_OPTION,
     crop_top: float = OCR_CROP_TOP_OPTION,
     crop_bottom: float | None = OCR_CROP_BOTTOM_OPTION,
     ai_correct: bool = OCR_AI_CORRECT_OPTION,
@@ -759,7 +763,7 @@ def ocr(
         typer.secho("--asr-assist 需要同时指定 --ai-correct", fg="red", err=True)
         raise typer.Exit(code=1)
     try:
-        ocr_config = OcrConfig(crop_top=crop_top, crop_bottom=crop_bottom)
+        ocr_config = OcrConfig(crop_top=crop_top, crop_bottom=crop_bottom, engine=engine)
         videos = ocr_batch.collect_videos(inputs)
         llm = LLMConfig(provider=llm_provider, model=llm_model, base_url=llm_base_url)
     except (FileNotFoundError, ValueError) as error:

@@ -382,6 +382,85 @@ def test_recognize_cues_returns_the_cues_and_writes_nothing(tmp_path, monkeypatc
     assert sorted(p.name for p in tmp_path.iterdir()) == ["e11.mp4"]
 
 
+def test_default_vision_does_not_import_refinement_or_optional_libraries(tmp_path, monkeypatch):
+    _fake_ffmpeg(monkeypatch, ["我們走吧", "我們走吧"])
+    real_import = builtins.__import__
+
+    def guarded_import(name, *args, **kwargs):
+        if name == "tenmin.ingest.rapid" or name.startswith(("rapidocr", "onnxruntime")):
+            pytest.fail(f"default Vision imported {name}")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", guarded_import)
+    cues = ocr.recognize_cues(_video(tmp_path), ocr=OcrConfig())
+    assert [cue.text for cue in cues] == ["我們走吧"]
+
+
+def test_combo_refines_merged_vision_cues_without_remerging(tmp_path, monkeypatch):
+    from tenmin.ingest import rapid
+
+    calls = _fake_ffmpeg(monkeypatch, ["我們走吧"] * 2 + ["明天見"] * 2)
+    video = _video(tmp_path)
+    config = OcrConfig(engine="vision_rapid", crop_top=0.6, crop_bottom=0.9)
+    received = []
+
+    def refine(path, cues, **kwargs):
+        received.append((path, cues, kwargs))
+        assert [cue.text for cue in cues] == ["我們走吧", "明天見"]
+        # Equal refined text must not merge two distinct Vision cues.
+        return [cue.model_copy(update={"text": "復識別"}) for cue in cues]
+
+    monkeypatch.setattr(rapid, "refine_cues", refine)
+    cues = ocr.recognize_cues(
+        video, ocr=config, ffmpeg_path="custom/ffmpeg", ffprobe_path="custom/ffprobe"
+    )
+    assert len(received) == 1
+    assert received[0][0] == video
+    assert received[0][2] == {
+        "ocr": config, "ffmpeg_path": "custom/ffmpeg", "ffprobe_path": "custom/ffprobe"
+    }
+    assert received[0][2]["ocr"] is config
+    assert [cue.text for cue in cues] == ["復識別", "復識別"]
+    assert [cue.model_dump(exclude={"text"}) for cue in cues] == [
+        cue.model_dump(exclude={"text"}) for cue in received[0][1]
+    ]
+    assert calls["ffmpeg"] == "custom/ffmpeg"
+    assert {kwargs["ffprobe"] for _, _, kwargs in calls["probes"]} == {"custom/ffprobe"}
+
+
+@pytest.mark.parametrize("existing", [False, True])
+@pytest.mark.parametrize("error_type", [ocr.OCRError, ocr.OCRUnavailableError])
+def test_combo_failure_never_publishes_pipeline_srt(tmp_path, monkeypatch, existing, error_type):
+    from tenmin.ingest import rapid
+
+    _fake_ffmpeg(monkeypatch, ["我們走吧"] * 2)
+    dest = tmp_path / "E11.ocr.srt"
+    if existing:
+        dest.write_bytes(b"hand edited")
+
+    def fail(*args, **kwargs):
+        raise error_type("RapidOCR 失败")
+
+    monkeypatch.setattr(rapid, "refine_cues", fail)
+    with pytest.raises(error_type, match="RapidOCR 失败"):
+        ocr.recognize(_video(tmp_path), dest, ocr=OcrConfig(engine="vision_rapid"))
+    if existing:
+        assert dest.read_bytes() == b"hand edited"
+    else:
+        assert not dest.exists()
+
+
+@pytest.mark.parametrize("bad_pts", [False, True])
+def test_combo_does_not_refine_failed_vision_output(tmp_path, monkeypatch, bad_pts):
+    from tenmin.ingest import rapid
+
+    _fake_ffmpeg(monkeypatch, ["我們走吧"] * 2 if bad_pts else ["", ""],
+                 times=[0.0] if bad_pts else None)
+    monkeypatch.setattr(rapid, "refine_cues", lambda *a, **kw: pytest.fail("Vision failed"))
+    with pytest.raises(ocr.OCRError):
+        ocr.recognize_cues(_video(tmp_path), ocr=OcrConfig(engine="vision_rapid"))
+
+
 def test_recognize_uses_the_real_pts_not_the_frame_index(tmp_path, monkeypatch):
     """时间戳读 showinfo 的 pts，不按「序号 × 步长 / 帧率」推算。"""
     _fake_ffmpeg(monkeypatch, ["我們走吧", "我們走吧"], times=[100.0, 100.25])

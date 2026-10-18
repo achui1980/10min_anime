@@ -702,6 +702,7 @@ def test_asr_section_is_overridable_from_yaml_shaped_data():
 def test_ocr_config_defaults():
     """默认值出自 spec 那次实测（ANi《我是不才惡女》第 11 集），改它要有新的实测。"""
     cfg = OcrConfig()
+    assert cfg.engine == "vision"
     assert (
         cfg.enabled,
         cfg.sample_fps,
@@ -718,6 +719,24 @@ def test_project_config_carries_an_ocr_section():
     cfg = ProjectConfig(show="测试番", slug="test")
     assert isinstance(cfg.ocr, OcrConfig)
     assert cfg.ocr.enabled is False
+
+
+@pytest.mark.parametrize("engine", ["vision", "vision_rapid"])
+def test_ocr_engine_loads_from_project_yaml(tmp_path, engine):
+    path = _write(tmp_path, MINIMAL + f"ocr:\n  engine: {engine}\n")
+    assert load_project(path).ocr.engine == engine
+
+
+@pytest.mark.parametrize("engine", ["rapid", "", None])
+def test_ocr_engine_rejects_invalid_values(engine):
+    with pytest.raises(ValidationError):
+        OcrConfig(engine=engine)
+
+
+def test_invalid_ocr_engine_names_its_yaml_field(tmp_path):
+    path = _write(tmp_path, MINIMAL + "ocr:\n  engine: rapid\n")
+    with pytest.raises(ProjectConfigError, match=r"ocr\.engine"):
+        load_project(path)
 
 
 @pytest.mark.parametrize(

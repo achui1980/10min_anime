@@ -425,4 +425,10 @@ def recognize_cues(
             f"{video.name} 的画面上一条字幕都没认出来。检查 ocr.crop_top（现在是 "
             f"{ocr.crop_top}，裁剪区要框住字幕所在的画面底部），或者这个片源其实没有硬字幕。"
         )
+    if ocr.engine == "vision_rapid":
+        from tenmin.ingest.rapid import refine_cues
+
+        cues = refine_cues(
+            video, cues, ocr=ocr, ffmpeg_path=ffmpeg_path, ffprobe_path=ffprobe_path
+        )
     return cues
