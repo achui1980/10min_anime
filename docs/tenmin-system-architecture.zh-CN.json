@@ -1,0 +1,43 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "tenmin · 番剧解说自动制作架构",
+    "locale": "zh-CN",
+    "quality_profile": "showcase",
+    "viewBox": [1390, 770]
+  },
+  "components": [
+    {"id":"command-entry","type":"frontend","label":"命令行与素材登记","sublabel":"cli.py / importer.py","tag":"run · import · ocr · glossary","pos":[30,60],"size":[250,90]},
+    {"id":"episode-scheduler","type":"backend","label":"按集编排与增量执行","sublabel":"pipeline.py · run_pipeline","tag":"配置切片 / mtime / 摘要完成戳","pos":[375,60],"size":[250,90]},
+    {"id":"document-output","type":"backend","label":"⑤ 解说文档生成","sublabel":"docgen/ · 对照表与配音文本","tag":"out/ · Markdown / TXT","pos":[720,60],"size":[250,90]},
+    {"id":"project-files","type":"database","label":"本地项目与阶段产物","sublabel":"work/<slug>/ · 按 E{NN} 分集","tag":"project.yaml / JSON / 音视频","pos":[1065,60],"size":[250,90]},
+    {"id":"dialogue-normalizer","type":"backend","label":"① 对白素材归一","sublabel":"ingest/ · 清洗、繁转简、片头尾过滤","tag":"01_dialogue/ · DialogueTrack","pos":[30,280],"size":[250,90]},
+    {"id":"language-and-highlights","type":"backend","label":"② 翻译与③高能点提取","sublabel":"translate/ · signals/","tag":"zh/ · 02_signals/ · 术语累积","pos":[375,280],"size":[250,90]},
+    {"id":"narration-author","type":"backend","label":"④ 分幕解说稿生成","sublabel":"script/ · 语义校验与时长返工","tag":"03_script/ · Script","pos":[720,280],"size":[250,90]},
+    {"id":"audiovisual-engine","type":"backend","label":"⑥ 配音 → ⑦ 时间轴","sublabel":"⑧ 混音 → ⑨ 剪辑与烧字幕","tag":"render/ · FFmpeg / libass","pos":[1065,280],"size":[250,90]},
+    {"id":"final-content-review","type":"backend","label":"⑩ 成片图片评级粗筛","sublabel":"content_check/ · 可选、默认关闭","tag":"08_check/ · 候选截图与报告","pos":[1065,650],"size":[250,90]},
+    {"id":"subtitle-source-selection","type":"external","label":"视频与字幕输入","sublabel":"手传 SRT → 软字幕 → OCR → ASR","tag":"声明硬字幕才走 OCR；失败不降级","pos":[30,500],"size":[250,90]},
+    {"id":"text-model-adapters","type":"external","label":"LLM 服务适配层","sublabel":"Gemini / MiniMax / OpenAI 兼容","tag":"LLMProvider · 退避 / schema 修复","pos":[720,500],"size":[250,90]},
+    {"id":"voice-synthesis-service","type":"external","label":"在线语音合成","sublabel":"edge-tts · TTSEngine","tag":"并发分块 / 哈希缓存 / 时长体检","pos":[1065,500],"size":[250,90]}
+  ],
+  "connections": [
+    {"id":"entry-schedules","from":"command-entry","to":"episode-scheduler","label":"加载配置并运行","variant":"emphasis"},
+    {"id":"scheduler-ingests","from":"episode-scheduler","to":"dialogue-normalizer","label":"调度阶段","fromSide":"left","toSide":"top"},
+    {"id":"source-resolves","from":"subtitle-source-selection","to":"dialogue-normalizer","label":"按优先级选源","fromSide":"top","toSide":"bottom"},
+    {"id":"dialogue-analyzes","from":"dialogue-normalizer","to":"language-and-highlights","label":"对白轨","variant":"emphasis"},
+    {"id":"analysis-authors","from":"language-and-highlights","to":"narration-author","label":"信号与术语","variant":"emphasis"},
+    {"id":"script-produces","from":"narration-author","to":"audiovisual-engine","label":"分幕稿","variant":"emphasis"},
+    {"id":"script-documents","from":"narration-author","to":"document-output","label":"渲染文档","fromSide":"top","toSide":"bottom"},
+    {"id":"documents-persist","from":"document-output","to":"project-files","label":"写入文档"},
+    {"id":"media-persist","from":"audiovisual-engine","to":"project-files","label":"写入音视频","fromSide":"top","toSide":"bottom"},
+    {"id":"media-reviews","from":"audiovisual-engine","to":"final-content-review","label":"检查成片","variant":"dashed","fromSide":"right","toSide":"right"},
+    {"id":"script-model-call","from":"narration-author","to":"text-model-adapters","label":"生成与返工请求","fromSide":"bottom","toSide":"top","labelDy":90},
+    {"id":"media-voice-call","from":"audiovisual-engine","to":"voice-synthesis-service","label":"配音合成请求","fromSide":"bottom","toSide":"top","labelDy":90}
+  ],
+  "cards": [
+    {"dot":"cyan","title":"来源驱动处理策略","items":["SRT 跳过翻译；OCR 直接交付简体字幕；ASR 调 LLM 翻译并累积术语。","OCR：Apple Vision，可选 RapidOCR 复识别与 AI 校对；ASR：mlx-whisper。"]},
+    {"dot":"violet","title":"编排与数据契约","items":["全局 ingest / signals 后逐集制作；图中编号表示逻辑阶段，非实际调度时间。","Pydantic 模型与 JSON 连接阶段；LLM 层也服务翻译与 OCR 校对，atomic.py 原子写入。"]},
+    {"dot":"emerald","title":"缓存与最终交付","items":["配置切片与 mtime 驱动重跑；ingest / signals 内容相同不重写；check 另验身份与完整性。","文档与中文字幕：out/；成片：07_render/E{NN}.mp4；粗筛候选供人工查看。"]}
+  ]
+}

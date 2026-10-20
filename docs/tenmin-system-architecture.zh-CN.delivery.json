@@ -1,0 +1,37 @@
+{
+  "type": "architecture",
+  "output": "tenmin-system-architecture.zh-CN.html",
+  "specification": {
+    "path": "tenmin-system-architecture.zh-CN.json",
+    "sha256": "78a385acdfd58c904185254952a6488b0125c208cd8c4016be251f752a2428a1",
+    "bytes": 5226
+  },
+  "artifact": {
+    "sha256": "ce67e6bb8578eedb06dc99c45d8d9ab0f3fe2c79b7bb09fe49a260e439d6ce40",
+    "bytes": 816974
+  },
+  "validation": {
+    "checksPassed": 9,
+    "checkCount": 9,
+    "compositionProfile": "showcase",
+    "errors": 0,
+    "warnings": 0
+  },
+  "correction_rounds": 2,
+  "browserEvidence": {
+    "status": "pass",
+    "receipt": "tenmin-system-architecture.zh-CN.visual-check.json",
+    "viewports": ["1440x900", "1600x1000", "1920x1080", "2048x1320"]
+  },
+  "perceptualVisualReview": {
+    "status": "pass",
+    "reviewer": "image-capable assistant",
+    "capturesReviewed": [
+      "tenmin-system-architecture.zh-CN.visual-check.1440x900.light.png",
+      "tenmin-system-architecture.zh-CN.visual-check.1440x900.dark.png",
+      "tenmin-system-architecture.zh-CN.visual-check.2048x1320.light.png",
+      "tenmin-system-architecture.zh-CN.visual-check.2048x1320.dark.png"
+    ],
+    "findings": "已逐张检查四张截图：节点与连线标签无明显遮挡，深浅主题文字对比清晰，大屏布局纵向均衡；较小视口的代码注释字号偏小，可用查看器缩放阅读。自动浏览器回执中的 visualReview 保持 pending，本字段单独记录实际截图审阅。"
+  }
+}
