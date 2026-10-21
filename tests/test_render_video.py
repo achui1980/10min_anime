@@ -3,6 +3,7 @@ from pathlib import Path
 import pytest
 
 from tenmin.config import RenderConfig
+from tenmin.mask import MaskRange
 from tenmin.models import Timeline, TimelineSegment
 from tenmin.render.video import (
     build_render_args,
@@ -112,6 +113,71 @@ def test_build_render_args_filter_graph_matches_expected(tmp_path):
         "[v0][v1]concat=n=2:v=1:a=0[vcat];"
         f"[vcat]subtitles=filename='{ass}'[vout]"
     )
+
+
+def test_build_render_args_without_mask_keeps_the_graph_byte_identical(tmp_path):
+    """没有标注时 filtergraph 一个字都不许变。
+
+    这是「遮罩功能对老项目零影响」的技术保证：没标过的集渲染出来的产物必须跟
+    加功能之前逐字节一致。
+    """
+    args = build(tmp_path)
+    graph = args[args.index("-filter_complex") + 1]
+    assert "gblur" not in graph
+    assert "vblurred" not in graph
+
+
+def test_build_render_args_inserts_gblur_between_concat_and_subtitles(tmp_path):
+    """模糊必须夹在 concat 与 subtitles 之间。
+
+    - concat 的输出 PTS 从 0 开始，所以 enable 里的 t 就是成片时间轴，跟人工
+      标注的秒数一一对应。
+    - subtitles 在模糊**之后**：被糊掉的是番剧画面（含原片自带的硬字幕），tenmin
+      自己烧的解说字幕仍然清晰。顺序反了的话解说字幕也跟着糊。
+    """
+    args = build(tmp_path, mask_ranges=[MaskRange(start=156.0, end=162.5)])
+    graph = args[args.index("-filter_complex") + 1]
+    ass = tmp_path / "05_timeline" / "E02.ass"
+    assert graph.endswith(
+        "[v0][v1]concat=n=2:v=1:a=0[vcat];"
+        "[vcat]gblur=sigma=20:steps=3:enable='between(t,156.000,162.500)'[vblurred];"
+        f"[vblurred]subtitles=filename='{ass}'[vout]"
+    )
+    assert graph.index("gblur") < graph.index("subtitles")
+
+
+def test_build_render_args_uses_the_given_sigma(tmp_path):
+    args = build(
+        tmp_path,
+        mask_ranges=[MaskRange(start=0.0, end=1.0)],
+        mask_sigma=8.5,
+    )
+    graph = args[args.index("-filter_complex") + 1]
+    assert "gblur=sigma=8.5:steps=3" in graph
+
+
+def test_build_render_args_joins_multiple_ranges_with_plus(tmp_path):
+    args = build(
+        tmp_path,
+        mask_ranges=[
+            MaskRange(start=0.0, end=2.0),
+            MaskRange(start=10.0, end=12.0),
+        ],
+    )
+    graph = args[args.index("-filter_complex") + 1]
+    assert "enable='between(t,0.000,2.000)+between(t,10.000,12.000)'" in graph
+
+
+def test_build_render_args_mask_still_chains_fade_and_outro(tmp_path):
+    """加了标注之后，片尾淡出与黑卡的链接不能断。"""
+    args = build(
+        tmp_path,
+        mask_ranges=[MaskRange(start=0.0, end=1.0)],
+        fade_out_seconds=1.5,
+        outro_seconds=3.0,
+    )
+    graph = args[args.index("-filter_complex") + 1]
+    assert "[vout]fade=t=out:st=28.500:d=1.500[vfaded]" in graph
 
 
 def test_build_render_args_opens_one_input_per_segment_with_input_level_seek(tmp_path):

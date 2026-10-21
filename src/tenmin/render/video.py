@@ -6,11 +6,13 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from fractions import Fraction
 from pathlib import Path
 
 from tenmin.atomic import atomic_path
 from tenmin.config import DEFAULT_RENDER
+from tenmin.mask import DEFAULT_SIGMA, MaskRange, enable_expression
 from tenmin.models import Timeline
 from tenmin.progress import NullProgressReporter, ProgressReporter, percent_reporter
 from tenmin.render.ffmpeg import run_with_progress
@@ -25,6 +27,10 @@ TUNE = DEFAULT_RENDER.tune
 VIDEOTOOLBOX_BITRATE = DEFAULT_RENDER.videotoolbox_bitrate
 OUTRO_FONT_NAME = DEFAULT_RENDER.outro_font_name
 PIX_FMT = "yuv420p"
+
+# gblur 的 steps。默认的 1 步只是拿一个 3x3 核反复卷，边缘会有阶梯状；3 步已经很接近
+# 真正的高斯模糊。它只影响模糊的平滑度，不影响速度量级（实测 30s 片段全片模糊 6.0s）。
+BLUR_STEPS = 3
 
 # 每段输入的 seek 余量（秒），两端各留这么多。
 #
@@ -159,11 +165,15 @@ def build_render_args(
     outro_title: str = "",
     outro_message: str = "",
     outro_font_name: str = OUTRO_FONT_NAME,
+    mask_ranges: Sequence[MaskRange] = (),
+    mask_sigma: float = DEFAULT_SIGMA,
 ) -> list[str]:
     """拼出渲染用的 ffmpeg 参数列表（不含 ffmpeg 本身）。
 
     输入结构是「一段一个 `-ss/-t` 输入 + 全局 `-copyts`」，见 segment_input_args。
     所以 `[N:v]` 里的 N **就是**段序号，音轨排在全部段之后（`[{段数}:a]`）。
+
+    `mask_ranges` 非空时在拼接结果与烧字幕之间插一段高斯模糊（见下面那处拼接）。
     """
     if not timeline.segments:
         raise ValueError("timeline 里没有任何 segment，无法渲染")
@@ -180,7 +190,23 @@ def build_render_args(
         )
     labels = "".join(f"[v{i}]" for i in range(len(timeline.segments)))
     parts.append(f"{labels}concat=n={len(timeline.segments)}:v=1:a=0[vcat]")
-    parts.append(f"[vcat]subtitles=filename={escape_filter_path(ass)}[vout]")
+    if mask_ranges:
+        # 模糊插在 concat 之后、subtitles 之前 —— 这是整套功能的要害：
+        # - concat 的输出 PTS 从 0 开始，所以 enable 表达式里的 t 就是**成片时间轴**，
+        #   跟人工标注的秒数一一对应（实测 concat 前后做同一组 enable，模糊的帧集合
+        #   逐帧一致）。
+        # - subtitles 在模糊**之后**，所以被糊掉的是番剧画面（含原片自带的硬字幕），
+        #   tenmin 自己烧的解说字幕仍然清晰。顺序反了的话解说字幕也跟着糊。
+        #
+        # enable 表达式走 escape_filter_arg：里面的逗号（between 的三个参数）必须被
+        # filtergraph 层的引号护住，否则会被当成 filter 之间的分隔符。
+        enable = escape_filter_arg(enable_expression(mask_ranges))
+        parts.append(
+            f"[vcat]gblur=sigma={mask_sigma:g}:steps={BLUR_STEPS}:enable={enable}[vblurred]"
+        )
+        parts.append(f"[vblurred]subtitles=filename={escape_filter_path(ass)}[vout]")
+    else:
+        parts.append(f"[vcat]subtitles=filename={escape_filter_path(ass)}[vout]")
 
     final_label = "[vout]"
     if fade_out_seconds > 0:
@@ -294,6 +320,8 @@ def render_video(
     outro_title: str = "",
     outro_message: str = "",
     outro_font_name: str = OUTRO_FONT_NAME,
+    mask_ranges: Sequence[MaskRange] = (),
+    mask_sigma: float = DEFAULT_SIGMA,
     reporter: ProgressReporter | None = None,
     ffmpeg: str = DEFAULT_RENDER.ffmpeg_path,
 ) -> Path:
@@ -327,6 +355,8 @@ def render_video(
             outro_title=outro_title,
             outro_message=outro_message,
             outro_font_name=outro_font_name,
+            mask_ranges=mask_ranges,
+            mask_sigma=mask_sigma,
         )
         run_with_progress(
             args,

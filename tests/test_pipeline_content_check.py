@@ -179,8 +179,9 @@ def test_run_check_passes_final_video_and_exact_service_contract(cfg, monkeypatc
     def fake(video_arg, directory, **kwargs):
         assert video_arg == video
         assert directory == cfg.root / "08_check" / "E02"
+        # episode 传下去是为了让报告页知道自己属于第几集（导出遮罩标注时要用）。
         assert kwargs == {"cfg": cfg.content_check, "ffmpeg": "/custom/ffmpeg",
-                          "ffprobe": "/custom/ffprobe", "force": True}
+                          "ffprobe": "/custom/ffprobe", "force": True, "episode": 2}
         return outcome(cfg, 2)
     monkeypatch.setattr(pipeline, "check_video", fake, raising=False)
     assert pipeline.run_check(cfg, 2, force=True) == outcome(cfg, 2)

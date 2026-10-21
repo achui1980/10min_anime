@@ -22,6 +22,7 @@ from tenmin.docgen.table import render_table
 from tenmin.ingest.normalize import build_track
 from tenmin.ingest.ocr_correction import prepare_asr, select_corrected
 from tenmin.ingest.resolve import resolve_subtitle_source
+from tenmin.mask import DEFAULT_SIGMA, load_mask
 from tenmin.models import (
     DialogueTrack,
     Script,
@@ -136,6 +137,15 @@ _ARTIFACTS: dict[str, tuple[str, str]] = {
     "mixed_audio": ("06_audio", ".mixed.m4a"),
     "video": ("07_render", ".mp4"),
     "check_dir": ("08_check", ""),
+    # 人工审核后写下的遮罩标注（哪些成片时刻要打马赛克/模糊）。它是 render 阶段的
+    # **输入**，所以改了它就会触发重渲染。
+    #
+    # 落点是 08_check/ 下的**兄弟文件**（E02.mask.json），不是 08_check/E02/ 目录里面。
+    # 原因只有一个：content_check 对 08_check/E{NN}/ 目录有所有权标记的约定
+    # （非空目录里必须有 .tenmin-content-check 且内容是 "1\n"，否则报「非本工具拥有的
+    # 非空输出目录」）。标注要是落在那个目录里、且先于 check 写入，后面的 check 就
+    # 会被自己人写的目录挡在门外。做成兄弟文件就没有这层耦合。
+    "mask": ("08_check", ".mask.json"),
     # 语音转写的落点。它（连同下面的 ocr_cache）是本表里仅有的落在 srt/（输入目录）里的条目，也是
     # 仅有的既不在带序号的阶段目录、也不在 out/ 交付目录里的，刻意的：这份 SRT 是双重身份的
     # —— 它是 ingest 自己产出的缓存，同时也是下一次运行的**输入**（转差了就手改，
@@ -250,6 +260,10 @@ class Paths:
 
     def check_dir(self, episode: int) -> Path:
         return self._artifact("check_dir", episode)
+
+    def mask(self, episode: int) -> Path:
+        """人工审核写下的遮罩标注，是 render 阶段的输入之一。"""
+        return self._artifact("mask", episode)
 
     def asr_cache(self, episode: int) -> Path:
         """语音转写结果的落点，也是 resolve_subtitle_source 的 cache 参数。"""
@@ -1322,6 +1336,11 @@ def run_render(
     ass = paths.subtitles(episode)
     if not ass.exists():
         raise FileNotFoundError(f"缺少字幕产物 {ass}，请先跑 timeline 阶段")
+    # 人工审核写下的遮罩标注。没有标注文件、或标注里一个区间都没有，就当没这回事：
+    # render/video.py 那边的 filtergraph 会逐字节保持原样（不加 gblur）。
+    mask = load_mask(paths.mask(episode))
+    mask_ranges = mask.ranges if mask is not None else []
+    mask_sigma = mask.sigma if mask is not None else DEFAULT_SIGMA
     return render_video(
         video=cfg.video_path(episode_cfg),
         timeline=timeline,
@@ -1335,6 +1354,11 @@ def run_render(
         preset=cfg.render.preset,
         tune=cfg.render.tune,
         videotoolbox_bitrate=cfg.render.videotoolbox_bitrate,
+        # 遮罩区间的时间轴是**成片时间轴**（concat 之后从 0 开始的那条），跟
+        # content_check 报告里 f.time 记的是同一条轴 —— 所以审核时看到的帧时间
+        # 可以直接抄进标注，不用换算。
+        mask_ranges=mask_ranges,
+        mask_sigma=mask_sigma,
         # 片尾黑卡要跟正片同帧率，否则成片是 VFR（见 render/video.py 那段注释）。
         # 帧率取 timeline 产物里记的那个 —— segments 的边界就是按它对齐的，
         # 这里再探一次只会引入「万一中途换了源片」的错位空间。
@@ -1361,6 +1385,7 @@ def run_check(cfg: ProjectConfig, episode: int, *, force: bool = False) -> Check
     return check_video(
         video, paths.check_dir(episode), cfg=cfg.content_check,
         ffmpeg=cfg.render.ffmpeg_path, ffprobe=cfg.render.ffprobe_path, force=force,
+        episode=episode,
     )
 
 
@@ -1779,6 +1804,10 @@ async def run_pipeline(
                     paths.mixed_audio(number),
                     paths.subtitles(number),
                     paths.timeline(number),
+                    # 人工审核写下的遮罩标注是 render 的输入：改了它就得重渲染。
+                    # 文件不存在时 _is_fresh 会直接忽略它，所以没有标注的老项目
+                    # 行为一点不变。
+                    paths.mask(number),
                     *video_inputs,
                 ]
                 if force or not is_fresh("render", number, outputs, inputs):

@@ -30,10 +30,10 @@ def valid_manifest():
     )
 
 
-def render(manifest):
+def render(manifest, episode=None):
     from tenmin.content_check.report import render_report
 
-    return render_report(manifest)
+    return render_report(manifest, episode=episode)
 
 
 class Document(HTMLParser):
@@ -69,33 +69,57 @@ class Document(HTMLParser):
 DOM = r"""
 class Element {
   constructor(tag) { this.tag=tag; this.children=[]; this.value=''; this.checked=false;
-    this.hidden=false; this.listeners={}; this.textContent=''; }
+    this.hidden=false; this.listeners={}; this.textContent=''; this.clicks=0; }
   append(...nodes) { this.children.push(...nodes); }
+  appendChild(node) { this.children.push(node); return node; }
+  removeChild(node) { const index=this.children.indexOf(node);
+    if(index>=0)this.children.splice(index,1); return node; }
   replaceChildren(...nodes) { this.children=[...nodes]; }
   insertRow() { const row=new Element('tr'); this.append(row); return row; }
   insertCell() { const cell=new Element('td'); this.append(cell); return cell; }
   addEventListener(event, fn) { this.listeners[event]=fn; }
+  click() { this.clicks++;
+    if(typeof this.onclick==='function')this.onclick();
+    if(this.listeners.click)this.listeners.click(); }
 }
 const elements={};
 for (const [id, attrs] of Object.entries(ATTRS)) {
   elements[id]=new Element('div'); elements[id].value=attrs.value || '';
 }
 elements.sort.value='risk';
-const document={getElementById: id=>elements[id], createElement: tag=>new Element(tag)};
+const STORE={};
+const localStorage={
+  getItem: key=>Object.prototype.hasOwnProperty.call(STORE,key)?STORE[key]:null,
+  setItem: (key,value)=>{STORE[key]=String(value);},
+  removeItem: key=>{delete STORE[key];},
+};
+const window={localStorage};
+const document={getElementById: id=>elements[id], createElement: tag=>new Element(tag),
+  body: new Element('body')};
+globalThis.Blob=class { constructor(parts, options) { this.parts=parts;
+  this.type=(options||{}).type; } };
+globalThis.URL.createObjectURL=()=>'blob:fake';
+globalThis.URL.revokeObjectURL=()=>{};
 const snapshot=()=>({summary:elements.summary.textContent, count:elements.count.textContent,
   segments:elements.segments.textContent, error:elements.error.textContent,
   s:elements.s.value, a:elements.a.value, more:elements.more.hidden,
+  maskstatus:elements.maskstatus.textContent, maskjson:elements.maskjson.textContent,
+  sigma:elements.sigma.value,
+  maskrows:elements.masklist.children.map(row=>({start:row.children[0].value,
+    end:row.children[2].value})),
+  cardbuttons:elements.grid.children.map(card=>card.children[3].textContent),
+  store:Object.assign({},STORE),
   cards:elements.grid.children.map(card=>({image:card.children[0].src,
     alt:card.children[0].alt, title:card.children[1].textContent,
     scores:card.children[2].children.map(row=>row.children.map(cell=>cell.textContent))}))});
 """
 
 
-def run_page(manifest, actions=""):
+def run_page(manifest, actions="", episode=None):
     node = shutil.which("node")
     if node is None:
         pytest.skip("Node.js is required for non-browser report interaction tests")
-    doc = Document(render(manifest))
+    doc = Document(render(manifest, episode))
     script = "const ATTRS=" + json.dumps(doc.elements) + ";\n" + DOM
     script += "\n".join(doc.scripts) + "\n" + actions
     script += "\nconsole.log(JSON.stringify(snapshot()));"
@@ -225,3 +249,87 @@ def test_invalid_threshold_has_parameter_message_and_recovers(valid_manifest, fi
                      f"elements.{field}.value='0.5'; elements.{field}.listeners.input();")
     assert state["error"] == ""
     assert "已检查，未发现" in state["count"]
+
+
+# --- 遮罩标注交互（report 页 → mask.json）---
+
+
+def test_mask_panel_marks_candidate_frame_and_exports(valid_manifest):
+    manifest = with_frames(valid_manifest, [(10, (0.2, 0.5, 0.2, 0.1)), (20, (1, 0, 0, 0))])
+    state = run_page(manifest, episode=2)
+    assert state["maskrows"] == []
+    assert "尚未标记任何区间" in state["maskstatus"]
+    assert state["cardbuttons"] == ["标记需遮罩"]
+
+    actions = "elements.grid.children[0].children[3].click();"
+    state = run_page(manifest, actions, episode=2)
+    assert state["maskrows"] == [{"start": "10.0", "end": "12.0"}]
+    assert state["cardbuttons"] == ["取消标记"]
+    assert "已标记 1 段" in state["maskstatus"]
+
+    state = run_page(manifest, actions + "elements.export.listeners.click();", episode=2)
+    payload = json.loads(state["maskjson"])
+    assert payload == {
+        "schema_version": 1, "sigma": 20.0,
+        "ranges": [{"start": 10.0, "end": 12.0}], "episode": 2,
+    }
+    assert "mask.json" in state["maskstatus"]
+
+
+def test_mask_export_without_episode_omits_episode_field(valid_manifest):
+    manifest = with_frames(valid_manifest, [(10, (0.2, 0.5, 0.2, 0.1))])
+    actions = "elements.grid.children[0].children[3].click(); elements.export.listeners.click();"
+    payload = json.loads(run_page(manifest, actions)["maskjson"])
+    assert "episode" not in payload
+    assert payload["ranges"] == [{"start": 10.0, "end": 12.0}]
+
+
+def test_mask_ranges_can_be_edited_and_deleted(valid_manifest):
+    manifest = with_frames(valid_manifest, [(10, (0.2, 0.5, 0.2, 0.1))])
+    actions = (
+        "elements.grid.children[0].children[3].click();"
+        "elements.masklist.children[0].children[0].value='3.5';"
+        "elements.masklist.children[0].children[0].oninput();"
+        "elements.masklist.children[0].children[2].value='9.5';"
+        "elements.masklist.children[0].children[2].oninput();"
+    )
+    state = run_page(manifest, actions + "elements.export.listeners.click();")
+    assert state["maskrows"] == [{"start": "3.5", "end": "9.5"}]
+    assert json.loads(state["maskjson"])["ranges"] == [{"start": 3.5, "end": 9.5}]
+
+    actions = ("elements.grid.children[0].children[3].click();"
+               "elements.masklist.children[0].children[3].click();")
+    state = run_page(manifest, actions)
+    assert state["maskrows"] == []
+    assert state["cardbuttons"] == ["标记需遮罩"]
+
+
+def test_mask_annotations_persist_in_local_storage(valid_manifest):
+    manifest = with_frames(valid_manifest, [(10, (0.2, 0.5, 0.2, 0.1))])
+    actions = "elements.grid.children[0].children[3].click();"
+    state = run_page(manifest, actions)
+    stored = list(state["store"].values())
+    assert len(stored) == 1
+    assert json.loads(stored[0])["ranges"] == [{"start": 10.0, "end": 12.0}]
+
+    state = run_page(manifest, actions + "loadMask(); renderMask();")
+    assert state["maskrows"] == [{"start": "10.0", "end": "12.0"}]
+
+
+def test_mask_sigma_is_editable_and_exported(valid_manifest):
+    manifest = with_frames(valid_manifest, [(10, (0.2, 0.5, 0.2, 0.1))])
+    actions = ("elements.sigma.value='12.5'; elements.sigma.listeners.input();"
+               "elements.grid.children[0].children[3].click();")
+    state = run_page(manifest, actions)
+    assert "sigma 12.5" in state["maskstatus"]
+    state = run_page(manifest, actions + "elements.export.listeners.click();")
+    assert json.loads(state["maskjson"])["sigma"] == 12.5
+
+
+def test_mask_clear_removes_every_range(valid_manifest):
+    manifest = with_frames(valid_manifest, [(10, (0.2, 0.5, 0.2, 0.1))])
+    actions = ("elements.grid.children[0].children[3].click();"
+               "elements.maskclear.listeners.click();")
+    state = run_page(manifest, actions)
+    assert state["maskrows"] == []
+    assert "尚未标记任何区间" in state["maskstatus"]

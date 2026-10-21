@@ -73,7 +73,7 @@ cat /path/to/zscaler_ca_bundle.pem >> .venv/lib/python3.14/site-packages/certifi
   ingest/signals **产物字节不变就不写**，避免下游因 mtime 变动连带重跑；全局阶段的新鲜度另由 `.config/{ingest,signals}.done` 记录上次完成时间及**每份产物 SHA-256 摘要**（`_is_fresh_stamped` 比对摘要和输入时间）。重跑前先将戳子置空，失败留下空戳子、下次必重跑；戳子不存在或是旧版阶段名纯文本时才退回按产物 mtime 判。`register_episode` 用 `ruamel.yaml` round-trip 只改目标集的 srt/video，保留其他字段、注释、键序、引号与原有序列缩进；配置读取仍用 PyYAML。登记 SRT 不存在时先报错，不拷贝也不写配置。
 
   批量模式的编排是**按集纵向**（P0-C 定的：中途失败要留下完整交付物，而不是一堆半成品）。script 阶段的多集并发（`llm.script_concurrency`，默认 1）是在这个纵向循环上加一个**有界预取窗口** —— 走到第 i 集时确保前 `i + concurrency` 集的 script task 都起了，然后 await 第 i 集那个。**刻意不把 script 抽成横向并发阶段**：那会直接推翻上面那条不变量（全部集的 script 跑完之前一集成片都不会有，而 script 恰好是最慢也最容易失败的阶段）。默认 1 的依据见 `config.LLMConfig.script_concurrency` 的注释（并发易撞 429、失败时在飞调用白花钱、audio/render 的同步 ffmpeg 会堵住事件循环）。失败收摊走 `_drain_script_tasks`，`try/finally` 包住整个纵向循环。
-- `src/tenmin/cli.py`：Typer CLI（`tenmin init` / `tenmin run` / `tenmin inspect` / `tenmin ocr` / `tenmin check-content` / `tenmin import` / `tenmin ocr-audit` / `tenmin glossary`）。`tenmin ocr` 是脱离项目的批量画面 OCR（见下面 `ingest/ocr_batch.py`），不走管线。`tenmin import <slug> <dir>`（函数名 `import_`，`import` 是关键字）扫描目录批量登记，见下面 `importer.py`：默认打印预览后要确认，`--yes` 跳过确认，`--dry-run` 只预览（含 LLM 兜底与 ffprobe，零写入），非 TTY 且没 `--yes` 报错退出；确认后先构造管线 provider（缺 key 时一个文件都不动），再**只对本次导入的集**逐集跑 `run_pipeline` 单集模式。`tenmin run` 支持四种用法：
+- `src/tenmin/cli.py`：Typer CLI（`tenmin init` / `tenmin run` / `tenmin inspect` / `tenmin ocr` / `tenmin check-content` / `tenmin import` / `tenmin ocr-audit` / `tenmin glossary` / `tenmin mask`）。`tenmin ocr` 是脱离项目的批量画面 OCR（见下面 `ingest/ocr_batch.py`），不走管线。`tenmin mask <slug> --episode N` 看遮罩标注状态、`--import <文件>` 导入报告页导出的 mask.json、`--clear` 删除，见下面 `mask.py`。`tenmin import <slug> <dir>`（函数名 `import_`，`import` 是关键字）扫描目录批量登记，见下面 `importer.py`：默认打印预览后要确认，`--yes` 跳过确认，`--dry-run` 只预览（含 LLM 兜底与 ffprobe，零写入），非 TTY 且没 `--yes` 报错退出；确认后先构造管线 provider（缺 key 时一个文件都不动），再**只对本次导入的集**逐集跑 `run_pipeline` 单集模式。`tenmin run` 支持四种用法：
   - `--episode N --srt <path> --video <path>`：注册新集并跑。
   - `--episode N --video <path>`（不带 `--srt`）：**生肉入口**，对白轨靠软字幕轨抽取、（声明了硬字幕时）画面 OCR 或语音转写拿。反过来「只传 `--srt`」非法（视频是渲染阶段的硬需求）。
   - `--episode N`（不带 srt/video）：重跑已注册的某一集。
@@ -135,6 +135,17 @@ cat /path/to/zscaler_ca_bundle.pem >> .venv/lib/python3.14/site-packages/certifi
 - `src/tenmin/content_check/`：`service.check_video` 是项目/独立 CLI 共用入口；`frames.py` 用真实 showinfo PTS 和旋转后的 DAR 抽图；`model.py` 固定 mobile revision/摘要、先查本地 HF 缓存，再按需联网，optional extra 的导入在执行函数体内；`candidates.py` 是候选/归组唯一口径；`report.py` 通过 `importlib.resources` 读取同包 `report.html`，安全嵌入 JSON。
   **缓存完成标记是最后原子发布的 `results.json`**：临时目录抽帧/推理，发布前清掉旧完成标记，固定所有权标记授权替换工具产物。阈值不进入推理身份，只重建候选和报告；截图缺失/JSON 损坏/身份变化/force 重跑。即使 render 跳过，仍调服务验证缓存。显式 only/from check 忽略 enabled、不构造 LLM/TTS；未知异常和中断传播，仅 `ContentCheckError` 转项目警告继续。`check_results` 只收本次成功，`check_errors` 记录未知异常来源以绕过 CLI 旧 ValueError 捕获；旧报告存在不能推断本次成功。
   修改抽帧、缓存或 HTML 时读 `docs/content-check-validation.md` 的真实验收及效果边界；分数是图片评级、候选是人工查看入口，不能宣称检测准确率。
+  报告页里多了一块**遮罩标注**面板（候选卡片上的「标记需遮罩」按钮 + 起止可编辑的区间列表 + sigma + 「导出 mask.json」）：标注只存在浏览器 localStorage 里，**导出写的是新文件、绝不回写 `results.json`**（保住上面那条已验证的不变量）；独立命令 `tenmin check-content` 出的报告不知道自己是第几集，所以导出时省掉 `episode` 字段，导入时由 `tenmin mask --episode` 补上。
+
+- `src/tenmin/mask.py`：人工审核后的**遮罩标注**（整屏高斯模糊）。数据流是「check 阶段出报告 → 人在 `08_check/E{NN}/report.html` 上标记 → 导出 mask.json → `tenmin mask --import` 落到 `08_check/E{NN}.mask.json` → render 阶段读它重渲染」。
+  - **标注文件落点是 `08_check/E{NN}.mask.json`，是 `08_check/E{NN}/` 的兄弟文件而不是它里面的文件**。三条理由同时成立：① 避开 content_check 的所有权标记冲突（`service.py::_prepare_output` 在目录非空时要求 `.tenmin-content-check` 内容等于 `"1\n"`，否则报「非本工具拥有的非空输出目录」；mask 先写、check 后跑的话会被自己的目录拒掉）；② 符合 `_ARTIFACTS` 表的 `(subdir, suffix)` → `root/subdir/E{NN}{suffix}` 约定；③ `test_paths_pad_episode_number_consistently` 断言 `paths.<kind>(ep).name` 以 `E02.` 开头，嵌套路径的 name 是 `mask.json` 会失败。
+  - **时间轴 = 成片时间轴**（concat 输出的 PTS 从 0 开始），与 content_check 报告里 `f.time` 同一根轴 —— 所以「报告里标哪一帧，模糊就作用在成片的同一时刻」。用无损 ffv1 逐帧 md5 对比实测过：concat 前后 filtergraph 里的 `t` 一致。
+  - 模型：`MaskRange`（`start`/`end` ≥ 0、`end > start`）、`MaskSpec`（`schema_version`/`episode`/`sigma`/`ranges`）、`MaskError(ValueError)`（CLI 的 `PIPELINE_ERRORS` 已含 ValueError，自动接住）。`merge_ranges` 合并重叠或首尾相接的区间；`enable_expression` → `between(t,156.000,162.500)+between(t,...)`。
+  - **`save_mask` 用 `atomic.write_text_if_changed`**：内容逐字节相同就不碰文件、保住 mtime —— 否则一次无意义的重导入会让 render 白跑几分钟。
+  - **刻意不带视频 identity**：遮罩后成片必然重渲染、mtime 必变，带 identity 会把标注自己判为失效。
+  - **sigma 只存在标注文件里**，不进 config（避免两处真相）；默认 `DEFAULT_SIGMA=20.0`（实测档位：16 还看得出轮廓、24 已糊成一片）。
+  - 渲染接入点在 `render/video.py::build_render_args`：`[vcat]` 之后、`subtitles` 之前插 `[vcat]gblur=sigma=<S>:steps=3:enable='<expr>'[vblurred];[vblurred]subtitles=…[vout]`。**模糊必须在 subtitles 之前**，否则 tenmin 自己烧的解说字幕也糊；**没有标注时 filtergraph 逐字节不变**（老项目零影响）。用 `gblur` 的 `enable` 时间窗而不是 split/concat 分段，是因为分段会让 filtergraph 复杂度随区间数线性增长。
+  - 新鲜度：标注文件进了 render 阶段的 inputs（`_is_fresh` 忽略不存在的输入），所以改标注会触发重渲染，文件不存在时老项目行为零变化。
 
 ## 测试
 

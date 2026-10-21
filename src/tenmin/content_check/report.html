@@ -33,6 +33,16 @@ table{width:100%;font-variant-numeric:tabular-nums;font-size:14px}
 td{border-top:1px solid #edf0ec;padding:4px 0}td:last-child{text-align:right;font-family:monospace}
 button{padding:8px 24px;margin-top:24px;background:var(--accent);color:white;border:0;border-radius:3px;cursor:pointer}
 [hidden]{display:none}
+.mask{background:white;border:1px solid var(--line);padding:16px;margin:20px 0}
+.mask h2{margin:0 0 8px;font-size:18px}
+.mask-hint{color:var(--muted);font-size:14px;margin:0 0 12px}
+.mask-row{display:flex;flex-wrap:wrap;align-items:center;gap:16px}
+.maskrange{display:flex;align-items:center;gap:8px;margin-top:8px}
+.maskrange input{width:104px}
+button.secondary{background:white;color:var(--accent);border:1px solid var(--accent);margin:12px 0 0;padding:6px 14px}
+button.secondary:hover{background:#eef3f0}
+#maskstatus{font-size:14px;margin:12px 0 0}
+#maskjson{font-size:12px;background:#f3f5f1;border:1px solid var(--line);padding:12px;overflow:auto;max-height:260px;white-space:pre-wrap;word-break:break-all}
 </style>
 </head>
 <body>
@@ -54,6 +64,18 @@ button{padding:8px 24px;margin-top:24px;background:var(--accent);color:white;bor
 <label>排序 <select id="sort"><option value="risk">筛选分数优先</option><option value="time">时间顺序</option></select></label>
 </section>
 <p><small>页面调整仅用于当前查看，不回写项目配置或 JSON。排序值 max(sensitive, questionable + explicit) 仅用于查看优先级；分数不是经过校准的色情概率，也不是严重程度百分制。</small></p>
+<section class="mask" aria-label="遮罩标注">
+<h2>遮罩标注</h2>
+<p class="mask-hint">在候选卡片上点「标记需遮罩」加入区间（默认覆盖该帧之后 2 秒），起止可以改。区间用的是成片时间轴，跟上面的采样时间一致。标注只存在本浏览器里，导出成 mask.json 之后用 <code>tenmin mask &lt;slug&gt; --episode N --import &lt;文件&gt;</code> 导入，再重跑 render 生效；它不会回写 results.json。</p>
+<div class="mask-row">
+<label>模糊强度 sigma <input id="sigma" type="number" min="0.1" max="200" step="0.1"></label>
+<button id="export" type="button" class="secondary">导出 mask.json</button>
+<button id="maskclear" type="button" class="secondary">清空标注</button>
+</div>
+<div id="masklist"></div>
+<p id="maskstatus"></p>
+<pre id="maskjson" hidden></pre>
+</section>
 <p id="error" role="alert"></p>
 <p id="count" role="status"></p>
 <div id="segments"></div>
@@ -63,6 +85,7 @@ button{padding:8px 24px;margin-top:24px;background:var(--accent);color:white;bor
 </main>
 <script>
 const report=__DATA__;
+const EPISODE=__EPISODE__;
 const labels={general:'普通',sensitive:'敏感',questionable:'成人倾向',explicit:'露骨'};
 const $=id=>document.getElementById(id);
 const stamp=t=>{
@@ -73,6 +96,11 @@ const stamp=t=>{
 };
 const risk=f=>Math.max(f.scores.sensitive,f.scores.questionable+f.scores.explicit);
 let limit=60;
+const MASK_KEY=`tenmin.mask:${report.identity.video_path}#${EPISODE}`;
+const DEFAULT_SIGMA=20;
+const DEFAULT_RANGE=2;
+let ranges=[];
+let sigma=DEFAULT_SIGMA;
 $('s').value=report.sensitive_threshold;
 $('a').value=report.adult_threshold;
 $('summary').textContent=`${report.identity.video_path} | ${report.identity.repository} / ${report.identity.model} | revision ${report.identity.revision} | ${report.frames.length} 帧 | 采样间隔 ${report.identity.sample_interval}s | 提取 ${report.extraction_seconds.toFixed(1)}s / 推理 ${report.inference_seconds.toFixed(1)}s | provider: ${report.providers.join(', ')}`;
@@ -80,6 +108,89 @@ function threshold(id){
   const raw=String($(id).value).trim();
   const value=Number(raw);
   return raw!==''&&Number.isFinite(value)&&value>=0&&value<=1?value:null;
+}
+function loadMask(){
+  try{
+    const raw=window.localStorage.getItem(MASK_KEY);
+    if(!raw)return;
+    const data=JSON.parse(raw);
+    if(Array.isArray(data.ranges)){
+      ranges=data.ranges.filter(r=>r&&Number.isFinite(r.start)&&Number.isFinite(r.end)&&r.end>r.start)
+        .map(r=>({start:r.start,end:r.end}));
+    }
+    if(Number.isFinite(data.sigma)&&data.sigma>0)sigma=data.sigma;
+  }catch(e){}
+}
+function saveMask(){
+  try{window.localStorage.setItem(MASK_KEY,JSON.stringify({ranges,sigma}));}catch(e){}
+}
+function isMarked(time){
+  return ranges.some(r=>Math.abs(r.start-time)<1e-6);
+}
+function toggleMark(time){
+  if(isMarked(time)){
+    ranges=ranges.filter(r=>Math.abs(r.start-time)>=1e-6);
+  }else{
+    ranges.push({start:time,end:time+DEFAULT_RANGE});
+    ranges.sort((a,b)=>a.start-b.start);
+  }
+  saveMask();
+  renderMask();
+  render();
+}
+function updateStatus(){
+  const total=ranges.reduce((sum,r)=>sum+Math.max(0,r.end-r.start),0);
+  $('maskstatus').textContent=ranges.length
+    ?`已标记 ${ranges.length} 段，共 ${total.toFixed(1)} 秒；sigma ${sigma}。`
+    :'尚未标记任何区间。';
+}
+function renderMask(){
+  const list=$('masklist');
+  list.replaceChildren();
+  ranges.forEach((range,index)=>{
+    const row=document.createElement('div');
+    row.className='maskrange';
+    const start=document.createElement('input');
+    start.type='number';start.step='0.1';start.min='0';start.value=range.start.toFixed(1);
+    const arrow=document.createElement('span');
+    arrow.textContent='→';
+    const end=document.createElement('input');
+    end.type='number';end.step='0.1';end.min='0';end.value=range.end.toFixed(1);
+    const remove=document.createElement('button');
+    remove.type='button';remove.className='secondary';remove.textContent='删除';
+    start.oninput=()=>{
+      const value=Number(start.value);
+      if(Number.isFinite(value)&&value>=0){range.start=value;saveMask();updateStatus();}
+    };
+    end.oninput=()=>{
+      const value=Number(end.value);
+      if(Number.isFinite(value)&&value>=0){range.end=value;saveMask();updateStatus();}
+    };
+    remove.onclick=()=>{ranges.splice(index,1);saveMask();renderMask();render();};
+    row.append(start,arrow,end,remove);
+    list.append(row);
+  });
+  updateStatus();
+}
+function exportMask(){
+  const payload={schema_version:1,sigma:Number(sigma),ranges:ranges.map(r=>({start:r.start,end:r.end}))};
+  if(EPISODE!==null&&EPISODE!==undefined)payload.episode=EPISODE;
+  const text=JSON.stringify(payload,null,2);
+  $('maskjson').textContent=text;
+  $('maskjson').hidden=false;
+  try{
+    const blob=new Blob([text],{type:'application/json'});
+    const url=URL.createObjectURL(blob);
+    const link=document.createElement('a');
+    link.href=url;link.download='mask.json';
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(url);
+    $('maskstatus').textContent='已导出 mask.json，请用 tenmin mask <slug> --episode N --import <文件> 导入，然后重跑 render。';
+  }catch(e){
+    $('maskstatus').textContent='浏览器下载被拦截，请复制下方 JSON 手动保存为 mask.json。';
+  }
 }
 function render(){
   const sensitive=threshold('s'), adult=threshold('a');
@@ -117,13 +228,25 @@ function render(){
       row.insertCell().textContent=`${label} · ${labels[label]}`;
       row.insertCell().textContent=f.scores[label].toFixed(4);
     }
-    card.append(img,title,table);$('grid').append(card);
+    const mark=document.createElement('button');
+    mark.type='button';mark.className='secondary';mark.textContent=isMarked(f.time)?'取消标记':'标记需遮罩';
+    mark.onclick=()=>toggleMark(f.time);
+    card.append(img,title,table,mark);$('grid').append(card);
   }
   $('more').hidden=limit>=shown.length;
 }
 for(const id of ['s','a'])$(id).addEventListener('input',()=>{limit=60;render();});
 for(const id of ['all','sort'])$(id).addEventListener('change',()=>{limit=60;render();});
 $('more').onclick=()=>{limit+=60;render();};
+$('sigma').addEventListener('input',()=>{
+  const value=Number($('sigma').value);
+  if(Number.isFinite(value)&&value>0){sigma=value;saveMask();updateStatus();}
+});
+$('export').addEventListener('click',exportMask);
+$('maskclear').addEventListener('click',()=>{ranges=[];saveMask();renderMask();render();});
+loadMask();
+$('sigma').value=sigma;
+renderMask();
 render();
 </script>
 </body>

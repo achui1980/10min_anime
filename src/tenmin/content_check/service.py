@@ -125,9 +125,13 @@ def _publish(
 def check_video(
     video: Path, output_dir: Path, *, cfg: ContentCheckConfig,
     ffmpeg: str = "ffmpeg", ffprobe: str = "ffprobe", force: bool = False,
-    offline: bool = False,
+    offline: bool = False, episode: int | None = None,
 ) -> CheckOutcome:
-    """Check a video or reuse scores; expected I/O failures never return success."""
+    """Check a video or reuse scores; expected I/O failures never return success.
+
+    `episode` 只是透传给报告页的：报告页拿它给导出的遮罩标注文件命名、并在文件里记下
+    集号。检查本身不依赖它，不知道集号（独立命令）也照样能跑。
+    """
     try:
         video_path, size, mtime = _video_stat(video)
         _prepare_output(output_dir)
@@ -184,7 +188,7 @@ def check_video(
                     "adult_threshold": cfg.adult_threshold,
                     "candidate_count": len(selected), "candidate_ranges": ranges,
                 })
-            html = render_report(manifest)
+            html = render_report(manifest, episode=episode)
             if _video_stat(video) != (video_path, size, mtime):
                 raise ContentCheckError("视频身份在检查中变化；本次检查失败／报告未更新")
             _publish(output_dir, manifest, html, staging,

@@ -13,6 +13,7 @@ from tenmin.atomic import part_path
 from tenmin.config import EpisodeConfig, ProjectConfig, ProjectConfigError, load_project
 from tenmin.ingest import resolve
 from tenmin.ingest.resolve import SubtitleSource
+from tenmin.mask import MaskRange, MaskSpec, save_mask
 from tenmin.models import (
     AudioDirection,
     Beat,
@@ -305,6 +306,7 @@ FROZEN_LAYOUT = {
     "mixed_audio": "06_audio/E02.mixed.m4a",
     "video": "07_render/E02.mp4",
     "check_dir": "08_check/E02",
+    "mask": "08_check/E02.mask.json",
     "asr_cache": "srt/E02.asr.srt",
     "ocr_cache": "srt/E02.ocr.srt",
 }
@@ -768,6 +770,78 @@ async def test_run_pipeline_reruns_the_render_stages_when_the_voice_changes(
     for stage in stages:
         assert ("stage_start", stage) in reporter.calls, stage
         assert ("stage_skip", stage) not in reporter.calls, stage
+
+
+@pytest.mark.asyncio
+async def test_mask_file_triggers_a_render_rerun(project, monkeypatch):
+    """遮罩标注是 render 阶段的新鲜度输入：标注一改，成片必须重渲染。
+
+    不这样的话，用户在报告里标完、导入了、却发现成片还是老的（没糊），
+    而且没有任何报错提示 —— 这是最容易被忽略的一种「功能没生效」。
+    """
+    video = _prepare_video(project)
+    video.write_bytes(b"source")
+    paths = Paths(project.root)
+    _write_script(paths.script(2), render_script())
+    await run_voice(project, FakeTTSEngine([8.0, 10.0, 10.0]), episode=2)
+    _write_dialogue_for_render_script(paths)
+    monkeypatch.setattr("tenmin.pipeline.probe_duration", lambda path, **_: 1400.0)
+    monkeypatch.setattr("tenmin.pipeline.probe_frame_rate", lambda path, **_: 25.0)
+    monkeypatch.setattr("tenmin.pipeline.preflight", lambda video, encoder, **_: 1400.0)
+    _stub_mix_audio_ffmpeg(monkeypatch)
+    monkeypatch.setattr("tenmin.render.video.run_with_progress", _touch_output_with_progress)
+
+    await run_pipeline(project, FakeProvider([]), only=["timeline", "audio", "render"])
+
+    reporter = FakeReporter()
+    await run_pipeline(project, FakeProvider([]), only=["render"], reporter=reporter)
+    assert ("stage_skip", "render") in reporter.calls
+
+    save_mask(paths.mask(2), MaskSpec(episode=2, ranges=[MaskRange(start=1.0, end=2.0)]))
+
+    reporter = FakeReporter()
+    await run_pipeline(project, FakeProvider([]), only=["render"], reporter=reporter)
+    assert ("stage_start", "render") in reporter.calls
+
+
+@pytest.mark.asyncio
+async def test_run_render_passes_the_mask_ranges_into_the_filter_graph(project, monkeypatch):
+    """标注里的区间与 sigma 必须真的进到 ffmpeg 参数里。"""
+    video = _prepare_video(project)
+    video.write_bytes(b"source")
+    paths = Paths(project.root)
+    _write_script(paths.script(2), render_script())
+    await run_voice(project, FakeTTSEngine([8.0, 10.0, 10.0]), episode=2)
+    _write_dialogue_for_render_script(paths)
+    monkeypatch.setattr("tenmin.pipeline.probe_duration", lambda path, **_: 1400.0)
+    monkeypatch.setattr("tenmin.pipeline.probe_frame_rate", lambda path, **_: 25.0)
+    monkeypatch.setattr("tenmin.pipeline.preflight", lambda video, encoder, **_: 1400.0)
+    _stub_mix_audio_ffmpeg(monkeypatch)
+
+    captured: list[list[str]] = []
+
+    def _capture(args, **kwargs):
+        captured.append(list(args))
+        return _touch_output_with_progress(args, **kwargs)
+
+    monkeypatch.setattr("tenmin.render.video.run_with_progress", _capture)
+    save_mask(
+        paths.mask(2),
+        MaskSpec(episode=2, sigma=12.0, ranges=[MaskRange(start=1.0, end=2.5)]),
+    )
+
+    await run_pipeline(project, FakeProvider([]), only=["timeline", "audio", "render"])
+
+    graphs = [
+        args[args.index("-filter_complex") + 1]
+        for args in captured
+        if "-filter_complex" in args
+    ]
+    assert graphs, "没有捕获到渲染参数"
+    graph = graphs[-1]
+    assert "gblur=sigma=12:steps=3" in graph
+    assert "enable='between(t,1.000,2.500)'" in graph
+    assert graph.index("gblur") < graph.index("subtitles")
 
 
 @pytest.mark.asyncio

@@ -32,6 +32,7 @@ from tenmin.ingest import ocr_audit, ocr_batch
 from tenmin.ingest.asr import ASRError
 from tenmin.ingest.normalize import credit_range_source
 from tenmin.ingest.ocr import OCRError, OCRUnavailableError
+from tenmin.mask import MaskError, load_mask, normalize, save_mask
 from tenmin.models import DialogueTrack, SignalReport
 from tenmin.pipeline import (
     STAGES,
@@ -867,3 +868,102 @@ def glossary_command(
         typer.secho(_error_message(error), fg="red", err=True)
         raise typer.Exit(code=1) from error
     typer.echo(f"已写入 {len(result.added)} 条：{project_file}")
+
+
+MASK_EPISODE_OPTION = typer.Option(..., "--episode", help="集数")
+MASK_IMPORT_OPTION = typer.Option(
+    None,
+    "--import",
+    help="导入在报告页导出的 mask.json（浏览器下载的那份）",
+)
+MASK_CLEAR_OPTION = typer.Option(False, "--clear", help="删除这一集的遮罩标注")
+
+
+@app.command("mask")
+def mask_command(
+    slug: str,
+    episode: int = MASK_EPISODE_OPTION,
+    work_dir: Path = WORK_DIR_OPTION,
+    import_file: Path | None = MASK_IMPORT_OPTION,
+    clear: bool = MASK_CLEAR_OPTION,
+) -> None:
+    """管理人工审核写下的遮罩标注（哪些成片时刻要模糊）。"""
+    project_file = _project_file(work_dir, slug)
+    try:
+        cfg = load_project(project_file)
+        _find_episode(cfg, episode)
+    except PIPELINE_ERRORS as error:
+        typer.secho(_error_message(error), fg="red", err=True)
+        raise typer.Exit(code=1) from error
+
+    paths = Paths(cfg.root)
+    target = paths.mask(episode)
+
+    if import_file is not None:
+        _mask_import(import_file, target, episode, slug)
+        return
+    if clear:
+        _mask_clear(target, episode)
+        return
+
+    _mask_status(target, episode)
+
+
+def _mask_import(source: Path, target: Path, episode: int, slug: str) -> None:
+    """把报告页导出的 mask.json 收进项目。"""
+    try:
+        if not source.is_file():
+            raise MaskError(f"找不到要导入的文件 {source}")
+        spec = load_mask(source)
+        if spec is None:  # is_file() 已经排除，兜底防 load_mask 以后改语义
+            raise MaskError(f"找不到要导入的文件 {source}")
+        merged = normalize(spec, episode=episode)
+        changed = save_mask(target, merged)
+    except PIPELINE_ERRORS as error:
+        typer.secho(_error_message(error), fg="red", err=True)
+        raise typer.Exit(code=1) from error
+    if changed:
+        typer.echo(f"已导入 E{episode:02d} 遮罩标注：{target}")
+    else:
+        typer.echo(f"内容与现有标注完全相同，未改动：{target}")
+    typer.echo(f"共 {len(merged.ranges)} 段、{merged.total_seconds:.1f}s，sigma={merged.sigma:g}")
+    typer.echo("重新渲染：tenmin run {0} --episode {1} --only render".format(slug, episode))
+
+
+def _mask_clear(target: Path, episode: int) -> None:
+    """删掉这一集的遮罩标注。"""
+    if not target.exists():
+        typer.echo(f"E{episode:02d} 还没有遮罩标注，无需删除。")
+        return
+    try:
+        target.unlink()
+    except OSError as error:
+        typer.secho(f"删除 {target} 失败：{error}", fg="red", err=True)
+        raise typer.Exit(code=1) from error
+    typer.echo(f"已删除 E{episode:02d} 的遮罩标注：{target}")
+
+
+def _mask_status(target: Path, episode: int) -> None:
+    """打印这一集的遮罩标注状态。"""
+    try:
+        spec = load_mask(target)
+    except PIPELINE_ERRORS as error:
+        typer.secho(_error_message(error), fg="red", err=True)
+        raise typer.Exit(code=1) from error
+    if spec is None:
+        typer.echo(f"E{episode:02d} 没有遮罩标注（{target}）。")
+        typer.echo(
+            "在 08_check/E{0:02d}/report.html 里标记要遮罩的帧，导出 mask.json，"
+            "再 tenmin mask <slug> --episode {0} --import <文件>".format(episode)
+        )
+        return
+    typer.echo(
+        f"E{episode:02d} 遮罩标注：{len(spec.ranges)} 段，"
+        f"合计 {spec.total_seconds:.1f}s，sigma={spec.sigma:g}"
+    )
+    for item in spec.ranges:
+        typer.echo(
+            f"  {format_timestamp(item.start)} → {format_timestamp(item.end)}"
+            f"（{item.duration:.1f}s）"
+        )
+    typer.echo(f"标注文件：{target}")
