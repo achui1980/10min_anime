@@ -333,3 +333,56 @@ def test_mask_clear_removes_every_range(valid_manifest):
     state = run_page(manifest, actions)
     assert state["maskrows"] == []
     assert "尚未标记任何区间" in state["maskstatus"]
+
+
+def test_manual_range_can_be_added_by_seconds_or_clock(valid_manifest):
+    manifest = with_frames(valid_manifest, [(10, (0.2, 0.5, 0.2, 0.1))])
+    actions = ("elements.mstart.value='83.4'; elements.mend.value='86.0';"
+               "elements.maskadd.listeners.click();")
+    state = run_page(manifest, actions)
+    assert state["maskrows"] == [{"start": "83.4", "end": "86.0"}]
+    assert "已添加区间" in state["maskstatus"]
+
+    actions = ("elements.mstart.value='01:23.4'; elements.mend.value='01:26.0';"
+               "elements.maskadd.listeners.click();")
+    state = run_page(manifest, actions)
+    assert state["maskrows"] == [{"start": "83.4", "end": "86.0"}]
+    state = run_page(manifest, actions + "elements.export.listeners.click();")
+    assert json.loads(state["maskjson"])["ranges"] == [{"start": 83.4, "end": 86.0}]
+
+
+def test_manual_range_rejects_invalid_input(valid_manifest):
+    manifest = with_frames(valid_manifest, [(10, (0.2, 0.5, 0.2, 0.1))])
+    state = run_page(manifest, "elements.mstart.value='10'; elements.mend.value='5';"
+                                "elements.maskadd.listeners.click();")
+    assert state["maskrows"] == []
+    assert "终点必须晚于起点" in state["maskstatus"]
+
+    state = run_page(manifest, "elements.mstart.value='abc'; elements.mend.value='5';"
+                                "elements.maskadd.listeners.click();")
+    assert state["maskrows"] == []
+    assert "请填写起止时间" in state["maskstatus"]
+
+    state = run_page(manifest, "elements.mstart.value='10'; elements.mend.value='5';"
+                                "elements.maskadd.listeners.click();"
+                                "elements.export.listeners.click();")
+    assert json.loads(state["maskjson"])["ranges"] == []
+
+
+def test_range_edit_cannot_invert_the_interval(valid_manifest):
+    manifest = with_frames(valid_manifest, [(10, (0.2, 0.5, 0.2, 0.1))])
+    actions = ("elements.grid.children[0].children[3].click();"
+               "elements.masklist.children[0].children[2].value='5';"
+               "elements.masklist.children[0].children[2].oninput();")
+    state = run_page(manifest, actions)
+    assert state["maskrows"] == [{"start": "10.0", "end": "12.0"}]
+    assert "终点必须晚于起点" in state["maskstatus"]
+    state = run_page(manifest, actions + "elements.export.listeners.click();")
+    assert json.loads(state["maskjson"])["ranges"] == [{"start": 10.0, "end": 12.0}]
+
+    actions = ("elements.grid.children[0].children[3].click();"
+               "elements.masklist.children[0].children[0].value='30';"
+               "elements.masklist.children[0].children[0].oninput();")
+    state = run_page(manifest, actions)
+    assert state["maskrows"] == [{"start": "10.0", "end": "12.0"}]
+    assert "起点必须早于终点" in state["maskstatus"]

@@ -39,6 +39,7 @@ button{padding:8px 24px;margin-top:24px;background:var(--accent);color:white;bor
 .mask-row{display:flex;flex-wrap:wrap;align-items:center;gap:16px}
 .maskrange{display:flex;align-items:center;gap:8px;margin-top:8px}
 .maskrange input{width:104px}
+#mstart,#mend{width:170px;padding:4px;border:1px solid var(--line);border-radius:3px}
 button.secondary{background:white;color:var(--accent);border:1px solid var(--accent);margin:12px 0 0;padding:6px 14px}
 button.secondary:hover{background:#eef3f0}
 #maskstatus{font-size:14px;margin:12px 0 0}
@@ -66,11 +67,19 @@ button.secondary:hover{background:#eef3f0}
 <p><small>页面调整仅用于当前查看，不回写项目配置或 JSON。排序值 max(sensitive, questionable + explicit) 仅用于查看优先级；分数不是经过校准的色情概率，也不是严重程度百分制。</small></p>
 <section class="mask" aria-label="遮罩标注">
 <h2>遮罩标注</h2>
-<p class="mask-hint">在候选卡片上点「标记需遮罩」加入区间（默认覆盖该帧之后 2 秒），起止可以改。区间用的是成片时间轴，跟上面的采样时间一致。标注只存在本浏览器里，导出成 mask.json 之后用 <code>tenmin mask &lt;slug&gt; --episode N --import &lt;文件&gt;</code> 导入，再重跑 render 生效；它不会回写 results.json。</p>
+<p class="mask-hint">在候选卡片上点「标记需遮罩」加入区间（默认覆盖该帧之后 2 秒），起止可以改；模型没标为候选、自己看片才发现的时间点，用下面的「手动添加区间」填起止时间加进来（可以写秒数，也可以写 <code>mm:ss</code> / <code>hh:mm:ss</code> 格式）。区间用的是成片时间轴，跟上面的采样时间一致。标注只存在本浏览器里，导出成 mask.json 之后用 <code>tenmin mask &lt;slug&gt; --episode N --import &lt;文件&gt;</code> 导入，再重跑 render 生效；它不会回写 results.json。</p>
 <div class="mask-row">
 <label>模糊强度 sigma <input id="sigma" type="number" min="0.1" max="200" step="0.1"></label>
 <button id="export" type="button" class="secondary">导出 mask.json</button>
 <button id="maskclear" type="button" class="secondary">清空标注</button>
+</div>
+<div class="mask-row">
+<label>手动添加区间
+<input id="mstart" type="text" inputmode="decimal" placeholder="起点 如 03:06.19 或 186.2" size="14">
+<span>→</span>
+<input id="mend" type="text" inputmode="decimal" placeholder="终点 如 03:08.00 或 188.0" size="14">
+</label>
+<button id="maskadd" type="button" class="secondary">添加区间</button>
 </div>
 <div id="masklist"></div>
 <p id="maskstatus"></p>
@@ -124,6 +133,54 @@ function loadMask(){
 function saveMask(){
   try{window.localStorage.setItem(MASK_KEY,JSON.stringify({ranges,sigma}));}catch(e){}
 }
+function parseTime(raw){
+  const text=String(raw==null?'':raw).trim();
+  if(!text)return null;
+  const parts=text.split(':');
+  if(parts.length>3)return null;
+  let seconds=0;
+  for(const part of parts){
+    if(!/^\d+(\.\d+)?$/.test(part))return null;
+    seconds=seconds*60+Number(part);
+  }
+  return seconds;
+}
+function addManualRange(){
+  const start=parseTime($('mstart').value);
+  const end=parseTime($('mend').value);
+  if(start===null||end===null){
+    $('maskstatus').textContent='请填写起止时间：秒数，或 mm:ss / hh:mm:ss 格式（例如 03:06.19）。';
+    return;
+  }
+  if(end<=start){
+    $('maskstatus').textContent='终点必须晚于起点。';
+    return;
+  }
+  ranges.push({start:start,end:end});
+  ranges.sort((a,b)=>a.start-b.start);
+  saveMask();
+  renderMask();
+  render();
+  $('mstart').value='';
+  $('mend').value='';
+  $('maskstatus').textContent=`已添加区间 ${stamp(start)} → ${stamp(end)}。`;
+}
+function applyTime(range,field,input){
+  const raw=String(input.value).trim();
+  const value=Number(raw);
+  const invalid=raw===''||!Number.isFinite(value)||value<0||
+    (field==='start'?value>=range.end:value<=range.start);
+  if(invalid){
+    input.value=range[field].toFixed(1);
+    $('maskstatus').textContent=field==='start'
+      ?'起点必须早于终点，这条改动没有生效。'
+      :'终点必须晚于起点，这条改动没有生效。';
+    return;
+  }
+  range[field]=value;
+  saveMask();
+  updateStatus();
+}
 function isMarked(time){
   return ranges.some(r=>Math.abs(r.start-time)<1e-6);
 }
@@ -158,14 +215,8 @@ function renderMask(){
     end.type='number';end.step='0.1';end.min='0';end.value=range.end.toFixed(1);
     const remove=document.createElement('button');
     remove.type='button';remove.className='secondary';remove.textContent='删除';
-    start.oninput=()=>{
-      const value=Number(start.value);
-      if(Number.isFinite(value)&&value>=0){range.start=value;saveMask();updateStatus();}
-    };
-    end.oninput=()=>{
-      const value=Number(end.value);
-      if(Number.isFinite(value)&&value>=0){range.end=value;saveMask();updateStatus();}
-    };
+    start.oninput=()=>applyTime(range,'start',start);
+    end.oninput=()=>applyTime(range,'end',end);
     remove.onclick=()=>{ranges.splice(index,1);saveMask();renderMask();render();};
     row.append(start,arrow,end,remove);
     list.append(row);
@@ -243,6 +294,10 @@ $('sigma').addEventListener('input',()=>{
   if(Number.isFinite(value)&&value>0){sigma=value;saveMask();updateStatus();}
 });
 $('export').addEventListener('click',exportMask);
+$('maskadd').addEventListener('click',addManualRange);
+for(const id of ['mstart','mend'])$(id).addEventListener('keydown',e=>{
+  if(e&&e.key==='Enter')addManualRange();
+});
 $('maskclear').addEventListener('click',()=>{ranges=[];saveMask();renderMask();render();});
 loadMask();
 $('sigma').value=sigma;

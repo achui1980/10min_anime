@@ -146,6 +146,7 @@ cat /path/to/zscaler_ca_bundle.pem >> .venv/lib/python3.14/site-packages/certifi
   - **sigma 只存在标注文件里**，不进 config（避免两处真相）；默认 `DEFAULT_SIGMA=20.0`（实测档位：16 还看得出轮廓、24 已糊成一片）。
   - 渲染接入点在 `render/video.py::build_render_args`：`[vcat]` 之后、`subtitles` 之前插 `[vcat]gblur=sigma=<S>:steps=3:enable='<expr>'[vblurred];[vblurred]subtitles=…[vout]`。**模糊必须在 subtitles 之前**，否则 tenmin 自己烧的解说字幕也糊；**没有标注时 filtergraph 逐字节不变**（老项目零影响）。用 `gblur` 的 `enable` 时间窗而不是 split/concat 分段，是因为分段会让 filtergraph 复杂度随区间数线性增长。
   - 新鲜度：标注文件进了 render 阶段的 inputs（`_is_fresh` 忽略不存在的输入），所以改标注会触发重渲染，文件不存在时老项目行为零变化。
+  - 报告页的「手动添加区间」控件支持写秒数或 `mm:ss` / `hh:mm:ss`（`parseTime` 解析）；区间编辑**不允许把区间改反**（`applyTime` 检测到会反转就还原输入并提示），因为导出的非法区间会被 `MaskRange` 的 `end > start` 校验拒掉。
 
 ## 测试
 
