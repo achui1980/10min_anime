@@ -11,3 +11,4 @@ work/
 tests/fixtures/generalize/
 graphify-out/
 .worktrees/
+mask-demo/
