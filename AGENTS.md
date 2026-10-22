@@ -73,7 +73,7 @@ cat /path/to/zscaler_ca_bundle.pem >> .venv/lib/python3.14/site-packages/certifi
   ingest/signals **产物字节不变就不写**，避免下游因 mtime 变动连带重跑；全局阶段的新鲜度另由 `.config/{ingest,signals}.done` 记录上次完成时间及**每份产物 SHA-256 摘要**（`_is_fresh_stamped` 比对摘要和输入时间）。重跑前先将戳子置空，失败留下空戳子、下次必重跑；戳子不存在或是旧版阶段名纯文本时才退回按产物 mtime 判。`register_episode` 用 `ruamel.yaml` round-trip 只改目标集的 srt/video，保留其他字段、注释、键序、引号与原有序列缩进；配置读取仍用 PyYAML。登记 SRT 不存在时先报错，不拷贝也不写配置。
 
   批量模式的编排是**按集纵向**（P0-C 定的：中途失败要留下完整交付物，而不是一堆半成品）。script 阶段的多集并发（`llm.script_concurrency`，默认 1）是在这个纵向循环上加一个**有界预取窗口** —— 走到第 i 集时确保前 `i + concurrency` 集的 script task 都起了，然后 await 第 i 集那个。**刻意不把 script 抽成横向并发阶段**：那会直接推翻上面那条不变量（全部集的 script 跑完之前一集成片都不会有，而 script 恰好是最慢也最容易失败的阶段）。默认 1 的依据见 `config.LLMConfig.script_concurrency` 的注释（并发易撞 429、失败时在飞调用白花钱、audio/render 的同步 ffmpeg 会堵住事件循环）。失败收摊走 `_drain_script_tasks`，`try/finally` 包住整个纵向循环。
-- `src/tenmin/cli.py`：Typer CLI（`tenmin init` / `tenmin run` / `tenmin inspect` / `tenmin ocr` / `tenmin check-content` / `tenmin import` / `tenmin ocr-audit` / `tenmin glossary` / `tenmin mask`）。`tenmin ocr` 是脱离项目的批量画面 OCR（见下面 `ingest/ocr_batch.py`），不走管线。`tenmin mask <slug> --episode N` 看遮罩标注状态、`--import <文件>` 导入报告页导出的 mask.json、`--clear` 删除，见下面 `mask.py`。`tenmin import <slug> <dir>`（函数名 `import_`，`import` 是关键字）扫描目录批量登记，见下面 `importer.py`：默认打印预览后要确认，`--yes` 跳过确认，`--dry-run` 只预览（含 LLM 兜底与 ffprobe，零写入），非 TTY 且没 `--yes` 报错退出；确认后先构造管线 provider（缺 key 时一个文件都不动），再**只对本次导入的集**逐集跑 `run_pipeline` 单集模式。`tenmin run` 支持四种用法：
+- `src/tenmin/cli.py`：Typer CLI（`tenmin init` / `tenmin run` / `tenmin inspect` / `tenmin ocr` / `tenmin check-content` / `tenmin import` / `tenmin ocr-audit` / `tenmin glossary` / `tenmin mask`）。`tenmin ocr` 是脱离项目的批量画面 OCR（见下面 `ingest/ocr_batch.py`），不走管线。`tenmin mask <slug> --episode N` 看遮罩标注状态、`--import <文件>` 导入报告页导出的 mask.json、`--clear` 删除，见下面 `mask.py`。`tenmin mask-apply <视频> --mask <文件>` 给**任意视频**打码（不经过 tenmin 管线），见下面 `mask_apply.py`。`tenmin import <slug> <dir>`（函数名 `import_`，`import` 是关键字）扫描目录批量登记，见下面 `importer.py`：默认打印预览后要确认，`--yes` 跳过确认，`--dry-run` 只预览（含 LLM 兜底与 ffprobe，零写入），非 TTY 且没 `--yes` 报错退出；确认后先构造管线 provider（缺 key 时一个文件都不动），再**只对本次导入的集**逐集跑 `run_pipeline` 单集模式。`tenmin run` 支持四种用法：
   - `--episode N --srt <path> --video <path>`：注册新集并跑。
   - `--episode N --video <path>`（不带 `--srt`）：**生肉入口**，对白轨靠软字幕轨抽取、（声明了硬字幕时）画面 OCR 或语音转写拿。反过来「只传 `--srt`」非法（视频是渲染阶段的硬需求）。
   - `--episode N`（不带 srt/video）：重跑已注册的某一集。
@@ -147,6 +147,15 @@ cat /path/to/zscaler_ca_bundle.pem >> .venv/lib/python3.14/site-packages/certifi
   - 渲染接入点在 `render/video.py::build_render_args`：`[vcat]` 之后、`subtitles` 之前插 `[vcat]gblur=sigma=<S>:steps=3:enable='<expr>'[vblurred];[vblurred]subtitles=…[vout]`。**模糊必须在 subtitles 之前**，否则 tenmin 自己烧的解说字幕也糊；**没有标注时 filtergraph 逐字节不变**（老项目零影响）。用 `gblur` 的 `enable` 时间窗而不是 split/concat 分段，是因为分段会让 filtergraph 复杂度随区间数线性增长。
   - 新鲜度：标注文件进了 render 阶段的 inputs（`_is_fresh` 忽略不存在的输入），所以改标注会触发重渲染，文件不存在时老项目行为零变化。
   - 报告页的「手动添加区间」控件支持写秒数或 `mm:ss` / `hh:mm:ss`（`parseTime` 解析）；区间编辑**不允许把区间改反**（`applyTime` 检测到会反转就还原输入并提示），因为导出的非法区间会被 `MaskRange` 的 `end > start` 校验拒掉。
+
+- `src/tenmin/mask_apply.py`：**独立打码路径**（`tenmin mask-apply`）。遮罩最初只是 render 环节的一环，只对 tenmin 的成片有效；这个模块让它也能对**任意视频**独立使用，不经过成片管线。
+  - **时间轴 = 这个视频自己的时间轴**（普通 `-i`，不传 `-copyts`、不加 `setpts`；ffmpeg 按容器 start_time 把第一帧归零，跟 `content_check/frames.py` 抽帧那条路一致）→ 与 `tenmin check-content` 报告里 `f.time` **同一根轴**，「标哪一帧就糊哪一帧」成立。跟集成路径的「成片时间轴」是两根轴，别混。
+  - 滤镜长什么样由 `mask.blur_filter` 说了算 —— 集成路径（`render/video.py`）与本命令**共用同一份定义**，两边效果不会走样。
+  - `build_apply_args`：`-map 0:v:0` + `-map 0:a:0?`（无音轨不报错）+ `-c:a copy`（音频不重编码）；**只带一条视频轨和第一条音轨**（封面图轨、字幕轨不搬运）；**刻意不传 `-pix_fmt`**（像素格式跟源片走，不把 10-bit 悄悄降成 8-bit）；mp4/mov/m4v 加 `-movflags +faststart`。
+  - 原子落盘跟 `render/video.py` 同一套：`with atomic_path(target) as part:` → **在块内**用 `part` 拼 `-vf` 的输出路径 → ffmpeg 写 `.part` → 块结束改名。**输出路径必须用 `part`，用正式路径会绕过原子性**（且 `tmp.replace()` 找不到文件直接炸）。
+  - `quality_args(encoder, crf=..., preset=...)` 是 **keyword-only**，positional 传参会 TypeError。
+  - `apply_mask` 的守卫：源片不存在 / 标注文件缺失 / 区间为空 / 输出 == 源片 / 输出已存在（没 `--force`）都报错退出（`MaskApplyError` 继承 `MaskError`→`ValueError`，CLI 的 `PIPELINE_ERRORS` 自动接住）。**区间先 `merge_ranges` 合并**再进 filtergraph。
+  - CLI 层：标注里带 `episode` 字段时**打印黄色警告**（那通常是成片时间轴，与本命令的轴对不上）。
 
 ## 测试
 

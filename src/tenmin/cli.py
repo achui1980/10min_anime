@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import sys
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any, Literal
 
@@ -33,6 +34,7 @@ from tenmin.ingest.asr import ASRError
 from tenmin.ingest.normalize import credit_range_source
 from tenmin.ingest.ocr import OCRError, OCRUnavailableError
 from tenmin.mask import MaskError, load_mask, normalize, save_mask
+from tenmin.mask_apply import apply_mask, load_spec
 from tenmin.models import DialogueTrack, SignalReport
 from tenmin.pipeline import (
     STAGES,
@@ -967,3 +969,82 @@ def _mask_status(target: Path, episode: int) -> None:
             f"（{item.duration:.1f}s）"
         )
     typer.echo(f"标注文件：{target}")
+
+
+MASK_APPLY_MASK_OPTION = typer.Option(
+    ..., "--mask", help="遮罩标注文件（报告页导出的 mask.json）"
+)
+MASK_APPLY_OUT_OPTION = typer.Option(
+    None, "--out", help="输出路径（默认 <源片名>.masked.<扩展名>）"
+)
+MASK_APPLY_SIGMA_OPTION = typer.Option(
+    None, "--sigma", help="模糊强度（不给就用标注文件里记的值）"
+)
+MASK_APPLY_ENCODER_OPTION = typer.Option(
+    "libx264", "--encoder", help="视频编码器（默认 libx264）"
+)
+MASK_APPLY_CRF_OPTION = typer.Option("20", "--crf", help="质量，越小越好（默认 20）")
+MASK_APPLY_PRESET_OPTION = typer.Option(
+    "medium", "--preset", help="编码速度预设（默认 medium）"
+)
+MASK_APPLY_FORCE_OPTION = typer.Option(
+    False, "--force", help="覆盖已存在的输出文件"
+)
+
+
+@app.command("mask-apply")
+def mask_apply_command(
+    video: Path,
+    mask_file: Path = MASK_APPLY_MASK_OPTION,
+    out: Path | None = MASK_APPLY_OUT_OPTION,
+    sigma: float | None = MASK_APPLY_SIGMA_OPTION,
+    encoder: str = MASK_APPLY_ENCODER_OPTION,
+    crf: str = MASK_APPLY_CRF_OPTION,
+    preset: str = MASK_APPLY_PRESET_OPTION,
+    force: bool = MASK_APPLY_FORCE_OPTION,
+) -> None:
+    """给任意视频按标注打上整屏高斯模糊（不经过 tenmin 的成片管线）。
+
+    标注用视频自己的时间轴：先用 `tenmin check-content <视频>` 出报告、在报告页里
+    标出要遮的帧、导出 mask.json，再跑这个命令。
+    """
+    try:
+        spec = load_spec(mask_file)
+        if spec.episode is not None:
+            typer.secho(
+                f"注意：标注里记着 episode={spec.episode}。那种通常是「成片时间轴」，"
+                "而本命令用的是这个视频自己的时间轴，两者对不上 —— 请确认区间是按"
+                "这个视频的时间填的。",
+                fg="yellow",
+            )
+        target = apply_mask(
+            video,
+            mask_file,
+            out_path=out,
+            sigma=sigma,
+            encoder=encoder,
+            crf=crf,
+            preset=preset,
+            force=force,
+            ffmpeg=DEFAULT_RENDER.ffmpeg_path,
+            ffprobe=DEFAULT_RENDER.ffprobe_path,
+            on_progress=_mask_apply_progress(),
+        )
+    except PIPELINE_ERRORS as error:
+        typer.secho(_error_message(error), fg="red", err=True)
+        raise typer.Exit(code=1) from error
+    typer.echo(f"已输出：{target}")
+
+
+def _mask_apply_progress() -> Callable[[float], None]:
+    """一行百分比进度（写 stderr，不污染 stdout）。"""
+    state = {"last": -1}
+
+    def report(fraction: float) -> None:
+        percent = int(fraction * 100)
+        if percent == state["last"]:
+            return
+        state["last"] = percent
+        typer.echo(f"\r模糊中 {percent}%", nl=False, err=True)
+
+    return report

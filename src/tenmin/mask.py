@@ -30,6 +30,7 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from tenmin.atomic import write_text_if_changed
+from tenmin.render.ffmpeg import escape_filter_arg
 
 # 标注文件的格式版本。往后改结构时 +1，旧文件读不出来时给出明确报错而不是
 # 「字段对不上」的一堆 pydantic 噪音。
@@ -42,6 +43,10 @@ DEFAULT_SIGMA = 20.0
 # 报告页上「标记需遮罩」按钮给新区间的默认长度（秒）。采样间隔默认 1s，2s 能盖住
 # 一帧到它前后各一秒，不至于只糊住一帧的宽度。
 DEFAULT_RANGE_SECONDS = 2.0
+
+# gblur 的 steps。1 步会有明显的阶梯状，3 步已经接近真正的高斯模糊，而步数几乎不影响
+# 速度量级（30s 全片模糊，medium/crf20 实测 6.0s）。
+BLUR_STEPS = 3
 
 
 class MaskError(ValueError):
@@ -124,6 +129,25 @@ def enable_expression(ranges: Iterable[MaskRange]) -> str:
     return "+".join(
         f"between(t,{item.start:.3f},{item.end:.3f})" for item in ranges
     )
+
+
+def blur_filter(
+    ranges: Iterable[MaskRange], sigma: float = DEFAULT_SIGMA
+) -> str:
+    """生成 ffmpeg 的高斯模糊滤镜片段（`gblur` + enable 时间窗）。
+
+    形如 `gblur=sigma=20:steps=3:enable='between(t,156.000,162.500)'`。
+
+    **为什么要有这层封装**：集成路径（`render/video.py` 的 filtergraph）和独立命令
+    （`tenmin mask-apply`）都要拼这一段，两边各写一遍迟早会走样。所以滤镜长什么样
+    只在这里定义一次。
+
+    enable 表达式走 `escape_filter_arg`：里面的逗号（between 的三个参数）必须被
+    filtergraph 层的引号护住，否则会被当成 filter 之间的分隔符。
+    """
+    expression = enable_expression(ranges)
+    enable = escape_filter_arg(expression)
+    return f"gblur=sigma={sigma:g}:steps={BLUR_STEPS}:enable={enable}"
 
 
 def parse_mask(payload: Any) -> MaskSpec:
